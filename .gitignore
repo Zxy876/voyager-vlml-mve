@@ -1,0 +1,58 @@
+# ---------------------------------------------------------------------------
+# 第三方仓库：各自有独立 history，不纳入本仓库
+#   vlml/            VLML 数据层（21 张表 + 46 个洞察 SQL）
+#   voyager-fork/    原版 MineDojo/Voyager 的本地 fork（只做对照阅读）
+#   study_companion/ N.E.K.O 伴学插件副本（只读参照，不修改、不分发）
+# ---------------------------------------------------------------------------
+/vlml/
+/voyager-fork/
+/study_companion/
+
+# ---------------------------------------------------------------------------
+# 凭据
+# ---------------------------------------------------------------------------
+.env
+mve/.env
+*.pem
+*.key
+*.p12
+
+# ---------------------------------------------------------------------------
+# 运行时产物（跑一次就会重新生成）
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行日志与曲线（run_log / causal_timeline / mastery_retention / ui_events）
+*.jsonl
+
+# 备份目录（每轮改动前自动留的）
+_backup_*/
+backups/
+
+# 数据库与导出
+*.db
+*.db-wal
+*.db-shm
+*.sqlite3
+mve/exports/
+
+# 状态文件：技能库 / 裁判缓存 / 驾驶舱状态 / 练习范围 / 工具 schema 缓存 / 图谱
+# （全部可重算，且 skill_store 里带模型学到的源码，属于运行数据不是源码）
+mve/skill_store.json
+mve/referee_store.json
+mve/pilot_state.json
+mve/practice_scope.json
+mve/tool_schemas.json
+mve/knowledge_graph.json
+mve/pilot.log
+mve/db_config.json
+
+# 本地工具目录
+.workbuddy/
+
+# macOS
+.DS_Store
