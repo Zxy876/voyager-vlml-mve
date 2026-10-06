@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import vlml_env  # noqa: F401,E402  必须先引导环境
 
 import causal_timeline  # noqa: E402
+import difficulty  # noqa: E402
 import bypass_learn  # noqa: E402
 import mastery_model  # noqa: E402
 import mastery_retention as retention  # noqa: E402
@@ -89,6 +90,9 @@ async def main() -> None:
         print(f"下一题：{b['question']}")
         print(f"  topic_id  : {b['topic_id']}")
         print(f"  推荐理由  : [{b['reason_label']}] {b['explanation']}")
+        print(f"  难度      : 题目 {b['difficulty']} → 目标 {b['difficulty_target']}"
+              f"（{b['difficulty_why']}）")
+        print(f"  支架档位  : {b['hint']} —— {b['hint_label']}")
         print(f"  跑法      : {b['cmd']}")
         return
 
@@ -103,6 +107,14 @@ async def main() -> None:
     for pol in ("auto", "always", "never"):
         if f"--help-policy={pol}" in argv:
             help_policy = pol
+
+    # 支架档位覆盖（默认由出题器按掌握度算，见 difficulty.py）。
+    # 给它是为了能 A/B：同一道题 full / partial / none 各跑一遍，
+    # 支架若真起作用，覆盖率应该随档位下降 —— 不下降说明档位是摆设。
+    hint_override = ""
+    for lv in (difficulty.HINT_FULL, difficulty.HINT_PARTIAL, difficulty.HINT_NONE):
+        if f"--hint={lv}" in argv:
+            hint_override = lv
 
     # 轮数上限。注意这只是**上限**：判对就 break（照 Voyager rollout 的 done=success），
     # 不会硬跑满。面板/驾驶舱用它控制一次跑多久。
@@ -139,11 +151,21 @@ async def main() -> None:
     print(f"  出题器    : {task.topic_id}")
     print(f"  推荐理由  : [{planner.REASON_LABEL.get(selection['reason'], selection['reason'])}] "
           f"{selection['explanation']}")
+    print(f"  难度梯度  : 题目 {task.difficulty} → 目标 "
+          f"{selection.get('difficulty_target')}（{selection.get('difficulty_why','')}）")
+    print(f"  支架档位  : {selection.get('hint')} —— {selection.get('hint_label','')}")
+    if hint_override:
+        print(f"  ⚠ 支架覆盖  : 出题器算的是 {selection.get('hint')}，"
+              f"本轮强制 {hint_override}（A/B 用）")
+        selection["hint"] = hint_override
+        selection["hint_label"] = difficulty.HINT_LABEL[hint_override]
     if selection["blocked"]:
         print("  ⚠ 拿不到证据 —— 按伴学的规矩，此时不出新题，重复这一题直到拿到证据。")
     print()
 
-    voyager: Any = LLMVoyager(blind=blind) if use_llm else ScriptedVoyager()
+    voyager: Any = LLMVoyager(blind=blind,
+                              hint_level=str(selection.get("hint") or "")) if use_llm \
+        else ScriptedVoyager()
     mode = ("LLM+BLIND" if blind else "LLM") if use_llm else "SCRIPTED"
     # 掌握度序列跨进程续接：从 run_log 恢复这道题的历史**证据**。
     # 不恢复的话，「跑一题就停」每次都是新进程，V2 只看到当前这一轮，

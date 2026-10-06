@@ -798,12 +798,19 @@ class LLMVoyager:
     有了教训 → 它应该学会下钻。
     """
 
-    def __init__(self, model: str = "", api_key: str = "", blind: bool = False) -> None:
+    def __init__(self, model: str = "", api_key: str = "", blind: bool = False,
+                 hint_level: str = "") -> None:
         # 技能库跨运行累积 —— 不累积就看不出进步曲线
         self.memory: list[str] = skill_store.load()
         self.trajectory: list[dict[str, Any]] = []
         self.last_thought = ""
         self.blind = blind                 # True = 规划时不给 dimension/subject 提示
+        # 支架档位（出题器按掌握度算出来，见 difficulty.py）：
+        #   full    给 ★ 声明口径路径 + critic 回灌真实候选路径
+        #   partial 只给聚焦后的结构文档，不给 ★、不给候选
+        #   none    不聚焦、不给 ★、不给候选（全放开）
+        # 空串 = 未指定 → 按 full 处理（保持旧行为，不回退）
+        self.hint_level = str(hint_level or "")
         self.failed_dims: list[str] = []   # 照 fork glm_curator._context()：失败维度喂给下一题
         self.last_critique = ""
         self.errors: list[str] = []        # 工具执行/计划解析的错误，必须上面板
@@ -1680,6 +1687,7 @@ VLML 的 10 个报告工具已经封装好指标口径。能用报告工具拿�
             critique=str(prev.get("critique") or ""),
             missing=list(getattr(self, "failed_dims", None) or []),
             skills_text=skills_text,
+            hint=str(getattr(self, "hint_level", "") or ""),
         )
 
         if out.get("error"):

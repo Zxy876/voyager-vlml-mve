@@ -510,10 +510,13 @@ function pPractice(s){
   const recmd = r.topic_id ? `<div class="recmd ${changed?'now':''}">
       <div><span class="chip ok">出题器当前推荐</span>
         <span class="chip grey">${ESC(r.reason_label||r.reason)}</span>
-        <span class="chip grey">难度 ${r.difficulty}</span>
+        <span class="chip grey">难度 ${r.difficulty}${r.difficulty_target?` → 目标 ${r.difficulty_target}`:''}</span>
+        ${r.hint?`<span class="chip grey">支架 ${ESC(r.hint)}</span>`:''}
         ${changed?`<span class="changed">本次导入后改推此题（原 ${ESC(window.__changedFrom)}）</span>`:''}</div>
       <div class="rq">${ESC(r.question)}</div>
       <div class="rw"><b>为什么是这题：</b>${ESC(r.explanation)}</div>
+      ${r.difficulty_why?`<div class="rw" style="margin-top:4px"><b>难度梯度：</b>${ESC(r.difficulty_why)}</div>`:''}
+      ${r.hint_label?`<div class="rw" style="margin-top:4px"><b>支架档位：</b>${ESC(r.hint)} —— ${ESC(r.hint_label)}</div>`:''}
       <div class="tm mono" style="margin-top:6px;font-size:12px;color:var(--muted)">${ESC(r.cmd||'')}</div>
     </div>` : '';
 

@@ -801,8 +801,14 @@ async def collect(task: Any, *, dims: list[str] | None = None,
                   code: str = "", error: str = "", critique: str = "",
                   missing: list[str] | None = None,
                   retries: int = 3, tools: list[str] | None = None,
-                  skills_text: str = "") -> dict[str, Any]:
-    """让模型写一段调 MCP 的代码，执行它，拿回原始值。"""
+                  skills_text: str = "", hint: str = "") -> dict[str, Any]:
+    """让模型写一段调 MCP 的代码，执行它，拿回原始值。
+
+    `hint` 是出题器按掌握度算出来的**支架档位**（见 `difficulty.py`）：
+    full 给足（★ 声明口径 + critic 给候选），none 全收（只说取空了）。
+    MVE 的题目难度是写死的，梯度只能落在支架上 —— 从扶到放。
+    """
+    import difficulty
     from llm_client import chat
 
     # 先确定这份题该看哪些工具的结构文档：题目声明的 + 图谱里点名的。
@@ -819,11 +825,19 @@ async def collect(task: Any, *, dims: list[str] | None = None,
         tools = sorted(set(t for t in tools if t in TOOL_SIGNATURES)) or list(TOOL_SIGNATURES)
 
     schemas = await probe_schemas(tools)
-    declared = declared_paths(task, dims or [])
+    # 支架档位决定「给多少」：会了就收，不会才扶。
+    # 空串（未指定）按 full 处理 —— 保持旧行为，不回退。
+    hint = str(hint or "") or difficulty.HINT_FULL
+    declared = declared_paths(task, dims or []) \
+        if difficulty.hint_allows(hint, "declared") else {}
     messages = [
         {"role": "system", "content": render_system_message(
-            render_tool_docs(schemas, dims, list(declared.values())),
-            graph_hints(dims, task), skills_text)},
+            render_tool_docs(
+                schemas,
+                dims if difficulty.hint_allows(hint, "focus") else None,
+                list(declared.values())),
+            graph_hints(dims, task) if difficulty.hint_allows(hint, "declared") else "",
+            skills_text)},
         {"role": "user", "content": render_human_message(
             task=task, code=code, error=error, critique=critique,
             missing=missing, dims=dims)},
@@ -869,7 +883,9 @@ async def collect(task: Any, *, dims: list[str] | None = None,
             # 实测三轮交出一模一样的错路径。这里把返回里真实存在的、
             # 名字里含该维度词的路径列出来 —— 这是"执行层观察"的回灌
             # （原版 critic 回灌的也是世界状态，不是"你错了"三个字）。
-            cands = _candidates(schemas, problem, limit=12)
+            # 候选路径也是支架的一部分：会了就只说"取空了"，不给答案方向
+            cands = (_candidates(schemas, problem, limit=12)
+                     if difficulty.hint_allows(hint, "candidates") else [])
             unknown = [p for p in used
                        if not any(p in paths for paths in schemas.values())]
             msg = []

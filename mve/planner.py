@@ -23,6 +23,7 @@ from __future__ import annotations
 from typing import Any
 
 import causal_timeline  # noqa: E402
+import difficulty  # noqa: E402
 import run_log  # noqa: E402
 from tasks import TASKS  # noqa: E402
 
@@ -89,7 +90,74 @@ def _mastery_by_topic() -> dict[str, dict[str, Any]]:
                 break
         rec["stale_run"] = run
         rec["stalled"] = run >= STALE_LIMIT and rec["last_coverage"] < 1.0
+
+    # 难度自适应要用的三个字段（`difficulty.py` 的判据照伴学 difficulty_policy）。
+    # 只取**最近一次**的快照：掌握度是序列的投影，用历史累计会把"曾经很好"
+    # 当成"现在很好"，那正是伴学用 recent_results 而不是累计的原因。
+    for topic, rec in out.items():
+        recent = [r for r in rows if str(r.get("topic_id") or "") == topic]
+        last = recent[-1] if recent else {}
+        rec["confidence"] = float(last.get("mastery_confidence") or 0.0)
+        rec["flags"] = list(last.get("flags") or [])
+        rec["recent_verdicts"] = [str(r.get("verdict") or "")
+                                  for r in recent[-2:]]
     return out
+
+
+def _has_reusable_program(topic: str) -> bool:
+    """技能库里有没有这道题**能直接跑**的程序（有源码 + 有主函数名）。
+
+    这是「能不能收支架」的前提：收支架的意思是"它已经会了，不用扶"，
+    而"会了"在本原型里的可观测形态就是**库里有跑通过的程序可以复用**。
+    没有程序就收支架不是提高难度，只是让它重犯老病 —— 实测同一道题
+    full 能取对（kast={109/109}、kd=1.24），partial / none 会取成 1.0。
+    """
+    try:
+        import skill_store
+    except Exception:
+        return False
+    for s in skill_store.all_skills():
+        if str(s.get("topic") or "") != topic:
+            continue
+        if str(s.get("source") or "") != "practice":
+            continue
+        if not str(s.get("code") or ""):
+            continue
+        if not str((s.get("blueprint") or {}).get("program_name") or ""):
+            continue
+        return True
+    return False
+
+
+def _hint_for(topic: str, rec: dict[str, Any] | None, reason: str) -> dict[str, Any]:
+    """这道题该给多少支架（照伴学 difficulty_policy.select 的同构物）。"""
+    seed = TASKS[topic].difficulty if topic in TASKS else 2
+    d = difficulty.select(
+        seed,
+        mastery=(rec or {}).get("last_mastery") or 0.0,
+        coverage=(rec or {}).get("last_coverage"),
+        attempts=(rec or {}).get("attempts") or 0,
+        confidence=(rec or {}).get("confidence") or 0.0,
+        flags=(rec or {}).get("flags") or (),
+        recent_verdicts=(rec or {}).get("recent_verdicts") or (),
+        reason=reason,
+    )
+    # 收支架的前提：库里有能直接跑的程序。没有就按 full 兜底。
+    if d["hint"] != difficulty.HINT_FULL and not _has_reusable_program(topic):
+        d["hint"] = difficulty.HINT_FULL
+        d["why"] += "；但这题还没有可复用的程序 → 支架先不收"
+    return d
+
+
+def _with_hint(sel: dict[str, Any], mastery: dict[str, Any]) -> dict[str, Any]:
+    """给一次选择补上「目标难度 + 支架档位 + 为什么」。"""
+    rec = mastery.get(sel["topic_id"])
+    d = _hint_for(sel["topic_id"], rec, sel["reason"])
+    sel["difficulty_target"] = d["difficulty"]
+    sel["hint"] = d["hint"]
+    sel["hint_label"] = difficulty.HINT_LABEL[d["hint"]]
+    sel["difficulty_why"] = d["why"]
+    return sel
 
 
 def _used_tools() -> set[str]:
@@ -102,12 +170,48 @@ def _used_tools() -> set[str]:
     return used
 
 
+def _global_target(mastery: dict[str, Any]) -> tuple[int, str]:
+    """全局目标难度：**会做的题越多，接下来该啃越难的**。
+
+    伴学不需要这一条 —— 它的难度是按 (知识点, 难度) 生成题目时直接算出来的
+    （`difficulty_policy.select`）。MVE 的题是硬编码的、每题一个写死的难度，
+    所以梯度只能落在"从哪道题往上走"上。
+
+    规则（MVE 自创，伴学没有同构物）：
+        目标难度 = 1 + 已满分（覆盖率 100%）的题数，clamp [1, 4]
+    一道都没拿下 → 出最基础的；拿下 1 道 → 上难度 2；拿下 3 道 → 上难度 4。
+    它把「掌握度」直接翻译成「下一步往哪走」，而不只是排序。
+    """
+    cleared = sum(1 for t, m in mastery.items()
+                  if t in TASKS and float(m.get("last_coverage") or 0) >= 1.0)
+    target = min(4, max(1, 1 + cleared))
+    return target, f"已拿下 {cleared} 道 → 目标难度 {target}"
+
+
+def _by_gradient(candidates: list[str], target: int) -> str:
+    """在候选里挑**离目标难度最近**的（同难度时取更简单的）。"""
+    return min(candidates,
+               key=lambda t: (abs(TASKS[t].difficulty - target),
+                              TASKS[t].difficulty, t))
+
+
 def select_next(*, explicit_topic_id: str = "") -> dict[str, Any]:
     """挑下一题，并说明为什么。
 
-    返回 {topic_id, reason, explanation, blocked}
+    返回 {topic_id, reason, explanation, blocked, hint, difficulty_target}
     """
     mastery = _mastery_by_topic()
+    target, why_target = _global_target(mastery)
+    sel = _select_raw(explicit_topic_id=explicit_topic_id, mastery=mastery,
+                      target=target)
+    sel = _with_hint(sel, mastery)
+    sel["difficulty_target"] = target
+    sel["difficulty_why"] = why_target + "｜" + str(sel.get("difficulty_why") or "")
+    return sel
+
+
+def _select_raw(*, explicit_topic_id: str, mastery: dict[str, Any],
+                target: int) -> dict[str, Any]:
 
     # 0) 人钉住一道题（伴学 explicit_topic 模式）
     if explicit_topic_id and explicit_topic_id in TASKS:
@@ -218,7 +322,7 @@ def select_next(*, explicit_topic_id: str = "") -> dict[str, Any]:
         fresh = [t for t in TASKS if _never_used(t)
                  and not (mastery.get(t) or {}).get("stalled")]
     if fresh:
-        topic = min(fresh, key=lambda t: (TASKS[t].difficulty, t))
+        topic = _by_gradient(fresh, target)
         gap = sorted(set(TASKS[topic].requires_tools) - used)
         return {
             "topic_id": topic,
@@ -233,11 +337,11 @@ def select_next(*, explicit_topic_id: str = "") -> dict[str, Any]:
     #    （这就是难度阶梯的走法：wrong_retry 被冷却让位后，先补没练过的最低难度）
     untouched = [t for t in TASKS if t not in mastery]
     if untouched:
-        topic = min(untouched, key=lambda t: (TASKS[t].difficulty, t))
+        topic = _by_gradient(untouched, target)
         return {
             "topic_id": topic,
             "reason": "recommended",
-            "explanation": f"这道还没练过，难度 {TASKS[topic].difficulty} 最低，从它开始",
+            "explanation": f"这道还没练过，难度 {TASKS[topic].difficulty} 离目标难度 {target} 最近 —— 从它往上走",
             "blocked": False,
         }
 
@@ -249,7 +353,8 @@ def select_next(*, explicit_topic_id: str = "") -> dict[str, Any]:
         if t in TASKS and m["last_coverage"] < 1.0 and not m["stalled"]
     ]
     if pushable:
-        topic, m = min(pushable, key=lambda kv: kv[1]["last_coverage"])
+        topic, m = min(pushable, key=lambda kv: (kv[1]["last_coverage"],
+                       abs(TASKS[kv[0]].difficulty - target)))
         return {
             "topic_id": topic,
             "reason": "default",
@@ -291,11 +396,11 @@ def select_next(*, explicit_topic_id: str = "") -> dict[str, Any]:
             "blocked": True,
         }
 
-    topic = min(TASKS, key=lambda t: (TASKS[t].difficulty, t))
+    topic = _by_gradient(list(TASKS), target)
     return {
         "topic_id": topic,
         "reason": "cold_start",
-        "explanation": "还没有任何练习记录，从最简单的开始",
+        "explanation": f"还没有任何练习记录，从离目标难度 {target} 最近的开始",
         "blocked": False,
     }
 
@@ -324,5 +429,9 @@ def next_brief() -> dict[str, Any]:
         "reason_label": REASON_LABEL.get(sel["reason"], sel["reason"]),
         "question": task.question if task else "",
         "difficulty": task.difficulty if task else 0,
+        "difficulty_target": sel.get("difficulty_target"),
+        "hint": sel.get("hint", ""),
+        "hint_label": sel.get("hint_label", ""),
+        "difficulty_why": sel.get("difficulty_why", ""),
         "cmd": f"python mve/run_mve.py --llm --topic {sel['topic_id']}",
     }
