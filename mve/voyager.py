@@ -471,9 +471,17 @@ GRAPH_SEED_FALLBACK = os.environ.get("MVE_GRAPH_SEED", "1") != "0"
 # 值由解释器按路径取出 —— 不经过 LLM 誊抄。
 # 存在的理由：实测"翻错键"的病根就在誊抄环节。源码里把路径
 # `key_metrics.team.consistency.kd` 写得清清楚楚，模型照样交出 kast 的值 1.0
-# （kast=109/109 未乘 100）—— 它是在工具返回的巨大 JSON 里**用眼睛翻**的。
+# （kast=109/109）—— 它是在工具返回的巨大 JSON 里**用眼睛翻**的。
 # 交给解释器执行路径，就翻不错。
-ACTION_CODE = os.environ.get("MVE_ACTION_CODE", "0") != "0"
+#
+# 2026-10-06 默认改为 1（原为 0）。对照实验（同一技能库 / 同一时间 / 同一道题）：
+#     代码路径 100%   —— kd_ratio 交出 1.24
+#     默认路径 50%   —— kd_ratio 交出 1.0（把 kast 的 num/denom 套到标量上）
+# 技能库里已经写明了正确路径，两条路的**输入完全相同**，差的只是"执行 vs 阅读"。
+# 这正是原版 Voyager 的本质：技能被 exec，不是被 read。
+# 默认打开不影响 SQL 类题 —— `_is_tool_path_task` 按口径源分流，
+# answer_spec.sql 仍走原路径（那条有图谱骨架与分层断言，corrode 曾因全走代码掉到 0%）。
+ACTION_CODE = os.environ.get("MVE_ACTION_CODE", "1") != "0"
 
 # 只关**断言**（硬校验），保留 prompt 提示 —— A/B 时必须能把两者分开：
 # 断言一旦生效就把失败挡住了，提示层的边际效果会被完全掩盖

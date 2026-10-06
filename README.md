@@ -249,7 +249,7 @@ python mve/dashboard.py                  # 面板 http://127.0.0.1:8777
 
 | 开关 | 默认 | 作用 |
 |---|---|---|
-| `MVE_ACTION_CODE` | 0 | 代码化取证（仅工具路径类题生效） |
+| `MVE_ACTION_CODE` | **1** | 代码化取证（仅工具路径类题生效，SQL 类自动走原路径） |
 | `MVE_GRAPH` / `_SEED` / `_SECTION` / `_INSIGHT` / `_STAGE` | 1 | 图谱各层，都能关掉做 A/B |
 | `MVE_ASSERT` | 1 | 硬校验（关掉才能测出提示层的边际效果） |
 | `MVE_PANEL_HOST` / `_PORT` / `_PREFIX` | `127.0.0.1` / 8777 / 空 | 面板部署用（见 `部署.md`） |

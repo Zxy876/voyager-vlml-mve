@@ -139,8 +139,19 @@ def _solution_code(task: Any) -> str:
                     f"    #   denom = dig(p, \"{den_path}\")\n"
                     f"    #   返回 {{\"num\": num, \"denom\": denom}}（不要自己算好再返回）")
             else:
-                tail = f"按路径取值：{path}" if path else ""
-                lines.append(f"[{dim}] {point}\n    {tool}({sig})\n    # {tail}")
+                # 标量指标。实测踩过一次，必须点破「标量 ≠ num/denom」：
+                #   kast 与 kd 同在 key_metrics.team.consistency 下（kast 是
+                #   {num,denom}，kd 是标量 1.24），长得太像。此前这里只写一句
+                #   「按路径取值」，模型照抄时把上一行 kast 的 num/denom 套路
+                #   套到 kd 上，取成 109/109 = 1.0 —— 连着 48 轮停在 50%。
+                #   只给路径不足以阻止套错，必须显式写清"不要取 .num/.denom"。
+                lines.append(
+                    f"[{dim}] {point}\n    {tool}({sig})\n"
+                    f"    # 标量：dig 到的就是最终值，不用再算\n"
+                    f"    #   value = dig(p, \"{path}\")\n"
+                    f"    #   注意：这个指标**不是** num/denom 结构 ——\n"
+                    f"    #   不要去取 .num / .denom，也不要拿别的指标的\n"
+                    f"    #   num/denom 去除出它，直接返回原值")
     return "\n".join(lines)
 
 
