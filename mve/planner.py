@@ -210,6 +210,50 @@ def select_next(*, explicit_topic_id: str = "") -> dict[str, Any]:
     return sel
 
 
+def _new_topic_suggestion(
+    stalled: list[tuple[str, dict[str, Any]]],
+) -> dict[str, Any]:
+    """照伴学 `weak_topic`：先确定「练什么」，再交给出题器去出题。
+
+    伴学这一步是 `get_weak_topics()`（knowledge_tracker.py:2066）给出薄弱知识点，
+    planner 据此定 `selection_reason=weak_topic`；**planner 自己不调 LLM** ——
+    生成题面是 entry 层的事（`entry_tutor_question_entries.py:1289
+    _generate_question_payload_impl`）。MVE 同构：这里只产出
+    「围绕什么出题 + 难度 + 为什么」，一个字都不交给模型。
+
+    为什么必须补这一层：伴学在「没有可推进的题」时会走 `weak_topic` 去**生成**一道
+    新题；MVE 原版走到 `all_stalled` 就只会标 blocked 卡住 —— 这正是
+    「连着 10 次停在 50%、没有可推进的题了」那个症状的根因。
+    """
+    if not stalled:
+        return {}
+    topic, m = min(stalled, key=lambda kv: (kv[1]["last_coverage"],
+                                            -kv[1]["stale_run"]))
+    task = TASKS.get(topic)
+    dims = [str(p.dimension) for p in (task.rubric if task else [])]
+    focus = dims[0] if dims else ""
+    # 已有题的 subject 用过哪些键 —— 新题必须换一个键，否则撞「与已有题重复」闸
+    used: set[str] = set()
+    for t in TASKS.values():
+        for p in t.rubric:
+            used.update((p.subject or {}).keys())
+    if "player" not in used:
+        want, what = "player", "队员级"
+    elif "map" not in used:
+        want, what = "map", "单图"
+    else:
+        want, what = "", "换个角度"
+    return {
+        "about": f"围绕「{focus}」这个口径，用{what}的范围出一道新题"
+                 + (f"（subject 带上 {want} 键）" if want else "（换一个 subject）"),
+        "focus_dimension": focus,
+        "subject_key": want,
+        "difficulty": int(getattr(task, "difficulty", 2) or 2),
+        "why": (f"{topic} 连着 {m['stale_run']} 次停在 {m['last_coverage']:.0%}，"
+                f"它考的口径（{focus or '未知'}）就是当前的薄弱点"),
+    }
+
+
 def _select_raw(*, explicit_topic_id: str, mastery: dict[str, Any],
                 target: int) -> dict[str, Any]:
 
@@ -372,8 +416,13 @@ def _select_raw(*, explicit_topic_id: str, mastery: dict[str, Any],
             "reason": "all_stalled",
             "explanation": f"没有可推进的题了：这道连着 {m['stale_run']} 次停在 "
                            f"{m['last_coverage']:.0%}（其余未满分的题也都停滞）—— "
-                           f"再排它只是重复，建议先补题目口径或换题",
+                           f"再排它只是重复",
             "blocked": True,
+            # 伴学在这里走 weak_topic 去**生成**一道新题（entry_tutor_answer_entries
+            # .py:174：reason != due_review 就 action=generate_question）。
+            # MVE 补齐这一环：planner 只给「练什么」，生成由 entry 层做。
+            "suggestion": _new_topic_suggestion(stalled),
+            "action": "generate_question",
         }
 
     # 6) blocked_diagnostic：兜底（助产士第四轮：拿不到证据就不生成新题）
@@ -413,7 +462,7 @@ REASON_LABEL = {
     "weak_topic": "人导入方向",
     "tool_coverage": "补工具覆盖",
     "blocked_diagnostic": "拿不到证据·重复",
-    "all_stalled": "全部停滞·重复",
+    "all_stalled": "全部停滞·生成新题",
     "recommended": "推进新题",
     "default": "补最弱的",
     "cold_start": "冷启动",

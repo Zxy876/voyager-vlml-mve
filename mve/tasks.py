@@ -418,6 +418,39 @@ TASKS: dict[str, Task] = {
 }
 
 
+def _merge_generated() -> int:
+    """把 `question_gen` 验过的题并入 TASKS。
+
+    为什么必须在这里合：图谱的维度节点全部从 `TASKS[].rubric` 派生
+    （tasks.py:360），不合进来的话，自动生成的题既进不了掌握度、也进不了图谱，
+    等于生成了个寂寞。
+
+    默认 `validated_target=False` —— 照伴学：只有 validated 的题才计分，
+    **生成 ≠ 生效**，先要能被裁判跑通并被确认口径。
+    """
+    try:
+        import question_gen
+    except Exception:                                        # pragma: no cover
+        return 0
+    added = 0
+    for rec in question_gen.load_generated():
+        topic = str(rec.get("topic_id") or "").strip()
+        if not topic or topic in TASKS:
+            continue
+        try:
+            task = question_gen.to_task(rec)
+        except Exception:                                    # pragma: no cover
+            continue
+        if not task.rubric:
+            continue
+        TASKS[topic] = task
+        added += 1
+    return added
+
+
+GENERATED_COUNT = _merge_generated()
+
+
 # ---------------------------------------------------------------------------
 # 练习范围与下一题（照 practice_scope.ordered_scope_topics）
 # ---------------------------------------------------------------------------

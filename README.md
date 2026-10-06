@@ -155,7 +155,101 @@ Voyager 的产出不是一段话，是**事实集**：
 | `select_practice_selection` 优先级链 retry>due>weak>blocked>recommended>default | **继承** | 每条都带 reason + explanation |
 | 82 个种子知识点 | **替换** | 6 道硬编码题，每题 = 一个知识点 × 一个写死的难度 |
 | `difficulty_policy.select` **算出**难度 2/3/4 | **新写（同构换维）** | 见下 |
-| 题目按 (知识点, 难度) **生成** | **不做** | 判定靠 `answer_spec`（服务端配方）；LLM 生成的新题没有 answer_spec，裁判无从独立算出标准答案 —— 硬边界 |
+| 题目按 (知识点, 难度) **生成** | **已做（`question_gen.py`）** | 见下「自动生成题目」 |
+
+### 自动生成题目：生成的是**配方**，不是答案
+
+> 我上一版在这里写的是「不做 —— LLM 生成的新题没有 answer_spec，
+> 裁判无从独立算出标准答案，硬边界」。**这个判断是错的**，下面这节是更正。
+
+错在把「不能信模型给的答案数值」等同于「不能让模型出题」。
+`loop_core.py:165` 确实写死了：expected 与 tolerance 只从服务端私有的
+`answer_spec` 读 —— 但这只禁止**信模型给的数**，不禁止**让模型出题**。
+
+正确做法：让 LLM 出的是**可执行的取数配方**（`answer_spec`：SQL，或
+工具 + 参数 + 取值路径），而不是答案数值。配方是可执行的 → 裁判跑一遍
+就从 VLML 拿到真值。实测：
+
+```
+[裁判 VLML0] series=2843069/team=Cloud9/map=Lotus · map_win_rate = 45.8 (base=24)
+             series=2843069/team=Cloud9/map=Lotus · rounds_won   = 11
+```
+
+**裁判能独立算出自动生成题的标准答案** —— 硬边界不成立。
+
+#### 四段闭环（照伴学 `question_generate` + `question_validate`）
+
+| # | 伴学 | MVE | 文件:行 |
+|---|---|---|---|
+| 1 | `resolve_target_question_type` 题型由服务端定 | `_dim_specs()` 口径由服务端定（percent/count/ratio/label + 要不要分母），并**枚举维度**给模型挑 | `question_gen.py` |
+| 2 | `_normalize_question` LLM 出题面 + 答案 | `propose()` 出题面 + **取数配方**（禁写答案数值，写了判废） | 同上 |
+| 3 | `question_validate` **第二个 LLM** 判三布尔 | `validate()` **确定性验题**：跑得出吗 / 值非空吗 / 量纲对吗 / 重复吗 | 同上 |
+| 4 | `enforce_mapped_question_type` 强制改回 | `enforce()` 强制改回：维度、工具、参数、percent、分母 | 同上 |
+
+第 3 步是 MVE 比伴学**强**的地方：伴学「答案是否被支持」是另一个模型的
+意见（所以它还得再加一致性标志防自相矛盾）；MVE 是数据事实，跑一遍就知道。
+
+#### 验题的七道闸（每条都能复盘）
+
+| 闸 | 判什么 | 实测抓到过什么 |
+|---|---|---|
+| 维度在服务端声明里吗 | 不许发明口径 | 模型把**工具名** `pattern_detection_report` 当维度填 |
+| 题面与维度定义相关吗 | 伴学的 `relevant` | 问「强起局胜率」却填 `pattern_confidence`（置信度标签） |
+| 与已有题 (subject, dimension) 重复吗 | 不出重复的题 | `pistol_win_rate` × {series,team} 已有 |
+| 题内两个评分点重复吗 | 两个点写成同一条查询 | 两点 SQL 一模一样 |
+| 百分比口径给分母了吗 | 问胜率却取个数 | 只给 `pistol.num`=3，真值是 3/6=50% |
+| 算出来是合法百分比吗 | 0–100 | — |
+| 计数量纲超上限吗 | ≤ 全场总回合数 59 | `SUM(round_number)`=145 被当成「打了多少回合」 |
+
+#### 失败会回灌，而且是「错在哪 + 怎么改」
+
+伴学 `entry_tutor_question_entries.py:1885` 把上一轮的 `validation_failure`
+塞进 `generation_feedback`。MVE 同构，但多给一句**怎么改** —— 只报症状
+实测三轮都改不动（模型会换一种方式犯同一个错）：
+
+```
+修法：SQL 里这些不是 `rounds` 的列：team_name。 rounds 表没有 team_name 列，
+      筛队伍用 winning_team_name
+修法：按题面看，更可能是：eco_win_rate, map_win_rate, pistol_win_rate
+```
+
+#### 服务端能补的就不废题（照伴学 enforce 的精神）
+
+模型漏写**格式**不该判废，口径归属本来就由服务端定：
+
+- 维度填错但配方对 → 按 `value_path` 反查维度改回来（实测把 `kast_pct` 纠正成 `pistol_win_rate`）
+- 工具名错 → 按图谱 `who_produces` 改回来
+- 必填参数忘传 → 从 `subject` 照签名补（`team` → `team_name`）
+- 百分比口径给了分母却没写 `percent` → 补 `true`
+- SQL 算出两列却忘填 `base_column` → 运行时补最后一列
+
+#### 调度：什么时候才生成新题（伴学 `weak_topic`）
+
+伴学答完一题后（`entry_tutor_answer_entries.py:174`）：
+`reason == "due_review"` → 复习旧卡；否则 → `action = "generate_question"`。
+
+MVE 补齐了这一层 —— 这正是「连着 10 次停在 50%、没有可推进的题了」的出口：
+
+```
+planner.py  all_stalled
+   → suggestion {about, focus_dimension, subject_key, difficulty, why}   ← 只选点，不调 LLM
+run_mve.py  看到 action=generate_question → question_gen.generate_adopt()
+   → 验过 → 落盘 generated_tasks.json → tasks.TASKS 自动合并
+```
+
+分工照伴学：**planner 只说清「练什么」，生成题面是 entry 层的活**。
+
+跑法：
+
+```bash
+python mve/question_gen.py --about "Cloud9 在 Lotus 图上的胜率" --difficulty 2 --adopt
+python mve/run_mve.py --no-gen      # 关掉自动生成
+```
+
+⚠️ 诚实的成功率：当前 LLM 走**工具路径**出题一次就能写对；走 **SQL 路径**
+时约三分之一能过（最常见的是把工具名当表名、或造一个不存在的列）。
+七道闸会把它挡下来并回灌，但三轮都改不动的情况确实存在 ——
+这是模型能力问题，不是链路问题。
 | `apply_readiness_policy`（拿不到证据不推进） | **继承** | |
 | `ordered_scope_topics`（错题、做过、难度、id） | **继承** | `tasks.next_topic` |
 | `practice_scope` 范围模式 | **继承** | |
@@ -365,6 +459,7 @@ python mve/dashboard.py                  # 面板 http://127.0.0.1:8777
 | `MVE_GRAPH` / `_SEED` / `_SECTION` / `_INSIGHT` / `_STAGE` | 1 | 图谱各层，都能关掉做 A/B |
 | `MVE_ASSERT` | 1 | 硬校验（关掉才能测出提示层的边际效果） |
 | `--hint=full\|partial\|none` | 由出题器算 | 强制支架档位（A/B 用，见 README 五之二） |
+| `--no-gen` | 关 | 关掉「没有可推进的题时自动生成新题」（见五之二） |
 | `MVE_PANEL_HOST` / `_PORT` / `_PREFIX` | `127.0.0.1` / 8777 / 空 | 面板部署用（见 `部署.md`） |
 
 ---
@@ -397,10 +492,13 @@ python mve/dashboard.py                  # 面板 http://127.0.0.1:8777
 4. **段内定位**：`key_metrics` 下还有 `team`/`opponent` 两层，模型会翻错层。
    工具路径类已由「题干声明口径 = 硬约束」解决（`declared_paths()`）；
    **SQL 路径类**（靠自己写 SQL 的题）没有等价护栏。
-5. **题集只有 6 道，且题面/难度全部硬编码**。梯度已由「支架收放」承担（见五之二），
-   但**题目本身仍写死在 `tasks.py`**，不能按 (知识点, 难度) 生成 ——
-   判定靠 `answer_spec`，生成新题就没有标准答案，这是硬边界。
-   要测「学」，得先有人补题（补题 = 补 answer_spec，不是补题面文案）。
+5. **题目不再写死，但生成成功率有限。** `question_gen.py` 已能自动生成题目
+   （生成的是**取数配方**不是答案，裁判跑一遍拿真值），并能在「没有可推进的题」
+   时自动生成（见五之二）。实测：生成的 `lotus_win_rate` 被判 100% 正确。
+   但当前 LLM 走 **SQL 路径**出题约三分之一能过（最常见：把工具名当表名、
+   造一个不存在的列）；走**工具路径**则一次就能写对。
+   另外生成的题默认 `validated_target=False`（**不进掌握度**）——
+   照伴学：生成 ≠ 生效，先要被确认口径。
 6. 面板的求助按钮与 help_decision 展示还没做。
 7. **SQL 路径的「编排漏条」未解**：`map_rounds_split` 60%、`fb_conversion_analysis` 80%，
    失败形态都是「某个 subject 组合（某张图）的评分点根本没查」，而不是值取错。

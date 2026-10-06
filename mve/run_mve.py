@@ -146,6 +146,37 @@ async def main() -> None:
     #   wrong_retry > due_review > weak_topic(人导入) > blocked_diagnostic > recommended > default
     # 每条都带 reason + explanation。上一版只有排序没有理由，那不算自适应。
     selection = planner.select_next(explicit_topic_id=topic_id or "")
+
+    # ---- 没有可推进的题 → 生成一道新的（伴学 weak_topic → generate_question）----
+    # 分工照伴学：planner 只说清「练什么」，**生成题面是 entry 层的活**
+    # （entry_tutor_question_entries.py:1289 _generate_question_payload_impl）。
+    # 伴学在 selection_reason != due_review 时就是 action=generate_question，
+    # MVE 补齐这一环 —— 否则「没有可推进的题」只会卡住（这正是此前
+    # 「连着 10 次停在 50%」那个症状的出口）。
+    if "--no-gen" not in argv and selection.get("action") == "generate_question":
+        sug = selection.get("suggestion") or {}
+        if sug:
+            print(f"  ⚠ {selection['explanation']}")
+            print(f"  → 照伴学 weak_topic，尝试生成一道新题：{sug.get('why', '')}")
+            try:
+                import question_gen
+                rec, _ = await question_gen.generate_adopt(
+                    about=str(sug.get("about") or ""),
+                    difficulty=int(sug.get("difficulty") or 2),
+                    tries=3, do_adopt=True, verbose=True)
+            except Exception as exc:                         # pragma: no cover
+                print(f"  ⚠ 自动出题失败（继续用现有题）：{type(exc).__name__}: {exc}")
+                rec = None
+            if rec:
+                new_id = str(rec.get("topic_id") or "")
+                # 就地并入 —— planner 读的就是同一个 dict
+                TASKS[new_id] = question_gen.to_task(rec)
+                print(f"  ✅ 新题已入闱：{new_id}")
+                selection = planner.select_next(explicit_topic_id=new_id)
+            else:
+                print("  ⚠ 三次都没生成出成立的题 —— 继续排现有题（诚实结果，"
+                      "不是 bug）")
+
     task = TASKS[selection["topic_id"]]
 
     print(f"  出题器    : {task.topic_id}")
@@ -375,8 +406,8 @@ async def main() -> None:
             task=task, referee=ref, verdict=ev.verdict,
             rejected_low_base=list(ev.rejected_low_base),
             confidence=round(0.6 + 0.35 * det_ratio, 4),
-        )
-        print(f"  critique  : {critique[:110]}")
+        ) or ""     # 脚本基线的 learn 不产出 critique（返回 None），这里兜住
+        print(f"  critique  : {critique[:110]}" if critique else "  critique  : （脚本基线，无）")
         fb = getattr(voyager, "last_feedback", None) or {}
         if fb.get("error_type"):
             print(f"  错误类型  : {fb['error_type']}")

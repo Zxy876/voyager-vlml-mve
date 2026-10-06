@@ -156,11 +156,19 @@ class ScriptedVoyager:
         """叙事段：不参与比对，只给人看。"""
         return f"本轮采集 {len(facts)} 条事实，覆盖 {'/'.join(sorted({f['dimension'] for f in facts}))}"
 
-    def learn(self, *, covered: list[str], missing: list[str], task: Any = None) -> None:
+    def learn(self, *, covered: list[str], missing: list[str], task: Any = None,
+              referee: Any = None, verdict: str = "",
+              rejected_low_base: list[str] | None = None,
+              confidence: float = 0.0) -> None:
         """一轮结束后更新技能库：缺哪个 dimension，就补一条能补上它的技能。
 
         注意：必须按 **dimension** 判断，不能按评分点的中文名——
         名字里没有维度信息（第一版就栽在这里，技能永远学不会）。
+
+        脚本基线**不消费**结构化反馈包（referee / verdict / rejected_low_base /
+        confidence）—— 那套是 LLMVoyager 学「写程序 → 跑通 → 存程序」用的；
+        这里收下它们只是为了与调用方签名一致（实测跑自动生成的新题时
+        因为签名不兼容直接 TypeError 崩了）。
         """
         dim_by_point = {p.point: p.dimension for p in (task.rubric if task else [])}
         miss_dims = [dim_by_point.get(m, m) for m in missing]
