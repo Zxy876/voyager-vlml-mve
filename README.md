@@ -1,214 +1,297 @@
-# MVE：把 Voyager 的自演化闭环搬到 VLML 上
+# MVE：让 Voyager 在 VLML 上学会「取数编排」
 
-一个可跑的原型，回答一个问题：**Voyager 式的 agent 能不能在真实数据层上，
-通过"判错 → 学标准解法 → 重做"这个循环，真的学会取数编排？**
-
-数据层是 **VLML**（Valorant 电竞数据）：21 张表、46 个洞察 SQL、8 个 MCP 工具。
-"学习"那一半的机制取自**猫娘伴学**（N.E.K.O `study_companion`）—— 它有成熟的
-知识图谱、掌握度与判分契约，正好补上原版 Voyager 没有的部分。
-
+> **线上面板**：<https://43.161.203.50:8443/mve/>（腾讯云，无鉴权，任何设备直接打开）
 > **仓库**：<https://github.com/Zxy876/voyager-vlml-mve>
-> **线上面板**：<https://43.161.203.50:8443/mve/>（腾讯云，与猫娘共用 8443 入口，
-> 挂在 `/mve/` 子路径下，**无鉴权，任何设备直接打开**）
->
-> 仓库只含 `mve/` 源码、文档与 `requirements.txt`（45 个文件，约 780KB）。
-> 第三方目录、`mve/.env`、运行日志与状态文件均不入库，见 `.gitignore`。
-> 部署细节见 `部署.md`。
+
+一个跑得起来的原型，回答一个问题：**当"学习者"不是人而是 agent 时，
+一套给人用的学习机制还剩下哪些是能直接搬的？**
+
+数据层是 **VLML**（Valorant 电竞数据，21 张表 / 46 个洞察 SQL / 8 个 MCP 工具）。
+学习机制取自**猫娘伴学**（N.E.K.O `study_companion`）—— 它有成熟的知识图谱、
+掌握度与判分契约。被考察的学习者是 **Voyager** 式的 agent。
 
 ---
 
-## 一、三个源头，怎么拼的
+## 一、对照旧原型：哪层继承、哪层替换、哪层新写
 
-| 原版 MineDojo/Voyager | 猫娘伴学 | 这里（MVE） |
+| 层 | 判定 | 内容 |
 |---|---|---|
-| `render_system_message` 把 control_primitives **源码**拼进 system | — | 工具签名 + 返回结构 + 图谱子图 + **已学会的解法源码** |
-| 产出 ```javascript 代码 | — | 产出 ```python（`async def xxx(mcp)`） |
-| `process_ai_message` 用 babel 做 AST 断言 | — | `ast.parse` 断言（必须 async、唯一参数名 `mcp`）+ SQL 分层断言 |
-| `SkillManager` 存 `program_code` | 掌握度 / FSRS | `skill_store` 存**解法源码** + hits/ok 有效性 |
-| `retrieve_skills` 取回的是源码 | — | 检索带回 `code`，拼进 prompt |
-| — | 知识图谱（82 个知识点种子，先于题目存在） | **212 个事实节点**（独立于题目，从 VLML 实查） |
-| — | `deterministic_evaluators`：期望值只从服务端配方读 | 裁判 `answer_spec` + 值由代码按路径取出，**不经模型誊抄** |
-| — | 讲解四段（题目解析/解题过程/答案/举一反三） | 旁路讲解同构，掌握度按"借助帮助"打 0.85 折 |
+| 数据源 / 使用场景 / 问题背景 | **原样继承** | Valorant 赛事数据、教练视角的洞察需求 |
+| 解决问题的方式与方案 | **替换件** | 整条链路换成 VLML：MCP 把模型直接连到数据库，要数字就查、不许猜，每条主张都有库里的记录支撑 |
+| Voyager 主代理亲历学习、积累技能 | **本轮新写** | 在 VLML 链路里反复做同一批题，把「怎么组合这 21 张表」沉淀成技能 |
+| 学习面板（衡量 Voyager 的进步） | **本轮新写** | 学习插件面板本来是给人用的；这里的学习者是 Voyager，学习内容只有一个标题：**洞察与分析瓦罗兰特的游戏数据** |
+| DriftCoach 旧原型的技术与实现 | **本轮不做** | 不做任何技术讨论，只做概念映射 |
 
-一句话概括三者的关系：**Voyager 给闭环，伴学给学与判的契约，VLML 给真实数据层。**
+一句话：**继承场景，替换链路，新写「agent 当学习者」这一层。**
 
 ---
 
-## 二、主循环
+## 二、界面区域指认
+
+面板七个分区，逐个标注它属于哪一类（形态取自伴学，数据取自 MVE）：
+
+| 分区 | 判定 | 依据 |
+|---|---|---|
+| 📈 概览（掌握度 / 覆盖率轨迹） | 继承结构 + 新写内容 | 五档状态与 flags 徽标照 `ui_api.py`；内容换成 Voyager 的覆盖率与掌握度 |
+| 🎯 练习（出题器派发） | 继承结构 + 新写触发者 | 照伴学 `practice_scope`：人在图谱上钉范围，界面上只剩开始/停止；触发者变成「给 Voyager 出题」 |
+| ✍️ 人导入 | **替换** | 记忆与解释的供应方换成 VLML 与其系统 LLM，不是让 Voyager 跑 |
+| 🧭 轨迹（行动序列） | **新写** | 伴学没有「工具调用序列」这个概念 |
+| 🧠 技能 · 因果 | **新写** | 技能库是 Voyager 的；因果时间线与伴学 `root_fact_seq` 同构 |
+| 🕸 知识图谱 | 继承形态 + 新写内容 | 形态照伴学；内容是**从 VLML 实查出来的 212 个事实**，不依赖题目 |
+| 🖥 运行日志 | 工具性，非学习状态 | 只为排障，不进掌握度 |
+
+---
+
+## 三、组合：全系统唯一的数据契约
+
+Voyager 的产出不是一段话，是**事实集**：
+
+```jsonc
+{ "subject":   {"series": "2843069", "map": "Corrode", "team": "Cloud9"},  // 交叉键字典
+  "dimension": "key_metrics.team.consistency.kast.num",                    // 指标名，可点号嵌套
+  "value": 109, "unit": "count",
+  "base":  109,                                                            // 分母，百分比类必须有
+  "scope":  {"rounds": 59, "confidence": "Strong"},                        // 借 VLML 算好的值
+  "source": {"tool": "match_analysis_report", "section": "key_metrics"} }
+```
+
+四个决定性的设计点（都有代码与出处）：
+
+| 点 | 为什么 | 实现 |
+|---|---|---|
+| `subject` 是**交叉键字典**不是字符串路径 | 实例里有 `mitch on Skye`、`Corrode R4` 这种多维交叉，字符串拼不出；且 `round:22` 里 22 是值不是键 | `loop_core.norm_subject()` 会把模型返回的字符串也归一成字典 |
+| 必须有 `base`，且**参与评分** | `insights_reference.md:130` 是硬规则：67% (16/24) 与 67% (2/3) 数值相同但不是同一个事实 | `base < min_base` 直接判缺失，**数值对也不算数** |
+| 能同时吃下两个极端 | `query_sql` 任意 SQL → `from_sql_result()`：一行一列 = 一个事实，只记结果不记这列属于哪张表；`pattern_detection_report` 聚合 → `from_key_metrics()`：每个 key 一个 dimension，scope 直接借 VLML 算好的 rounds/confidence，不自造 | JOIN、CASE、窗口派生列都不影响 |
+| diff 单元 = `(subject, dimension)` 对 | 与 rubric 的 key_points 做**覆盖率**比对，不是路径一致性比对——避免惩罚殊途同归 | `loop_core.fact_key()` |
+
+**判定次序（确定性层先跑，不调 LLM）**：
 
 ```
-自适应出题  →  做题  →  判错（这就是学习信号）
-                          ↓
-              重试时发现知识点没掌握
-                          ↓
-              同一题跑 VLML0，观摩标准解法 → 存成"解法源码"进技能库
-                          ↓
-              再次做题（源码已进 prompt）→ 掌握度提升
+0. 工具调用闸 —— 一次工具都没调成功 → 整轮判「无证据」   ← 防编造
+1. base 过闸   —— 分母不够，数值对也不算数
+2. (subject, dimension) 命中
+3. 值容差比对 —— 容差只从服务端 answer_spec 读
+判不了的点 → unjudgeable，不静默算对也不静默算错
 ```
 
-判错本身就是信号，不需要另造。关键是把"学到了什么"**存成源码**而不是一句话——
-原版存的是 `program_code`，不是"我下次要注意"这种话。
+`confidence` 四档（`n≥100 Strong / 50-99 Moderate / 20-49 Weak / <20 Insufficient`，
+`insights_reference.md:122-127`）**由 `base` 直接算出**，落进确定性层，不用问模型。
+
+### 叙事性自然语言在哪、怎么声明不参与比对
+
+| 位置 | 标记 |
+|---|---|
+| 解释输出区（VLML + 其 LLM 产出，人可覆盖） | `comparable: false` |
+| Voyager 答卷末尾的 narrative 段 | `comparable: false` |
+| 出题器生成的题干 | 参与比对的是 key_points，不是题干文本 |
+| covered / missing points | `string[]`（评分点名字），不是散文，参与比对 |
+
+双重标记：机器可读 `{"narrative": {"text": "...", "comparable": false}}`
+＋ 面板上人可读的「不参与比对」标签。这条边界 VLML 自己就画好了
+（`README.md:97`：All reports return metrics and evidence only. LLMs should generate insights.）
 
 ---
 
-## 三、这一轮做了什么
+## 四、意图是对象，不是自由文本
 
-### 3.1 种子层：让图谱对**所有题目**生效
+出题器产出的是**对象**：`question + answer + key_points[] + rubric{评分点: 权重}
++ solution_steps[] + difficulty(1-5) + topic + target_topic_id`。
 
-之前图谱的维度节点全部从题目 rubric 派生（只有 13 个 = 5 道题），**新题的图谱块
-是空字符串**。对照伴学源码才发现差距不在细节粒度，在方向：
+**人工导入与出题器产出不是同一种结构**，两者被一个布尔量切开 ——
+伴学叫 `validated_target`（`practice_outcome.py:53-67`）：
 
-| | 伴学 | 改之前 |
+| | 人工导入 | 出题器产出 |
 |---|---|---|
-| 图谱是什么 | 82 个知识点种子，**先于题目存在** | 13 个维度，**从题目派生** |
-| 题目扮演什么 | 用 `match_topics(query=题干)` 匹配焦点 | 硬绑 topic_id，没出过题 = 没有节点 |
+| key_points / rubric | 可以有（能从题干抽） | 有 |
+| 能批改出 verdict | 能 | 能 |
+| `validated_target` | **false** | true |
+| 计入掌握度 | **否**，强制 `insufficient_evidence` | 是 |
 
-照 `knowledge_graph_guidance.py:1269 / :481 / :1302` 与
-`knowledge_graph_index.py:116 / :86 / :1073` 移植：212 个事实节点（45 洞察 +
-146 工具段 + 21 张表，全部 VLML 实查）、`match_facts` 文本匹配、逐关系限流、
-`plan/explain/judge/minimal` 四档分流、压成语义桶、`raw_seed_included=False`。
+### 行动因果时间线
 
-### 3.2 学习闭环：旁路学到的解法源码进技能库
+所有类型的事实进**同一条单调递增时间线**，只保证顺序，不产生分数
+（伴学 `docs/认知引擎阶段文档.md:80` 的 `root_fact_seq` 同构）：
 
-`learn_from_referee` 此前**只在 CLI 手动跑过，主循环一次都没调**——旁路学到的
-东西从来没进过技能库。现在判错 + 求助时触发，存的是**脱敏后的解法源码**
-（SQL 字面量 → `'?'`，工具实参抹掉；给口径与组合，不给答案值）。
+| fact kind | 谁产生 | 进因果 | 进掌握度 |
+|---|---|---|---|
+| `control`（人导入：出题、给解释、改范围） | 人 | ✅ | ❌ |
+| `attempt`（Voyager 的编排与事实集） | Voyager | ✅ | ✅ |
+| `referee`（裁判判定） | VLML0 | ✅ | ✅ |
+| `narrative`（叙事产出） | LLM | ✅ | ❌ |
 
-### 3.3 代码化取证：值由解释器取，不由模型誊抄
-
-`async def xxx(mcp)` → `ast.parse` 断言 → 执行 → facts 直接由代码产出。
+没有这条线，人导入就等于什么都没发生。出题器读的是**时间线（因果）+ 掌握度（评分）**两者，
+不是只看分数。
 
 ---
 
-## 四、实测（含负结果）
+## 五、三档粒度 = VLML 展开的三种深度
 
-### 4.1 有效果的
+同一套结构，三种展开深度，不需要两套结构：
 
-| 题 | 原路径（plan JSON） | 代码路径 |
+| 档 | VLML 展开到 | 面板位置 | 对应伴学 |
+|---|---|---|---|
+| 最粗 | 21 张表 / 45 个洞察 / 146 个工具段 = **212 个事实节点** | 知识图谱 | 知识图谱 |
+| 中 | 展开到记录，算出每个组合归档成类的掌握程度 | 练习范围 | 练习范围详情 |
+| 最细 | 完全展开，按组合评价 Voyager 每次给出的答案 | 概览 / 轨迹 | 判分 |
+
+图谱的关键性质：**212 个事实是先于题目存在的全集**（从 VLML 实查，不依赖 rubric），
+而不是题目派生出来的投影。新题没有图谱缓存时，按题干匹配仍能召回
+（`graph_topics.match_facts`）。
+
+---
+
+## 六、面板上可观测的状态清单
+
+| 状态 | 判定 | 依据 |
 |---|---|---|
-| `kast_adr_check` | **50%**（六次全 50%，把 kast 当 kd） | **100%** |
-| `pistol_eco_pattern` | 100% | 100% |
-| `corrode_collapse` | 100% | 100% |
-| `fb_conversion_analysis` | 80% | 80% |
+| 任务派发触发点 | 继承结构 + 新写触发者 | 伴学 `practice_scope` + `mode: explicit_topic` |
+| Voyager 行动序列 | **新写** | 伴学没有「工具调用序列」 |
+| 解释输出 | **替换** | 供应方换 VLML + 其 LLM，人可覆盖 |
+| covered / missing points | 继承结构 + 新写内容 | `string[]`，`evaluator_type: llm_rubric` |
+| verdict | 继承 | 四档 `correct / partial / wrong / dont_know` |
+| mastery + 等级标记 | 继承 | 三套阈值并存（见下） |
+| false_mastery / low_confidence | 继承 | 见下 |
+| FSRS / BKT / DKT / DriftCoach 技术层 | **本轮不做** | — |
 
-`kast_adr_check` 那道题：源码里路径 `key_metrics.team.consistency.kd` 写得清清楚楚，
-模型照样交 1.0（kast=109/109 未乘 100）—— 它是**用眼睛在返回的 JSON 里翻**的。
-交由解释器执行路径后一次就对。
+**掌握度三套阈值（并存）**
 
-### 4.2 没效果的（同样重要）
+| 层 | 取值 |
+|---|---|
+| 数值 mastery | 0.0–1.0 |
+| 五级 level | 未接触 <0.20 / 薄弱 <0.40 / 进行中 <0.60 / 熟练 <0.80 / 掌握 ≥0.80 |
+| UI status | `unassessed / weak / progress / good / mastered` |
+| 三态 mastery_status | `insufficient_evidence / progressing / mastered` |
 
-加了三层细节，A/B 测下来**在当前题集上全都是冗余的**：
+两个 flag：`false_mastery` = 平均分不低但波动大（**蒙对的、不稳定**）——
+它的杀伤力在 UI 层：分数 0.95 但带 false_mastery，面板仍显示 `weak`；
+`low_confidence` = 证据不足。
+
+**必须继承的一条原则**（`ui_api.py:41`）：
+**没有证据 = `unassessed` + `mastery: None`，不是 0%。**
+Voyager 首次接触某个组合时面板不能显示 0%，否则掌握度曲线从第一题开始就是假的。
+
+---
+
+## 七、这一轮没拿到证据时，面板显示什么
+
+| 情况 | 判定 | 面板表现 |
+|---|---|---|
+| 一次工具都没调成功 | `evidence_status: none`、`no_tool_calls: true`、verdict `dont_know` | 不计入掌握度 |
+| 分母全不够 | `below_threshold`，点名进 `rejected_low_base` | 显示被拒的评分点及原因 |
+| 裁判自己也没有这个点的答案 | 进 `unjudgeable` | 不静默算对也不静默算错 |
+| VLML MCP 连不上 / 字段不全 | 同上，且不推进 | 出题器 readiness 闸门：**没拿到证据就不出下一题** |
+
+怎么看出来：面板上掌握度显示成「掌握度 {before} → {after}」——
+**两个数值没变化，就是这轮没拿到证据**，而且不会生成新题（会重复旧题直到拿到证据）。
+
+实测样本（56 轮里正好有一轮）：
+
+```
+pistol_eco_pattern   verdict=dont_know  evidence=none  no_tool_calls=true  facts=0
+```
+
+---
+
+## 八、现在跑到哪了（截至 2026-10-06 21:30，56 轮）
+
+| 指标 | 值 |
+|---|---|
+| 总轮数 | 56（judge 全部为 `referee`，56/56 —— 标准答案全部由 VLML0 独立跑出） |
+| verdict | correct 3 / partial 51 / dont_know 1 |
+| 无证据轮 | 1（工具全失败，已按上节处理） |
+| 技能库 | 4 条技能，33 次写入（21 次重写 / 8 次判为膨胀跳过） |
+| 掌握度（按题，最新） | fb_conversion 0.60 / corrode 0.61 / pistol 0.57 / series_totals 0.55 / kast 0.47 / map_rounds 0.43 |
+
+### 有效果的
+
+| 项 | 结果 |
+|---|---|
+| 代码化取证（口径来自 answer_spec 的题走代码路径，值由解释器取） | `kast_adr_check` **50% → 100%**；pistol 100% / corrode 100% / fb 80%，无回退 |
+| 图谱（表结构 + 口径 + 参数陷阱） | 无图谱 0% → 有图谱 100% |
+| 学习闭环接通 | 判错触发旁路学习，脱敏解法源码进技能库并注入 prompt |
+
+### 没效果的（同样重要）
+
+加了三层细节，A/B 测下来**在当前题集上全是冗余**：
 
 | 层 | A/B | 结论 |
 |---|---|---|
-| section 层（"取返回里的哪一段"） | 开/关各 3 次，全 100% | 冗余 |
-| 洞察层（"这段由哪些 SQL 拼成"） | 开/关各 3 次，全 100%，且模型一次 SQL 都没多写 | 冗余 |
-| 种子层（212 个事实节点） | 新题开/关各 3 次，全 50%，失败模式一样 | 解决了"有没有"，没解决"有没有用" |
+| section 层（取返回里的哪一段） | 开/关各 3 次，全 100% | 冗余 |
+| 洞察层（这段由哪些 SQL 拼成） | 开/关各 3 次，全 100%，模型一次 SQL 都没多写 | 冗余 |
+| 种子层（212 个事实节点） | 新题开/关各 3 次，全 50%，失败模式一样 | 解决了「有没有」，没解决「有没有用」 |
 
-**真正被模型用上的，仍然只有最早那一层：表结构 + 口径 + 参数陷阱**
-（那次 A/B：无图谱 0% → 有图谱 100%）。
+**真正被模型用上的仍然只有最早那一层：表结构 + 口径 + 参数陷阱。**
 
-行为证据：洞察层开着时，四次跑的 SQL 数全是 0、`calls` 只有一个工具——
-洞察行点名的表从未进入模型任何行为。
+### 一个必须记下来的同构边界
 
-### 4.3 一个必须记下来的同构边界
+**SQL 类不走代码路径。** 先按「全部走代码」跑，corrode 从 100% 掉到 0%。
 
-**SQL 类不走代码路径。** 先按"全部走代码"跑，corrode 从 100% 掉到 0%。
-
-理由不是调参：原版的 JS 是"调用 bot 上的 API"，对应这里调 MCP 工具；而 SQL 是
-`query_sql` 的**参数字符串**，对应原版 `bot.chat("...")` 的参数——**原版从不把
-chat 的字符串当程序来学**，技能库里也没有这一类技能。
-
-所以按口径源分流（`_is_tool_path_task`）：`answer_spec.tool` 走代码路径，
-`answer_spec.sql` 走原路径（那条有图谱骨架与分层断言，正是 SQL 需要的护栏）。
+理由不是调参：原版 Voyager 的 JS 是「调用 bot 上的 API」，对应这里调 MCP 工具；
+而 SQL 是 `query_sql` 的**参数字符串**，对应原版 `bot.chat("...")` 的参数
+—— **原版从不把 chat 的字符串当程序来学**。所以按口径源分流
+（`_is_tool_path_task`）：`answer_spec.tool` 走代码路径，`answer_spec.sql` 走原路径
+（那条有图谱骨架与分层断言，正是 SQL 需要的护栏）。
 
 ---
 
-## 五、跑法
+## 九、跑法
 
 ```bash
-# 1) 依赖与凭据
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt       # 见下
-echo 'ZHIPU_API_KEY=xxx' > mve/.env
+pip install -r requirements.txt          # duckdb + httpx，其余全是标准库
+cp .env.example mve/.env                 # 填 ZHIPU_API_KEY
 
-# 2) 环境体检（VLML 数据层要就位，见第六节）
-python mve/verify_env.py
-
-# 3) 建知识图谱
-python mve/knowledge_graph.py --build
-
-# 4) 跑一轮
-python mve/run_mve.py --llm --topic pistol_eco_pattern --rounds 3
-python mve/run_mve.py --llm --topic kast_adr_check --rounds 3 --help-policy=always
-
-# 5) 面板
-python mve/dashboard.py
+python mve/verify_env.py                 # 环境体检（VLML 数据层要就位）
+python mve/knowledge_graph.py --build    # 建图谱（212 事实）
+python mve/run_mve.py --llm --topic kast_adr_check --rounds 3
+python mve/dashboard.py                  # 面板 http://127.0.0.1:8777
 ```
 
-开关（都能关掉做 A/B）：
-
-| 环境变量 | 默认 | 作用 |
+| 开关 | 默认 | 作用 |
 |---|---|---|
-| `MVE_GRAPH` | 1 | 图谱注入总开关 |
-| `MVE_GRAPH_SECTION` / `_STAGE` / `_INSIGHT` | 1 | 图谱内各层单独开关 |
-| `MVE_GRAPH_SEED` | 1 | 种子层兜底（老路径拿不到时按题干匹配） |
-| `MVE_ASSERT` | 1 | 硬校验（关掉才能测出提示层的边际效果） |
 | `MVE_ACTION_CODE` | 0 | 代码化取证（仅工具路径类题生效） |
-| `MVE_DEBUG_PROMPT` | 0 | 落盘 prompt 到 /tmp |
-| `MVE_PANEL_HOST` | `127.0.0.1` | 面板监听地址（部署时绑 docker 网桥，见 `部署.md`） |
-| `MVE_PANEL_PORT` | 8777 | 面板端口 |
-| `MVE_PANEL_PREFIX` | 空 | 挂在反向代理子路径下时填（如 `/mve`） |
+| `MVE_GRAPH` / `_SEED` / `_SECTION` / `_INSIGHT` / `_STAGE` | 1 | 图谱各层，都能关掉做 A/B |
+| `MVE_ASSERT` | 1 | 硬校验（关掉才能测出提示层的边际效果） |
+| `MVE_PANEL_HOST` / `_PORT` / `_PREFIX` | `127.0.0.1` / 8777 / 空 | 面板部署用（见 `部署.md`） |
 
 ---
 
-## 六、部署
+## 十、部署
 
-已部署到腾讯云 `43.161.203.50`，面板在 **https://43.161.203.50:8443/mve/**。
+已部署到腾讯云 `43.161.203.50`，面板 **https://43.161.203.50:8443/mve/**（无鉴权）。
 
-这台机器只放行 22 / 8443，8443 已被猫娘的 Caddy 网关占着，所以 MVE 挂在它的
-子路径下：`Caddy(/mve* → basic_auth → 转发) → 172.18.0.1:8777(面板, systemd)`。
-面板只监听 docker 网桥地址，公网够不到；鉴权全在 Caddy 一层。
+这台机器只放行 22 / 8443，8443 已被猫娘的 Caddy 网关占着，所以 MVE 挂在它的子路径下：
+`Caddy(handle /mve* → 172.18.0.1:8777)` → 面板只监听 docker 网桥地址，systemd 托管、开机自启。
+为此面板支持 `--host / --prefix`：服务端剥前缀（不带前缀一律 404），
+前端 13 处 `fetch('/api/...')` 注入 `window.MVE_PREFIX` 自动加前缀。
+完整步骤、Caddy 片段与自检见 **`部署.md`**。
 
-为此面板加了 `--host / --prefix`：服务端剥前缀（没带前缀的一律 404），
-前端 13 处 `fetch('/api/...')` 注入 `window.MVE_PREFIX` 后自动加前缀。
-本地不带前缀跑，行为完全不变。
-
-完整步骤、Caddy 片段、自检与更新命令见 **`部署.md`**。
-
----
-
-## 七、仓库里不包含什么
-
-| 目录 | 为什么 |
-|---|---|
-| `vlml/` | VLML 数据层，独立 git 仓库（18M）。本仓库的图谱构建依赖它，请自行放置 |
-| `voyager-fork/` | 原版 Voyager 本地 fork，只做对照阅读 |
-| `study_companion/` | 伴学插件副本，只读参照（不修改、不分发） |
-| `mve/.env` | API 凭据 |
-
-代码里所有凭据都走 `os.getenv`，**没有任何硬编码**。
+**仓库不含**：`vlml/`（数据层，独立 git 仓库）、`voyager-fork/`、`study_companion/`
+（只读参照，不分发）、`mve/.env`、运行日志与状态文件。凭据全走 `os.getenv`，无硬编码。
 
 ---
 
-## 八、已知缺口
+## 十一、已知缺口（含与设计的失配）
 
-1. **段内定位**：`key_metrics` 下还有 `team`/`opponent` 两层，模型会翻错层。
-   这不在伴学图谱的职责内（它管知识点关系，不管工具返回结构），要自己补——
-   候选是把工具返回的结构骨架（有哪些子键、每个是 `num/denom` 还是标量）
-   作为契约进图，仍然只给结构不给数值。
-2. **SQL 类的代码化**：目前 SQL 类走原路径。要让代码路径也能覆盖，需要把
-   `_check_sql_layering` 那套分层断言搬到代码里的 SQL 上。
-3. `procedure_step` 边默认不建（`--build --observe` 才跑裁判补实测边）。
-4. 面板的求助按钮与 help_decision 展示还没做。
-5. 题集太小（6 道），且 4 道首轮就满分 —— 测不出学习曲线。要测"学"，得先有梯度。
+1. **掌握度挂在 `topic_id` 上，不是「组合归档成的类」。**
+   设计要的是「按组合类算掌握程度」，代码目前按题聚合。三档粒度里最细那档（按组合评价）
+   已经做到，但账本仍挂在题上 —— 这是当前与纸面设计的**最大失配**，未修。
+2. **双路去重解释不做。** 存在的是「人导入 → VLML 解释 → 进时间线 → 反哺出题器」；
+   设计里问到的「用户提问、由 VLML 与 Voyager 去重后交 LLM 解释」那条通路**本轮不存在**，
+   也不打算做。
+3. **出题器会被错题卡住。** 实测 56 轮里 45 轮给了 `kast_adr_check`（覆盖率长期停在 50%），
+   其余 5 道题加起来只拿到 11 轮。已有冷却闸与「没进展就毕业」机制，但仍会重现。
+4. **段内定位**：`key_metrics` 下还有 `team`/`opponent` 两层，模型会翻错层。
+   候选是把工具返回的结构骨架作为契约进图（只给结构不给数值）。
+5. **题集只有 6 道**，且 4 道首轮接近满分 —— 测不出学习曲线。要测「学」，得先有梯度。
+6. 面板的求助按钮与 help_decision 展示还没做。
 
 ---
 
-## 九、文档
+## 十二、文档
 
-- `部署.md` —— 腾讯云上的部署形态、Caddy 片段、自检与更新
-- `知识图谱与求助闭环.md` —— 本次全部改动的取证与实测（12 节，含负结果）
-- `取证通路-原版Voyager对照.md` —— "原件进判定" vs "誊抄本进判定"
+- `部署.md` —— 腾讯云部署形态、Caddy 片段、自检与更新
+- `知识图谱与求助闭环.md` —— 图谱三层与学习闭环的完整取证（含负结果）
+- `取证通路-原版Voyager对照.md` —— 「原件进判定」vs「誊抄本进判定」
 - `裁判链路记录.md` / `反馈链路与旁路学习.md` / `掌握度调研-猫娘伴学对照.md`
 - `进度对照.md` / `环境体检.md` / `MVE跑通记录.md`
