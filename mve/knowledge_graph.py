@@ -63,6 +63,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import re
 import sys
@@ -707,6 +708,8 @@ class KnowledgeGraph:
                 "tools": len(self.tools()),
                 "tables": len(self.tables()),
                 "edges": len(self.edges),
+                # 缓存过期判据：见 `load()` 里的 `_stale`
+                "task_fingerprint": _task_fingerprint(),
             },
         }
 
@@ -720,6 +723,17 @@ class KnowledgeGraph:
         if not path.exists():
             return g
         raw = json.loads(path.read_text(encoding="utf-8"))
+        # 过期守卫：图谱是 `build()` 的**落盘缓存**，而它的输入是 tasks.py 的
+        # answer_spec。加了一道新题却不重建，图谱里就永远没有那个维度 ——
+        # 实测 `kast_adr_check` 就是这样：图谱里没有 kast_pct / kd_ratio，
+        # 提示整段为空，模型连着三轮在错分支上重试。缓存必须自己知道过期。
+        if _stale(raw, _task_fingerprint()):
+            try:
+                g = build()
+                g.save(path)
+                return g
+            except Exception:
+                pass          # 重建失败就退回旧图，总比没有强
         for n in raw.get("nodes") or []:
             g.add_node(Node(id=n["id"], kind=n["kind"],
                             label=n.get("label", ""), detail=n.get("detail") or {}))
@@ -734,6 +748,32 @@ class KnowledgeGraph:
 # --------------------------------------------------------------------------
 # 构建
 # --------------------------------------------------------------------------
+def _task_fingerprint() -> str:
+    """tasks.py 里「题目 → 维度 → 声明路径」的指纹。
+
+    图谱的输入就是这个指纹覆盖的东西；指纹变了说明加/改了题，缓存必须重建。
+    """
+    try:
+        from tasks import TASKS
+    except Exception:
+        return ""
+    parts = []
+    for topic_id in sorted(TASKS):
+        for p in (getattr(TASKS[topic_id], "rubric", None) or []):
+            s = getattr(p, "answer_spec", None)
+            parts.append(
+                f"{topic_id}|{p.dimension}|"
+                f"{getattr(s, 'tool', '') or ''}:{getattr(s, 'value_path', '') or ''}"
+                f":{getattr(s, 'sql', '') or ''}")
+    return hashlib.sha1("\n".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def _stale(raw: dict[str, Any], fingerprint: str) -> bool:
+    if not fingerprint:
+        return False
+    return str((raw.get("summary") or {}).get("task_fingerprint") or "") != fingerprint
+
+
 def _create_table_columns(text: str) -> dict[str, list[str]]:
     """从 CREATE TABLE 语句里解析列名（schema/*.sql 是唯一权威来源之一）。
 

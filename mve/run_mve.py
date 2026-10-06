@@ -41,6 +41,22 @@ from voyager import LLMVoyager, ScriptedVoyager  # noqa: E402
 
 from tasks import SERIES, TASKS, TASK, TASK_HARD, TASK_MID, TASK_PATTERN, next_topic  # noqa: E402
 
+# 「跑通」的判据：覆盖率到这个数，才把自己写的程序存进技能库。
+# 照原版：任务完成才 add_new_skill；没跑通的存进去等于把错误做法固化。
+PRACTICE_SAVE_COVERAGE = 0.95
+
+
+def _stable_skill_name(task: Any) -> str:
+    """技能的**稳定主键**（照原版 `program_name`）。
+
+    原版技能的主键是函数名——稳定，所以同名会走 Rewriting 更新同一条。
+    MVE 此前用 LLM 每轮生成的一句话当名字，措辞一变就是"新技能"：
+    实测同一条经验被写成「按 team 维度下钻」「按 team 维度拆分」「按 team 下钻」三版，
+    于是 versions 涨到 49、膨胀率 17.5，而每一版都没被真正更新过（ok=0）。
+    名字必须由**题目**决定，不由模型当次的措辞决定。
+    """
+    return f"{getattr(task, 'topic_id', '') or 'task'}解法"
+
 
 def _deterministic_ratio(ref_facts: list[dict[str, Any]]) -> float:
     """裁判事实里「确定性来源」占多少 —— V2 证据权重的 evaluator_confidence 用它。
@@ -198,6 +214,10 @@ async def main() -> None:
             print(f"  技能      : {result['skill_used']}   "
                   f"技能库={[s.name for s in voyager.skills]}")
         print(f"  事实数    : {ev.facts_count}   evidence={ev.evidence_status}")
+        if result.get("reused_skill"):
+            # 学到的程序被**跑**了，不是被读了 —— 这是「学会」的可观测形态。
+            print(f"  复用技能  : {result['reused_skill']}"
+                  f"（直接执行技能库里的程序，本轮未重新生成代码）")
         print(f"  已覆盖    : {ev.covered_points}")
         print(f"  缺失      : {ev.missing_points}")
         if ev.rejected_low_base:
@@ -347,6 +367,34 @@ async def main() -> None:
         if fb.get("next_action"):
             print(f"  下一步    : {fb['next_action'][:150]}")
 
+        # ---- 学习 ①：自己跑通了 → 存**自己写的**程序 ----
+        # 这是原版 `add_new_skill` 的本体：
+        #   原版：自己写 JS → 跑通 → 存 program_code → 下次直接跑
+        # 此前 MVE 只存 VLML0 的解法（观摩来的），自己跑通的那段
+        # 从来没存过 —— 于是"跑通"这件事对技能库没有任何贡献。
+        # 判据照原版：任务完成（这里用覆盖率达标）才存，
+        # 没跑通的存进去等于把错误做法固化下来。
+        try:
+            prog = str(result.get("program_code") or "")
+            if prog and ev.coverage >= PRACTICE_SAVE_COVERAGE:
+                _saved = skill_store.add(
+                    task.topic_id,
+                    _stable_skill_name(task),
+                    f"自己跑通的编排（覆盖率 {ev.coverage:.0%}）："
+                    f"{result.get('program_name') or ''}",
+                    code=prog,
+                    # 主函数名必须一起存：复用时 `execute(code, name)` 要靠它
+                    # 找到入口。只存源码不存函数名，程序取出来也跑不了。
+                    blueprint={"source": "practice",
+                               "coverage": ev.coverage,
+                               "program_name": result.get("program_name") or ""},
+                    source="practice")
+                print(f"  学会技能  : {_saved[0]} "
+                      f"（自己写的程序 {len(prog)} 字符已入库）")
+        except Exception as e:                # pragma: no cover
+            print(f"  （存程序失败：{type(e).__name__}: {e}）")
+
+
         # ---- 求助闭环：判错后由 Voyager 自己决定要不要去旁路看解释 ----
         # 顺序有讲究：先自己按图谱说的工具名试一次，实在不行才求助。
         # 求助一次就要在掌握度上记一笔（used_hint → 0.85 折），
@@ -374,8 +422,8 @@ async def main() -> None:
                             print(f"  {sec}：{body[:150]}")
                         print(f"  重做时只带做法（编排 {' → '.join(pack.get('plan') or [])}），数值自己取")
 
-                        # ---- 学习：把 VLML0 的解法源码写进技能库 ----
-                        # 这是原版 `add_new_skill` 的同构物，也是这一轮的核心：
+                        # ---- 学习 ②：没跑通 → 观摩 VLML0 的标准解法 ----
+                        # 这是原版 `add_new_skill` 的同构物，也是之前的核心：
                         #   原版：自己写 JS → 跑通 → 存 program_code
                         #   MVE ：判错（学习信号）→ 观摩 VLML0 → 存它的解法源码
                         # 判错本身就是信号，不需要另造；而"学到了什么"必须落进

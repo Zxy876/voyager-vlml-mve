@@ -206,9 +206,11 @@ pistol_eco_pattern   verdict=dont_know  evidence=none  no_tool_calls=true  facts
 
 | 项 | 结果 |
 |---|---|
-| 代码化取证（口径来自 answer_spec 的题走代码路径，值由解释器取） | `kast_adr_check` **50% → 100%**；pistol 100% / corrode 100% / fb 80%，无回退 |
+| 代码化取证（口径来自 answer_spec 的题走代码路径，值由解释器取） | `kast_adr_check` **50% → 100%**（根治后空库首轮即 100%）；pistol 100% / corrode 100% / series_totals 100% |
 | 图谱（表结构 + 口径 + 参数陷阱） | 无图谱 0% → 有图谱 100% |
 | 学习闭环接通 | 判错触发旁路学习，脱敏解法源码进技能库并注入 prompt |
+| 自己跑通 → 存程序 → 下次直接跑 | `复用技能：kast_adr_check解法（本轮未重新生成代码）` → 100% |
+| 图谱缓存过期守卫 | 加题后 `load()` 自动重建（此前 `kast_adr_check` 因图谱未重建，提示整段为空） |
 
 ### 没效果的（同样重要）
 
@@ -234,6 +236,52 @@ pistol_eco_pattern   verdict=dont_know  evidence=none  no_tool_calls=true  facts
 
 ---
 
+## 八之二、「连着 48 轮停在 50%」的根治（2026-10-06）
+
+症状：`kast_adr_check` 反复停在 50%（kd 交 1.0，真值 1.24），其余未满分的题也一起停滞。
+诊断过程见 `取证通路-原版Voyager对照.md`。**根因不是「取数能力不够」，是四个具体的 bug**：
+
+| # | bug | 证据 | 修法 |
+|---|---|---|---|
+| 1 | 结构文档**按固定条数截断**：`_MAX_PATHS=60`，而 `match_analysis_report` 正好 61 条 —— 正确路径 `key_metrics.team.consistency.kast.num` 在**抽取阶段就被砍掉** | 缓存里 61 条止于 `team_comparison.NRG.assists` | 抽取上限提到 400，**展示**改按维度聚焦（命中 → 同父兄弟 → 顶层骨架，各父节点限 8 条） |
+| 2 | 图谱是**落盘缓存且已过期**：`kast_adr_check` 是后加的题，图谱里根本没有 `kast_pct`/`kd_ratio` 节点，`graph_hints` 整段返回空 | 301 个节点全是老题种的 | `load()` 加指纹守卫（`_task_fingerprint` 变了就自动重建）；`graph_hints` 在图谱缺维度时**直接读题目自己的 rubric** |
+| 3 | critic 只说「路径不对」，**不给候选**：模型三轮交出一模一样的错路径 | 三次回灌同一份代码 | 用 AST 抽出模型写过的路径，指明「这条不在返回里」，并列出返回里真实存在的候选 |
+| 4 | 声明的口径只是**建议**不是约束：`team_comparison.*.consistency` 是一支占位值分支（Cloud9 与 NRG 的 `kd_ratio` 都是 1.0、`adr` 分母都是 59），照样能 dig 出数字 | 权威段 `key_metrics.team` 才是 1.24 / 109 | `declared_paths()` 把题干口径变成**硬约束**：prompt 里打 ★ 排最前；critic 单独判「取到值但取错分支」 |
+
+修完的表现：**空技能库、第一轮即 100%**（`kast={109/109}`、`kd=1.24`），
+工具类题（kast / pistol / corrode / series_totals）全部 100%，SQL 类无回退。
+
+### 学习循环的后半环：程序是拿来**跑**的，不是拿来读的
+
+原版 `add_new_skill` 存的是 `program_name + program_code`（自己写、跑通了的完整源码），
+下次取出来**直接 exec**。此前 MVE 只有前半环，缺的三件事这次补齐：
+
+| 原版 | 此前 MVE | 现在 |
+|---|---|---|
+| 任务完成才 `add_new_skill` | 自己跑通的那段代码从来没存过，只存观摩来的解法 | 覆盖率 ≥ 0.95 就存**自己写的程序**（`PRACTICE_SAVE_COVERAGE`），连主函数名一起存进 blueprint |
+| 主键是函数名（稳定，同名走 Rewriting） | 主键是 LLM 每轮生成的一句话（「按 team 下钻」/「按 team 拆分」）→ 永远算新技能，versions 49、膨胀率 17.5 | 主键固定为 `{topic_id}解法`；`learn()` 那条文字经验也改用同一个 key，两条通道覆盖同一条 |
+| 检索出来直接 exec | 检索出来拼进 prompt 让人**读**，模型每轮重写一遍（每次重写都是新的翻错机会） | `_reuse_skill()`：先直接执行库里的程序，维度齐全就采用（`复用技能` 打印），跑不通才让模型重写 |
+
+另外修了一处统计口径：代码路径此前从不设置 `_injected_keys`，技能的
+`hits` / `ok` / 有效性加权全是死的，面板上「本轮注入 0/5」不是没注入而是没记。
+
+### SQL 侧顺手修的一个 bug
+
+`map_rounds_split`：模型一条 `GROUP BY map_name` 查三行再按行号取值，交上
+Corrode/Haven/Lotus = 21/24/14，真值是 14/21/24 —— **数字全对，只是配错了地图**。
+这类错不报错、不取空，只有裁判比对才发现。已加 `_check_group_order` 断言
+（GROUP BY 无 ORDER BY 即驳回，并给出「每个分组一条 SQL」的骨架）。
+该题仍有 2 个评分点没覆盖（胜率两条压根没查），见「已知缺口」第 7 条。
+
+顺带查出第二处：计划校验里写死的「每轮最多 3 次调用」。
+`fb_conversion_analysis` 有 4 个评分点、`map_rounds_split` 有 5 个，
+按图一条查询最少就要 4 / 5 条 —— 写死 3 等于**必然漏条**（模型写 4 条就被闸拦下，
+三次重试全废在「条数超了」上，最后降级放行 3 条）。上限已改成
+`max(3, len(rubric))`。放开之后模型仍然只规划 3 条，所以这只是解除了一个
+**机制性封顶**，不是解法本身。
+
+---
+
 ## 九、跑法
 
 ```bash
@@ -242,10 +290,13 @@ pip install -r requirements.txt          # duckdb + httpx，其余全是标准�
 cp .env.example mve/.env                 # 填 ZHIPU_API_KEY
 
 python mve/verify_env.py                 # 环境体检（VLML 数据层要就位）
-python mve/knowledge_graph.py --build    # 建图谱（212 事实）
+python mve/knowledge_graph.py --build    # 建图谱（可选 —— 见下）
 python mve/run_mve.py --llm --topic kast_adr_check --rounds 3
 python mve/dashboard.py                  # 面板 http://127.0.0.1:8777
 ```
+
+> `--build` 其实可以不跑：`KnowledgeGraph.load()` 带指纹守卫，
+> 发现落盘图谱与 tasks.py 对不上会**自动重建**（加过题忘了重建是踩过的坑）。
 
 | 开关 | 默认 | 作用 |
 |---|---|---|
@@ -282,9 +333,19 @@ python mve/dashboard.py                  # 面板 http://127.0.0.1:8777
 3. **出题器会被错题卡住。** 实测 56 轮里 45 轮给了 `kast_adr_check`（覆盖率长期停在 50%），
    其余 5 道题加起来只拿到 11 轮。已有冷却闸与「没进展就毕业」机制，但仍会重现。
 4. **段内定位**：`key_metrics` 下还有 `team`/`opponent` 两层，模型会翻错层。
-   候选是把工具返回的结构骨架作为契约进图（只给结构不给数值）。
+   工具路径类已由「题干声明口径 = 硬约束」解决（`declared_paths()`）；
+   **SQL 路径类**（靠自己写 SQL 的题）没有等价护栏。
 5. **题集只有 6 道**，且 4 道首轮接近满分 —— 测不出学习曲线。要测「学」，得先有梯度。
 6. 面板的求助按钮与 help_decision 展示还没做。
+7. **SQL 路径的「编排漏条」未解**：`map_rounds_split` 60%、`fb_conversion_analysis` 80%，
+   失败形态都是「某个 subject 组合（某张图）的评分点根本没查」，而不是值取错。
+   图谱上下文给全了口径骨架、feedback 也点名了缺哪个维度，模型下一轮仍只出 3 条查询。
+   试过两条路都**没有奏效**，故如实记录：
+   - 加提示要求「每个 subject 组合一条查询」→ **反而掉到 50%**（模型写 4 条被
+     「最多 3 次调用」的闸拦下，三次重试全废）。已撤销该提示。
+   - 把调用上限从写死的 3 改成 `max(3, len(rubric))` → 回到 80%，模型**仍然只规划 3 条**。
+   结论：缺的不是提示措辞、也不只是条数上限，而是「按评分点逐条展开」的
+   **结构性约束**（例如把评分点展开成强制的 call 模板），未做。
 
 ---
 

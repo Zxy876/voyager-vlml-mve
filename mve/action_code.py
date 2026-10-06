@@ -145,6 +145,9 @@ class MCPHandle:
 # --------------------------------------------------------------------------
 # prompt（照原版 action_response_format.txt 的结构）
 # --------------------------------------------------------------------------
+# 主函数名**不要**写成 `your_main_function_name` 这类占位符：实测模型会原样照抄
+# 占位名（存进技能库后叫 `your_main_function_name`，复盘时看不出这是哪题的解法）。
+# 给一个具体的示例名，模型就会照着起一个真名字。
 RESPONSE_FORMAT = """Explain: 一两句话说明你打算怎么取这些数
 Plan:
 1) ...
@@ -155,7 +158,7 @@ Code:
 # helper functions (only if needed, try to avoid them)
 ...
 # main function after the helper functions
-async def your_main_function_name(mcp):
+async def collect_stats(mcp):
     # 正确用法示例：先拿工具返回，再用 dig 按**点分路径**取值
     p = await mcp.<工具名>(<参数>)
     return {
@@ -176,8 +179,22 @@ async def your_main_function_name(mcp):
 # 这不是"泄题"：给的是**结构**（哪个字段在哪），不是**值**。
 # 真实场景里 agent 拿得到 API 文档，原版 Voyager 也给。
 SCHEMA_CACHE = HERE / "tool_schemas.json"
-_MAX_PATHS = 60
+
+# 抽取上限（写进缓存的全量骨架）。
+# 实测踩过：这里原来是 60，`match_analysis_report` 正好 61 条，于是
+# `key_metrics.team.consistency.kast.num` **在抽取阶段就被砍掉了** ——
+# 模型在 prompt 里永远看不到正确路径，只能在看得见的那 60 条里挑一条
+# 长得像的（`team_comparison.Cloud9.kast.num`，还抄漏了 consistency），
+# 三次 critic 重试也只是在同一条错路上打转。抽取阶段不能砍。
+_MAX_PATHS = 400
 _MAX_DEPTH = 6
+
+# 展示预算（进 prompt 的条数）。抽取全留 ≠ 全展示：
+# 61 条一起塞进 prompt，正确那条会被淹没在 `team_comparison.NRG.*` 这类
+# 无关分支里（实测模型就是被它们带偏的）。所以按「与本题维度相关」聚焦。
+_RENDER_BUDGET = 60   # 一个维度都没命中时的兜底展示条数
+_FOCUS_BUDGET = 40    # 命中维度时的聚焦展示条数
+_SIBLINGS_PER_PARENT = 8   # 同父兄弟的配额
 
 
 def _leaf_paths(obj: Any, prefix: str = "", depth: int = 0,
@@ -204,6 +221,125 @@ def load_schemas() -> dict[str, list[str]]:
         return raw if isinstance(raw, dict) else {}
     except Exception:
         return {}
+
+
+# --------------------------------------------------------------------------
+# 结构文档的「聚焦裁剪」：把正确路径挑出来，而不是把整个返回骨架截断
+# --------------------------------------------------------------------------
+# 原版 Voyager 不需要这一步 —— control_primitives 是几十个小函数，全给就行。
+# MVE 不一样：`match_analysis_report` 一个工具就有 61+ 条叶子路径，全给会让
+# 正确那条被埋掉，按固定条数截断又会把正确那条砍掉（两个方向都实测翻过车）。
+# 所以按**维度名**检索：命中优先 → 补同父兄弟（看得见"同层两种混放"）→
+# 补顶层骨架（看得懂整体形状）→ 剩余预算才给其它分支。
+_STOP_TOKENS = {"pct", "rate", "ratio", "avg", "mean", "total", "num", "denom",
+                "count", "value", "index", "score", "check", "analysis"}
+
+
+def _tokens(dim: str) -> list[str]:
+    """维度名 → 匹配用的词。去掉口径后缀，只留指标本体。
+
+    `kast_pct` → ["kast"]、`kd_ratio` → ["kd"] —— `pct`/`ratio` 是口径不是
+    指标名，留着会命中一大片无关路径。
+    """
+    parts = re.split(r"[^a-z0-9]+", str(dim or "").lower())
+    return [p for p in parts if len(p) >= 2 and p not in _STOP_TOKENS]
+
+
+def _stem_of(path: str) -> str:
+    """去掉 num/denom 口径后缀，留下指标本体：`....kast.num` → `....kast`。"""
+    for suf in (".num", ".denom"):
+        if path.endswith(suf):
+            return path[: -len(suf)]
+    return path
+
+
+def _uses_declared(used: list[str], declared: str) -> bool:
+    """模型有没有按声明的口径取。
+
+    百分比指标声明的是 `...kast.num`，模型写 `pct(p, "...kast.num")` 算命中，
+    写 `pct(p, "...kast")` 由 pct 自己推 denom 也算命中（都比到 stem）。
+    """
+    stem = _stem_of(declared)
+    return any(u == declared or _stem_of(u) == stem for u in used)
+
+
+def _same_metric(a: str, b: str) -> bool:
+    """两条路径是不是指向同一个指标（`kd` 与 `kd_ratio` 算同一个）。"""
+    ta = set(_tokens(_stem_of(a).rsplit(".", 1)[-1]))
+    tb = set(_tokens(_stem_of(b).rsplit(".", 1)[-1]))
+    return bool(ta & tb)
+
+
+def _candidates(schemas: dict[str, list[str]], dims: list[str],
+                limit: int = 12) -> list[str]:
+    """critic 回灌用：返回里真实存在、名字里含该维度词的路径。"""
+    out: list[str] = []
+    for d in dims:
+        toks = _tokens(d)
+        if not toks:
+            continue
+        for paths in schemas.values():
+            for p in paths:
+                if p in out:
+                    continue
+                if any(t in p.lower() for t in toks):
+                    out.append(p)
+    return out[:limit]
+
+
+def _parent(path: str) -> str:
+    return path.rsplit(".", 1)[0] if "." in path else ""
+
+
+def focus_paths(paths: list[str], dims: list[str] | None,
+                prefer: list[str] | None = None,
+                budget: int = _FOCUS_BUDGET) -> tuple[list[str], list[str]]:
+    """把 paths 分成（与维度相关的、其余的）。
+
+    返回的两段都由调用方决定怎么展示 —— 相关那段要**完整**给，
+    其余那段只在预算富余时给（它们是干扰项的来源）。
+    `prefer` 是题干声明的口径路径，永远排最前并打星。
+    """
+    if not paths:
+        return [], []
+    toks: list[str] = []
+    for d in (dims or []):
+        for t in _tokens(d):
+            if t not in toks:
+                toks.append(t)
+    if not toks:
+        return [], list(paths)
+
+    hit = [p for p in paths if any(t in p.lower() for t in toks)]
+    if not hit:
+        return [], list(paths)
+
+    # 同父兄弟：让模型看得见「同一个父节点下 kast 是 num/denom、kd 是标量」
+    # 这种混放。只给命中那一条，模型照样会把 kast 的套路套到 kd 上。
+    # 每个父节点限 8 条：不设限的话 `player_performance.0` 一个父节点就能
+    # 拉进 20 条选手字段，把真正要用的那几条淹掉。
+    by_parent: dict[str, list[str]] = {}
+    for p in paths:
+        by_parent.setdefault(_parent(p), []).append(p)
+    sibs: list[str] = []
+    for par in {_parent(p) for p in hit}:
+        for p in by_parent.get(par, [])[:_SIBLINGS_PER_PARENT]:
+            if p not in sibs:
+                sibs.append(p)
+    # 顶层骨架（depth<=1）：让模型知道返回大概长什么样，不至于把路径编出根
+    head = [p for p in paths if p and "." not in p][:8]
+
+    focus: list[str] = []
+    for p in hit + sibs + head:
+        if p not in focus:
+            focus.append(p)
+    # 题干声明的口径排到最前：它在文档里排第几，模型就照第几条写 ——
+    # 实测声明路径排在 `team_comparison.Cloud9...` 后面时，模型挑了后者。
+    if prefer:
+        focus = [p for p in prefer if p in focus] + \
+                [p for p in focus if p not in set(prefer)]
+    rest = [p for p in paths if p not in set(focus)]
+    return focus[:budget], rest
 
 
 async def probe_schemas(tools: list[str], *, force: bool = False) -> dict[str, list[str]]:
@@ -255,13 +391,34 @@ def _default_args(tool: str) -> dict[str, Any]:
     return args
 
 
-def render_tool_docs(schemas: dict[str, list[str]]) -> str:
+def render_tool_docs(schemas: dict[str, list[str]],
+                     dims: list[str] | None = None,
+                     prefer: list[str] | None = None) -> str:
+    """把工具返回结构拼进 prompt —— **按维度聚焦，不再按固定条数截断**。"""
     if not schemas:
         return ""
+    stars = set(prefer or [])
     blocks = []
     for t, paths in schemas.items():
-        shown = "\n".join(f"    {p}" for p in paths[:_MAX_PATHS])
-        blocks.append(f"await mcp.{TOOL_SIGNATURES.get(t, t)} 返回结构（叶子路径）：\n{shown}")
+        focus, rest = focus_paths(paths, dims, prefer)
+        shown = "\n".join(f"    {'★ ' if p in stars else '  '}{p}"
+                          for p in focus[:_FOCUS_BUDGET])
+        if focus:
+            head = (f"await mcp.{TOOL_SIGNATURES.get(t, t)} 返回结构"
+                    f" —— **与本题维度相关的路径**（★ = 题干声明的口径，"
+                    f"必须用它）：")
+            blocks.append(f"{head}\n{shown}")
+            if rest:
+                # 其余分支只给条数提示，不铺开：铺开就是干扰项
+                # （实测 `team_comparison.NRG.*` 把模型带偏过）。
+                blocks.append(
+                    f"    （另有 {len(rest)} 条与本题维度无关的路径，"
+                    f"多为对手/其它分支 —— 不要用）")
+        else:
+            shown = "\n".join(f"    {p}" for p in paths[:_RENDER_BUDGET])
+            blocks.append(f"await mcp.{TOOL_SIGNATURES.get(t, t)} 返回结构"
+                          f"（叶子路径，共 {len(paths)} 条，展示前 "
+                          f"{min(len(paths), _RENDER_BUDGET)} 条）：\n{shown}")
     # 光给叶子路径不够 —— 原版 control_primitives 里是有**用法示例**的，
     # 模型照着示例才会写对。实测踩过：query_sql 的返回是
     # {"columns": [...], "rows": [[...]]}，模型却写了 res["rounds"]，
@@ -278,8 +435,8 @@ def render_tool_docs(schemas: dict[str, list[str]]) -> str:
     return "\n\n".join(blocks)
 
 
-def graph_hints(dims: list[str] | None) -> str:
-    """图谱给的「维度 → 由哪个工具产出」。
+def graph_hints(dims: list[str] | None, task: Any = None) -> str:
+    """图谱给的「维度 → 由哪个工具产出 + 按哪条路径取值」。
 
     没有它模型会选错工具（实测：economy 类维度去调 match_economy_report，
     而图谱声明它们由 pattern_detection_report 产出）。
@@ -290,26 +447,93 @@ def graph_hints(dims: list[str] | None) -> str:
         import knowledge_graph
         g = knowledge_graph.KnowledgeGraph.load()
     except Exception:
-        return ""
+        g = None
     lines = []
     for d in dims:
-        prod = g.who_produces(d)
-        if not prod:
-            continue
+        prod = list(g.who_produces(d)) if g else []
         # 必须给到 **value_path**，不能只给工具名。
         # 实测踩过：只说"kast_pct 由 match_analysis_report 产出"，模型就在
         # 返回结构里挑了一条长得像的路径 `team_comparison.Cloud9...`，
         # 而真值口径在 `key_metrics.team...` —— 挑错分支就 dig 到 None。
         # 给路径属于"给结构"不是"给值"（图谱里早就这么给了），不算泄题。
-        node = g.nodes.get(f"dim:{d}")
+        node = g.nodes.get(f"dim:{d}") if g else None
         vp = str((node.detail.get("value_path") if node else "") or "")
-        line = f"    {d} → 调 {' 或 '.join(prod)}"
+        if not prod or not vp:
+            # 图谱缺这个维度时的兜底：**题目自己的 rubric 才是权威口径来源**。
+            # 图谱是 tasks.py 的缓存（`build()` 读的就是 answer_spec），
+            # 缓存过期不该让模型退回猜路径 —— 实测 kast_adr_check 就是因为
+            # 图谱没重建，提示整段为空，模型连着三轮都在错路上重试。
+            spec = _spec_of(task, d)
+            if spec:
+                prod = prod or [spec[0]]
+                vp = vp or spec[1]
+        line = f"    {d} → 调 {' 或 '.join(prod)}" if prod else ""
         if vp:
-            line += f"，按路径取值 {vp}"
-        lines.append(line)
+            line += (f"，按路径取值 {vp}"
+                     + ("（百分比：另有同层 .denom 作分母）" if spec_percent(task, d)
+                        else "（标量：dig 到就是最终值，不要再除）"))
+        if line:
+            lines.append(line)
     if not lines:
         return ""
     return "\n\n知识图谱声明（维度由哪个工具产出）：\n" + "\n".join(lines)
+
+
+def declared_paths(task: Any, dims: list[str]) -> dict[str, str]:
+    """题干声明的口径：维度 → 取值路径。
+
+    权威来源是图谱（它由 tasks.py 的 answer_spec 构建），图谱缺这个维度时
+    直接读题目自己的 rubric —— 实测 `kast_adr_check` 加进 tasks.py 后图谱
+    没重建，提示整段为空，模型连着三轮在错分支上重试。
+
+    为什么必须是**硬约束**而不是提示：`match_analysis_report` 里
+    `team_comparison.*.consistency` 是一支**占位值**分支（Cloud9 与 NRG 的
+    kd_ratio 都是 1.0、adr 分母都是 59），而权威段 `key_metrics.team` 才是
+    1.24 / 109。两条路都"取得到值"，光看"空不空"根本区分不出来 ——
+    所以声明的口径必须拿来筛分支，不能只拿来建议。
+    """
+    out: dict[str, str] = {}
+    try:
+        import knowledge_graph
+        g = knowledge_graph.KnowledgeGraph.load()
+    except Exception:
+        g = None
+    for d in dims:
+        vp = ""
+        if g is not None:
+            node = g.nodes.get(f"dim:{d}")
+            vp = str((node.detail.get("value_path") if node else "") or "")
+        if not vp:
+            spec = _spec_of(task, d)
+            vp = spec[1] if spec else ""
+        if vp:
+            out[d] = vp
+    return out
+
+
+def _spec_of(task: Any, dim: str) -> tuple[str, str] | None:
+    """从**题目自己的 rubric** 读 (tool, value_path) —— 不依赖图谱缓存。"""
+    for p in (getattr(task, "rubric", None) or []):
+        if str(getattr(p, "dimension", "") or "") != dim:
+            continue
+        s = getattr(p, "answer_spec", None)
+        if s is None:
+            continue
+        tool = str(getattr(s, "tool", "") or "")
+        vp = str(getattr(s, "value_path", "") or "")
+        if tool and vp:
+            return tool, vp
+    return None
+
+
+def spec_percent(task: Any, dim: str) -> bool:
+    for p in (getattr(task, "rubric", None) or []):
+        if str(getattr(p, "dimension", "") or "") != dim:
+            continue
+        s = getattr(p, "answer_spec", None)
+        if s is not None and bool(getattr(s, "percent", False)):
+            return True
+    return False
 
 
 def render_system_message(tool_docs: str = "", dim_hints: str = "",
@@ -332,10 +556,17 @@ def render_system_message(tool_docs: str = "", dim_hints: str = "",
 {sigs}
 {tool_docs}
 
-工具返回里取值的辅助函数已经备好：
-    dig(obj, "a.b.0.c")   —— 按点分路径取值，取不到返回 None（绝不猜、绝不兜底）
+取值的辅助函数已经备好（**按指标类型分两个入口，不要混用**）：
+    scalar(obj, "a.b.c")              —— **标量**（如 kd = 1.24）：dig 到就是最终值
+    pct(obj, "a.b.num", "a.b.denom")  —— **百分比**（如 kast）：返回 {{"num":..,"denom":..}}
+    dig(obj, "a.b.0.c")               —— 通用按点分路径取值，取不到返回 None
 
-**dig 的路径必须从上面的返回结构里照抄**，不要自己编字段名。
+⚠️ 先判断指标是标量还是百分比，再决定用哪个：
+   同一个父节点下常常两种混着放（实测：consistency 下 kast 是 num/denom、kd 是标量）。
+   把标量路径传给 pct() 会拿到 denom=None —— 那时请改用 scalar()。
+   **不要用别的指标的 num/denom 去除出当前指标**，那是取错，不是算对。
+
+**路径必须从上面的返回结构里照抄**，不要自己编字段名。
 
 ⚠️ 取值只能用 dig —— **不要写 obj.get("a.b.c")**：点分路径不是一个 key，
 字典的 key 里没有点号。实测踩过：模型写了
@@ -381,6 +612,47 @@ def render_human_message(*, task: Any = None, code: str = "", error: str = "",
 # 解析（原版 process_ai_message 的同构物）
 # --------------------------------------------------------------------------
 _CODE_BLOCK = re.compile(r"```(?:python|py)(.*?)```", re.DOTALL)
+
+
+def is_empty(value: Any) -> bool:
+    """维度算不算"没取到"。
+
+    pct() 的返回是 {"num","denom"} 两个数，**两个都空才算没取到**；
+    只有一个为空是另一回事（口径上分母本来就可能不存在），不能当成取错。
+    """
+    if value is None:
+        return True
+    if isinstance(value, dict):
+        keys = {"num", "denom"}
+        if keys & set(value):
+            return all(value.get(k) is None for k in keys & set(value))
+        return len(value) == 0
+    if isinstance(value, str):
+        return not value.strip()
+    return False
+
+
+def paths_in_code(code: str) -> list[str]:
+    """把模型代码里写过的取值路径抽出来（AST，不靠正则）。
+
+    用途：critic 回灌时要能指着说"你用的这条路径不在返回里"。
+    只能说"路径不对"而不给候选，模型就只能原地重试 —— 实测三轮回灌，
+    它三次交出一模一样的 `team_comparison.Cloud9.kast.num`：
+    它不知道还有别的路可走。
+    """
+    try:
+        tree = ast.parse(code or "")
+    except SyntaxError:
+        return []
+    out: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                and node.func.id in ("dig", "pct", "scalar"):
+            for a in node.args:
+                if isinstance(a, ast.Constant) and isinstance(a.value, str):
+                    if a.value not in out:
+                        out.append(a.value)
+    return out
 
 
 class CodeParseError(ValueError):
@@ -460,6 +732,32 @@ def dig(obj: Any, path: str) -> Any:
     return cur
 
 
+def scalar(obj: Any, path: str) -> Any:
+    """标量指标：dig 到的就是最终值，不用再算。
+
+    与 `pct` 分开成两个函数，是刻意的——实测踩过一次，代价是连着 48 轮停在 50%：
+    `key_metrics.team.consistency` 下 kast 是 {num,denom}、kd 是标量 1.24，
+    两者长得太像，模型把 kast 的 num/denom 套路套到标量 kd 上，交出 109/109=1.0。
+    只靠注释说"这个不是 num/denom"挡不住；**类型层面分开两个入口才挡得住**——
+    标量路径传给 pct() 拿不到 denom，模型就只能改调 scalar()。
+    """
+    return dig(obj, path)
+
+
+def pct(obj: Any, num_path: str, den_path: str = "") -> dict[str, Any]:
+    """百分比指标：返回 {"num":..,"denom":..}，**绝不自己算好再返回一个数**。
+
+    为什么必须返回两个数：insights_reference.md:130 是硬规则——
+    67% (16/24) 与 67% (2/3) 数值相同但不是同一个事实，分母参与评分。
+    只交分子的实测后果：模型 dig 到 num=3 就交上来（3 ≠ 50.0）。
+    """
+    num = dig(obj, num_path)
+    den = dig(obj, den_path) if den_path else None
+    if den is None and str(num_path).endswith(".num"):
+        den = dig(obj, str(num_path)[: -len(".num")] + ".denom")
+    return {"num": num, "denom": den}
+
+
 async def execute(program_code: str, program_name: str) -> dict[str, Any]:
     """执行模型产出的代码，返回它 return 的原始 dict。
 
@@ -468,6 +766,7 @@ async def execute(program_code: str, program_name: str) -> dict[str, Any]:
     mcp = MCPHandle()
     ns: dict[str, Any] = {"__builtins__": dict(_SAFE_BUILTINS),
                           "mcp": mcp, "dig": dig,
+                          "scalar": scalar, "pct": pct,
                           # 预置常量：不预置的话模型会自己写 `series_id=...`
                           # 然后 NameError（实测踩过）。
                           "SERIES": SERIES, "C9": C9}
@@ -520,9 +819,11 @@ async def collect(task: Any, *, dims: list[str] | None = None,
         tools = sorted(set(t for t in tools if t in TOOL_SIGNATURES)) or list(TOOL_SIGNATURES)
 
     schemas = await probe_schemas(tools)
+    declared = declared_paths(task, dims or [])
     messages = [
         {"role": "system", "content": render_system_message(
-            render_tool_docs(schemas), graph_hints(dims), skills_text)},
+            render_tool_docs(schemas, dims, list(declared.values())),
+            graph_hints(dims, task), skills_text)},
         {"role": "user", "content": render_human_message(
             task=task, code=code, error=error, critique=critique,
             missing=missing, dims=dims)},
@@ -547,6 +848,62 @@ async def collect(task: Any, *, dims: list[str] | None = None,
             messages.append({"role": "user",
                              "content": f"执行失败：{last_err}\n请修正后重出一段完整代码。"})
             continue
+
+        # ---- 原版 critic 环节的同构物：跑通了 ≠ 取对了 ----
+        #
+        # 此前只在「代码跑不起来」时重试；代码跑通就直接返回，于是
+        # "路径取错、值取成 None"这类错误**根本没有修正机会** —— 它既不是
+        # 解析错误也不是执行错误，静悄悄地就交上去了。
+        # 原版是：执行 → critic 判断有没有完成 → 没完成就把观察回灌 → 再写。
+        # 这里同构：执行 → 看维度是不是空/是不是取错分支 → 回灌 → 再写。
+        used = paths_in_code(parsed["program_code"])
+        missing_now = [d for d in (dims or [])
+                       if is_empty(out.get("values", {}).get(d))]
+        # 取到值 ≠ 取对分支：`team_comparison.*` 那支是占位值（kd_ratio 恒 1.0），
+        # 照样能 dig 出数字。所以口径不符要**单独**判，不能只看空不空。
+        off_spec = [d for d in (dims or [])
+                    if d in declared and not _uses_declared(used, declared[d])]
+        problem = sorted(set(missing_now) | set(off_spec))
+        if problem and attempt < retries - 1:
+            # 反馈必须带**候选路径**：只说"路径不对"，模型没有可改的方向，
+            # 实测三轮交出一模一样的错路径。这里把返回里真实存在的、
+            # 名字里含该维度词的路径列出来 —— 这是"执行层观察"的回灌
+            # （原版 critic 回灌的也是世界状态，不是"你错了"三个字）。
+            cands = _candidates(schemas, problem, limit=12)
+            unknown = [p for p in used
+                       if not any(p in paths for paths in schemas.values())]
+            msg = []
+            if missing_now:
+                msg.append(f"代码跑通了，但这些维度取到的是空：{', '.join(missing_now)}")
+            if off_spec:
+                # 点名"你用的是哪条、声明的是哪条" —— 只说"分支不对"没有可改方向。
+                msg.append("这几个维度**没有用题干声明的口径**：")
+                for d in off_spec:
+                    mine = [p for p in used if _same_metric(p, declared[d])] or used
+                    msg.append(f"    {d}：声明按 `{declared[d]}` 取值，"
+                               f"你用了 `{'、'.join(mine[:2]) or '（未取）'}`")
+                msg.append("    同一份返回里有多支同名字段，只有声明的那一支是"
+                           "权威口径；别的分支即使取到数字也不可信。")
+            if unknown:
+                msg.append("你写的这些路径**不在工具返回里**："
+                           + "、".join(unknown[:6]))
+            if cands:
+                msg.append("返回里真实存在的候选路径（从中挑，不要自己编段名）：")
+                msg += [f"    {c}" for c in cands]
+            msg += [
+                "自查三条：",
+                "  1. 这个维度是**标量**还是**百分比**？标量用 scalar(obj, path)，"
+                "百分比用 pct(obj, num_path, den_path)；",
+                "  2. 是 team 还是 opponent？是队伍整体还是某个选手？"
+                "（题目口径优先）；",
+                "  3. 有没有拿**别的指标**的 num/denom 去除出它（那是取错）。",
+                "取不到就让它空着也不要编，改的是路径不是数。",
+            ]
+            messages.append({"role": "assistant", "content": text})
+            messages.append({"role": "user", "content": "\n".join(msg)})
+            missing = missing_now
+            continue
+
         out["program_code"] = parsed["program_code"]
         out["program_name"] = parsed["program_name"]
         out["attempts"] = attempt + 1

@@ -258,7 +258,7 @@ query_sql 的实测限制（踩过）：
 PLAN_SCHEMA = """只输出一个 JSON 对象：
 {"thought": "一句话说明你打算怎么查",
  "calls": [{"tool": "工具名", "args": {"参数名": "参数值"}}]}
-最多 3 次调用。不要输出解释文字。"""
+调用条数上限 = 本题评分点的条数（每个评分点一条查询就够）；不要输出解释文字。"""
 
 
 # ---------------------------------------------------------------------------
@@ -570,6 +570,42 @@ def _inner_where(sql: str) -> str:
     rest = sql[i:]
     j = rest.find(")")
     return rest[:j] if j > 0 else rest
+
+
+def _check_group_order(sql: str, task: Any) -> tuple[list[str], str]:
+    """GROUP BY 之后必须确定行序 —— 否则「按第 N 行取数」会把值配错分组。
+
+    实测（`map_rounds_split`）：模型写了一条 `GROUP BY map_name` 查三行，
+    然后按行号取数，交上 Corrode/Haven/Lotus = 21/24/14，真值是 14/21/24
+    —— **数字全对，只是配错了地图**。这类错误不会报错、不会取空，
+    只有裁判比对才能发现，而那时一整轮已经浪费掉。
+
+    最稳的写法是**每个分组一条 SQL**（裁判自己的 answer_spec 就是这么写的：
+    `WHERE map_name='Corrode'`），所以驳回时把那条形同口径的骨架一起给出去。
+    """
+    if not (GRAPH_ENABLED and ASSERT_ENABLED):
+        return [], ""
+    s = (sql or "").upper()
+    if "GROUP BY" not in s or "ORDER BY" in s:
+        return [], ""
+    recipe = ""
+    for p in (getattr(task, "rubric", None) or []):
+        subj = getattr(p, "subject", None) or {}
+        spec = getattr(p, "answer_spec", None)
+        if subj.get("map") and getattr(spec, "sql", ""):
+            try:
+                from knowledge_graph import _sql_recipe
+                recipe = _sql_recipe(str(spec.sql))[:400]
+            except Exception:
+                recipe = ""
+            break
+    return ([
+        "你用了 GROUP BY 但**没有 ORDER BY** —— 结果行的顺序不确定，"
+        "按第 N 行取数会把数字配错分组（实测 Corrode/Haven/Lotus 回合数"
+        "整体错位：交 21/24/14，真值 14/21/24 —— 数都是对的，只是配错了图）。"
+        "改成**每个分组一条 SQL**（WHERE map_name='?'）最稳；"
+        "坚持用 GROUP BY 就必须显式 ORDER BY 分组键。",
+    ], recipe)
 
 
 def _check_sql_layering(sql: str, task: Any) -> tuple[list[str], str]:
@@ -1063,8 +1099,15 @@ class LLMVoyager:
         calls = plan.get("calls")
         if not isinstance(calls, list) or not calls:
             return "calls 为空或不是数组"
-        if len(calls) > 3:
-            return f"calls 超过 3 个（{len(calls)}）—— 本原型每轮最多 3 次调用"
+        # 上限跟着**评分点数**走，不是写死的 3。
+        # 实测踩过：写死 3 的时候，`fb_conversion_analysis`（4 个评分点、
+        # 每个按图一条查询）和 `map_rounds_split`（5 个）**必然漏条** ——
+        # 模型写 4 条就被闸拦下、3 次重试全废在"条数超了"上，最后降级放行 3 条，
+        # 于是每张图一条这种最简单的写法根本用不了。
+        # 上限是"每个评分点一条查询"，不是"三次机会"。
+        cap = max(3, len(getattr(task, "rubric", None) or []))
+        if len(calls) > cap:
+            return f"calls 超过 {cap} 个（{len(calls)}）—— 本轮最多 {cap} 次调用"
         for i, c in enumerate(calls):
             if not isinstance(c, dict):
                 return f"calls[{i}] 不是对象"
@@ -1122,6 +1165,9 @@ class LLMVoyager:
                 # 所有问题**一起**说，并附上正确骨架：一次只说一条会让它在
                 # 两个错之间来回打转，三次重试用完就整轮作废。
                 bad, recipe = _check_sql_layering(sql, task)
+                if not bad:
+                    # 分层没问题再看「分组顺序」—— 两者独立，别互相挡住
+                    bad, recipe = _check_group_order(sql, task)
                 if bad:
                     msg = f"calls[{i}] 口径错误：" + "；".join(bad)
                     if recipe:
@@ -1573,10 +1619,17 @@ VLML 的 10 个报告工具已经封装好指标口径。能用报告工具拿�
         # 技能库里学到的解法源码要进 system（照原版 `+ skills`）——
         # 不然旁路学到的东西在写代码时一句都看不见。
         skills_text = ""
+        top: list[dict[str, Any]] = []
         try:
             top = skill_store.retrieve(getattr(task, "topic_id", ""),
                                        getattr(task, "question", ""),
                                        top_k=skill_store.RETRIEVAL_TOP_K)
+            # 注入计数与 mark_used 必须在这里做：此前只有 plan 那条路
+            # （`_memory_block`）设置过 `_injected_keys`，代码路径永远是空的，
+            # 于是技能的 hits / ok / 有效性加权全是死的 —— 面板上"本轮注入 0/5"
+            # 不是没注入，是没记。
+            self._injected_keys = [s["key"] for s in top]
+            skill_store.mark_used(self._injected_keys)
             blocks = [f"- {s.get('text','')}{_code_block(s)}" for s in top]
             if blocks:
                 # 必须写明"这些路径已被验证正确、优先照抄"：不写的话模型会在
@@ -1587,6 +1640,37 @@ VLML 的 10 个报告工具已经封装好指标口径。能用报告工具拿�
                                + "\n".join(blocks))
         except Exception:
             skills_text = ""
+            self._injected_keys = []
+
+        # ---- 先跑库里的程序，跑通就直接采用（原版"技能被 exec"的本体）----
+        #
+        # 此前技能只被**拼进 prompt 让人读**，不会被运行 —— 这正是
+        # "技能库有内容但覆盖率不涨"的根因：模型每轮重写一遍，每次重写都是
+        # 一次新的翻错机会。原版 Voyager 是把 `program_code` 取出来直接 exec 的。
+        # 只复用 `practice` 通道（自己跑通过的源码）；旁路通道存的是伪代码
+        # 注释（`bypass_learn._solution_code`），没有主函数，跑不起来。
+        reused = await self._reuse_skill(top, dims)
+        if reused is not None:
+            out, skill = reused
+            self.trajectory = [{"tool": str(t), "error": ""}
+                               for t in (out.get("tools") or [])]
+            self.attempted = [dict(c) for c in (out.get("calls") or [])]
+            facts = self._facts_from_values(task, out.get("values") or {},
+                                            out.get("tools") or [])
+            self.last_round = {"calls": self.attempted, "errors": [],
+                               "critique": "", "schema_hints": [],
+                               "code": str(out.get("program_code") or "")}
+            return {
+                "facts": facts,
+                "narrative": {"text": "", "comparable": False},
+                "skill_used": f"reuse({skill.get('name','')})",
+                "reused_skill": skill.get("name", ""),
+                "program_code": str(out.get("program_code") or ""),
+                "program_name": str((skill.get("blueprint") or {})
+                                    .get("program_name") or ""),
+                "trajectory": self.trajectory, "errors": [],
+                "hallucinations": [], "attempted": self.attempted,
+            }
 
         prev = getattr(self, "last_round", None) or {}
         out = await action_code.collect(
@@ -1626,12 +1710,43 @@ VLML 的 10 个报告工具已经封装好指标口径。能用报告工具拿�
             "facts": facts,
             "narrative": {"text": "", "comparable": False},
             "skill_used": f"action_code({out.get('program_name') or ''})",
+            # 自己写的这段源码要带出去：跑通了就由主循环存进技能库 ——
+            # 原版是「自己写 → 跑通 → 存 program_code」，不是存别人给的答案。
+            "program_code": str(out.get("program_code") or ""),
+            "program_name": str(out.get("program_name") or ""),
             # 对外仍报工具名列表（面板/日志用），内部 self.trajectory 才是 dict 形态
             "trajectory": self.trajectory,
             "errors": list(self.errors),
             "hallucinations": [],
             "attempted": self.attempted,
         }
+
+    async def _reuse_skill(self, top: list[dict[str, Any]],
+                           dims: list[str]) -> tuple[dict[str, Any], dict] | None:
+        """试着直接跑技能库里的程序；跑得通且维度齐全就返回 (结果, 技能)。
+
+        这是原版 `SkillManager.retrieve_skills` → `exec` 那一段的同构物。
+        判据用「维度齐不齐」而不是「有没有异常」：程序能跑完但路径取错时
+        不会抛异常（dig 取不到就返回 None），只看异常会把错的也当成对的。
+        """
+        import action_code
+        for s in top or []:
+            if str(s.get("source") or "") != "practice":
+                continue
+            code = str(s.get("code") or "")
+            name = str((s.get("blueprint") or {}).get("program_name") or "")
+            if not code or not name:
+                continue
+            try:
+                out = await action_code.execute(code, name)
+            except Exception:
+                continue
+            vals = out.get("values") or {}
+            if dims and all(not action_code.is_empty(vals.get(d)) for d in dims):
+                out["program_code"] = code
+                out["program_name"] = name
+                return out, s
+        return None
 
     def _facts_from_values(self, task: Any, values: dict[str, Any],
                            tools: list[str]) -> list[dict[str, Any]]:
@@ -1787,8 +1902,14 @@ VLML 的 10 个报告工具已经封装好指标口径。能用报告工具拿�
             #
             # lesson 不再是模板（"先取整体报告再下钻 query_sql"—— 那句是写死的，
             # 写进技能库等于什么都没写）：现在是**这套具体编排 + 它覆盖的维度**。
+            # 名字必须是**稳定主键**：`{topic}解法`。
+            # 此前这里叫 `{topic}编排`，主循环「学习①」存自己跑通的程序时
+            # 叫 `{topic}解法` —— 同一个成果落成两条，一条有源码一条没有，
+            # 注入时模型可能读到那条没有源码的（那正是"技能是伪代码注释
+            # 只被 read"的残留）。统一成一个 key，两条通道覆盖同一条：
+            # 没跑通时留文字经验，跑通了由「学习①」把**自己写的源码**补上。
             action, key = skill_store.add(
-                topic, f"{topic}编排", fb.lesson,
+                topic, f"{topic}解法", fb.lesson,
                 source="practice", blueprint=feedback_mod.blueprint_for(fb),
             )
             self._log_skill(action, key)
