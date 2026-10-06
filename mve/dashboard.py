@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -65,10 +66,41 @@ def _scope_json() -> str:
                           ensure_ascii=False)
 
 
-PORT = 8777
+# 默认只绑回环：面板没有任何鉴权，绑 0.0.0.0 等于把「启停进程」的接口裸奔到公网。
+# 要放到服务器上从外面访问，显式给 --host（配合安全组只放行自己的 IP）。
+PORT = int(os.environ.get("MVE_PANEL_PORT") or 8777)
+HOST = os.environ.get("MVE_PANEL_HOST") or "127.0.0.1"
+# 挂到反向代理子路径下时用（如 https://host:8443/mve/）：
+# 服务端剥前缀，前端所有 fetch 也要跟着加前缀，否则会打到代理的根路径上去。
+PREFIX = os.environ.get("MVE_PANEL_PREFIX") or ""
+
 for _i, _a in enumerate(sys.argv[1:]):
     if _a == "--port" and _i + 2 <= len(sys.argv):
         PORT = int(sys.argv[_i + 2])
+    if _a == "--host" and _i + 2 <= len(sys.argv):
+        HOST = sys.argv[_i + 2]
+    if _a == "--prefix" and _i + 2 <= len(sys.argv):
+        PREFIX = "/" + sys.argv[_i + 2].strip("/")
+def _strip_prefix(path: str) -> str:
+    """剥掉反向代理挂在前面的子路径（/mve/api/state → /api/state）。
+
+    设了前缀却没带前缀的请求一律打空串（走 404），避免代理后面被直接绕过前缀访问。
+    """
+    if PREFIX:
+        if path == PREFIX:
+            return "/"
+        return path[len(PREFIX):] if path.startswith(PREFIX + "/") else ""
+    return path
+
+
+def _html() -> str:
+    """前缀注入：前端 fetch('/api/...') 要带上前缀，否则请求会打到代理的根路径。"""
+    if not PREFIX:
+        return HTML
+    return (HTML.replace("<head>", '<head>\n'
+                         f'<script>window.MVE_PREFIX="{PREFIX}";</script>', 1)
+                .replace("fetch('", "fetch(window.MVE_PREFIX+'"))
+
 
 HTML = r"""<!doctype html>
 <html lang="zh-CN">
@@ -1208,9 +1240,9 @@ class Handler(BaseHTTPRequestHandler):
             return {}
 
     def do_GET(self) -> None:  # noqa: N802
-        path = self.path.split("?")[0]
+        path = _strip_prefix(self.path.split("?")[0])
         if path in ("/", "/index.html"):
-            body = HTML.encode("utf-8")
+            body = _html().encode("utf-8")
             ctype = "text/html; charset=utf-8"
         elif path == "/api/state":
             body = panel_data.as_json().encode("utf-8")
@@ -1232,7 +1264,7 @@ class Handler(BaseHTTPRequestHandler):
         人发意图：/api/preview（只归类，不拉 VLML）、/api/coach（真跑）
         驾驶舱  ：/api/pilot/start|stop|clear-log
         """
-        path = self.path.split("?")[0]
+        path = _strip_prefix(self.path.split("?")[0])
         payload = self._payload()
 
         if path == "/api/preview":
@@ -1413,8 +1445,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-    print(f"MVE 面板已启动：http://127.0.0.1:{PORT}")
+    srv = ThreadingHTTPServer((HOST, PORT), Handler)
+    print(f"MVE 面板已启动：http://{HOST}:{PORT}")
     print("停止：Ctrl-C")
     try:
         srv.serve_forever()

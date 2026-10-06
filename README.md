@@ -7,6 +7,10 @@
 "学习"那一半的机制取自**猫娘伴学**（N.E.K.O `study_companion`）—— 它有成熟的
 知识图谱、掌握度与判分契约，正好补上原版 Voyager 没有的部分。
 
+> **仓库**：<https://github.com/Zxy876/voyager-vlml-mve>
+> 只含 `mve/` 源码、文档与 `requirements.txt`（45 个文件，约 780KB）。
+> 第三方目录、`mve/.env`、运行日志与状态文件均不入库，见 `.gitignore`。
+
 ---
 
 ## 一、三个源头，怎么拼的
