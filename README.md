@@ -295,6 +295,61 @@ A/B（同一道题、同一输入，走不带技能库复用的干净通道）�
 
 ---
 
+## 五之三、人导入文本 → 生成解释 → 影响出题（与伴学对账）
+
+### 伴学这条链怎么走
+
+1. 人录入文本（粘贴 / 导入 / OCR）→ `study_explain_text`（`entry_tutor_explain_entries.py:169`）
+2. LLM 生成解释（`concept_explain`）
+3. 导入的**材料**经 `MaterialTopicMapper` 映射到图谱里**已存在**的知识点
+   （`material_topic_mapper.py:227`：映射到不存在的 topic 一律 rejected）
+4. 这些知识点成为练习范围 → 出题器按 `weak_topic` 出题
+5. **归不上时**：提示人去图谱里选一个知识点（`ui.practice.baseline_topic_prompt`）
+
+注意第 3 步：**伴学也不是从文本凭空长出新知识点，而是映射到已有知识点**。
+
+### MVE 的对应
+
+| 环节 | 伴学 | MVE | 状态 |
+|---|---|---|---|
+| 录入文本 | `study_explain_text` | `coach.explain()` | ✅ 同构 |
+| 生成解释 | `concept_explain`（LLM） | VLML 取数 + `narrator` 出解释 | ✅ 同构 |
+| 解释写进记录 | learning record | `causal_timeline` CONTROL fact | ✅ 同构 |
+| 归到已有知识点 | `MaterialTopicMapper` | `infer_topic()` | ✅ 同构 |
+| 记录影响出题 | practice_scope / weak_topic | planner `human_focus` | ✅ 已通（实测推荐理由就是 human_focus） |
+| **归不上时** | 提示人选知识点 | **原本断线**（topic_id 空 → 出题器跳过） | ✅ 本轮补上 |
+
+### 本轮修的两个断口
+
+**断口一：`infer_topic` 漏了后加的题。**
+手写表 `TOPIC_HINTS` 里没有 `kast_adr_check`（加题时漏补），
+实测「Cloud9 这场比赛的 KAST 是多少」直接归不上 —— 题库里明明有这道题。
+改成**从 TASKS 自动派生**（`_auto_hints()`）：
+
+```
+kast_adr_check  ← kast, pct, ratio, k/d      （dimension 词干 + point 里的缩写）
+series_totals   ← rounds, total, won
+```
+
+手写表优先（人工精修的更准），自动派生作兜底且要求 ≥3 字符
+（长度闸只管自动派生 —— 手写的中文单字「崩」也是有效关键词）。
+
+**断口二：归不上就断线。**
+`coach.explain()` 加了 `auto_task`：归不上已有题时，拿这段文本去
+`question_gen` **生成一道新题**，成功就写进 `TASKS` 并挂到 control fact 上，
+出题器于是看得见。这比伴学多一条路 —— 伴学只能让人去选，MVE 能自己长出一道。
+生成失败也**不影响解释照常返回**（人看到的内容不受影响）。
+
+### 诚实的限制
+
+维度枚举是从已有题派生出来的，所以**超出已有维度的新方向**
+（如「进攻方胜率」「道具使用效率」）既归不上、也生成不了 ——
+实测这类导入只能拿到解释，长不出新题。
+要突破得让维度枚举能从数据层派生（`match_analysis_report`
+返回的 `attack_rounds_won` 之类），这是下一步的事。
+
+---
+
 ## 六、面板上可观测的状态清单
 
 | 状态 | 判定 | 依据 |

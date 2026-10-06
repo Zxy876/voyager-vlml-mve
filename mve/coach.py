@@ -43,7 +43,7 @@ from llm_client import chat_json  # noqa: E402
 from loop_core import make_fact  # noqa: E402
 import narrator  # noqa: E402
 from voyager import LOCAL_SQL_NOTES, TOOL_CATALOG, TOOL_REGISTRY, VLML_USAGE_TIPS  # noqa: E402
-from tasks import infer_topic  # noqa: E402  (tasks 不拉 VLML，可安全 import)
+from tasks import TASKS, infer_topic  # noqa: E402  (tasks 不拉 VLML，可安全 import)
 
 # 人导入的题永远 validated_target=False —— 这是伴学的判定链，不是可选项
 VALIDATED_TARGET_IMPORTED = False
@@ -187,7 +187,33 @@ async def _execute(calls: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], l
     return obs, traj, errors
 
 
-async def explain(question: str, *, topic_id: str = "") -> dict[str, Any]:
+async def _task_from_text(question: str) -> tuple[str, str]:
+    """归不上已有题时，拿这段文本去生成一道新题。返回 (topic_id, 说明)。
+
+    失败就坦然返回空 —— 出题器那条线断了，但**解释本身照常返回**，
+    人看到的内容不受影响。
+    """
+    try:
+        import question_gen
+        rec, _ = await question_gen.generate_adopt(
+            about=question, difficulty=2, tries=2, do_adopt=True, verbose=False)
+    except Exception as exc:                                 # pragma: no cover
+        print(f"  [导入] 生成新题失败：{type(exc).__name__}: {str(exc)[:120]}")
+        return "", ""
+    if not rec:
+        return "", ""
+    new_id = str(rec.get("topic_id") or "").strip()
+    if not new_id:
+        return "", ""
+    try:
+        TASKS[new_id] = question_gen.to_task(rec)
+    except Exception as exc:                                 # pragma: no cover
+        return "", ""
+    return new_id, "（导入文本归不上已有题，已生成新题）"
+
+
+async def explain(question: str, *, topic_id: str = "",
+                  auto_task: bool = True) -> dict[str, Any]:
     """人导入一个问题，由 VLML 解释回答。
 
     返回结构与 Voyager 的答卷同构（facts + narrative），但：
@@ -197,6 +223,13 @@ async def explain(question: str, *, topic_id: str = "") -> dict[str, Any]:
     关于 topic_id：不填的话这条 control fact 的 topic_id 就是空的，而出题器
     `latest_topics_by_kind()` 会跳过空 topic —— 等于人导入了但出题器看不见，
     「影响自适应出题」这条线断在这里。所以入口处先把它归到一题上。
+
+    `auto_task`：归**不上**任何已有题时，拿这段文本去**生成一道新题**。
+
+    这一步补的是伴学里「导入学习内容 → MaterialTopicMapper 映射到已有知识点」
+    的**反面**：伴学映射不到就让人去图谱里选一个（`baseline_topic_prompt`）；
+    MVE 多了 `question_gen`，可以直接把这段文本变成一道题，于是
+    「人导入 → 影响出题」不会在归不上时断掉 —— 反而多了一种长新题的方式。
     """
     inferred, hit = "", ""
     if topic_id:
@@ -204,6 +237,8 @@ async def explain(question: str, *, topic_id: str = "") -> dict[str, Any]:
     else:
         inferred, hit = infer_topic(question)
         topic_id = inferred
+        if not topic_id and auto_task:
+            topic_id, hit = await _task_from_text(question)
 
     base: dict[str, Any] = {
         "question": question,

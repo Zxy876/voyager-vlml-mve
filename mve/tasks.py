@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from loop_core import AnswerSpec, RubricPoint, Task  # noqa: E402
@@ -547,23 +548,63 @@ TOPIC_HINTS: dict[str, tuple[str, ...]] = {
 }
 
 
+def _auto_hints() -> dict[str, tuple[str, ...]]:
+    """从 TASKS **自动派生**归题关键词 —— 手写表 `TOPIC_HINTS` 的兜底。
+
+    为什么必须自动：`kast_adr_check` 是后加的题，手写表里没有它 ——
+    实测「Cloud9 这场比赛的 KAST 是多少」直接归不上，于是这条 control fact
+    的 topic_id 为空，出题器 `latest_topics_by_kind()` 跳过它，
+    人导入的意图就这么断了。**每加一道题补一次手写表，迟早还会再漏一次。**
+
+    派生的三源（都是服务端既有的硬事实，不需要人工维护）：
+      1. `rubric.dimension` 的英文词干：kast_pct → kast / pct
+      2. `rubric.point` 里的大写缩写：KAST、ADR
+      3. `rubric.point` 里的比值写法：K/D
+    """
+    out: dict[str, set[str]] = {}
+    for tid, task in TASKS.items():
+        words = out.setdefault(tid, set())
+        for p in task.rubric:
+            for w in re.split(r"[^A-Za-z0-9]+", str(p.dimension) or ""):
+                if len(w) >= 3:
+                    words.add(w.lower())
+            for abbr in re.findall(r"[A-Z]{2,}", str(p.point) or ""):
+                words.add(abbr.lower())
+            for ratio in re.findall(r"[A-Za-z]/[A-Za-z]", str(p.point) or ""):
+                words.add(ratio.lower())
+    return {k: tuple(sorted(v)) for k, v in out.items()}
+
+
+AUTO_HINTS: dict[str, tuple[str, ...]] = _auto_hints()
+
+
 def infer_topic(question: str) -> tuple[str, str]:
     """把一句自然语言归到最可能的那道题。返回 (topic_id, 命中的词)。
 
     归不上返回 ("", "") —— 调用方必须处理这个分支，不能默认第一题。
+
+    两级：先查人工精修的 `TOPIC_HINTS`，再查从 TASKS 自动派生的
+    `AUTO_HINTS`（后加的题没补手写表时靠它兜住）。
     """
     q = (question or "").lower()
     if not q.strip():
         return "", ""
     best_topic, best_hit, best_score = "", "", 0
-    for topic, hints in TOPIC_HINTS.items():
-        if topic not in TASKS:
-            continue
-        for h in hints:
-            hl = h.lower()
-            if hl in q:
+    # 手写表优先（人工精修过的更准）；自动派生的词短且泛（map / win / rate），
+    # 只作兜底，且要求 ≥3 字符 —— 长度闸**只管自动派生**，
+    # 手写的中文单字（「崩」）也是有效关键词，不能被它滤掉。
+    for source, weight, minlen in ((TOPIC_HINTS, 0, 0), (AUTO_HINTS, -2, 3)):
+        for topic, hints in source.items():
+            if topic not in TASKS:
+                continue
+            for h in hints:
+                hl = h.lower()
+                if len(h) < minlen or hl not in q:
+                    continue
                 # 英文词加一点权重：它是精确的维度名，比中文字面更可靠
-                score = len(h) + (3 if h.isascii() else 0)
+                score = len(h) + (3 if h.isascii() else 0) + weight
                 if score > best_score:
                     best_topic, best_hit, best_score = topic, h, score
+        if best_topic:
+            break
     return best_topic, best_hit
