@@ -134,6 +134,31 @@ def _dim_specs() -> dict[str, dict[str, Any]]:
                     rec["example"] = f"base_path={s.base_path}"
                 elif s.sql and s.base_column is not None:
                     rec["example"] = f"SQL 第 {s.base_column} 列作分母/样本量"
+    # ---- 人导入采纳的新维度 ----
+    # 不加这一段，`_graph_blueprint()` 的 `if not specs.get(d,{}).get("by_sql")`
+    # 会把新人导入的维度整条跳过 —— 实测：图谱里明明有了
+    # `plant_success_rate` 节点，出题点却仍挑回 `map_fb_conv`，
+    # 出的题跟人问的毫无关系（人问爆弹成功率，出了首血转换率）。
+    # 这些维度是 VLML **用 SQL 答出来的**，所以 by_sql 必为真 —— 不是猜的。
+    try:
+        import knowledge_graph
+        for irec in knowledge_graph.load_imported_dimensions():
+            d = str(irec.get("dimension") or "").strip()
+            if not d or d in out:
+                continue
+            low = d.lower()
+            is_pct = any(k in low for k in ("rate", "ratio", "pct", "conv",
+                                            "success", "win"))
+            out[d] = {
+                "kind": "percent" if is_pct else "count",
+                "needs_base": bool(is_pct),
+                "example": "SQL 里自己算好百分比，另取一列作样本量",
+                "by_tool": bool(irec.get("tool")) and not bool(irec.get("sql")),
+                "by_sql": bool(irec.get("sql")),
+                "origin": "human_import",
+            }
+    except Exception:                                        # pragma: no cover
+        pass
     for d, rec in out.items():
         pt = ""
         if g is not None:
@@ -558,6 +583,8 @@ def _graph_blueprint(difficulty: int = 2,
                 # 而不是让它从零发明 —— 这正是"题点归服务端"该覆盖的最后一层。
                 "skeleton": str(det.get("recipe") or "")[:700],
                 "own_difficulty": own,
+                # 百分比维度要连样本量一起取（见 propose 里的 require_base 提示）
+                "require_base": bool(specs.get(d, {}).get("needs_base")),
             }))
     if not cands:
         return {}
@@ -603,6 +630,13 @@ async def propose(*, about: str = "", difficulty: int = 2,
         )
         for e in (blueprint.get("typical_errors") or []):
             bp += f"\n  典型错法：{e}"
+        # 百分比口径必须**额外取一列**当样本量。不写这条，模型每次都只取
+        # 分子（实测：连续 4 次被验题以"取不到分母/样本量"判废，白烧 4 次调用）。
+        # 事前说清楚比事后回灌 critique 便宜。
+        if blueprint.get("require_base"):
+            bp += (f"\n  ★ 这个维度是**百分比**：SQL 里除了比值本身，必须再取一列"
+                   f"当样本量/分母，并在 answer_spec 里用 `base_column` 标出它是第几列"
+                   f"（0 开始数）。只给比值、不给样本量的题一律判废。")
         skel = str(blueprint.get("skeleton") or "").strip()
         if skel:
             # 骨架是**服务端给出的正确形状**（脱敏过的，'?' 是占位符）。

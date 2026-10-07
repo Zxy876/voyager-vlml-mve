@@ -1,62 +1,51 @@
-# ---------------------------------------------------------------------------
-# 第三方仓库：各自有独立 history，不纳入本仓库
+
+#   study_companion/ N.E.K.O 伴学插件副本（只读参照，不修改、不分发）
 #   vlml/            VLML 数据层（21 张表 + 46 个洞察 SQL）
 #   voyager-fork/    原版 MineDojo/Voyager 的本地 fork（只做对照阅读）
-#   study_companion/ N.E.K.O 伴学插件副本（只读参照，不修改、不分发）
 # ---------------------------------------------------------------------------
-/vlml/
-/voyager-fork/
-/study_companion/
-
-# ---------------------------------------------------------------------------
+# macOS
 # 凭据
-# ---------------------------------------------------------------------------
-.env
-mve/.env
-*.pem
+# 备份目录（每轮改动前自动留的）
+# 学习单元日志（learn.py 每跑一个单元就往里追加练习轮的完整输出）
+# 数据库与导出
+# 本地工具目录
+# 状态文件：技能库 / 裁判缓存 / 驾驶舱状态 / 练习范围 / 工具 schema 缓存 / 图谱
+# 第三方仓库：各自有独立 history，不纳入本仓库
+# 自动生成的题（运行时产物；带验题证据，可重算，不进仓库）
+# 运行日志与曲线（run_log / causal_timeline / mastery_retention / ui_events）
+# 运行时产物（跑一次就会重新生成）
+# （全部可重算，且 skill_store 里带模型学到的源码，属于运行数据不是源码）
+*.db
+*.db-shm
+*.db-wal
+*.egg-info/
+*.jsonl
 *.key
 *.p12
-
-# ---------------------------------------------------------------------------
-# 运行时产物（跑一次就会重新生成）
-# ---------------------------------------------------------------------------
-__pycache__/
+*.pem
 *.py[cod]
-*.egg-info/
+*.sqlite3
+.DS_Store
+.env
 .venv/
-venv/
-
-# 运行日志与曲线（run_log / causal_timeline / mastery_retention / ui_events）
-*.jsonl
-
-# 备份目录（每轮改动前自动留的）
+.workbuddy/
+/study_companion/
+/vlml/
+/voyager-fork/
+__pycache__/
 _backup_*/
 backups/
-
-# 数据库与导出
-*.db
-*.db-wal
-*.db-shm
-*.sqlite3
+mve/.env
+mve/db_config.json
 mve/exports/
-
-# 状态文件：技能库 / 裁判缓存 / 驾驶舱状态 / 练习范围 / 工具 schema 缓存 / 图谱
-# （全部可重算，且 skill_store 里带模型学到的源码，属于运行数据不是源码）
-mve/skill_store.json
-mve/referee_store.json
+mve/generated_tasks.json
+mve/imported_dimensions.json
+mve/knowledge_graph.json
+mve/learn.log
+mve/pilot.log
 mve/pilot_state.json
 mve/practice_scope.json
+mve/referee_store.json
+mve/skill_store.json
 mve/tool_schemas.json
-mve/knowledge_graph.json
-mve/pilot.log
-# 学习单元日志（learn.py 每跑一个单元就往里追加练习轮的完整输出）
-mve/learn.log
-mve/db_config.json
-# 自动生成的题（运行时产物；带验题证据，可重算，不进仓库）
-mve/generated_tasks.json
-
-# 本地工具目录
-.workbuddy/
-
-# macOS
-.DS_Store
+venv/

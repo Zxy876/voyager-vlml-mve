@@ -67,6 +67,7 @@ import hashlib
 import json
 import re
 import sys
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -1436,7 +1437,155 @@ def build(*, observe: bool = False, with_schema: bool = True) -> KnowledgeGraph:
 
     if observe:
         asyncio.run(_observe_procedure(g))
+    _merge_imported_dimensions(g)
     return g
+
+
+# --------------------------------------------------------------------------
+# 人导入的答案 → 图谱维度节点（伴学 `ensure_topic` 的同构物）
+# --------------------------------------------------------------------------
+# 为什么必须有这一段（用户原话 + 实测）：
+#   「人出一些新的题有时候因为没有匹配到 VLML 图谱的标签，而导致不影响给
+#    voyager 的自适应出题……但是其实人出题 VLML 是可以回答解释的，意味着
+#    是有标准答案的，那么如果匹配不到可以增加图谱节点。」
+#
+# 实测证据：导入「Cloud9 每回合的爆弹（plant）成功率是多少？」
+#   - `infer_topic()` 归不上（题库里没有这个维度）
+#   - VLML 照答不误：`plant_success_rate = 12.95 (base=100)`
+#   - 但 topic_id 是空的 → control fact 的 topic 为空 → 出题器读不到
+#     → **不影响自适应出题**，于是回到"反复做同一道旧题"
+#
+# 根因是图谱节点的来源：维度节点全部从 `TASKS[].rubric` 派生
+# （tasks.py:361 明确写着"出过题的才进图"）。人问的新维度没出过题，
+# 就不在图里；不在图里，`question_gen._graph_blueprint()` 就挑不到它，
+# 出题器自然永远推不出这个方向的新题 —— 死锁。
+#
+# 伴学的对应机制：
+#   `material_topic_mapper.py` 把导入材料映射到已有知识点，映射不上时
+#   交回 UI（`baseline_topic_prompt`：请在图谱里选一个知识点）—— 伴学是
+#   **让人来补节点**。MVE 多了 VLML：人问的题它能答出维度 + 取数 SQL，
+#   于是这个节点可以由**系统自己补**，不必等人去图谱里手动选。
+#
+# 所以同构关系是这样：
+#   伴学  MaterialTopicMapper → 映射已有知识点 / 交回人选
+#   MVE   adopt_dimension()   → 用 VLML 的答案建维度节点（含表/列/骨架）
+IMPORTED_DIMS = HERE / "imported_dimensions.json"
+
+
+def load_imported_dimensions() -> list[dict[str, Any]]:
+    """人导入时被采纳的新维度（持久化，build 时并进图谱）。"""
+    try:
+        raw = json.loads(IMPORTED_DIMS.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, list) else []
+    except Exception:
+        return []
+
+
+def adopt_dimension(*, dimension: str, sql: str = "", tool: str = "",
+                    question: str = "", subject: dict[str, Any] | None = None,
+                    value: Any = None) -> dict[str, Any]:
+    """把人导入时 VLML 答出的维度写成图谱节点。返回落盘记录。
+
+    节点必须带 `tables` / `columns` / `recipe` —— 否则
+    `question_gen._graph_blueprint()` 的第一道闸就是 `if not tables: continue`，
+    加了节点也照样挑不到它，等于没加。这三样从人导入那次**真实的取数 SQL**
+    里解析出来（`_tables_in_sql` / `_used_columns` / `_sql_recipe`），
+    不是模型编的 —— 与图谱其余部分"来源必须是声明或实测"的规矩一致。
+    """
+    dim = str(dimension or "").strip()
+    if not dim:
+        return {}
+    items = [it for it in load_imported_dimensions()
+             if str(it.get("dimension") or "") != dim]
+    rec = {
+        "dimension": dim,
+        "sql": str(sql or "")[:4000],
+        "tool": str(tool or ""),
+        "question": str(question or "")[:300],
+        "subject": dict(subject or {}),
+        "value": value,
+        "adopted_at": datetime.now().isoformat(timespec="seconds"),
+        "origin": "human_import",
+    }
+    items.append(rec)
+    IMPORTED_DIMS.write_text(
+        json.dumps(items, ensure_ascii=False, indent=1), encoding="utf-8")
+
+    # 光落盘不够：**当前这张图里也必须立刻有这个节点**。
+    # 出题器（`question_gen._graph_blueprint`）读的是 `KnowledgeGraph.load()`
+    # 出来的对象，不是 json 文件；只写文件的话，本次导入后出题器照样挑不到
+    # 它（实测：加了节点、topic_id 仍是空）。所以这里在现有图上打补丁并落盘。
+    # 指纹没变 → 下次 load 不会重建 → 补丁留得住；等新题进 TASKS 指纹一变，
+    # build() 里的 `_merge_imported_dimensions` 会从 json 重新合并，不会丢。
+    try:
+        g = KnowledgeGraph.load()
+        _merge_imported_dimensions(g)
+        g.save()
+    except Exception:
+        pass                                                 # 打补丁失败不影响落盘
+    return rec
+
+
+def _merge_imported_dimensions(g: KnowledgeGraph) -> int:
+    """build 时把人导入的维度并进图 —— 不然下次重建它们就没了。
+
+    为什么要持久化而不是只在导入时改一次图：图谱是 `build()` 的产物，
+    指纹一变（加了新题、VLML 文档变了）就整体重建，直接在图对象上打的
+    补丁会被冲掉。落盘成 `imported_dimensions.json`，与
+    `question_gen.generated_tasks.json` 是同一种持久化思路。
+    """
+    known = _known_tables()
+    added = 0
+    for rec in load_imported_dimensions():
+        dim = str(rec.get("dimension") or "").strip()
+        if not dim:
+            continue
+        sql = str(rec.get("sql") or "")
+        tbls = _tables_in_sql(sql, known) if sql else []
+        cols_map = _used_columns(sql, tbls, known) if (sql and tbls) else {}
+        # 「定义」就是人问的那句话 —— 新维度没有服务端权威定义，只有人的原话。
+        # 括号要**去掉而不是截断**：`_dim_specs` 里 desc 取括号前的主名，
+        # 实测「…爆弹（plant）成功率是多少？」被截成「…爆弹」，
+        # 丢了「成功率」这个关键词，验题的"题面与维度相关"直接判不相关。
+        q = (str(rec.get("question") or "")
+             .replace("（", "").replace("）", "")
+             .replace("(", "").replace(")", "").strip())
+        node = Node(id=f"dim:{dim}", kind="dimension", label=dim,
+                    detail={
+                        "point": q or dim,
+                        "seed_question": str(rec.get("question") or "")[:300],
+                        "topics": [],
+                        "tables": tbls,
+                        "columns": sorted({c for v in cols_map.values()
+                                           for c in v}),
+                        "columns_by_table": cols_map,
+                        "semantics": _sql_semantics(sql) if sql else "",
+                        "recipe": _sql_recipe(sql) if sql else "",
+                        "difficulty": _sql_difficulty(sql) if sql else 2,
+                        "unit": _unit_of(dim, {"point": dim}),
+                        "skills": _skills_of(sql),
+                        "origin": "human_import",
+                        "adopted_at": str(rec.get("adopted_at") or ""),
+                        "seed_value": rec.get("value"),
+                    })
+        # 直接覆盖，不走 add_node 的合并：合并式写入会**保留旧 detail**，
+        # 于是第一次落盘时带括号的旧 point 永远改不掉（实测改了代码、
+        # 重跑了合并，desc 仍是「…爆弹」，括号后的「成功率」还是丢了）。
+        # 这些节点的全部内容都来自导入记录，覆盖不会有信息损失。
+        g.nodes[node.id] = node
+        tool = str(rec.get("tool") or "").strip()
+        if tool:
+            g.add_edge(Edge(src=f"tool:{tool}", dst=f"dim:{dim}",
+                            relation=PRODUCED_BY, origin="observed",
+                            reason="人导入时由该工具取出（实测）",
+                            confidence=0.9))
+        for t in tbls:
+            g.add_edge(Edge(src=f"dim:{dim}", dst=f"table:{t}",
+                            relation=DERIVED_FROM, origin="observed",
+                            reason="人导入时的取数 SQL 读了该表",
+                            confidence=0.9))
+        added += 1
+    return added
 
 
 _GRAIN_ZH = {"round": "回合", "game": "图", "series": "series", "player": "选手",

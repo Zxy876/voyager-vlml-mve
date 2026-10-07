@@ -190,16 +190,60 @@ async def _execute(calls: list[dict[str, Any]],
     return obs, traj, errors
 
 
-async def _task_from_text(question: str) -> tuple[str, str]:
+async def _task_from_text(question: str,
+                          facts: list[dict[str, Any]] | None = None
+                          ) -> tuple[str, str]:
     """归不上已有题时，拿这段文本去生成一道新题。返回 (topic_id, 说明)。
 
     失败就坦然返回空 —— 出题器那条线断了，但**解释本身照常返回**，
     人看到的内容不受影响。
+
+    `facts` 是 VLML 刚才给出的答案。它是这条链路的关键：
+
+      人问的题归不上 → 但 VLML 答得出（有维度、有值、有取数 SQL）
+      → 那个维度就是**新知识点**，先种进图谱 → 再围绕它出题
+
+    不传 facts 的话，出题点只能由 `_graph_blueprint()` 从**已有**维度里挑，
+    而已有维度几乎都出过题（图谱的维度节点全部从 TASKS[].rubric 派生），
+    于是挑出来的还是旧方向 —— 人导入的意图就这么被吃掉了。
+    实测：导入「爆弹成功率」时 VLML 答出 `plant_success_rate`，但 topic_id
+    仍为空，出题器毫无反应。
     """
+    # 1) 先把人问出来的维度种进图谱（伴学 ensure_topic 的同构物）
+    dims: list[str] = []
+    for f in (facts or []):
+        d = str((f or {}).get("dimension") or "").strip()
+        if d and d not in dims:
+            dims.append(d)
+    if not dims:
+        # 没取到事实也要留个记号：题干本身可以当维度名候选，交给模型起名
+        dims = []
+    tool = ""
+    if facts:
+        tool = str((facts[0] or {}).get("tool") or "")
+    focus = ""
+    for d in dims:
+        try:
+            import knowledge_graph
+            knowledge_graph.adopt_dimension(
+                dimension=d,
+                sql=str((facts[0] or {}).get("sql") or ""),
+                tool=tool,
+                question=question,
+                subject=dict((facts[0] or {}).get("subject") or {}),
+                value=(facts[0] or {}).get("value"),
+            )
+            focus = focus or d
+            print(f"  [导入] 图谱新增维度节点：{d}（来自 VLML 的答案）")
+        except Exception as exc:                             # pragma: no cover
+            print(f"  [导入] 维度入图失败：{type(exc).__name__}: {str(exc)[:120]}")
+
+    # 2) 围绕这个新维度出题（题点归服务端，模型只写题面）
     try:
         import question_gen
         rec, _ = await question_gen.generate_adopt(
-            about=question, difficulty=2, tries=2, do_adopt=True, verbose=False)
+            about=question, difficulty=2, tries=2, do_adopt=True, verbose=False,
+            focus_dimension=focus)
     except Exception as exc:                                 # pragma: no cover
         print(f"  [导入] 生成新题失败：{type(exc).__name__}: {str(exc)[:120]}")
         return "", ""
@@ -233,6 +277,12 @@ async def explain(question: str, *, topic_id: str = "",
     的**反面**：伴学映射不到就让人去图谱里选一个（`baseline_topic_prompt`）；
     MVE 多了 `question_gen`，可以直接把这段文本变成一道题，于是
     「人导入 → 影响出题」不会在归不上时断掉 —— 反而多了一种长新题的方式。
+
+    关于时机：**归不上时不再取数前就急着生成题**。人问的新维度往往是 VLML
+    刚答出来的（取数前根本不知道它叫什么），先取数、拿到事实，再用那个维度
+    去种图谱节点 + 出题，才对得上人的方向。取数前生成只会让
+    `_graph_blueprint()` 从已有维度里挑一个旧的（实测：导入「爆弹成功率」，
+    生成的题和 plant 毫无关系）。
     """
     inferred, hit = "", ""
     if topic_id:
@@ -240,8 +290,7 @@ async def explain(question: str, *, topic_id: str = "",
     else:
         inferred, hit = infer_topic(question)
         topic_id = inferred
-        if not topic_id and auto_task:
-            topic_id, hit = await _task_from_text(question)
+        # 归不上时不在这里生成题 —— 等取完数拿到维度再说（见 docstring）
 
     base: dict[str, Any] = {
         "question": question,
@@ -258,6 +307,17 @@ async def explain(question: str, *, topic_id: str = "",
         {"role": "user", "content": _plan_prompt(question)},
     ])
     obs, traj, errors = await _execute(plan.get("calls") or [])
+
+    # 人导入这次**真实用过的取数 SQL 与工具** —— 新维度进图谱时要靠它填
+    # tables / columns / recipe，没有这三样 `_graph_blueprint()` 挑不到它。
+    used_sql, used_tool = "", ""
+    for o in obs:
+        a = o.get("args") or {}
+        if not used_sql and a.get("sql_query"):
+            used_sql = str(a.get("sql_query") or "")
+            used_tool = str(o.get("tool") or "")
+    if not used_tool and traj:
+        used_tool = str(traj[0])
 
     # 工具调用闸（与 Voyager 那条同款）：一次都没调成功就不许产出事实。
     # 实测踩过：工具全报错时模型照样编出 3 条"事实"，值全是它自己想的。
@@ -290,9 +350,13 @@ async def explain(question: str, *, topic_id: str = "",
     ])
 
     facts = []
+    raw_facts: list[dict[str, Any]] = []
     for f in (out.get("facts") or []):
         if not isinstance(f, dict) or "subject" not in f or "dimension" not in f:
             continue
+        # 原始事实要带上这次的取数 SQL / 工具：新维度进图谱时靠它们填
+        # tables / columns / recipe（没有这三样出题器挑不到新节点）。
+        raw_facts.append({**f, "sql": used_sql, "tool": used_tool})
         facts.append(make_fact(
             subject=f.get("subject") or {},
             dimension=str(f.get("dimension")),
@@ -301,6 +365,14 @@ async def explain(question: str, *, topic_id: str = "",
             base=f.get("base"),
             source={"tool": "vlml_coach", "args": {}},
         ))
+
+    # 归不上已有题 → 用 VLML 刚答出的维度种图谱节点 + 围绕它出新题。
+    # 放在取数之后：维度名是取数才有的，取数前生成只会绕回旧维度。
+    if not topic_id and auto_task:
+        topic_id, hit = await _task_from_text(question, raw_facts)
+        base["topic_id"] = topic_id
+        base["topic_matched"] = bool(topic_id)
+        base["topic_hit"] = hit
 
     # 解释由 LLM 出（VLML README:97：指标由工具出，洞察由 LLM 出）
     story = narrator.narrate(None, facts, verdict="") if facts else {
