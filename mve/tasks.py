@@ -438,6 +438,13 @@ def _merge_generated() -> int:
         topic = str(rec.get("topic_id") or "").strip()
         if not topic or topic in TASKS:
             continue
+        # 复核判废的题不进题库（见 `question_gen.revalidate_store`）。
+        # 为什么需要这道闸：验题规则是**后来才补**的，而题是先入库的 ——
+        # 实测 `max_losing_streak_map` 的 value_column 指到了 map_name
+        # （真值是地图名 'Lotus'），连跑 5 轮全 0%、critique 一字不变。
+        # 那种不是"学不会"，是题坏了；坏题混在库里会把学习曲线画成平的。
+        if rec.get("invalid"):
+            continue
         try:
             task = question_gen.to_task(rec)
         except Exception:                                    # pragma: no cover

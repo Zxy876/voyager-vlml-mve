@@ -29,6 +29,53 @@ def fact_key(f: dict[str, Any]) -> tuple[str, str]:
     return (subj, str(f.get("dimension")))
 
 
+def _key_match(a: tuple[str, str], b: tuple[str, str]) -> bool:
+    """两个 fact_key 是否指同一条事实 —— **'?' 是通配符**。
+
+    为什么必须通配：subject 里 `map: '?'` 的语义是"这一维不指定"
+    （出题器用它表示"你查到哪张图就是哪张图"）。但裁判跑配方拿到的 fact
+    把 '?' 原样带了出来（`series=2843069/team=Cloud9/map=?`），而评分点声明的
+    subject 写的是真值 `map=Lotus` —— 键永远对不上。
+
+    实测后果：`max_losing_streak_map` 连跑 5 轮，裁判每次都记
+    `unjudgeable`（"裁判自己也没答出来"），coverage=0、missing=[] 、
+    rejected=[] —— 模型**做什么都拿不到分**，critique 五轮一字不变。
+    这不是学不会，是比对层把它判成了"不可判"。
+    """
+    if a == b:
+        return True
+    if a[1] != b[1]:
+        return False
+    sa, sb = a[0], b[0]
+    if sa == sb:
+        return True
+    pa, pb = sa.split("|"), sb.split("|")
+    if len(pa) != len(pb):
+        return False
+    for x, y in zip(pa, pb):
+        if x == y:
+            continue
+        xk, _, xv = x.partition("=")
+        yk, _, yv = y.partition("=")
+        if xk != yk:
+            return False
+        if xv == "?" or yv == "?":     # 一方未指定 → 视为同一条
+            continue
+        return False
+    return True
+
+
+def _lookup(index: dict, key: tuple[str, str]) -> Any | None:
+    """先精确查，查不到再按 '?' 通配查。"""
+    hit = index.get(key)
+    if hit is not None:
+        return hit
+    for k, v in index.items():
+        if _key_match(k, key):
+            return v
+    return None
+
+
 def norm_subject(value: Any) -> dict[str, Any]:
     """把模型返回的 subject 归一化成交叉键字典。
 
@@ -279,12 +326,12 @@ def evaluate_vs_referee(
 
     for p in rubric:
         key = fact_key({"subject": p.subject, "dimension": p.dimension})
-        ref = ref_index.get(key)
+        ref = _lookup(ref_index, key)
         if ref is None:
             # 裁判自己也没答出来 —— 这题出得有问题，不能算 Voyager 错
             unjudgeable.append(p.point)
             continue
-        got_fact = voyager_index.get(key)
+        got_fact = _lookup(voyager_index, key)
         if got_fact is None:
             missing.append(p.point)
             continue

@@ -82,9 +82,32 @@ def _save_store(data: dict[str, Any]) -> None:
     )
 
 
-def cached(topic_id: str) -> RefereeAnswer | None:
+def spec_fingerprint(task: Any) -> str:
+    """这道题的**取数配方**指纹 —— 缓存过期判据。
+
+    为什么必须加它：缓存原来只按 `topic_id` 存，而生成的题会被**重新生成**
+    （同 topic_id、换配方）。实测 `max_losing_streak_map` 重出之后，裁判
+    仍然拿着缓存里的旧真值 `'Corrode'`（旧配方的 value_column 指到了
+    map_name）去比对新答案 —— 模型交的 `3` **是对的**，却被判"值不可比"，
+    连跑 5 轮 0%。题变了而裁判不知道，跟图谱缓存那个坑是同一个病。
+    """
+    import hashlib
+    parts = [str(getattr(task, "topic_id", ""))]
+    for p in (getattr(task, "rubric", None) or []):
+        s = getattr(p, "answer_spec", None)
+        parts.append(f"{p.dimension}|{p.subject}|"
+                     f"{getattr(s, 'sql', '') or ''}"
+                     f"{getattr(s, 'tool', '') or ''}{getattr(s, 'value_path', '') or ''}"
+                     f"{getattr(s, 'value_column', '')}")
+    return hashlib.sha1("\n".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def cached(topic_id: str, fingerprint: str = "") -> RefereeAnswer | None:
     raw = _load_store().get(topic_id)
     if not raw:
+        return None
+    # 配方变了 → 这份缓存是**旧题的答案**，不能再用
+    if fingerprint and str(raw.get("spec_fingerprint") or "") != fingerprint:
         return None
     return RefereeAnswer(
         topic_id=raw.get("topic_id", topic_id),
@@ -291,8 +314,9 @@ async def answer(task: Any, *, force: bool = False) -> RefereeAnswer:
 
     次序照伴学 AssessmentEngine：确定性层先跑，缺口才交给 LLM。
     """
+    fp = spec_fingerprint(task)
     if not force:
-        hit = cached(task.topic_id)
+        hit = cached(task.topic_id, fp)
         if hit is not None:
             return hit
 
@@ -358,7 +382,9 @@ async def answer(task: Any, *, force: bool = False) -> RefereeAnswer:
     )
 
     store = _load_store()
-    store[task.topic_id] = ans.as_dict()
+    rec = ans.as_dict()
+    rec["spec_fingerprint"] = fp        # 配方换了就得重跑（见 spec_fingerprint）
+    store[task.topic_id] = rec
     _save_store(store)
     return ans
 

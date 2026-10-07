@@ -436,7 +436,19 @@ def build_feedback(
         reference_plan=ref_plan, my_plan=my_plan, confidence=float(confidence),
     )
 
-    if not items:
+    # ⚠️ 判据必须是**判定结果**，不能是"missing 列表为不为空"。
+    #
+    # 实测踩的坑：一道题 verdict=wrong、coverage=0、covered=[]，但 missing 也
+    # 是 []（事实被判 `below_threshold` 拒收，走的是 rejected 而不是 missing）。
+    # 于是这里走进"全覆盖"分支，输出：
+    #     「我的事实集覆盖了裁判的全部 0 个评分点，编排方式有效。
+    #       这套编排可以固化 —— 写进技能库，下次同类题直接复用。」
+    # **把失败讲成了成功**。critique 就是这样回灌给模型的 —— 模型每轮读到
+    # "有效、可以固化"，于是五轮如一日地重复同一个错。学习曲线起不来的
+    # 直接断点就是这一行：不是模型学不会，是反馈在骗它。
+    judged_ok = (str(verdict).lower() in ("correct", "ok", "true")
+                 or float(coverage) >= 1.0)
+    if not items and judged_ok:
         fb.error_type = ""
         fb.error_types = []
         fb.feedback = f"覆盖了裁判的全部 {len(covered)} 个评分点，编排方式有效。"
@@ -456,6 +468,36 @@ def build_feedback(
             fb.lesson = f"未调工具即覆盖 {len(covered)} 个评分点（可疑，检查是否用了缓存事实）。"
         fb.step_feedback = _step_feedback(my_plan, ref_plan, [])
         fb.related_topics = dims
+        return fb
+
+    if not items:
+        # **没漏维度，但一个事实都没被认可**（拒收 / 值不对 / 证据不足）。
+        # 以前这里会掉到下面 `ranked[0]` 直接 IndexError —— 而更早以前它
+        # 干脆被当成"全覆盖"，把失败播报成成功。必须单独一支，说清**没被认可**。
+        fb.error_type = "not_accepted"
+        fb.error_types = ["not_accepted"]
+        fb.feedback = (
+            f"交上去的事实一个都没被裁判认可（判定 {verdict}，覆盖率 "
+            f"{round(float(coverage) * 100)}%，已覆盖 {len(covered)} 个评分点）。"
+            "**交了 ≠ 拿到了证据** —— 这不是「编排有效」。")
+        why: list[str] = []
+        if rejected_low_base:
+            why.append("有事实因样本量不足被拒收（"
+                       + "、".join(str(p) for p in list(rejected_low_base)[:3])
+                       + "）：放宽过滤或换更粗的粒度，别只取一行")
+        if my_plan and ref_plan:
+            lack = [t for t in ref_plan if t not in my_plan]
+            if lack:
+                why.append(f"裁判的编排是 {' → '.join(ref_plan)}，你只做了 "
+                           f"{' → '.join(my_plan)}，还差 {'、'.join(lack)}")
+        fb.next_action = ("先搞清为什么没被认可再重跑：" + "；".join(why)) if why else (
+            "事实没通过裁判校验 —— 不是漏维度，是**没被认可**。换一种取法，"
+            "别把上一轮完全相同的查询再跑一遍：同一条 SQL 只会拿到同一个结果。")
+        fb.misconceptions.append(
+            "我把「把事实交上去」当成了「拿到了证据」 —— 覆盖率 0% 说明还没有。"
+            "重复同样的编排不会让它变对。")
+        fb.step_feedback = _step_feedback(my_plan, ref_plan, [])
+        fb.related_topics = sorted({dim_by_point.get(c, c) for c in covered})
         return fb
 
     # 主错误类型 = 最严重的那条

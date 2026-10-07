@@ -549,6 +549,14 @@ def _graph_blueprint(difficulty: int = 2,
                 "columns": list(cols),
                 "semantics": str(det.get("semantics") or ""),
                 "typical_errors": list(det.get("typical_errors") or [])[:2],
+                # 结构骨架：**难度 4 能不能出出来，全靠给不给它**。
+                # 实测不给骨架连试 4 次，模型每次都写成
+                # `COUNT(*) OVER (ORDER BY ...)`（累计计数，不是连续段数）
+                # 或把 `team_name` 写进没有这列的 rounds 表 —— 4/4 全废。
+                # 而 gaps-and-islands 的正确形状**就在图谱里**（脱敏过的
+                # recipe，还标了 WHERE 该放哪一层）。让模型照骨架改值，
+                # 而不是让它从零发明 —— 这正是"题点归服务端"该覆盖的最后一层。
+                "skeleton": str(det.get("recipe") or "")[:700],
                 "own_difficulty": own,
             }))
     if not cands:
@@ -595,6 +603,15 @@ async def propose(*, about: str = "", difficulty: int = 2,
         )
         for e in (blueprint.get("typical_errors") or []):
             bp += f"\n  典型错法：{e}"
+        skel = str(blueprint.get("skeleton") or "").strip()
+        if skel:
+            # 骨架是**服务端给出的正确形状**（脱敏过的，'?' 是占位符）。
+            # 不给骨架的实测：难度 4 连出 4 次全废（写成累计计数 / 编造列）。
+            bp += (
+                "\n  ★ 照这个**结构骨架**写你的 SQL（'?' 换成你查到的真实值，"
+                "形状不许改）：\n" + skel +
+                "\n  骨架里 WHERE 的**位置就是口径**：内层先编号、外层再筛。"
+                "不要把过滤条件全塞进最内层 —— 塞进去段就断了。")
         user += bp
     if avoid:
         user += ("\n\n下面这些 (subject, dimension) 组合**已经有题了，不要再出**：\n"
@@ -1023,6 +1040,31 @@ async def validate(candidate: dict[str, Any], *,
                     reasons.append(f"「{point}」量纲越界（{got.get('value')} > {cap}）")
                     continue
 
+        # 闸 3b（通用）：只要这道评分点是**按数值比**（有 numeric_tolerance，
+        # 或维度声明不是枚举/标签），跑出来的值就必须能当数字用。
+        #
+        # 为什么不能只靠上面那条 count 专属的闸：实测 `max_losing_streak_map`
+        # 就是这么混进来的 —— 它的 SQL 是
+        #   `SELECT map_name, MAX(cnt) ... GROUP BY map_name` + `value_column: 0`
+        # 取到的是**地图名** 'Lotus'，而题干问"最长连败回合数"、tolerance=0.05。
+        # 裁判拿 'Lotus' 当真值，模型交任何数字都判错 → 连跑 5 轮全 0%，
+        # critique 一字不变。那不是"学不会"，是**题是坏的**。
+        # 坏题比没有题更糟：它会伪装成"学习曲线没起来"，把人引向错的方向。
+        if str(dspec.get("kind")) != "count" and spec.get("sql"):
+            try:
+                float(got.get("value"))
+            except (TypeError, ValueError):
+                row["ok"] = False
+                row["fix"] = (
+                    f"配方取出来的值是 {got.get('value')!r}，不是数字 —— "
+                    "value_column 指错列了（多半指到了 map_name / player_name "
+                    "这类标签列）。把它改成数值那一列；"
+                    "如果这一列本来就是分组键，就把它从 SELECT 里去掉或挪到后面。")
+                row["why"] = f"取出的值 {got.get('value')!r} 不是数字（题干按数值评分）"
+                checks.append(row)
+                reasons.append(f"「{point}」取出的值不是数字（{got.get('value')!r}）")
+                continue
+
         row["ok"] = True
         row["why"] = "配方跑得出非空值"
         row["value"] = got.get("value")
@@ -1046,6 +1088,42 @@ async def validate(candidate: dict[str, Any], *,
     gap = _difficulty_gap(candidate, int(candidate.get("difficulty") or 2))
     if gap:
         reasons.append(f"难度不达标（要求 {candidate.get('difficulty')} 档）：{gap}")
+
+    # ---- 闸 9（题级）："连续"语义必须有 gaps-and-islands 的可数形状 ----
+    # `COUNT(*) OVER (ORDER BY ...)` 也是窗口函数，能过闸 8，但它算的是
+    # **累计计数**（到当前行为止一共输了多少），MAX 出来 = 总共输了几个回合，
+    # 根本不是"最长**连续**连败"。实测 `max_losing_streak_map` 就是这么生成的：
+    # 难度闸过了、结构闸过了，口径却是错的 —— 于是这道题永远做不对。
+    #
+    # gaps-and-islands 的形状是可数的，认这两种：
+    #   (a) 差值法：ROW_NUMBER 出现 ≥2 次（两个编号相减得到段号）
+    #   (b) 重置法：LAG / SUM(...) OVER 做断点累计
+    # 两条都没有 → 判废，并把这个形状要求原样写进 fix 回灌给模型。
+    text = " ".join(
+        [str(candidate.get("question") or "")]
+        + [str(rp.get("point") or "")
+           for rp in (candidate.get("rubric") or []) if isinstance(rp, dict)]
+    ).lower()
+    if any(k in text for k in ("连续", "连败", "连胜", "streak")):
+        sqls = " \n ".join(
+            str((rp.get("answer_spec") or {}).get("sql") or "").lower()
+            for rp in (candidate.get("rubric") or []) if isinstance(rp, dict))
+        if sqls.strip():
+            n_rn = sqls.count("row_number")
+            has_reset = ("lag(" in sqls or "lead(" in sqls
+                         or ("sum(" in sqls and " over " in sqls))
+            if n_rn < 2 and not has_reset:
+                gap_msg = ("「连续/连败」必须用 gaps-and-islands："
+                           "两个 ROW_NUMBER() 相减得段号"
+                           "（ROW_NUMBER() OVER (ORDER BY round_number) "
+                           "- ROW_NUMBER() OVER (PARTITION BY 队伍 ORDER BY round_number)），"
+                           "再用 LAG/SUM() OVER 做断点重置。"
+                           "COUNT(*) OVER (ORDER BY ...) 是**累计计数**，不是连续段数。")
+                reasons.append(gap_msg)
+                for c in checks:
+                    c["ok"] = False
+                    c.setdefault("fix", gap_msg)
+                ok = False
 
     return {"ok": ok, "checks": checks, "reasons": reasons,
             "difficulty": candidate.get("difficulty"),
@@ -1223,6 +1301,47 @@ def adopt(candidate: dict[str, Any], checks: list[dict[str, Any]]) -> dict[str, 
     STORE.write_text(json.dumps(items, ensure_ascii=False, indent=1),
                      encoding="utf-8")
     return rec
+
+
+async def revalidate_store() -> list[dict[str, Any]]:
+    """回头复核**已入库**的生成题 —— 新闸管不到存量，必须补一刀。
+
+    为什么必须有它：验题规则是逐步补的，题是先入库的。实测
+    `max_losing_streak_map` 在新闸（"取出的值必须是数字"）加上之前就落盘了，
+    之后无论重跑多少轮，它都静静地躺在库里当"永远做不对的题"：
+    连跑 5 轮 0%、critique 一字不变 —— 看起来像"学习曲线起不来"，
+    其实是**一道坏题把整条曲线钉死在地板上**。
+    """
+    items = load_generated()
+    bad: list[dict[str, Any]] = []
+    changed = False
+    for rec in items:
+        topic = str(rec.get("topic_id") or "")
+        if not topic:
+            continue
+        try:
+            vr = await validate(rec)
+        except Exception as e:                               # pragma: no cover
+            rec["invalid"] = True
+            rec["invalid_reason"] = f"复核时报错：{type(e).__name__}: {e}"
+            bad.append(rec); changed = True
+            continue
+        if not vr.get("ok") or vr.get("difficulty_gap"):
+            rec["invalid"] = True
+            rec["invalid_reason"] = "；".join(
+                str(r) for r in (vr.get("reasons") or []))[:400]
+            rec["invalid_note"] = ("复核判废（不是删除）：配方在**现在的**验题规则下"
+                                   "过不了。留着是为了复盘，但不再进题库。")
+            bad.append(rec); changed = True
+        elif rec.get("invalid"):
+            # 修好了就恢复 —— 复核是双向的
+            rec.pop("invalid", None); rec.pop("invalid_reason", None)
+            rec.pop("invalid_note", None)
+            changed = True
+    if changed:
+        STORE.write_text(json.dumps(items, ensure_ascii=False, indent=1),
+                         encoding="utf-8")
+    return bad
 
 
 def to_task(rec: dict[str, Any]) -> Task:
@@ -1421,7 +1540,19 @@ def _main() -> int:
     ap.add_argument("--difficulty", type=int, default=2)
     ap.add_argument("--tries", type=int, default=3, help="最多生成几次")
     ap.add_argument("--adopt", action="store_true", help="验过就并入库")
+    ap.add_argument("--revalidate", action="store_true",
+                    help="回头复核已入库的生成题，在新的验题规则下过不了的标记判废")
     args = ap.parse_args()
+
+    if args.revalidate:
+        bad = asyncio.run(revalidate_store())
+        if not bad:
+            print("存量复核：全部通过（没有被判废的题）")
+            return 0
+        print(f"存量复核：{len(bad)} 道题在新验题规则下过不了，已标记 invalid（不删，留证据）")
+        for r in bad:
+            print(f"  ✗ {r.get('topic_id')}：{str(r.get('invalid_reason'))[:200]}")
+        return 1
 
     rec, _ = asyncio.run(generate_adopt(
         about=args.about, difficulty=args.difficulty,
