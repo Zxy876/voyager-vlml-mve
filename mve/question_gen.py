@@ -142,7 +142,9 @@ def _dim_specs() -> dict[str, dict[str, Any]]:
     # 这些维度是 VLML **用 SQL 答出来的**，所以 by_sql 必为真 —— 不是猜的。
     try:
         import knowledge_graph
-        for irec in knowledge_graph.load_imported_dimensions():
+        for irec in knowledge_graph.load_imported_links():
+            if not irec.get("covered"):
+                continue                 # 工具集覆盖不到的，不配当出题方向
             d = str(irec.get("dimension") or "").strip()
             if not d or d in out:
                 continue
@@ -586,6 +588,58 @@ def _graph_blueprint(difficulty: int = 2,
                 # 百分比维度要连样本量一起取（见 propose 里的 require_base 提示）
                 "require_base": bool(specs.get(d, {}).get("needs_base")),
             }))
+
+    # ---- 候选来源 2：人导入落的**边**（不建节点，见 knowledge_graph.link_import）----
+    #
+    # 为什么必须有这一段：图谱的维度节点全部从 `TASKS[].rubric` 派生（出过题
+    # 才进图），而人导入的题**故意不建节点** —— 于是上面那个循环永远挑不到
+    # 人的方向，自适应出题又绕回旧题。人定的题要影响出题，入口只能在边上：
+    # 边记录了它真实用到的表/列/骨架（来自那次真跑过的 SQL）。
+    try:
+        import knowledge_graph as _kg
+        for lk in _kg.load_imported_links():
+            if not lk.get("covered"):
+                continue
+            d = str(lk.get("dimension") or "").strip()
+            if not d or not specs.get(d, {}).get("by_sql"):
+                continue                 # 没真跑过 SQL 的方向不拿来出题
+            sql = str(lk.get("sql") or "")
+            shape = _kg.sql_shape(sql, list(lk.get("tables") or []))
+            if not shape["tables"]:
+                continue
+            tbl = shape["tables"][0]
+            cols = (shape["columns_by_table"].get(tbl)
+                    or shape["columns"] or [])
+            # 人的题面自带 subject（那次取数的粒度），它才是"新"的地方
+            subj = dict(lk.get("subject") or {}) or {"series": SERIES}
+            key = (json.dumps(subj, sort_keys=True), d)
+            if key in avoid:
+                continue
+            score = -6                   # 人导入的方向优先（弱于 prefer 的 -10）
+            if prefer and d == prefer:
+                score -= 10
+            own = int(shape["difficulty"] or 2)
+            score += abs(own - int(difficulty or 2)) * 3
+            cands.append((score, d, {
+                "dimension": d,
+                "subject": subj,
+                "subject_key": next((k for k in subj
+                                     if k not in ("series", "team")), "series"),
+                "table": tbl,
+                "columns": list(cols),
+                "semantics": shape["semantics"],
+                "typical_errors": [],
+                "skeleton": str(shape["recipe"] or "")[:700],
+                "own_difficulty": own,
+                "require_base": bool(specs.get(d, {}).get("needs_base")),
+                "source": "human_link",           # 溯源：这个方向来自人导入的边
+                "seed_question": str(lk.get("question") or "")[:300],
+                "cover_level": str(lk.get("cover_level") or ""),
+                "insights": list(lk.get("insights") or []),
+            }))
+    except Exception:                                        # pragma: no cover
+        pass
+
     if not cands:
         return {}
     cands.sort(key=lambda x: (x[0], x[1]))
@@ -1492,6 +1546,11 @@ async def generate_adopt(*, about: str = "", difficulty: int = 2,
         # 题点归服务端，题面归模型 —— 不能两头都听。
         about = (f"围绕「{bp.get('dimension')}」这个口径，按 "
                  f"{bp.get('subject_key')} 的粒度出一道新题")
+        # 方向来自人导入的**边**时，把人的原题给模型当母本 —— 否则它只看到
+        # 一个干巴巴的维度名，出的题跟人问的不是一回事（这是"影响自适应
+        # 出题"真正要落的地方）。
+        if bp.get("source") == "human_link" and bp.get("seed_question"):
+            about += f"。参考人导入的原题：{bp['seed_question']}"
         if verbose:
             print(f"  图谱出题点 : {bp.get('dimension')} × {bp.get('subject_key')}"
                   f"｜表 {bp.get('table')}"

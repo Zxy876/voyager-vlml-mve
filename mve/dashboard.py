@@ -659,6 +659,12 @@ function pImport(s){
         写一句你想问 VLML 的话。它由<b>原版 VLML</b> 取数并解释（不经过 Voyager），
         然后作为 <b>control fact</b> 写进行动因果时间线 —— 出题器读这条线决定下一题。
       </div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:8px">
+        <b>收录判据</b>（不是"图谱里有没有同名维度"）：VLML 这次取数读到的表，
+        有没有被图谱里<b>表内覆盖的工具集</b>（46 个 SQL 洞察）覆盖到。
+        覆盖得到 → 收录，落法是<b>建边、不建节点</b>（伴学同款：材料映射不上
+        不为它新建知识点）；覆盖不到 → 如实不收，也不据此出题。
+      </div>
       <textarea id="q" placeholder="例：Cloud9 的手枪局到底打得怎么样？这个结论置信度够吗？"></textarea>
       <div class="imp-row">
         <select id="topic"><option value="">自动匹配（按关键词归类）</option></select>
@@ -1035,6 +1041,7 @@ function importsList(s){
         ${im.topic_id?`<span class="chip">${ESC(im.topic_id)}</span>`:'<span class="chip bad">未归入任何题</span>'}
         ${im.topic_hit?`<span class="chip grey">命中「${ESC(im.topic_hit)}」</span>`:''}
         ${(im.trajectory||[]).length?`<span class="chip grey">编排：${(im.trajectory||[]).map(t=>ESC(t)).join(' → ')}</span>`:'<span class="chip bad">未取到数据</span>'}
+        ${graphLinkChips(im.graph_link)}
         <span class="chip grey">${im.facts_count} 条事实</span>
       </div>
       <div class="nocmp-body" style="margin-top:6px;font-size:13px">${ESC(im.question)}</div>
@@ -1042,6 +1049,19 @@ function importsList(s){
       ${(im.insights||[]).length?`<div class="nocmp-sub"><b>洞察：</b><ul>${im.insights.map(i=>`<li>${ESC(i)}</li>`).join('')}</ul></div>`:''}
       ${(im.caveats||[]).length?`<div class="nocmp-sub"><b>数据局限：</b>${im.caveats.map(c=>ESC(c)).join('；')}</div>`:''}
     </div>`).join('');
+}
+
+/* 人导入在图谱侧落了什么 —— 收录判据是「VLML 能不能用表内覆盖的工具集
+   完成这个工作」，收录的落法是**建边、不建节点**。这一行让它在面板上可查，
+   而不是只在终端日志里出现一次。 */
+function graphLinkChips(gl){
+  if(!gl || !Object.keys(gl).length) return '';
+  if(!gl.covered)
+    return '<span class="chip bad">图谱未收录：工具集覆盖不到</span>';
+  return '<span class="chip ok">图谱已收录（建边，不建节点）</span>'
+    + `<span class="chip grey">覆盖层 ${ESC(gl.cover_level||'')}`
+    + `｜洞察 ${(gl.insights||[]).length}/${ESC(gl.insights_total||0)} 个`
+    + `｜表 ${(gl.tables||[]).length} 张</span>`;
 }
 
 function renderImportResult(res){
@@ -1057,6 +1077,7 @@ function renderImportResult(res){
       ${res.topic_hit?`<span class="chip grey">命中「${ESC(res.topic_hit)}」</span>`:''}
       <span class="chip grey">validated_target: ${ESC(res.validated_target)}</span>
       ${(res.trajectory||[]).length?`<span class="chip grey">编排：${(res.trajectory||[]).map(t=>ESC(t)).join(' → ')}</span>`:'<span class="chip bad">未取到数据</span>'}
+      ${graphLinkChips(res.graph_link)}
     </div>
     ${res.skipped?`<div><b>未产出解释：</b>${ESC(res.skipped)}</div>`:''}
     ${(res.errors||[]).length?`<div style="margin-top:5px"><b>工具报错：</b>${(res.errors||[]).map(e=>ESC(e)).join('；')}</div>`:''}

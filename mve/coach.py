@@ -96,6 +96,8 @@ def _log_import(result: dict[str, Any]) -> None:
         "topic_id": result.get("topic_id", ""),
         "topic_matched": result.get("topic_matched", False),
         "topic_hit": result.get("topic_hit", ""),
+        # 图谱侧落了什么（建边 / 覆盖层 / 命中洞察数）—— "收录了没有"要可回看
+        "graph_link": result.get("graph_link") or {},
         "validated_target": result.get("validated_target", False),
         "trajectory": result.get("trajectory") or [],
         "facts_count": len(result.get("facts") or []),
@@ -201,44 +203,59 @@ async def _task_from_text(question: str,
     `facts` 是 VLML 刚才给出的答案。它是这条链路的关键：
 
       人问的题归不上 → 但 VLML 答得出（有维度、有值、有取数 SQL）
-      → 那个维度就是**新知识点**，先种进图谱 → 再围绕它出题
+      → 判「工具集覆盖不覆盖得到」→ 覆盖得到就把这题**收进图谱的边上**
+      → 出题器从边上挑方向 → 人的意图进到自适应出题里
 
-    不传 facts 的话，出题点只能由 `_graph_blueprint()` 从**已有**维度里挑，
-    而已有维度几乎都出过题（图谱的维度节点全部从 TASKS[].rubric 派生），
+    不传 facts 的话，出题点只能由 `_graph_blueprint()` 从**已有**维度节点里
+    挑，而已有维度几乎都出过题（图谱的维度节点全部从 TASKS[].rubric 派生），
     于是挑出来的还是旧方向 —— 人导入的意图就这么被吃掉了。
     实测：导入「爆弹成功率」时 VLML 答出 `plant_success_rate`，但 topic_id
     仍为空，出题器毫无反应。
+
+    ⚠️ 收录的落法是**建边、不建节点**（`knowledge_graph.link_import`）：
+    图谱在「表 × 工具集（insight）」这层是完全覆盖的，人的题只要 VLML 能用
+    那套工具集做出来就够格收录，不需要再造一个维度节点去占位。
     """
-    # 1) 先把人问出来的维度种进图谱（伴学 ensure_topic 的同构物）
+    # 1) 先把人问出来的题收进图谱的**边**上（不建节点）
     dims: list[str] = []
     for f in (facts or []):
         d = str((f or {}).get("dimension") or "").strip()
         if d and d not in dims:
             dims.append(d)
-    if not dims:
-        # 没取到事实也要留个记号：题干本身可以当维度名候选，交给模型起名
-        dims = []
     tool = ""
     if facts:
         tool = str((facts[0] or {}).get("tool") or "")
     focus = ""
+    covered = False
     for d in dims:
         try:
             import knowledge_graph
-            knowledge_graph.adopt_dimension(
+            rec = knowledge_graph.link_import(
+                question=question,
                 dimension=d,
                 sql=str((facts[0] or {}).get("sql") or ""),
                 tool=tool,
-                question=question,
                 subject=dict((facts[0] or {}).get("subject") or {}),
                 value=(facts[0] or {}).get("value"),
             )
+            if not rec.get("adopted"):
+                # 覆盖不到就如实说 —— 伴学同款：映射不上不硬造，交回人
+                print(f"  [导入] 未收录：{str(rec.get('reason') or '')[:160]}")
+                continue
+            covered = True
             focus = focus or d
-            print(f"  [导入] 图谱新增维度节点：{d}（来自 VLML 的答案）")
+            print(f"  [导入] 图谱新增联系边（不建节点）：{d}"
+                  f"｜覆盖层={rec.get('cover_level')}"
+                  f"｜洞察 {len(rec.get('insights') or [])} 个"
+                  f"｜表 {len(rec.get('tables') or [])} 张")
         except Exception as exc:                             # pragma: no cover
-            print(f"  [导入] 维度入图失败：{type(exc).__name__}: {str(exc)[:120]}")
+            print(f"  [导入] 入图失败：{type(exc).__name__}: {str(exc)[:120]}")
 
-    # 2) 围绕这个新维度出题（题点归服务端，模型只写题面）
+    # 2) 围绕这个方向出题（题点归服务端，模型只写题面）
+    if not covered:
+        # 覆盖不到还要硬出题，出题器只会从旧维度里挑一个凑数 —— 不如不出，
+        # 免得制造"人导入已生效"的假象。
+        return "", "（工具集覆盖不到，未收录进图谱，也不据此出题）"
     try:
         import question_gen
         rec, _ = await question_gen.generate_adopt(
@@ -373,6 +390,23 @@ async def explain(question: str, *, topic_id: str = "",
         base["topic_id"] = topic_id
         base["topic_matched"] = bool(topic_id)
         base["topic_hit"] = hit
+        # 图谱侧到底落了什么，回给面板看 —— "收录了没有"必须可验证，
+        # 不能只在日志里一行字。
+        try:
+            import knowledge_graph as _kg
+            hit_lk = [l for l in _kg.load_imported_links()
+                      if str(l.get("question") or "")[:300] == question[:300]]
+            if hit_lk:
+                lk = hit_lk[-1]
+                base["graph_link"] = {
+                    "covered": bool(lk.get("covered")),
+                    "cover_level": str(lk.get("cover_level") or ""),
+                    "insights": list(lk.get("insights") or []),
+                    "insights_total": int(lk.get("insights_total") or 0),
+                    "tables": list(lk.get("tables") or []),
+                }
+        except Exception:                                    # pragma: no cover
+            pass
 
     # 解释由 LLM 出（VLML README:97：指标由工具出，洞察由 LLM 出）
     story = narrator.narrate(None, facts, verdict="") if facts else {

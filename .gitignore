@@ -40,6 +40,7 @@ mve/db_config.json
 mve/exports/
 mve/generated_tasks.json
 mve/imported_dimensions.json
+mve/imported_links.json
 mve/knowledge_graph.json
 mve/learn.log
 mve/pilot.log
