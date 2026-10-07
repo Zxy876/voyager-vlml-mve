@@ -1102,7 +1102,8 @@ async function submitImport(){
            +' · '+(res.facts||[]).length+' 条事实 · 编排 '+(res.trajectory||[]).join(' → ')
            +' · validated_target=false 不计掌握度')
         : ('失败：'+(res.error||'未知')));
-    q.value=''; document.getElementById('hit').textContent='归类结果会在这里显示。';
+    q.value=''; q.blur();   // 失焦：让下一轮轮询照常刷新导入历史（焦点在输入框上时渲染是被 hold 住的）
+    document.getElementById('hit').textContent='归类结果会在这里显示。';
     await load();
   }catch(e){ renderImportResult({ok:false,error:String(e)}); }
   finally{ busy=false; btn.disabled=false; btn.textContent='交给 VLML 解释'; }
@@ -1198,21 +1199,40 @@ function render(s){
   renderHero(s);
   renderNav(s);
   fillTopics(s);
-  const html=(PANELS[TAB]||pOverview)(s);
-  document.getElementById('stage').innerHTML=html;
-  const il=document.getElementById('implist');
-  if(il) il.innerHTML=importsList(s);
+  const stage=document.getElementById('stage');
+  // ---- 人导入分区正在被人使用时，不能整页重建 ----
+  // 轮询每 4 秒 render 一次，stage.innerHTML 一换，textarea 的值、焦点、
+  // 归类提示（#hit）、刚出的解释结果（#result）就全没了 —— 实测症状正是
+  // 「输入总是很快消失，闪回」。两个触发点：
+  //   a) 正在输入（#q 聚焦中）→ 跳过本轮重建
+  //   b) 提交进行中（busy）—— submitImport 里 renderImportResult 刚把结果
+  //      写进 #result，紧接着 await load() 又重建一次，结果被洗掉。
+  // 人点开别处（失焦）后，下一轮轮询照常刷新，数据不会少。
+  const qEl=document.getElementById('q');
+  const holdImport = busy || (qEl && document.activeElement===qEl);
+  if(!(TAB==='import' && holdImport)){
+    // 即便重建，也把已输入的草稿带过去 —— 焦点在别处时轮询照常刷，
+    // 不能因为刷新把人写到一半的问题清掉。
+    const draft = qEl ? qEl.value : null;
+    stage.innerHTML=(PANELS[TAB]||pOverview)(s);
+    if(draft!==null){
+      const nq=document.getElementById('q');
+      if(nq){ nq.value=draft; if(document.activeElement===qEl){ nq.focus(); } }
+    }
+    const il=document.getElementById('implist');
+    if(il) il.innerHTML=importsList(s);
 
-  const go=document.getElementById('go'); if(go) go.onclick=submitImport;
-  const clr=document.getElementById('clr'); if(clr) clr.onclick=()=>{
-    document.getElementById('q').value='';
-    document.getElementById('result').innerHTML='';
-    document.getElementById('hit').textContent='归类结果会在这里显示。';
-  };
-  const qq=document.getElementById('q');
-  if(qq){
-    qq.addEventListener('input',()=>{clearTimeout(pvTimer);pvTimer=setTimeout(preview,350);});
-    qq.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter')submitImport();});
+    const go=document.getElementById('go'); if(go) go.onclick=submitImport;
+    const clr=document.getElementById('clr'); if(clr) clr.onclick=()=>{
+      document.getElementById('q').value='';
+      document.getElementById('result').innerHTML='';
+      document.getElementById('hit').textContent='归类结果会在这里显示。';
+    };
+    const qq=document.getElementById('q');
+    if(qq){
+      qq.addEventListener('input',()=>{clearTimeout(pvTimer);pvTimer=setTimeout(preview,350);});
+      qq.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter')submitImport();});
+    }
   }
   const cl=document.getElementById('clearLog'); if(cl) cl.onclick=async()=>{
     await fetch('/api/pilot/clear-log',{method:'POST'});
