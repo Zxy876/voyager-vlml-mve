@@ -478,6 +478,7 @@ function examCard(s){
   const runningJob=busy?(p.job_label||p.job||'任务'):'';
   const ctl=`<div class="runctl">
       <button class="btn btn-primary" id="btnPlacement" ${busy?'disabled':''}>摸底（全库撤图谱考一遍）</button>
+      <button class="btn btn-secondary" id="btnFinal" ${busy?'disabled':''}>结业考（带技能库再考一遍）</button>
       <span class="lbl">单元</span>
       <select id="learnUnits">${[2,4,6,8].map(n=>`<option value="${n}" ${n===4?'selected':''}>${n}</option>`).join('')}</select>
       <span class="lbl">迁移对照每</span>
@@ -504,11 +505,18 @@ function examCard(s){
       : (t.delta_pp<0?`<span class="chip bad">${t.delta_pp}pp</span>`:'<span class="chip grey">持平</span>'));
     return `<tr><td class="mono">${ESC(t.topic_id)}${t.exhausted?' <span class="chip grey">已毕业让位</span>':''}</td>
       <td>${ESC(t.baseline_pct)} <span class="hint">${ESC(t.level)}</span></td>
-      <td>${after}</td><td>${d}</td></tr>`;
+      <td>${after}</td>
+      <td>${t.final_pct?`<span class="chip ${t.final>=1?'ok':(t.final>0?'warn':'bad')}">${ESC(t.final_pct)}</span>`:'<span class="hint">—</span>'}</td>
+      <td>${d}</td></tr>`;
   }).join('');
   const tr=e.transfer;
   const trHtml=tr?`<div class="note"><b>迁移对照（${tr.count} 次未练题考核）：</b>${ESC((tr.seq||[]).join(' → '))} ——
     ${tr.rose?'涨了，说明是真学会而不只是记住了这道题。':'<b>没涨</b>：上升的是「记住了这道题的解法」，不是可迁移的能力。'}</div>`:'';
+  const fin=e.final;
+  const finHtml=fin?`<div class="note"><b>结业考（${fin.count} 道${fin.covered_all?'·全库':'·部分'}）：</b>
+    摸底均值 ${fin.avg_baseline}% → 结业均值 ${fin.avg}%
+    （${fin.delta_pp>0?'+':''}${fin.delta_pp}pp，≥80% 的 ${fin.mastered} 道）
+    —— 这是<b>带着技能库</b>撤图谱再考一遍的结果，和摸底同一个分母，可直接比。</div>`:'';
   return `<div class="panel"><div class="panel__head"><h2>真实水平曲线 · 撤支架考核</h2>
       <span class="hint">练习给图谱 / 考核撤图谱 —— 按题分行，不首尾相连</span></div>
     <div class="kpis">
@@ -518,12 +526,14 @@ function examCard(s){
       <div class="kpi"><div class="label">重考过 / 涨了</div><div class="value">${e.retested} / ${e.rose}</div></div>
       <div class="kpi"><div class="label">平均涨幅</div><div class="value">${e.avg_delta_pp===null?'—':(e.avg_delta_pp>0?'+':'')+e.avg_delta_pp+'pp'}</div></div>
     </div>
-    <table><thead><tr><th>题</th><th>摸底（裸考）</th><th>练后重考</th><th>Δ</th></tr></thead>
+    <table><thead><tr><th>题</th><th>摸底（裸考）</th><th>练后重考</th><th>结业考</th><th>Δ</th></tr></thead>
       <tbody>${rowsHtml}</tbody></table>
+    ${finHtml}
     ${trHtml}
     ${ctl}
-    <div class="legend">摸底 = 清库后第一次全库裸考；重考 = 练完这一题后撤掉图谱再考。
-      出题器按「最弱优先」选题，读的就是摸底那一列。</div></div>`;
+    <div class="legend">摸底 = 清库后第一次全库裸考（基线，不会被顶掉）；重考 = 练完这一题后撤掉图谱再考；
+      结业考 = <b>带着现有技能库</b>把全库再考一遍，和摸底同一个分母，可直接比。
+      出题器按「最弱优先」选题，读的是摸底那一列。</div></div>`;
 }
 
 function pOverview(s){
@@ -1172,6 +1182,19 @@ async function startPlacement(){
   await runJob('placement',{btnId:'btnPlacement',
     btnText:'摸底（全库撤图谱考一遍）', busyText:'摸底中…'});
 }
+/* 结业考：和摸底**前提相反** —— 摸底要空库（测零基础），结业考要有库
+   （测"学到现在，撤掉支架还剩多少"）。它落盘 kind="final"，不覆盖摸底基线，
+   所以摸底那一列跑完结业考后还在。 */
+async function startFinal(){
+  const n=window.__skills||0;
+  if(!n){
+    alert('技能库是空的 —— 结业考测的是「学到现在还剩多少」，没学就没得考。\n\n'
+      +'先跑「学习单元」攒技能，或先点「摸底」测零基础水平。');
+    return;
+  }
+  await runJob('final',{btnId:'btnFinal',
+    btnText:'结业考（带技能库再考一遍）', busyText:'结业考中…'});
+}
 async function pilotStop(){
   const b=document.getElementById('runStop'); if(b.disabled) return;
   b.disabled=true; b.textContent='停止中…';
@@ -1241,6 +1264,8 @@ function render(s){
   };
   const bp=document.getElementById('btnPlacement');
   if(bp) bp.onclick=startPlacement;
+  const bf=document.getElementById('btnFinal');
+  if(bf) bf.onclick=startFinal;
   const bl=document.getElementById('btnLearn');
   if(bl) bl.onclick=()=>runJob('learn',{btnId:'btnLearn', btnText:'跑学习单元',
     busyText:'学习中…',

@@ -76,8 +76,9 @@ PY = _pick_python()
 # 单题超时（15 分钟）对它们不够 —— 学习单元 8 个要 15 分钟以上。
 JOB_LABEL = {"practice": "练题（带图谱）",
              "placement": "摸底（全库撤图谱考一遍）",
+             "final": "结业考（带技能库全库撤图谱再考）",
              "learn": "学习单元（练一题 + 撤图谱重考）"}
-JOB_TIMEOUT = {"practice": 900, "placement": 1800, "learn": 5400}
+JOB_TIMEOUT = {"practice": 900, "placement": 1800, "final": 1800, "learn": 5400}
 
 # 当前在跑的 run_mve 子进程（停止时要一起带走，否则会留孤儿）
 _CHILDREN: list[subprocess.Popen] = []
@@ -174,7 +175,7 @@ def start(*, mode: str = "once", topic: str = "", rounds: int = 3,
     mode = "loop" if mode == "loop" else "once"
     rounds = max(1, min(10, int(rounds or 3)))
     job = str(job or "practice")
-    if job not in ("practice", "placement", "learn"):
+    if job not in ("practice", "placement", "final", "learn"):
         job = "practice"
     units = max(1, min(20, int(units or 1)))
     transfer = max(0, min(10, int(transfer or 0)))
@@ -353,6 +354,11 @@ def _loop(mode: str, topic: str, rounds: int, logf, job: str = "practice",
         if job == "placement":
             cmd = [PY, str(ROOT / "exam.py"), "--all"]
             what = f"摸底（全库撤图谱考一遍）· {_now()}"
+        elif job == "final":
+            # 结业考：带着现有技能库全库重考。与摸底的唯一差别是前提
+            # （摸底要空库，结业考要有库），落盘 kind="final" 不覆盖摸底基线。
+            cmd = [PY, str(ROOT / "exam.py"), "--final"]
+            what = f"结业考（带技能库全库撤图谱再考）· {_now()}"
         elif job == "learn":
             cmd = [PY, str(ROOT / "learn.py"), "--units", str(units),
                    "--rounds", str(rounds)]

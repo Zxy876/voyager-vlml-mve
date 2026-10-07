@@ -45,7 +45,8 @@ _CODE_SPAN_RE = re.compile(r"`[^`]*`")
 _MAX_TEXT_CHARS = 2000
 _MAX_MARKDOWN_CHARS = 120_000
 # 考核类型后缀：重考与迁移对照在表里长一样，不标就读不出迁移
-KIND_SUFFIX = {"placement": "·摸底", "practice_exam": "·重考", "transfer": "·迁移"}
+KIND_SUFFIX = {"placement": "·摸底", "practice_exam": "·重考",
+               "transfer": "·迁移", "final": "·结业"}
 
 
 def _escape_segment(text: str) -> str:
@@ -193,9 +194,15 @@ def build_markdown(state: dict[str, Any] | None = None) -> str:
                        else "没涨 → 上升的是「记住了这道题」，不是可迁移的能力")
             lines.append(f"- 迁移对照（{tr.get('count')} 次**未练过**的题）："
                          f"{' → '.join(tr.get('seq') or [])} —— {verdict}")
+        if exam_view.get("final"):
+            fin = exam_view["final"]
+            lines.append(f"- 结业考（{fin.get('covered_all') and '全库' or '部分'} "
+                         f"{fin.get('count')} 道，**带技能库**）：摸底均值 "
+                         f"{fin.get('avg_baseline')}% → 结业均值 {fin.get('avg')}%"
+                         f"（{fin.get('delta_pp'):+d}pp）")
         lines.append("")
-        lines.append("| 题 | 摸底（裸考） | 摸底等级 | 练后重考 | 最新 | Δ | 考核次数 |")
-        lines.append("|---|---|---|---|---|---|---|")
+        lines.append("| 题 | 摸底（裸考） | 摸底等级 | 练后重考 | 结业考 | 最新 | Δ | 考核次数 |")
+        lines.append("|---|---|---|---|---|---|---|---|")
         for t in exam_tracks:
             # 重考那一格要标类型：练后重考和迁移对照长得很像，混在一起读不出迁移
             after = " → ".join(
@@ -210,6 +217,7 @@ def build_markdown(state: dict[str, Any] | None = None) -> str:
                 f"{' · 已毕业让位' if t.get('exhausted') else ''} "
                 f"| {t.get('baseline_pct')} "
                 f"| {escape_markdown(t.get('level'))} | {after} "
+                f"| {t.get('final_pct') or '—'} "
                 f"| {t.get('latest_pct')} | {dcell} | {t.get('exam_count')} |"
             )
 

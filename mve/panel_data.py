@@ -143,24 +143,37 @@ def _exam_view() -> dict[str, Any]:
 
     tracks: list[dict[str, Any]] = []
     for t, seq in by_topic.items():
-        base = float(seq[0].get("coverage") or 0.0)
-        rest = [float(r.get("coverage") or 0.0) for r in seq[1:]]
+        # 基线**锚定 placement**，不能取"第一条记录" —— 加了结业考（kind=final）
+        # 之后，一道题的记录里顺序不再保证摸底在最前（补摸底、--force 重跑
+        # 都会打乱）。"第一条 == 摸底"这个隐含假设一旦破了，基线就变成
+        # "练过之后的水平"，学习曲线凭空消失。
+        pl = [r for r in seq if str(r.get("kind") or "") == "placement"]
+        anchor = pl[0] if pl else seq[0]
+        base = float(anchor.get("coverage") or 0.0)
+        rest = [r for r in seq if r is not anchor]
+        rest_cov = [float(r.get("coverage") or 0.0) for r in rest]
+        finals = [float(r.get("coverage") or 0.0) for r in seq
+                  if str(r.get("kind") or "") == "final"]
         tracks.append({
             "topic_id": t,
             "baseline": base,
             "baseline_pct": _pct(base),
+            "has_placement": bool(pl),
             "level": exam.level_of(base),
             "exam_count": len(seq),
             "after": [{"cov": c, "pct": _pct(c),
                        "kind": str(r.get("kind") or "")}
-                      for c, r in zip(rest, seq[1:])],
-            "delta_pp": round((rest[-1] - base) * 100) if rest else None,
+                      for c, r in zip(rest_cov, rest)],
+            "delta_pp": round((rest_cov[-1] - base) * 100) if rest_cov else None,
             # 最新水平单独给一列：`profile()` 只留最后一次记录，练后重考 100%
             # 会把摸底顶掉。只有 baseline 那列会让人以为"练了个寂寞"，
             # 只有 latest 那列会让人以为"本来就会" —— 两列必须一起给。
-            "latest": rest[-1] if rest else base,
-            "latest_pct": _pct(rest[-1] if rest else base),
-            "latest_level": exam.level_of(rest[-1] if rest else base),
+            "latest": rest_cov[-1] if rest_cov else base,
+            "latest_pct": _pct(rest_cov[-1] if rest_cov else base),
+            "latest_level": exam.level_of(rest_cov[-1] if rest_cov else base),
+            # 结业考单独一列：带着技能库全库再考一遍，回答"学到现在还剩多少"
+            "final": finals[-1] if finals else None,
+            "final_pct": _pct(finals[-1]) if finals else None,
             # 练了裸考也不涨 → 已毕业让位（伴学没有这条，MVE 自有）
             "exhausted": bool(exam.exhausted(t)),
         })
@@ -183,12 +196,38 @@ def _exam_view() -> dict[str, Any]:
         "avg_delta_pp": round(sum(deltas) / len(deltas)) if deltas else None,
         "mastered": sum(1 for c in covs if c >= 0.80),
         "mastered_now": sum(1 for c in lates if c >= 0.80),
+        # 结业考：带着现有技能库全库重考。它和「练后重考」的差别是覆盖面 ——
+        # 练后重考只考刚练过的那一题，结业考是全库，所以均值才可比。
+        "final": _final_view(tracks, covs),
         # 迁移对照：没练过的题涨不涨 —— 分辨「记住了这道题」和「真学会了」
         "transfer": {
             "count": len(tseq),
             "seq": [_pct(c) for c in tseq],
             "rose": bool(len(tseq) >= 2 and tseq[-1] > tseq[0] + 0.001),
         } if tseq else None,
+    }
+
+
+def _final_view(tracks: list[dict[str, Any]],
+                baselines: list[float]) -> dict[str, Any] | None:
+    """结业考汇总：全库带着技能库撤图谱重考一遍之后的水平。
+
+    为什么必须单列：`latest` 那列是"每题最后一次考核"，练后重考 100% 也在里面，
+    但它只覆盖了**练过的**题 —— 拿它当"现在的水平"会把没练过的题漏掉。
+    结业考是**全库**，所以它的均值才和摸底均值可比（同一个分母）。
+    """
+    vals = [float(t["final"]) for t in tracks if t.get("final") is not None]
+    if not vals:
+        return None
+    b = sum(baselines) / len(baselines) if baselines else 0.0
+    f = sum(vals) / len(vals)
+    return {
+        "count": len(vals),
+        "avg": round(f * 100),
+        "avg_baseline": round(b * 100),
+        "delta_pp": round((f - b) * 100),
+        "mastered": sum(1 for v in vals if v >= 0.80),
+        "covered_all": len(vals) == len(tracks),
     }
 
 

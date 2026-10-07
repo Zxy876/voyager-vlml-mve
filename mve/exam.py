@@ -140,6 +140,11 @@ def profile_split() -> dict[str, dict[str, Any]]:
     而面板上按题分行显示的摸底均值还是 19% —— 同一个 exam_log，
     两个视图给出两个结论。基线必须留着：曲线是「基线 → 现在」，
     只剩"现在"就没有曲线了。
+
+    基线**锚定 kind=="placement" 的第一条**，不是"第一条记录"：
+    加了结业考（kind=="final"）之后，一道题的记录里可能既有摸底又有结业考，
+    而且顺序不一定是摸底在前（先练后补摸底、或结业考被 --force 重跑时）。
+    "第一条 == 摸底"是隐含假设，一旦破了，基线就会变成"练过之后的水平"。
     """
     out: dict[str, dict[str, Any]] = {}
     for r in load():
@@ -147,10 +152,18 @@ def profile_split() -> dict[str, dict[str, Any]]:
         if not t:
             continue
         cov = float(r.get("coverage") or 0.0)
+        is_placement = str(r.get("kind") or "") == "placement"
         rec = out.get(t)
         if rec is None:
             rec = out[t] = {"topic_id": t, "baseline": cov, "latest": cov,
-                            "exams": 0, "kind": "", "verdict": ""}
+                            "exams": 0, "kind": "", "verdict": "",
+                            "has_placement": False}
+        # 基线只认摸底；还没有摸底记录之前先用第一条顶着，摸底一到就换掉
+        if is_placement and not rec["has_placement"]:
+            rec["baseline"] = cov
+            rec["has_placement"] = True
+        elif not rec["has_placement"] and rec["exams"] == 0:
+            rec["baseline"] = cov
         rec["exams"] += 1
         rec["latest"] = cov
         rec["kind"] = str(r.get("kind") or "")
@@ -272,17 +285,38 @@ def placement_blocked(*, force: bool = False) -> str:
     return ""
 
 
+def final_blocked() -> str:
+    """结业考的前提反过来：**技能库不能是空的**。返回空串表示可以考。
+
+    摸底（`placement`）测的是「零基础上的真实水平」，所以要求技能库为空；
+    结业考（`final`）测的是「学到现在，撤掉图谱还剩多少」——
+    **恰恰要带着技能库考**，重放它自己攒下的程序才是这次考试的题意。
+
+    技能库为空时结业考在数值上等于摸底，但它会以 kind="final" 落盘，
+    把「这一列到底是基线还是结业」搅浑。所以这里也必须是硬闸。
+    """
+    n = _skills_count()
+    if not n:
+        return ("技能库是空的 —— 结业考测的是「学到现在还剩多少」，"
+                "没学就没得考。先跑学习单元（python mve/learn.py --units 8），"
+                "或先摸底（python mve/exam.py --all）")
+    return ""
+
+
 async def exam(topic_id: str, *, verbose: bool = True,
                kind: str = "practice_exam",
                extra: dict[str, Any] | None = None,
                force: bool = False) -> dict[str, Any]:
     """考一道题：撤掉图谱，只留题干 + 工具 + 自己的技能库。
 
-    `kind` 区分三种考核，事后能对得上曲线是怎么涨的：
+    `kind` 区分四种考核，事后能对得上曲线是怎么涨的：
       placement     —— 摸底（清库后第一次全库考一遍，那时技能库是空的）
       practice_exam —— 练完这一题之后的重考（曲线上的正式数据点）
       transfer      —— **没练过的题**的重考。它的涨落回答的是：
                        "曲线上升是记住了这道题，还是真学会了能迁移"
+      final         —— 结业考。**带着现有技能库**把全库再撤图谱考一遍，
+                       回答"学到现在，去掉支架还剩多少"。与摸底的差别不是
+                       代码路径，是**前提**：摸底要空库，结业考要有库。
     """
     task = tasks_mod.TASKS.get(topic_id)
     if task is None:
@@ -293,6 +327,12 @@ async def exam(topic_id: str, *, verbose: bool = True,
         if why:
             if verbose:
                 print(f"  ✗ 摸底中止：{why}")
+            return {"error": why, "blocked": True}
+    elif kind == "final":
+        why = final_blocked()
+        if why:
+            if verbose:
+                print(f"  ✗ 结业考中止：{why}")
             return {"error": why, "blocked": True}
 
     prev = voyager_mod.GRAPH_STATE["on"]
@@ -336,7 +376,8 @@ def curve() -> None:
     if not rows:
         print("还没有考核记录。先跑 python mve/exam.py --topic <题>")
         return
-    KIND_MARK = {"placement": "摸底", "practice_exam": "重考", "transfer": "迁移"}
+    KIND_MARK = {"placement": "摸底", "practice_exam": "重考",
+                 "transfer": "迁移", "final": "结业"}
     print("=" * 78)
     print("  撤支架考核曲线（练习给图谱，考核撤图谱）")
     print("=" * 78)
@@ -371,30 +412,52 @@ def progress() -> None:
     by_topic: dict[str, list[dict[str, Any]]] = {}
     for r in rows:
         by_topic.setdefault(str(r.get("topic_id") or ""), []).append(r)
-    print("=" * 78)
-    print("  学习进程（按题分行：摸底 → 练后重考）")
-    print("=" * 78)
-    print(f"  {'题':28} {'摸底':>6}  →  之后的重考")
-    print("  " + "-" * 72)
+    split = profile_split()          # 基线锚定 placement，不靠"第一条"
+    MARK = {"placement": "摸底", "practice_exam": "重考",
+            "transfer": "迁移", "final": "结业"}
+    print("=" * 82)
+    print("  学习进程（按题分行：摸底 → 练后重考 → 结业考）")
+    print("=" * 82)
+    print(f"  {'题':28} {'摸底':>6}  →  之后的考核")
+    print("  " + "-" * 76)
     deltas: list[float] = []
-    for t in sorted(by_topic, key=lambda k: float(by_topic[k][0].get("coverage") or 0)):
+    finals: list[float] = []
+    bases: list[float] = []
+    for t in sorted(by_topic, key=lambda k: split[k]["baseline"]):
         seq = by_topic[t]
-        base = float(seq[0].get("coverage") or 0)
-        rest = [float(r.get("coverage") or 0) for r in seq[1:]]
-        arrow = " → ".join(f"{c * 100:.0f}%" for c in rest) if rest else "（还没重考过）"
+        base = split[t]["baseline"]
+        bases.append(base)
+        # 基线那一条自己不再进箭头（它就是箭头左边的数）
+        rest = [r for r in seq
+                if not (str(r.get("kind") or "") == "placement"
+                        and float(r.get("coverage") or 0) == base)] or seq[1:]
+        arrow = " → ".join(
+            f"{float(r.get('coverage') or 0) * 100:.0f}%"
+            f"·{MARK.get(str(r.get('kind') or ''), '·')}" for r in rest
+        ) if rest else "（还没重考过）"
         mark = ""
         if rest:
-            d = rest[-1] - base
+            last_v = float(rest[-1].get("coverage") or 0)
+            d = last_v - base
             deltas.append(d)
             mark = ("  ✅ +" if d > 0.001 else ("  ─  持平" if abs(d) <= 0.001
                                                else "  ⚠ ")) + \
                    (f"{d * 100:.0f}pp" if abs(d) > 0.001 else "")
+        fs = [float(r.get("coverage") or 0) for r in seq
+              if str(r.get("kind") or "") == "final"]
+        if fs:
+            finals.append(fs[-1])
         print(f"  {t:28} {base * 100:>5.0f}%  →  {arrow}{mark}")
-    print("  " + "-" * 72)
+    print("  " + "-" * 76)
     if deltas:
         up = sum(1 for d in deltas if d > 0.001)
         print(f"  重考过的 {len(deltas)} 道里 {up} 道涨了 · "
               f"平均 Δ {sum(deltas) / len(deltas) * 100:+.0f} 个百分点")
+    if finals:
+        print(f"  结业考 {len(finals)} 道 · 均值 {sum(finals) / len(finals) * 100:.0f}%"
+              + (f"  （摸底均值 {sum(bases) / len(bases) * 100:.0f}% → "
+                 f"Δ {(sum(finals) / len(finals) - sum(bases) / len(bases)) * 100:+.0f}pp）"
+                 if bases else ""))
     # 迁移对照：没练过的题有没有跟着涨 —— 这才是"学会了"而不是"记住了"
     tr = [r for r in rows if str(r.get("kind") or "") == "transfer"]
     if tr:
@@ -409,6 +472,8 @@ def _main() -> int:
     ap = argparse.ArgumentParser(description="撤支架考核：学习曲线的真正数据源")
     ap.add_argument("--topic", default="", help="考哪道题")
     ap.add_argument("--all", action="store_true", help="全库摸底（没考过的考一遍）")
+    ap.add_argument("--final", action="store_true",
+                    help="全库结业考：带着现有技能库撤图谱再考一遍（不覆盖摸底基线）")
     ap.add_argument("--profile", action="store_true", help="打印裸考画像（真实水平）")
     ap.add_argument("--curve", action="store_true", help="打印考核流水")
     ap.add_argument("--progress", action="store_true", help="打印学习进程（按题分行）")
@@ -429,6 +494,28 @@ def _main() -> int:
         print_profile()
         return 0
     if args.progress:
+        progress()
+        return 0
+
+    if args.final:
+        # 结业考：**每道题都考**，不管考没考过 —— 它要的是"现在的全库水平"，
+        # 不是"补没考过的"。与 --all 的差别正是这里：--all 只补没摸过的，
+        # 且要求技能库为空；--final 全部重考，且要求技能库非空。
+        #
+        # 落盘 kind="final"，不覆盖摸底基线（`profile_split()` 的基线锚定
+        # placement），所以摸底那一列跑完结业考后还在 —— 曲线不会凭空消失。
+        why = final_blocked()
+        if why:
+            print(f"结业考中止：{why}")
+            return 1
+        ids = sorted(tasks_mod.TASKS)
+        print(f"结业考：{len(ids)} 道题，带着现有技能库全部撤图谱考一遍\n")
+        for t in ids:
+            rec = asyncio.run(exam(t, kind="final"))
+            if rec.get("error"):
+                print(f"\n结业考中止：{rec['error']}")
+                return 1
+        print()
         progress()
         return 0
 

@@ -769,10 +769,10 @@ python mve/learn.py --go 8 --transfer 3
 
 | 文件 | 作用 |
 |---|---|
-| `mve/exam.py` | 撤支架考核。`--all` 摸底、`--profile` 裸考画像、`--progress` 按题进程、`--curve` 流水 |
+| `mve/exam.py` | 撤支架考核。`--all` 摸底、`--final` 结业考、`--profile` 裸考画像、`--progress` 按题进程、`--curve` 流水 |
 | `mve/learn.py` | 学习进程调度：`--go N` = 清库 → 摸底 → N 个单元；`--transfer K` 迁移对照 |
 | `voyager._replay_saved` | plan 路径的技能复用（重放调用序列），维度取齐才采用 |
-| `pilot.py` 的 `--job` | 驾驶舱扩成三种任务：`practice`（练题）/ `placement`（摸底）/ `learn`（学习单元） |
+| `pilot.py` 的 `--job` | 驾驶舱四种任务：`practice`（练题）/ `placement`（摸底）/ `final`（结业考）/ `learn`（学习单元） |
 | 面板「真实水平曲线」 | 按题分行显示摸底 → 重考，右上角三个键钮：摸底 / 跑学习单元 / 停止 |
 
 ### 面板上怎么用
@@ -799,6 +799,7 @@ python mve/learn.py --go 8 --transfer 3
 
 ```bash
 python mve/learn.py --go 8 --transfer 3   # 一键：清库 → 摸底 → 8 单元 → 进程
+python mve/exam.py --final                # 结业考：带着现有技能库全库撤图谱再考一遍
 python mve/exam.py --profile               # 只看裸考画像
 python mve/exam.py --progress              # 只看学习进程
 ```
@@ -821,6 +822,7 @@ python mve/dashboard.py                  # 面板 http://127.0.0.1:8777
 python mve/learn.py --go 8 --transfer 3
 python mve/exam.py --profile             # 裸考画像（真实水平）
 python mve/exam.py --progress            # 按题的学习进程
+python mve/exam.py --final               # 结业考（要技能库非空，不覆盖摸底基线）
 ```
 
 > `--build` 其实可以不跑：`KnowledgeGraph.load()` 带指纹守卫，
