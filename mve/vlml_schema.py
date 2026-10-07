@@ -43,6 +43,7 @@ MVE 的同构物是**数据流顺序**：算什么之前必须先有什么。
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import sys
@@ -419,6 +420,311 @@ def section_insights() -> dict[str, dict[str, list[str]]]:
             if sections:
                 result[tool] = sections
     return result
+
+
+# --------------------------------------------------------------------------
+# 建模声明：VLML **自己写**的建模文档
+# --------------------------------------------------------------------------
+# 和 `discover()` 的分工
+# ----------------------
+# `discover()` 是**实查数据库 / 解析源码** → 得到"库里现在有什么"（列名、行数、
+# 派生关系）。连不上库它就没了 —— 实测断库时图谱里 21 张表全空。
+#
+# 但伴学的知识点并不是"实查"出来的：457 个节点**自带** difficulty /
+# question_types / typical_misconceptions / prerequisites，是作者声明的。
+# VLML 里同层的"作者声明"就是 `database/` 下这四份建模文档：
+#
+#   DATA_MODEL.md              每张表的 Grain + Use cases + 核心关系链
+#   DERIVED_TABLES.md          7 张派生表的粒度/上游/用途/关键列/示例查询
+#   metadata/column_definitions.yaml   列级口径（141 行）
+#   DATA_DICTIONARY.json       13 张表的 pk / 列类型 / 指标公式
+#
+# 这些是**文件**，永远在。把它们解析成结构化声明写进图谱，图谱才真正承担起
+# 伴学 knowledge_seeds 那个角色：出题器读的是图谱，不是读数据库、也不是读题。
+DATA_DIR = VLML_ROOT / "database"
+MODEL_FILES = (
+    DATA_DIR / "DATA_MODEL.md",
+    DATA_DIR / "DERIVED_TABLES.md",
+    DATA_DIR / "metadata" / "column_definitions.yaml",
+    DATA_DIR / "DATA_DICTIONARY.json",
+)
+
+
+def _read(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+
+def _parse_core_lineage(text: str) -> dict[str, dict[str, Any]]:
+    """DATA_MODEL.md 的 Core Relationships：series → games → rounds → base_events。
+
+    这是 VLML 的**主干血缘**（谁是谁的子表），伴学 `prerequisites` 的同构物：
+    要算回合级指标，必须先有 rounds；要算事件级，必须先有 base_events。
+    """
+    m = re.search(r"##\s+Core Relationships\s*```(.*?)```", text, re.S)
+    if not m:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    stack: list[tuple[int, str]] = []
+    for raw in m.group(1).splitlines():
+        if not raw.strip():
+            continue
+        nm = re.search(r"([a-z_][a-z_0-9]*)\s*\(", raw)
+        if not nm:
+            continue
+        name = nm.group(1)
+        keys: list[str] = []
+        km = re.search(r"\(([^)]*)\)", raw)
+        if km:
+            keys = [k.strip() for k in km.group(1).split(",") if k.strip()]
+        indent = len(raw) - len(raw.lstrip())
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        out[name] = {"parent": stack[-1][1] if stack else "", "keys": keys}
+        stack.append((indent, name))
+    return out
+
+
+def _parse_data_model(text: str) -> dict[str, dict[str, Any]]:
+    """`### Title (`tbl`)` + `**Grain:**` + `**Use cases:**`。"""
+    out: dict[str, dict[str, Any]] = {}
+    for m in re.finditer(
+            r"^###\s+(.+?)\s*\(`([a-z_0-9]+)`\)\s*$(.*?)(?=^###\s|\Z)",
+            text, re.S | re.M):
+        tbl, body = m.group(2), m.group(3)
+        rec: dict[str, Any] = {"title": m.group(1).strip()}
+        gm = re.search(r"\*\*Grain:\*\*\s*(.+)", body)
+        um = re.search(r"\*\*Use cases:\*\*\s*(.+)", body)
+        if gm:
+            rec["grain"] = gm.group(1).strip()
+        if um:
+            rec["use_cases"] = um.group(1).strip()
+        if len(rec) > 1:
+            out[tbl] = rec
+    # 参考表是 bullet 形式：「- `agent_roles`: one row per agent, role mapping」
+    rm = re.search(r"##\s+Reference Tables(.*?)(?=^##\s|\Z)", text, re.S | re.M)
+    if rm:
+        for lm in re.finditer(r"^-\s+`([a-z_0-9]+)`:\s*(.+)$", rm.group(1), re.M):
+            rec = out.setdefault(lm.group(1), {"title": lm.group(1)})
+            rec.setdefault("use_cases", lm.group(2).strip())
+    return out
+
+
+def _parse_derived_tables(text: str) -> dict[str, dict[str, Any]]:
+    """DERIVED_TABLES.md：概览表（粒度/上游/用途）+ 每个 `###` 块的详情。"""
+    out: dict[str, dict[str, Any]] = {}
+    for lm in re.finditer(
+            r"^\|\s*`([a-z_0-9]+)`\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|",
+            text, re.M):
+        tbl, grain, src, purpose = lm.groups()
+        if tbl in ("Table", "table") or set(tbl) <= set("-: "):
+            continue                       # 表头行
+        out[tbl] = {"grain": grain.strip(), "upstream_raw": src.strip(),
+                    "purpose": purpose.strip()}
+    for m in re.finditer(r"^###\s+([a-z_0-9]+)\s*$(.*?)(?=^###\s|\Z)",
+                         text, re.S | re.M):
+        tbl, body = m.group(1), m.group(2)
+        rec = out.setdefault(tbl, {})
+        pm = re.search(r"\*\*Primary Key:\*\*\s*`?([^`\n]+)`?", body)
+        if pm:
+            rec["pk_text"] = pm.group(1).strip().strip("`")
+        # 标题下第一段散文 = 用途
+        for line in body.splitlines():
+            s = line.strip()
+            if s and not s.startswith(("**", "-", "|", "```", "#")):
+                rec.setdefault("use_cases", s)
+                break
+        kc = re.search(r"\*\*Key Columns:\*\*(.*?)(?=\*\*|\Z)", body, re.S)
+        if kc:
+            cols: dict[str, str] = {}
+            # `\s+` 会吃掉换行，于是 "- a, b - desc" 会跨行粘到下一条 bullet
+            # 上（实测 games_played 的说明变成了下一行的列名）——只吃空格。
+            for cm in re.finditer(r"^-\s+(.+?)[ \t]+-[ \t]+(.+)$",
+                                  kc.group(1), re.M):
+                for n in re.findall(r"`([a-z_0-9]+)`", cm.group(1)):
+                    cols[n] = cm.group(2).strip()
+            if cols:
+                rec["key_columns"] = cols
+        rc = re.search(r"\*\*Row count:\*\*\s*(.+)", body)
+        if rc:
+            rec["row_count_text"] = rc.group(1).strip()
+        ex = re.search(r"```sql(.*?)```", body, re.S)
+        if ex:
+            rec["example_sql"] = ex.group(1).strip()
+    return out
+
+
+def _parse_column_yaml(path: Path) -> dict[str, dict[str, Any]]:
+    """metadata/column_definitions.yaml：列级口径（VLML 手写，比字典更细）。"""
+    try:
+        import yaml
+        raw = yaml.safe_load(_read(path)) or {}
+    except Exception:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for tbl, body in (raw.get("tables") or {}).items():
+        if not isinstance(body, dict):
+            continue
+        out[str(tbl)] = {
+            "description": str(body.get("description") or ""),
+            "columns": {str(k): str(v)
+                        for k, v in (body.get("columns") or {}).items()},
+        }
+    return out
+
+
+def _parse_data_dictionary(path: Path) -> dict[str, dict[str, Any]]:
+    """DATA_DICTIONARY.json：pk / 列类型 / flag / unit / **指标公式**。"""
+    try:
+        raw = json.loads(_read(path))
+    except Exception:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for e in raw or []:
+        tbl = str(e.get("table") or "")
+        if not tbl:
+            continue
+        cols: dict[str, dict[str, Any]] = {}
+        for c, v in (e.get("columns") or {}).items():
+            if isinstance(v, dict):
+                item = {k: v[k] for k in ("desc", "type", "unit")
+                        if v.get(k)}
+                if v.get("flag"):
+                    item["flag"] = True
+                cols[str(c)] = item
+            elif v:
+                cols[str(c)] = {"desc": str(v)}
+        out[tbl] = {
+            "grain": str(e.get("grain") or ""),
+            "pk": [str(x) for x in (e.get("pk") or [])],
+            "columns": cols,
+            "metrics": {str(k): str(v)
+                        for k, v in (e.get("metrics") or {}).items()},
+        }
+    return out
+
+
+def _upstream_of(rec: dict[str, Any], parent: str, known: set[str]) -> list[str]:
+    """上游表：DERIVED_TABLES 的 Source 列 + 主干父表。
+
+    `seed` 不是上游（它表示"手工种子数据"），自身也不算。
+    """
+    got: list[str] = []
+    for tok in re.split(r"[,\s]+", str(rec.get("upstream_raw") or "")):
+        t = tok.strip().strip("`")
+        if t and t != "seed" and t in known and t not in got:
+            got.append(t)
+    if parent and parent not in got:
+        got.append(parent)
+    return got
+
+
+def _layer_of(name: str, core: dict[str, dict[str, Any]],
+              derived: dict[str, Any]) -> str:
+    """这张表在建模里的角色（伴学 `chapter` 的同构物）。"""
+    if name in core:
+        return "core"                 # 主干：series / games / rounds / base_events
+    if derived:
+        return "derived"              # DERIVED_TABLES.md 里单列声明的 7 张
+    if name.startswith(("agent_", "weapon_", "map_", "ability_", "ref_")):
+        return "ref"                  # 参考/字典表
+    return "agg"
+
+
+def model_specs() -> dict[str, Any]:
+    """把四份建模文档解析成每张表的结构化声明。
+
+    返回 `{"tables": {name: {...}}, "fingerprint": str, "files": [...]}`。
+    fingerprint 用来判断缓存是否过期 —— 建模文档一改，图谱就得重建，
+    否则新声明永远进不了已经落盘的 `knowledge_graph.json`。
+    """
+    dm_p, dt_p = MODEL_FILES[0], MODEL_FILES[1]
+    cd_p, dd_p = MODEL_FILES[2], MODEL_FILES[3]
+    dm_text, dt_text = _read(dm_p), _read(dt_p)
+    core = _parse_core_lineage(dm_text)
+    model = _parse_data_model(dm_text)
+    derived = _parse_derived_tables(dt_text)
+    ycols = _parse_column_yaml(cd_p)
+    ddic = _parse_data_dictionary(dd_p)
+
+    names = set(core) | set(model) | set(derived) | set(ycols) | set(ddic)
+    tables: dict[str, dict[str, Any]] = {}
+    for n in sorted(names):
+        a, b = model.get(n) or {}, derived.get(n) or {}
+        c, d = ycols.get(n) or {}, ddic.get(n) or {}
+
+        # 列口径：yaml 是手写的（更细），字典补 type/flag/unit
+        coldesc: dict[str, dict[str, Any]] = {}
+        for col, txt in (c.get("columns") or {}).items():
+            coldesc[str(col)] = {"desc": str(txt)}
+        for col, meta in (d.get("columns") or {}).items():
+            cur = coldesc.setdefault(str(col), {})
+            if meta.get("desc") and not cur.get("desc"):
+                cur["desc"] = str(meta["desc"])
+            for k in ("type", "flag", "unit"):
+                if meta.get(k) is not None:
+                    cur[k] = meta[k]
+        # 派生表不在 DATA_DICTIONARY 里（13 张表没覆盖 7 张派生表），列口径
+        # 只能从 DERIVED_TABLES.md 的 Key Columns 取 —— 而 agg_first_blood_stats
+        # 恰恰是出题用得最多的表，`fb_team_won` 的口径就在那儿写着。
+        for col, txt in (b.get("key_columns") or {}).items():
+            cur = coldesc.setdefault(str(col), {})
+            if not cur.get("desc"):
+                cur["desc"] = str(txt)
+                cur["origin"] = "DERIVED_TABLES"
+        coldesc = {k: v for k, v in coldesc.items() if v.get("desc")}
+
+        pk: list[str] = []
+        pkm = re.findall(r"[a-z_][a-z_0-9]*", str(b.get("pk_text") or ""))
+        if pkm:
+            pk = pkm
+        elif d.get("pk"):
+            pk = list(d["pk"])
+
+        # 反引号是 markdown 的行内代码标记，不是粒度的一部分
+        grain = re.sub(r"`", "", str(
+            a.get("grain") or b.get("grain") or d.get("grain") or "")).strip()
+        tables[n] = {
+            "title": str(a.get("title") or n),
+            # 用途优先取**完整散文句**（"Pre-joined first blood events with
+            # round outcomes."），概览表里的 "FB events + outcomes" 是缩写
+            "purpose": (str(a.get("use_cases") or "")
+                        or str(b.get("use_cases") or "")
+                        or str(c.get("description") or "")
+                        or str(b.get("purpose") or "")),
+            "purpose_short": str(b.get("purpose") or ""),
+            "description": str(c.get("description") or ""),
+            "use_cases": (str(a.get("use_cases") or "")
+                          or str(b.get("use_cases") or "")),
+            "grain": grain,
+            "pk": pk,
+            "parent": str((core.get(n) or {}).get("parent") or ""),
+            "keys": list((core.get(n) or {}).get("keys") or []),
+            "upstream": _upstream_of(b, (core.get(n) or {}).get("parent", ""),
+                                     names),
+            "column_desc": coldesc,
+            "metrics": dict(d.get("metrics") or {}),
+            "key_columns": dict(b.get("key_columns") or {}),
+            "example_sql": str(b.get("example_sql") or "")[:900],
+            "row_count_text": str(b.get("row_count_text") or ""),
+            # 层：主干（series→games→rounds→base_events）/ 派生（DERIVED_TABLES
+            # 里声明的 7 张）/ 参考字典 / 其余走命名约定的聚合表
+            "layer": _layer_of(n, core, b),
+        }
+
+    h = hashlib.sha1()
+    for p in MODEL_FILES:
+        try:
+            h.update(p.read_bytes())
+        except Exception:
+            h.update(str(p).encode("utf-8"))
+    return {
+        "tables": tables,
+        "fingerprint": h.hexdigest()[:16],
+        "files": [str(p.relative_to(VLML_ROOT)) for p in MODEL_FILES],
+    }
 
 
 async def discover() -> dict[str, Any]:

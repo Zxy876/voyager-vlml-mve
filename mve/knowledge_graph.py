@@ -78,6 +78,11 @@ GRAPH_PATH = HERE / "knowledge_graph.json"
 # VLML 的数据建模表：schema 17 张 + transformations 13 张（派生动 schema 的 agg_*）
 DATA_DICT = (HERE.parent / "vlml" / "database" / "DATA_DICTIONARY.json")
 
+# 落盘格式版本。**改了节点的声明字段就必须 +1** —— 否则已经存在的
+# knowledge_graph.json 永远"看起来没过期"（指纹只覆盖 tasks.py），新声明就
+# 一辈子进不了图。这是"持久化"最容易踩的坑：写了代码，图里还是旧的。
+SCHEMA_VERSION = 2      # 2 = 表节点带 VLML 建模声明，维度节点带伴学式声明
+
 # --------------------------------------------------------------------------
 # 边的关系类型（比伴学的 10 种少：只保留 MVE 真的用得上的）
 # --------------------------------------------------------------------------
@@ -96,8 +101,11 @@ SYMMETRIC = frozenset({CONFUSABLE, CO_OCCURS})
 # 阶段名（数据流分层）照伴学的 stage；从 vlml_schema 拿，避免两处各写一份。
 # 这个模块只 import 标准库，不连库，可以安全地在顶部导入。
 try:
+    # 这个模块只 import 标准库 + 读文件，不连库，可以安全地在顶部导入。
+    import vlml_schema
     from vlml_schema import STAGE_LABEL, STAGE_ORDER  # noqa: F401
 except Exception:                                    # pragma: no cover
+    vlml_schema = None                               # type: ignore[assignment]
     STAGE_LABEL, STAGE_ORDER = {}, []
 
 _RE_FROM = re.compile(r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
@@ -593,6 +601,13 @@ class KnowledgeGraph:
             if d.get("typical_errors"):
                 lines.append("   典型错法："
                             + "；".join(str(e) for e in d["typical_errors"][:4]))
+            # 单位：伴学知识点自带 unit，MVE 以前没有 —— 模型于是把
+            # 「转换率」算成小数还是百分数全靠运气（实测交过 0.55 和 55 两种）。
+            if d.get("unit"):
+                lines.append(f"   单位：{d['unit']}"
+                             + ("（百分数，不是小数）" if d["unit"] == "%" else ""))
+            if d.get("skills"):
+                lines.append(f"   要用到的 SQL 技能：{'、'.join(d['skills'])}")
 
         # 表结构：只列焦点维度真正读的表（写 SQL 时最需要的一份）
         # 带上**它在数据流的哪一层、上游是谁** —— 这是"22 张表之间的关系"，
@@ -612,11 +627,27 @@ class KnowledgeGraph:
                 f"· 表 {t['label']}"
                 + (f"［{STAGE_LABEL.get(stage, stage)}］" if (stage and with_stage)
                    else "")
-                + f"（{t['detail'].get('grain') or ''}，{t['detail'].get('rows', 0)} 行）"
+                + f"（{t['detail'].get('grain') or ''}"
+                + (f"；建模粒度 {gdoc}" if (gdoc := t["detail"].get("grain_doc")) else "")
+                + (f"；主键 {', '.join(pk)}" if (pk := t["detail"].get("pk") or []) else "")
+                + f"，{t['detail'].get('rows', 0)} 行）"
                 + (f" 上游：{'、'.join(up)}" if (up and with_stage) else "")
                 + f"\n   列：{', '.join(ordered[:b.max_cols])}"
                 + (f" …共 {t['detail'].get('n_columns', 0)} 列"
                    if t["detail"].get("n_columns", 0) > b.max_cols else ""))
+            # 列**含义**：VLML 建模文档写的口径。以前只有列名，模型只能按常识
+            # 猜（fb_player 猜成 player_name、map 猜成别的），撞了三次才改对。
+            desc = t["detail"].get("column_desc") or {}
+            if desc:
+                named = [c for c in ordered[:b.max_cols] if c in desc]
+                if named:
+                    named = named[:b.max_cols]
+                    lines.append("   列的含义："
+                                 + "；".join(
+                                     f"{c}={str((desc[c] or {}).get('desc') or '')[:60]}"
+                                     for c in named[:6]))
+            if t["detail"].get("purpose"):
+                lines.append(f"   这张表是干什么的：{t['detail']['purpose']}")
 
         # 取哪一段：value_path 的段首就是工具的 section（洞察目录）。
         # 缺了这层，模型知道调 match_analysis_report，却不知道值在
@@ -700,7 +731,7 @@ class KnowledgeGraph:
     # ---- 持久化 ----
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": SCHEMA_VERSION,
             "nodes": [n.to_dict() for n in self.nodes.values()],
             "edges": [e.to_dict() for e in self.edges],
             "summary": {
@@ -708,8 +739,11 @@ class KnowledgeGraph:
                 "tools": len(self.tools()),
                 "tables": len(self.tables()),
                 "edges": len(self.edges),
-                # 缓存过期判据：见 `load()` 里的 `_stale`
+                # 缓存过期判据：见 `load()` 里的 `_stale`。
+                # 两个指纹缺一不可：题变了要重建（tasks.py），
+                # VLML 建模文档变了也要重建（声明来自文档，不是来自题）。
                 "task_fingerprint": _task_fingerprint(),
+                "model_fingerprint": _model_fingerprint(),
             },
         }
 
@@ -723,11 +757,16 @@ class KnowledgeGraph:
         if not path.exists():
             return g
         raw = json.loads(path.read_text(encoding="utf-8"))
-        # 过期守卫：图谱是 `build()` 的**落盘缓存**，而它的输入是 tasks.py 的
-        # answer_spec。加了一道新题却不重建，图谱里就永远没有那个维度 ——
-        # 实测 `kast_adr_check` 就是这样：图谱里没有 kast_pct / kd_ratio，
-        # 提示整段为空，模型连着三轮在错分支上重试。缓存必须自己知道过期。
-        if _stale(raw, _task_fingerprint()):
+        # 过期守卫：图谱是 `build()` 的**落盘缓存**。加了一道新题却不重建，
+        # 图谱里就永远没有那个维度 —— 实测 `kast_adr_check` 就是这样：
+        # 图谱里没有 kast_pct / kd_ratio，提示整段为空，模型连着三轮在错分支
+        # 上重试。缓存必须自己知道过期。
+        #
+        # 三个判据，缺一个都会漏：
+        #   题指纹   —— 加题/改题（tasks.py 的 answer_spec 变了）
+        #   建模指纹 —— VLML 的建模文档改了（表节点与维度节点的声明来自文档）
+        #   格式版本 —— 节点的声明字段本身改了（题没变、文档也没变，但**代码**变了）
+        if _stale(raw):
             try:
                 g = build()
                 g.save(path)
@@ -768,10 +807,30 @@ def _task_fingerprint() -> str:
     return hashlib.sha1("\n".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
-def _stale(raw: dict[str, Any], fingerprint: str) -> bool:
-    if not fingerprint:
-        return False
-    return str((raw.get("summary") or {}).get("task_fingerprint") or "") != fingerprint
+def _model_fingerprint() -> str:
+    """VLML 四份建模文档的指纹（`vlml_schema.model_specs()`）。
+
+    表节点与维度节点的声明是从这些文档解析出来的 —— 文档改了，图就得重建。
+    """
+    try:
+        return str(vlml_schema.model_specs().get("fingerprint") or "")
+    except Exception:
+        return ""
+
+
+def _stale(raw: dict[str, Any]) -> bool:
+    """三判据：格式版本 / 题指纹 / 建模文档指纹。"""
+    if int(raw.get("schema_version") or 0) != SCHEMA_VERSION:
+        return True
+    summary = raw.get("summary") or {}
+    fp = _task_fingerprint()
+    if fp and str(summary.get("task_fingerprint") or "") != fp:
+        return True
+    mf = _model_fingerprint()
+    # 建模指纹为空（文档读不到）时不判过期 —— 否则每次 load 都重建，慢且吵
+    if mf and str(summary.get("model_fingerprint") or "") != mf:
+        return True
+    return False
 
 
 def _create_table_columns(text: str) -> dict[str, list[str]]:
@@ -1359,9 +1418,317 @@ def build(*, observe: bool = False, with_schema: bool = True) -> KnowledgeGraph:
         _add_vlml_schema(g, schema)
         _add_seed_facts(g, schema)
 
+    # VLML 的建模声明：**读文件**，连不上库也在。放在 schema 之后是因为
+    # 它要往已经建好的表节点上补声明（实查的列名 + 文档的口径合起来才完整）。
+    model: dict[str, Any] = {}
+    if vlml_schema is not None:
+        try:
+            model = vlml_schema.model_specs()
+        except Exception as e:        # 文档读不到就只缺声明，不能整图崩掉
+            print(f"（VLML 建模声明解析失败：{type(e).__name__}: {e}）")
+    if model:
+        _add_model_declarations(g, model)
+    _add_dimension_declarations(g, model)
+
     if observe:
         asyncio.run(_observe_procedure(g))
     return g
+
+
+_GRAIN_ZH = {"round": "回合", "game": "图", "series": "series", "player": "选手",
+             "team": "队伍", "map": "地图", "date": "日", "tournament": "赛事",
+             "entity_type": "实体类型", "entity": "实体", "factor": "因子"}
+
+
+def _zh_grain(doc: str) -> str:
+    """把建模文档写的粒度（`(round_id, team_name)`）翻成中文行粒度。
+
+    `_grain_of_table()` 只认 `agg_{主体}_{粒度}_stats` 这种命名，
+    7 张派生表名字不合约定就一律退化成"聚合表"三个字 —— 而
+    agg_first_blood_stats 恰恰是**一回合一行**，说成"聚合表"，模型就会
+    再 JOIN 一次 rounds，行数翻倍。文档里有精确粒度，用它。
+    """
+    toks = re.findall(r"[a-z_][a-z_0-9]*", (doc or "").lower())
+    if not toks:
+        return "", 0
+    keys = [t[:-3] if t.endswith("_id") else
+            (t[:-5] if t.endswith("_name") else t) for t in toks]
+    # "One row per round" 这类英文散文不是键列表 —— 认不全就别硬翻，
+    # 否则会翻出「每（one × row × per × 回合）一行」这种鬼话（实测）。
+    if any(k not in _GRAIN_ZH for k in keys):
+        return "", 0
+    zh = [_GRAIN_ZH[k] for k in keys]
+    return (f"每{zh[0]}一行" if len(zh) == 1
+            else "每（" + " × ".join(zh) + "）一行"), len(zh)
+
+
+def _add_model_declarations(g: KnowledgeGraph, specs: dict[str, Any]) -> None:
+    """把 VLML 的**建模声明**写进表节点 —— 伴学 knowledge_seeds 的同构物。
+
+    伴学的 457 个知识点节点自带 19 个字段（difficulty / question_types /
+    typical_misconceptions / prerequisites / unit / depth / …），出题器读节点
+    声明来定题型与口径，模型只写题面。VLML 里同层的"作者声明"就是
+    `database/` 下四份建模文档：
+
+        DATA_MODEL.md          粒度 Grain + 用途 Use cases + 主干血缘
+        DERIVED_TABLES.md      7 张派生表的粒度/上游/关键列/示例查询
+        column_definitions.yaml 列级口径
+        DATA_DICTIONARY.json   主键 / 列类型 / **指标公式**（sum/denom）
+
+    之前这些一概没进图：表节点只有"列名 + 行数 + 中文粒度"，`pk` 全是空
+    数组（实测 `table:rounds` 的 pk=[] ，而文档白纸黑字写着 round_id），
+    派生表连粒度都只写"聚合表"三个字。出题时模型只能猜列的含义 ——
+    这正是它把 `fb_player` 写成 `player_name` 的根源。
+    """
+    tbl_specs = specs.get("tables") or {}
+    if not tbl_specs:
+        return
+    declared_by = ("VLML 建模文档：DATA_MODEL.md / DERIVED_TABLES.md / "
+                   "metadata/column_definitions.yaml / DATA_DICTIONARY.json")
+
+    # 第一遍：先把节点建齐（上游表可能排在下游表后面，边要等两端都在）
+    for name, s in sorted(tbl_specs.items()):
+        nid = f"table:{name}"
+        if nid not in g.nodes:
+            g.add_node(Node(id=nid, kind="table", label=name, detail={}))
+        node = g.nodes[nid]
+        grain_doc = s.get("grain") or ""
+        # 命名约定推不出来（"聚合表"/"参考/字典表"）就换成文档写的精确粒度；
+        # 文档粒度有三个以上键时（如 agg_team_map_stats 是 队伍×地图×赛事）
+        # 约定版也表达不了，同样以文档为准。
+        zh_grain, n_keys = _zh_grain(grain_doc)
+        if zh_grain and (node.detail.get("grain") in ("", None, "聚合表", "参考/字典表")
+                         or n_keys >= 3):
+            node.detail["grain"] = zh_grain
+        node.detail.update({
+            "purpose": s.get("purpose") or node.detail.get("purpose") or "",
+            "grain_doc": grain_doc,             # 建模文档写的精确粒度
+            "pk": list(s.get("pk") or node.detail.get("pk") or []),
+            "column_desc": dict(s.get("column_desc") or {}),
+            "metrics": dict(s.get("metrics") or {}),
+            "layer": s.get("layer") or node.detail.get("layer") or "",
+            "parent": s.get("parent") or "",
+            "use_cases": s.get("use_cases") or "",
+            "example_sql": s.get("example_sql") or "",
+            "declared_by": declared_by,
+        })
+
+    # 第二遍：建模文档声明的上游（DERIVED_TABLES 的 Source + 主干父表）。
+    # 为什么要单独建一遍：`discover()` 的 lineage 来自实查 transformations，
+    # 断库就没了；这条来自文档，永远在。origin 标 "model" 以示区别。
+    for name, s in sorted(tbl_specs.items()):
+        for up in s.get("upstream") or []:
+            if f"table:{up}" not in g.nodes:
+                continue
+            g.add_edge(Edge(src=f"table:{up}", dst=f"table:{name}",
+                            relation=DERIVED_FROM, origin="model",
+                            reason=f"建模文档声明：{name} 由 {up} 算出",
+                            confidence=1.0))
+
+
+# --------------------------------------------------------------------------
+# 维度节点的伴学式声明
+# --------------------------------------------------------------------------
+# 伴学节点 19 个字段里，能在这里**真填**的 12 个；剩下 7 个（aliases /
+# curriculum_tags / curriculum_version / exam_region / exam_type 等）在
+# MVE 里没有同构物 —— 不编、不填。填了假声明比不填更危险。
+def _sql_difficulty(sql: str) -> int:
+    """这条 SQL 的难度档（1-4），判据可数，不靠模型自评。
+
+    与 `question_gen.DIFFICULTY_RUBRIC` 同一套分档（1 单表聚合 / 2 分组 /
+    3 JOIN 或条件分支 / 4 窗口函数或嵌套子查询）。图谱自带难度，出题器
+    就不用各处重新数一遍关键字了 —— 伴学的 difficulty 也是长在节点上的。
+    """
+    low = (sql or "").lower()
+    if "over (" in low or "over(" in low or "from (select" in low:
+        return 4
+    if " join " in low or "case when" in low or " having " in low:
+        return 3
+    if "group by" in low:
+        return 2
+    return 1
+
+
+def _unit_of(dim: str, d: dict[str, Any]) -> str:
+    """这个指标的单位（伴学 `unit` 的同构物）。按命名与口径文本推，可查。
+
+    判据顺序有讲究：`max_losing_streak` 里的 "losing_**s**treak" 含 `_s`，
+    先判时间就会把它错标成"秒"（实测就是这么错的）。先判连败/回合。
+    """
+    text = " ".join(str(d.get(k) or "") for k in ("point", "semantics")).lower()
+    if ("pct" in dim or "rate" in dim or "conv" in dim or "kast" in dim
+            or "adr" in dim or "%" in text or "率" in text):
+        return "%"
+    if "ratio" in dim or "share" in dim or "比值" in text:
+        return "比值"
+    if "streak" in dim or "rounds" in dim or "回合" in text:
+        return "回合"
+    if dim.endswith("_s") or "time" in dim or "delay" in dim or "秒" in text:
+        return "秒"
+    return "计数"
+
+
+def _skills_of(sql: str) -> list[str]:
+    low = (sql or "").lower()
+    out = []
+    if "over (" in low or "over(" in low or "row_number" in low:
+        out.append("窗口函数")
+    if "from (select" in low or "from(select" in low:
+        out.append("嵌套子查询")
+    if " join " in low:
+        out.append("多表 JOIN")
+    if "case when" in low or "coalesce(" in low:
+        out.append("条件分支")
+    if "group by" in low:
+        out.append("分组聚合")
+    if any(k in low for k in ("count(", "avg(", "sum(", "max(", "min(")):
+        out.append("聚合函数")
+    return out
+
+
+LAYER_LABEL = {"core": "主干表", "derived": "派生表", "agg": "聚合表",
+               "ref": "参考/字典表"}
+
+
+def _table_depth(g: KnowledgeGraph, name: str, seen: set[str] | None = None) -> int:
+    """这张表在数据流里被推导了几层（伴学 `depth` 的同构物）。"""
+    seen = seen or set()
+    nid = f"table:{name}"
+    if nid in seen:
+        return 0
+    seen.add(nid)
+    ups = [e.src[len("table:"):]
+           for e in g._in.get(nid, []) if e.relation == DERIVED_FROM]
+    ups = [u for u in ups if u != name]
+    if not ups:
+        return 0
+    return 1 + max(_table_depth(g, u, seen) for u in ups)
+
+
+def _add_dimension_declarations(g: KnowledgeGraph, specs: dict[str, Any]) -> None:
+    """给 15 个维度节点补上伴学式的声明字段。
+
+    此前这些字段**只存在于 detail 里由 tasks.py 临时派生的那几项**
+    （tables / columns / semantics），而且没有任何一项是"教学声明"——
+    没有难度、没有单位、没有先修、没有知识点级的典型错法。出题器要挑
+    "上一档更难的点"时无从下手，只能自己数 SQL 关键字（还数错了）。
+    """
+    tbl_specs = specs.get("tables") or {}
+    # 难度要从**完整 SQL** 数，不能从 detail 里的 `semantics` 数 ——
+    # semantics 只是 SELECT 投影（"ROUND(AVG(fb_team_won)*100,1) AS conv"），
+    # 里面没有 GROUP BY / JOIN，于是明明要分组的题被判成 1 档（实测
+    # map_fb_conv 就是这样，出题器按"最简单"把它排在了最后）。
+    sql_by_dim: dict[str, list[str]] = {}
+    try:
+        from tasks import TASKS
+        for _tid, _t in TASKS.items():
+            for _p in getattr(_t, "rubric", None) or []:
+                _s = getattr(_p, "answer_spec", None)
+                if _s is not None and getattr(_s, "sql", ""):
+                    sql_by_dim.setdefault(str(_p.dimension), []).append(
+                        _desensitize(str(_s.sql)))
+    except Exception:
+        sql_by_dim = {}
+
+    for dim in sorted(g.dimensions()):
+        node = g.nodes.get(f"dim:{dim}")
+        if node is None:
+            continue
+        d = node.detail
+        tables = list(d.get("tables") or [])
+        recipe = str(d.get("recipe") or d.get("semantics") or "")
+        # 只认 `recipe`（真 SQL 骨架）。`semantics` 对工具路径来说是
+        # 一句中文说明，拿它数关键字会凭空得到 1 档 —— 工具维度应当是 0。
+        sqls = sql_by_dim.get(dim) or ([d["recipe"]] if d.get("recipe") else [])
+
+        # --- difficulty：图谱自带，出题器不再各数各的 ---
+        # 工具路径没有 SQL 可数，标 0（不参与 1-4 分档），不假装是 1 档。
+        d["difficulty"] = (max((_sql_difficulty(s) for s in sqls), default=0)
+                           if sqls else 0)
+        # --- unit / skills / question_types ---
+        d["unit"] = _unit_of(dim, d)
+        skills = _skills_of(" \n ".join(sqls))
+        if skills:
+            d["skills"] = skills
+        d["question_types"] = (["sql_recipe"] if d.get("tables")
+                               else ["tool_recipe"])
+
+        # --- chapter / depth：这张维度站在数据流的哪一层 ---
+        primary = tables[0] if tables else ""
+        layer = str((tbl_specs.get(primary) or {}).get("layer") or "")
+        d["chapter"] = (LAYER_LABEL.get(layer, layer) if tables
+                        else "工具内聚合（不出 SQL）")
+        d["depth"] = (1 + max((_table_depth(g, t) for t in tables), default=0)
+                      if tables else 0)
+
+        # --- prerequisites：先修 = 上游表（伴学 prerequisites 的同构物）---
+        ups: list[str] = []
+        for t in tables:
+            # `upstream_tables` 返回的是**节点 id**，不是表名 —— 忘了剥前缀
+            # 就会写出 "table:table:base_events"（实测就是这样）。
+            for u in g.upstream_tables(t, depth=2):
+                u = u[len("table:"):] if u.startswith("table:") else u
+                if u != t and u not in ups:
+                    ups.append(u)
+        # 派生表本身也是"先会它的上游才谈得上用它"；再加一层建模文档声明的
+        for t in tables:
+            for u in (tbl_specs.get(t) or {}).get("upstream") or []:
+                if u != t and u not in ups:
+                    ups.append(u)
+        d["prerequisites"] = [
+            {"id": f"table:{u}", "relation": "prerequisite",
+             "reason": f"{dim} 读的表 {primary or '（工具）'} 由 {u} 算出"
+                       + (f"（{(tbl_specs.get(u) or {}).get('grain') or ''}）"
+                          if (tbl_specs.get(u) or {}).get("grain") else "")}
+            for u in ups[:4]]
+
+        # --- related：易混 / 共现（图里本来就有边，这里做成节点可读的）---
+        rel: list[dict[str, str]] = []
+        for e in g._out.get(f"dim:{dim}", []) + g._in.get(f"dim:{dim}", []):
+            other = e.dst if e.src == f"dim:{dim}" else e.src
+            if not other.startswith("dim:") or other == f"dim:{dim}":
+                continue
+            if e.relation == CONFUSABLE:
+                rel.append({"id": other, "relation": "confusable"})
+            elif e.relation == CO_OCCURS:
+                rel.append({"id": other, "relation": "co_occurs"})
+        seen_rel: set[str] = set()
+        rel = [r for r in rel if not (r["id"] in seen_rel or seen_rel.add(r["id"]))]
+        if rel:
+            d["related"] = rel[:6]
+
+        # --- typical_misconceptions：种子错法 + 建模文档推出来的错法 ---
+        misc = list(d.get("typical_errors") or [])
+        for t in tables:
+            s = tbl_specs.get(t) or {}
+            grain = str(s.get("grain") or "")
+            if s.get("layer") == "derived" and "round" in grain:
+                misc.append(
+                    f"{t} 已经是「{grain}」一行（主键 {','.join(s.get('pk') or []) or '见文档'}），"
+                    "不要再 JOIN rounds 去重 —— 会放大行数")
+            for m, formula in list((s.get("metrics") or {}).items())[:1]:
+                misc.append(f"{t}.{m} 是「{formula}」算出来的，"
+                            "不能直接 AVG 那个同名列")
+            break
+        if misc:
+            d["typical_misconceptions"] = list(dict.fromkeys(misc))[:5]
+
+        # --- examples：口径示例（伴学 examples 的同构物）---
+        ex: list[str] = []
+        if d.get("recipe"):
+            ex.append(str(d["recipe"])[:400])
+        elif d.get("semantics"):
+            ex.append(str(d["semantics"])[:200])
+        for t in tables[:1]:
+            s = tbl_specs.get(t) or {}
+            if s.get("example_sql"):
+                ex.append(str(s["example_sql"])[:300])
+        if ex:
+            d["examples"] = ex[:2]
+        d["name"] = dim
+        d["subject"] = "vlml0"
+        d["declared_by"] = ("VLML 建模文档 + tasks.py 的 answer_spec"
+                            "（难度/单位/先修由文档推，口径由 answer_spec 定）")
 
 
 def _add_vlml_schema(g: KnowledgeGraph, schema: dict[str, Any]) -> None:

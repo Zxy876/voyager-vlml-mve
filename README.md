@@ -707,10 +707,66 @@ python mve/dashboard.py                  # 面板 http://127.0.0.1:8777
    **口径写错**（如 gaps-and-islands 的过滤层级），会被计划校验与验题拦下并回灌。
    另外生成的题默认 `validated_target=False`（**不进掌握度**）——
    照伴学：生成 ≠ 生效，先要被确认口径。
-   **未解**：MVE 的图谱维度节点 `attrs` 仍是空的（`{}`），`tables` / `columns` /
-   `semantics` / `typical_errors` 只存在于 `detail`（由 tasks.py 派生，不持久化）。
-   伴学那 457 个节点是**每个都自带 17 个声明字段**的。要把 MVE 的图谱补成
-   伴学那样（含 `difficulty` / `question_types` / `prerequisites`），未做。
+   **已补（八之五）**：图谱节点现在自带声明并持久化。表节点带 VLML 建模文档写的
+   `purpose / grain / pk / column_desc / metrics / upstream / layer`，
+   维度节点带伴学式的 `difficulty / unit / skills / prerequisites / related /
+   typical_misconceptions / examples / chapter / depth`。
+   **没填的字段（7 个）**：`aliases` / `curriculum_tags` / `curriculum_version` /
+   `exam_region` / `exam_type` 等在 MVE 里没有同构物 —— 不编、不填。
+
+---
+
+## 八之五、图谱补成伴学那样：把 VLML 的建模声明写进节点并持久化
+
+上一节的结尾留了个真缺口：**MVE 的图谱节点没有"作者声明"**。伴学的 457 个知识点
+每个自带 19 个字段（难度、题型、先修、典型错法…），出题器读节点声明定题型与口径，
+模型只写题面。MVE 这边呢 —— `table:rounds` 的 `pk` 是空数组，派生表的粒度只写着
+"聚合表"三个字，列**只有名字没有含义**。
+
+VLML 里同层的"作者声明"一直都在，就在 `database/` 下四份建模文档里：
+
+| 文档 | 提供什么 |
+|---|---|
+| `DATA_MODEL.md` | 每张表的 `**Grain:**` + `**Use cases:**`；主干血缘 `series → games → rounds → base_events` |
+| `DERIVED_TABLES.md` | 7 张派生表的粒度 / 上游 Source / 关键列 / **示例查询** |
+| `metadata/column_definitions.yaml` | 列级口径（141 行手写） |
+| `DATA_DICTIONARY.json` | 主键 / 列类型 / flag / **指标公式**（`avg_survival_time = survival_time_sum_s / survival_time_denom`） |
+
+新增 `vlml_schema.model_specs()` 解析这四份（**读文件，断库也在**），
+`_add_model_declarations()` 写进表节点，`_add_dimension_declarations()` 给 15 个维度
+节点补伴学式声明，随 `save()` 落盘 `knowledge_graph.json`。
+
+### 声明真的被用上了吗（三处消费点）
+
+1. **出题器不再各数各的难度。** `_graph_blueprint` 以前自己数脱敏骨架的关键字，
+   而骨架常常没有 `GROUP BY` → 明明要分组的 `map_fb_conv` 被判成 1 档，排在最后。
+   现在难度长在节点上（`map_fb_conv=1`、`map_win_rate=3`、`max_losing_streak=4`），
+   判据与 `DIFFICULTY_RUBRIC` 同一套，只是**算一次存下来**。
+2. **写 SQL 时知道每列是什么。** prompt 里现在有
+   `列的含义：fb_team_won=Conversion flag (1/0)`、`主键：round_id（一行 = 每回合一行）`、
+   `这张表是干什么的：first blood conversion analysis…`。
+   以前只有列名 —— 于是模型把 `fb_player` 写成 `player_name`，critique 每轮都列真名，
+   它照样按常识编三次。**给真名不够，得给含义。**
+3. **单位。** 伴学知识点自带 `unit`。MVE 以前没有，模型交过 `0.55` 和 `55` 两种答案。
+   现在维度节点带 `unit: %`，prompt 里明写"百分数，不是小数"。
+
+### 三个坑（都踩了）
+
+- **持久化 = 缓存过期。** 写完代码图里还是旧的 —— 因为 `_stale()` 只比 tasks.py 的指纹。
+  加了 `SCHEMA_VERSION`（2）与建模文档指纹，凑成三判据：格式版本 / 题指纹 / 建模指纹。
+  缺任何一个都会漏：改了代码但题没变、文档也没变的情况，只有版本号能抓住。
+- **难度要从完整 SQL 数，不能从 `semantics` 数。** `semantics` 只是 SELECT 投影
+  （`ROUND(AVG(fb_team_won)*100, 1) AS conv`），里面没有 `GROUP BY`。
+- **`_s` 的误判。** `max_losing_streak` 里的 "losing_**s**treak" 含 `_s`，
+  先判时间就把它错标成"秒"（实测就是这么错的）。判据顺序：先连败/回合，再时间。
+  同理 `One row per round` 这种英文散文不能被硬翻成键列表 —— 会翻出
+  「每（one × row × per × 回合）一行」。
+
+### 实测
+
+- 图谱：维度 15 · 工具 9 · **表 22**（多出 `ability_types`）· 边 767（+3 条建模声明的上游边）。
+- 无回退：`fb_conversion_analysis` 100%、`map_rounds_split` 100%、
+  难度 4 的生成题 `max_losing_streak_map` 首轮 0%（与改动前一致）。
 6. 面板的求助按钮与 help_decision 展示还没做。
 7. **~~SQL 路径的「编排漏条」~~ （2026-10-07 已解，见八之三）** —— 曾是 60% / 80% 长期卡死，
    根因是执行层 `[:3]` 硬截断 + critique 永远为 None + 反馈只点维度不点评分点。

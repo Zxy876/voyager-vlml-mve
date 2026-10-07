@@ -351,6 +351,24 @@ async def _server_skeleton() -> str:
                     + f" {tag}")
                 for e in (det.get("typical_errors") or [])[:2]:
                     lines.append(f"      典型错法：{str(e)[:90]}")
+                # 建模声明（表节点，来自 VLML 的 DATA_MODEL.md / DERIVED_TABLES.md
+                # / column_definitions.yaml）：一行是什么、每列是什么意思。
+                # 只给列名的后果已经实测过：模型把 fb_player 写成 player_name，
+                # critique 每轮都把真名列出来，它照样按常识编三次。
+                tnode = g.nodes.get(f"table:{tbl}")
+                tdet = (getattr(tnode, "detail", None) or {})
+                if tdet.get("pk"):
+                    lines.append(
+                        f"      {tbl} 主键：{'、'.join(tdet['pk'])}"
+                        f"（一行 = {tdet.get('grain') or tdet.get('grain_doc') or ''}）")
+                desc = tdet.get("column_desc") or {}
+                named = [c for c in (cbt.get(tbl) or det.get("columns") or [])
+                         if c in desc]
+                if named:
+                    lines.append("      列的含义："
+                                 + "；".join(
+                                     f"{c}={str((desc[c] or {}).get('desc') or '')[:50]}"
+                                     for c in named[:5]))
     except Exception as e:                                   # pragma: no cover
         lines.append(f"（图谱不可用：{type(e).__name__}）")
 
@@ -509,16 +527,19 @@ def _graph_blueprint(difficulty: int = 2,
             score = 0
             if prefer and d == prefer:
                 score -= 10              # planner 指定的方向优先
-            # 难度匹配：该维度的参考配方本身是什么档
-            recipe = str(det.get("recipe") or det.get("semantics") or "")
-            low = recipe.lower()
-            own = 1
-            if "over (" in low or "over(" in low or "from (select" in low:
-                own = 4
-            elif " join " in low or "case when" in low:
-                own = 3
-            elif "group by" in low:
-                own = 2
+            # 难度匹配：读**图谱自带**的 difficulty（伴学的难度长在知识点节点
+            # 上，不在出题器里）。以前这里自己数 recipe 的关键字，而 recipe
+            # 只是脱敏骨架、常常没有 GROUP BY，于是明明要分组的题被判成 1 档。
+            own = int(det.get("difficulty") or 0)
+            if not own:                      # 老图没这个字段才退回数关键字
+                low = str(det.get("recipe") or det.get("semantics") or "").lower()
+                own = 1
+                if "over (" in low or "over(" in low or "from (select" in low:
+                    own = 4
+                elif " join " in low or "case when" in low:
+                    own = 3
+                elif "group by" in low:
+                    own = 2
             score += abs(own - int(difficulty or 2)) * 3
             cands.append((score, d, {
                 "dimension": d,
