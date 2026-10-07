@@ -552,6 +552,13 @@ TOPIC_HINTS: dict[str, tuple[str, ...]] = {
         "三张图", "每张图", "各打了多少回合", "回合数", "图上的胜率",
         "map_rounds", "map_win_rate", "分图",
     ),
+    # lotus_win_rate 是后加的题，手写表里漏了它 —— 实测「Cloud9 在 Lotus 上的胜率
+    # 是多少？」归不上（AUTO_HINTS 派生的 map/win/rate 是**英文**词干，中文提问
+    # 命中不了），于是这条人导入的 topic_id 为空，出题器看不见，
+    # 还会拿这段文本去生成一道和已有题重复的新题。这里补上。
+    "lotus_win_rate": (
+        "lotus", "洛图", "lotus_win_rate", "lotus 图", "lotus图上",
+    ),
 }
 
 
