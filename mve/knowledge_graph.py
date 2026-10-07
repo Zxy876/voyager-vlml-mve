@@ -1704,15 +1704,21 @@ def _merge_imported_links(g: KnowledgeGraph) -> int:
     """
     added = 0
     for rec in load_imported_links():
-        if not rec.get("covered"):
+        # **覆盖要在合并时重算，不能信落盘时的旧结论**。实测：图谱重建前
+        # 服务器上 insight 层是空的，一条人导入被判成 table 级；重建后
+        # insight 补齐了，可那条记录还写着 table 级 —— 边就永远停在低置信上。
+        # 判据的输入（真实 SQL / 工具 / 表）都存在记录里，重算是免费的。
+        tbls0 = [str(t) for t in (rec.get("tables") or [])]
+        cov = coverage_of(tables=tbls0, tool=str(rec.get("tool") or ""), g=g)
+        if not cov["covered"]:
             continue                     # 覆盖不到的不进图（伴学：映射不上不硬造）
         dim = str(rec.get("dimension") or "").strip()
         q = str(rec.get("question") or "")[:40]
         tag = f"人导入「{q}」"
         dim_tag = f"（维度 {dim}）" if dim else ""
-        ins = [f"insight:{i}" for i in (rec.get("insights") or [])
+        ins = [f"insight:{i}" for i in (cov.get("insights") or [])
                if f"insight:{i}" in g.nodes]
-        tbls = [f"table:{t}" for t in (rec.get("tables") or [])
+        tbls = [f"table:{t}" for t in (cov.get("tables") or [])
                 if f"table:{t}" in g.nodes]
         tool = str(rec.get("tool") or "").strip()
         tool_id = f"tool:{tool}" if tool else ""
