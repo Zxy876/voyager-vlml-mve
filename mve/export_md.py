@@ -44,6 +44,8 @@ _MARKDOWN_ESCAPE_RE = re.compile(r"([\\`*_{}\[\]()#+!|])")
 _CODE_SPAN_RE = re.compile(r"`[^`]*`")
 _MAX_TEXT_CHARS = 2000
 _MAX_MARKDOWN_CHARS = 120_000
+# 考核类型后缀：重考与迁移对照在表里长一样，不标就读不出迁移
+KIND_SUFFIX = {"placement": "·摸底", "practice_exam": "·重考", "transfer": "·迁移"}
 
 
 def _escape_segment(text: str) -> str:
@@ -140,9 +142,13 @@ def build_markdown(state: dict[str, Any] | None = None) -> str:
 
     # ---------------- 概览 ----------------
     series = s.get("series") or []
+    exam_view = s.get("exam_curve") or {}
+    exam_tracks = exam_view.get("tracks") or []
     lines.extend([
         "", "## 概览", "",
-        f"- 累计轮次: {s.get('total_rounds', 0)}",
+        f"- 累计轮次: {s.get('total_rounds', 0)}（练习 · run_log）",
+        f"- 考核次数: {sum(int(t.get('exam_count') or 0) for t in exam_tracks)}"
+        f"（摸底/重考/迁移 · exam_log，**不进 run_log**）",
         f"- 掌握度变化: {escape_markdown(s.get('mastery_delta', '—'))}",
         f"- 技能库: {stats.get('skills', 0)} 条"
         f"（累计写入 {stats.get('writes', 0)} 次 · 覆盖 {stats.get('rewrites', 0)}"
@@ -154,8 +160,61 @@ def build_markdown(state: dict[str, Any] | None = None) -> str:
     if s.get("reading_text"):
         lines.append(f"- 判读: {escape_markdown(s['reading_text'])}")
 
+    # ---------------- 真实水平：撤支架考核 ----------------
+    #
+    # 这一节是补的：摸底 / 重考 / 迁移全写进 exam_log.jsonl，而导出器原先
+    # 只读 panel_data 里 run_log 派生出来的字段，**整条考核链在导出里是哑的**。
+    # 实测后果：12:10 那份导出里，界面交互明明记着「11:43:36 启动摸底」
+    # 「11:48/11:56 两次跑学习单元」，正文里却连一行摸底数据都没有，
+    # 「判读」还写着「首轮即满分：任务太简单」—— 跑了的证据全丢了。
+    lines.extend(["", "## 真实水平 · 撤支架考核（exam_log）", ""])
+    if not exam_view.get("has_data"):
+        lines.append("_还没有裸考记录。跑 `python mve/exam.py --all`（全库摸底），"
+                     "再跑 `python mve/learn.py --units 8`。_")
+        lines.append("")
+        lines.append("练习（run_log）那 100% 是**带着知识图谱**跑出来的，量的是支架的高度，"
+                     "不是模型的水平。要判「学到了多少」必须撤掉图谱重考。")
+    else:
+        tr = exam_view.get("transfer")
+        lines.extend([
+            f"- 数据源: `exam_log.jsonl` —— 与上面的 run_log **两码事**："
+            f"练习给图谱（教），考核撤图谱（考）。",
+            f"- 摸底均值 {exam_view.get('avg_baseline')}% → "
+            f"最新均值 {exam_view.get('avg_latest')}%"
+            f"（Δ {exam_view.get('avg_delta_pp_all') or 0:+d} 个百分点）",
+            f"- 重考过 {exam_view.get('retested')} 道，其中 {exam_view.get('rose')} 道涨了"
+            + (f"，平均 {exam_view['avg_delta_pp']:+d}pp"
+               if exam_view.get("avg_delta_pp") is not None else ""),
+            f"- 摸底掌握（≥80%）{exam_view.get('mastered')} 道 → "
+            f"现在 {exam_view.get('mastered_now')} 道",
+        ])
+        if tr:
+            verdict = ("涨了 → 有迁移" if tr.get("rose")
+                       else "没涨 → 上升的是「记住了这道题」，不是可迁移的能力")
+            lines.append(f"- 迁移对照（{tr.get('count')} 次**未练过**的题）："
+                         f"{' → '.join(tr.get('seq') or [])} —— {verdict}")
+        lines.append("")
+        lines.append("| 题 | 摸底（裸考） | 摸底等级 | 练后重考 | 最新 | Δ | 考核次数 |")
+        lines.append("|---|---|---|---|---|---|---|")
+        for t in exam_tracks:
+            # 重考那一格要标类型：练后重考和迁移对照长得很像，混在一起读不出迁移
+            after = " → ".join(
+                f"{a.get('pct') or '—'}{KIND_SUFFIX.get(str(a.get('kind') or ''), '')}"
+                for a in (t.get("after") or [])
+            ) or "（还没重考过）"
+            d = t.get("delta_pp")
+            dcell = "—" if d is None else (f"+{d}pp" if d > 0 else (f"{d}pp" if d < 0 else "持平"))
+            # 「已毕业让位」写在题名那一格：另起一行会打断表格
+            lines.append(
+                f"| {code(t.get('topic_id'), 60)}"
+                f"{' · 已毕业让位' if t.get('exhausted') else ''} "
+                f"| {t.get('baseline_pct')} "
+                f"| {escape_markdown(t.get('level'))} | {after} "
+                f"| {t.get('latest_pct')} | {dcell} | {t.get('exam_count')} |"
+            )
+
     # ---------------- 掌握度 ----------------
-    lines.extend(["", "## 掌握度（按题）", ""])
+    lines.extend(["", "## 掌握度（按题 · run_log，带支架）", ""])
     by_topic: dict[str, dict[str, Any]] = {}
     for p in series:
         t = p.get("topic_id")
@@ -246,6 +305,11 @@ def build_markdown(state: dict[str, Any] | None = None) -> str:
     # ---------------- 判读说明（照伴学对 mastery 的态度：它不能当证据）----------------
     lines.extend([
         "", "## 怎么读这份导出", "",
+        "- **两条线别混**：`run_log.jsonl` 是练习（**带着知识图谱**跑，实测首轮就 100%，"
+        "量的是支架不是水平）；`exam_log.jsonl` 是撤支架考核（只剩题干 + 工具 + 自己的技能库）。"
+        "说「学会了多少」只能看后者。",
+        "- **基线不能被顶掉**：考核画像必须「摸底 / 最新」两列一起看。`profile()` 只保留最后一次记录，"
+        "练后重考的 100% 会把摸底的 19% 覆盖掉 —— 只剩最新那一列，学习曲线就没了。",
         "- **判据是覆盖率，不是掌握度**：mastery 的 confidence 项随「证据权重之和」"
         "上升（V2 模型），反复作答就会把它推高，用它说「学会了」是假阳性。",
         "- **掌握度是会忘的**：另有保持度模型 `baseline × 2^(-天数/半衰期)`，"

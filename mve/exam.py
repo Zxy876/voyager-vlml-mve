@@ -128,6 +128,40 @@ def profile() -> dict[str, dict[str, Any]]:
     return out
 
 
+def profile_split() -> dict[str, dict[str, Any]]:
+    """每题的**摸底基线**和**最新水平**分开返回 —— 不要只留最后一个数。
+
+    `profile()` 只保留最后一次记录，语义没错（"现在是什么水平"），
+    但单独用它看画像会出事：练完重考是 100%，它就把摸底的 19% **顶掉**，
+    画像看上去像"本来就会"，学习曲线凭空消失。
+
+    实测就是这样：服务器上跑完 7 题摸底（平均 19%）+ 8 次练后重考（全 100%）后，
+    `exam.py --profile` 打印出来的是「全部 100% · 平均 100%」，
+    而面板上按题分行显示的摸底均值还是 19% —— 同一个 exam_log，
+    两个视图给出两个结论。基线必须留着：曲线是「基线 → 现在」，
+    只剩"现在"就没有曲线了。
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for r in load():
+        t = str(r.get("topic_id") or "")
+        if not t:
+            continue
+        cov = float(r.get("coverage") or 0.0)
+        rec = out.get(t)
+        if rec is None:
+            rec = out[t] = {"topic_id": t, "baseline": cov, "latest": cov,
+                            "exams": 0, "kind": "", "verdict": ""}
+        rec["exams"] += 1
+        rec["latest"] = cov
+        rec["kind"] = str(r.get("kind") or "")
+        rec["verdict"] = str(r.get("verdict") or "")
+    for r in out.values():
+        r["baseline_level"] = level_of(r["baseline"])
+        r["latest_level"] = level_of(r["latest"])
+        r["delta_pp"] = round((r["latest"] - r["baseline"]) * 100)
+    return out
+
+
 def true_level(topic_id: str) -> float | None:
     """这道题的真实水平；**没裸考过返回 None**（不是 0.0）。
 
@@ -178,31 +212,34 @@ def exhausted(topic_id: str) -> bool:
 
 
 def print_profile() -> None:
-    prof = profile()
-    if not prof:
+    split = profile_split()
+    if not split:
         print("还没有裸考记录。先跑：python mve/exam.py --all（全库摸底）")
         return
-    print("=" * 74)
-    print("  裸考画像（撤掉知识图谱后的真实水平）")
-    print("=" * 74)
-    print(f"  {'题':30} {'真实水平':>8}  {'等级':<6}  {'判定':<10} 考核次数")
-    print("  " + "-" * 70)
-    counts: dict[str, int] = {}
-    for r in load():
-        counts[str(r.get("topic_id"))] = counts.get(str(r.get("topic_id")), 0) + 1
-    for t in sorted(prof, key=lambda k: float(prof[k]["coverage"])):
-        p = prof[t]
-        print(f"  {t:30} {float(p['coverage']) * 100:>7.0f}%  "
-              f"{str(p.get('level') or ''):<6}  {str(p.get('verdict') or ''):<10}"
-              f" {counts.get(t, 0)}")
+    print("=" * 82)
+    print("  裸考画像（撤掉知识图谱后的真实水平 · 摸底基线 vs 最新水平）")
+    print("=" * 82)
+    print(f"  {'题':30} {'摸底':>6} → {'最新':>6}  {'Δ':>7}  {'最新等级':<6} 考核次数")
+    print("  " + "-" * 78)
+    for t in sorted(split, key=lambda k: (split[k]["baseline"], k)):
+        r = split[t]
+        d = r["delta_pp"]
+        dmark = "—" if d == 0 else (f"+{d}pp" if d > 0 else f"{d}pp")
+        print(f"  {t:30} {r['baseline'] * 100:>5.0f}% → {r['latest'] * 100:>5.0f}%  "
+              f"{dmark:>7}  {r['latest_level']:<6} {r['exams']}")
     missing = unplaced()
     if missing:
         print(f"  （还没裸考过：{', '.join(missing)}）")
-    cov = [float(p["coverage"]) for p in prof.values()]
-    print("  " + "-" * 70)
-    print(f"  平均 {sum(cov) / len(cov) * 100:.0f}%   最低 {min(cov) * 100:.0f}%   "
-          f"最高 {max(cov) * 100:.0f}%   "
-          f"（掌握 ≥80% 的 {sum(1 for c in cov if c >= MASTERED_LIMIT)} 道）")
+    base = [r["baseline"] for r in split.values()]
+    late = [r["latest"] for r in split.values()]
+    print("  " + "-" * 78)
+    print(f"  摸底均值 {sum(base) / len(base) * 100:.0f}%  →  "
+          f"最新均值 {sum(late) / len(late) * 100:.0f}%   "
+          f"（Δ {(sum(late) / len(late) - sum(base) / len(base)) * 100:+.0f} 个百分点）")
+    print(f"  摸底掌握 ≥80% 的 {sum(1 for c in base if c >= MASTERED_LIMIT)} 道 → "
+          f"现在 {sum(1 for c in late if c >= MASTERED_LIMIT)} 道")
+    print("  注：「最新」用的是每题最后一次考核。练后重考 100% 会把摸底顶掉，")
+    print("      所以必须两列一起看 —— 只有最新那一列就没有学习曲线了。")
 
 
 def _skills_count() -> int:

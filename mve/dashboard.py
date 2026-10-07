@@ -513,7 +513,8 @@ function examCard(s){
       <span class="hint">练习给图谱 / 考核撤图谱 —— 按题分行，不首尾相连</span></div>
     <div class="kpis">
       <div class="kpi"><div class="label">摸底均值</div><div class="value">${e.avg_baseline}%</div></div>
-      <div class="kpi"><div class="label">已掌握（≥80%）</div><div class="value">${e.mastered}</div></div>
+      <div class="kpi"><div class="label">最新均值</div><div class="value">${e.avg_latest}%</div></div>
+      <div class="kpi"><div class="label">掌握 ≥80%（摸底→现在）</div><div class="value">${e.mastered} → ${e.mastered_now}</div></div>
       <div class="kpi"><div class="label">重考过 / 涨了</div><div class="value">${e.retested} / ${e.rose}</div></div>
       <div class="kpi"><div class="label">平均涨幅</div><div class="value">${e.avg_delta_pp===null?'—':(e.avg_delta_pp>0?'+':'')+e.avg_delta_pp+'pp'}</div></div>
     </div>

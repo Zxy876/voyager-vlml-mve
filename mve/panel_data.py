@@ -155,6 +155,12 @@ def _exam_view() -> dict[str, Any]:
                        "kind": str(r.get("kind") or "")}
                       for c, r in zip(rest, seq[1:])],
             "delta_pp": round((rest[-1] - base) * 100) if rest else None,
+            # 最新水平单独给一列：`profile()` 只留最后一次记录，练后重考 100%
+            # 会把摸底顶掉。只有 baseline 那列会让人以为"练了个寂寞"，
+            # 只有 latest 那列会让人以为"本来就会" —— 两列必须一起给。
+            "latest": rest[-1] if rest else base,
+            "latest_pct": _pct(rest[-1] if rest else base),
+            "latest_level": exam.level_of(rest[-1] if rest else base),
             # 练了裸考也不涨 → 已毕业让位（伴学没有这条，MVE 自有）
             "exhausted": bool(exam.exhausted(t)),
         })
@@ -162,16 +168,21 @@ def _exam_view() -> dict[str, Any]:
 
     deltas = [x["delta_pp"] for x in tracks if x["delta_pp"] is not None]
     covs = [float(x["baseline"]) for x in tracks]
+    lates = [float(x["latest"]) for x in tracks]
     transfer = [r for r in rows if str(r.get("kind") or "") == "transfer"]
     tseq = [float(r.get("coverage") or 0.0) for r in transfer]
     return {
         "has_data": True,
         "tracks": tracks,
         "avg_baseline": round(sum(covs) / len(covs) * 100) if covs else 0,
+        "avg_latest": round(sum(lates) / len(lates) * 100) if lates else 0,
+        "avg_delta_pp_all": (round((sum(lates) / len(lates) - sum(covs) / len(covs)) * 100)
+                             if covs else 0),
         "retested": len(deltas),
         "rose": sum(1 for d in deltas if d > 0),
         "avg_delta_pp": round(sum(deltas) / len(deltas)) if deltas else None,
         "mastered": sum(1 for c in covs if c >= 0.80),
+        "mastered_now": sum(1 for c in lates if c >= 0.80),
         # 迁移对照：没练过的题涨不涨 —— 分辨「记住了这道题」和「真学会了」
         "transfer": {
             "count": len(tseq),
@@ -396,15 +407,52 @@ def build_state() -> dict[str, Any]:
 
     hallucination_total = sum(s["hallucination_count"] for s in series)
 
-    # ---- 判读：覆盖率轨迹（可信）vs mastery 轨迹（不可信）----
+    # ---- 判读：**撤支架考核优先** ----
+    #
+    # 这一段原来只看 run_log 的覆盖率轨迹，判出来的话是错的 —— 实测：
+    # 服务器跑完 7 题摸底（平均 19%）+ 8 次练后重考（全 100%），
+    # 导出的「判读」写的是「首轮即满分：这个任务对模型太简单，测不出学习曲线」。
+    # 依据的那 8 个 100% 全是**带着知识图谱**练出来的（实测给着图谱首轮就满分），
+    # 量的是支架的高度，不是模型的水平。真实情况是 19% → 100%，涨了 81pp。
+    #
+    # 所以判读顺序改成：有撤支架考核数据就以它为准，run_log 那条降级为附注。
     cov = [s["coverage"] for s in series if s["coverage"] is not None]
     mas = [s["mastery"] for s in series if s["mastery"] is not None]
+    exam_curve = _exam_view()
 
-    first_full = cov[0] >= 1.0 if cov else False
-    if len(cov) >= 2:
+    if exam_curve.get("has_data") and exam_curve.get("retested"):
+        b = exam_curve["avg_baseline"]
+        l = exam_curve["avg_latest"]
+        n = exam_curve["retested"]
+        up = exam_curve["rose"]
+        d = exam_curve["avg_delta_pp"] or 0
+        # 「+84pp」里的加号会被 export_md 的 escape_markdown 转义成 "\+84pp"，
+        # 用「涨/退」两个字代替符号。
+        word = "涨" if d > 0 else "退"
+        if d > 0:
+            reading = "learned"
+            reading_text = (
+                f"撤支架考核：摸底 {b}% → 练后重考 {l}%（{n} 道重考里 {up} 道涨，"
+                f"平均{word} {abs(d)}pp）—— 真实水平上升了。"
+            )
+        elif d < 0:
+            reading = "regressed"
+            reading_text = (f"撤支架考核：摸底 {b}% → 练后重考 {l}%（平均 {word} {abs(d)}pp）"
+                            f"—— 反而退步，检查技能库是否引入了错误经验。")
+        else:
+            reading = "flat"
+            reading_text = (f"撤支架考核：摸底 {b}% → 练后重考 {l}%（持平）—— "
+                            f"练了没涨，学习未发生或任务已饱和。")
+    elif exam_curve.get("has_data"):
+        reading = "insufficient"
+        reading_text = (f"已摸底 {exam_curve['avg_baseline']}%（{len(exam_curve['tracks'])} 道），"
+                        f"还没重考过 —— 跑「学习单元」后才有 Δ。")
+    elif len(cov) >= 2:
+        first_full = cov[0] >= 1.0
         if first_full:
             reading = "too_easy"
-            reading_text = "首轮即满分：这个任务对模型太简单，测不出学习曲线。"
+            reading_text = ("练习首轮即满分：注意这是**带着知识图谱**跑的，量的是支架不是水平。"
+                            "要判学没学会，得跑摸底 + 练后重考（撤支架考核）。")
         elif cov[-1] > cov[0]:
             reading = "learned"
             reading_text = f"覆盖率 {cov[0]:.0%} → {cov[-1]:.0%}：补齐缺失后做得更全了。"
@@ -479,7 +527,8 @@ def build_state() -> dict[str, Any]:
             else f"掌握度 {_pct(last['mastery'])}"
         ),
         # 真实水平曲线（撤支架考核）—— 学习曲线该看的那一列
-        "exam_curve": _exam_view(),
+        # （上面判读已经算过一次，这里复用，别再读一遍 exam_log）
+        "exam_curve": exam_curve,
     }
 
 
