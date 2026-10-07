@@ -51,7 +51,13 @@ def current_mastery(baseline: float, half_life: float, elapsed_sessions: float) 
         raise ValueError("invalid half life")
     if not math.isfinite(elapsed_sessions) or elapsed_sessions < 0:
         raise ValueError("invalid elapsed sessions")
-    value = baseline * math.exp2(-elapsed_sessions / half_life)
+    # 用 `2.0 ** x` 而不是 `math.exp2`：后者是 Python 3.11 才加的，
+    # 在 3.10 的解释器上直接 AttributeError。而 AttributeError 不在
+    # 调用方 (`ValueError, TypeError`) 的捕获范围内 —— 实测每一轮都在
+    # apply_attempt 处抛出并保持度**从未更新过**（日志里那句
+    # 「保持度未更新：module 'math' has no attribute 'exp2'」）。
+    # 同 mastery_model._decay 的修法保持一致。
+    value = baseline * 2.0 ** (-elapsed_sessions / half_life)
     return 0.0 if value < ZERO_THRESHOLD else value
 
 

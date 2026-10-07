@@ -820,6 +820,9 @@ class LLMVoyager:
         # 空串 = 未指定 → 按 full 处理（保持旧行为，不回退）
         self.hint_level = str(hint_level or "")
         self.failed_dims: list[str] = []   # 照 fork glm_curator._context()：失败维度喂给下一题
+        # 点名的**评分点**（比维度更细）：同一维度可能挂多个评分点，
+        # 只说维度名模型会以为自己已经交过。
+        self.failed_points: list[str] = []
         self.last_critique = ""
         self.errors: list[str] = []        # 工具执行/计划解析的错误，必须上面板
 
@@ -986,7 +989,15 @@ class LLMVoyager:
         """
         calls = self.last_round.get("calls") or []
         errs = self.last_round.get("errors") or []
-        crit = (self.last_round.get("critique") or "").strip()
+        # Critique 必须取**当前**的 self.last_critique，不能取 last_round 里的快照：
+        # last_round 是上一轮 run() 末尾拍下的，那一刻 learn() 还没跑，critique
+        # 恒为空字符串 —— 于是 `_render_observation` 每次都渲染成 "None"。
+        # 实测取证（MVE_DEBUG_PROMPT=1 落盘的 prompt）：
+        #   「上一轮你的自我反思 Critique：None」
+        # 这正是 fb_conversion_analysis 连跑 23 轮停在 80%、Haven 图首血转换率
+        # 一次都没取到的直接原因 —— 配方写进反馈了，但从未进过下一轮的眼睛。
+        crit = (getattr(self, "last_critique", "") or "").strip() \
+            or (self.last_round.get("critique") or "").strip()
 
         if calls:
             call_lines = []
@@ -1008,6 +1019,13 @@ class LLMVoyager:
             + (crit if crit else "None"),
             "上一轮裁判判定的缺口维度："
             + ("、".join(self.failed_dims) if self.failed_dims else "None"),
+            # 维度名不够 —— map_fb_conv 在本题挂着 Corrode 与 Haven 两个评分点，
+            # 只说"缺 map_fb_conv"，模型会以为自己已经交过（它确实交了 Corrode）。
+            # 必须**点名评分点**，并说明每个都要单独一条查询。
+            "上一轮没覆盖到的评分点（每一个都要单独出一条查询，"
+            "不要把两条并成一条）："
+            + ("、".join(self.failed_points) if getattr(self, "failed_points", None)
+               else "None"),
             # 光说"你错了"没用，要说"你有什么可用"—— 否则它只能再猜一次
             "上一轮写错的表，实际可用的列："
             + ("；".join(self.last_round.get("schema_hints") or [])[:900]
@@ -1032,20 +1050,10 @@ class LLMVoyager:
                   "直接填数会被溯源校验拦下。）")
         return "\n".join(lines)
 
-    def _feedback_block(self) -> str:
-        """打分回传：把上一轮裁判判定的缺口维度写进本轮 prompt。
-
-        照 fork glm_curator.py:238-241 —— _context() 里那行
-        "已失败任务（缺口类型）：{task_id:classification}"。
-        Voyager 只看得到"哪个维度没拿到"，看不到裁判的具体数值（否则等于给答案）。
-        """
-        if not self.failed_dims:
-            return ""
-        return (
-            "【上一轮裁判判定的缺口】这些维度你没取到事实，本轮必须补上："
-            + "、".join(self.failed_dims)
-            + "\n（具体数值不会告知，你自己查。）"
-        )
+    # 注：这里原本有个 `_feedback_block()`，但从未被任何地方调用 ——
+    # "打分回传"实际上由 `_render_observation` 里的两行承担
+    # （「上一轮裁判判定的缺口维度」+「上一轮没覆盖到的评分点」）。
+    # 死代码比没有代码更危险：看起来反馈链路是通的，其实没接。已删。
 
     # ---- 计划 ----
     def _memory_block(self, task: Any) -> str:
@@ -1190,7 +1198,7 @@ class LLMVoyager:
                     return msg
         return ""
 
-    def _plan(self, task: Any, retries: int = 3) -> dict[str, Any]:
+    def _plan(self, task: Any, retries: int = 3, call_limit: int = 3) -> dict[str, Any]:
         mem = self._memory_block(task)
         # 知识图谱子图 —— 原版 render_system_message 拼 control_primitives 的位置。
         # 放在工具目录之后：先知道"有哪些工具"，再知道"这个指标怎么用它们算"。
@@ -1234,6 +1242,8 @@ VLML 的 10 个报告工具已经封装好指标口径。能用报告工具拿�
 你过去积累的经验（只列出与本题最相关的几条）：
 {mem}
 {self._render_observation()}
+【本轮调用条数】必须出满 {call_limit} 条 —— 每个评分点一条查询。
+少一条就有一个评分点永远拿不到事实（执行层只跑前 {call_limit} 条，多出的会被丢弃）。
 {PLAN_SCHEMA}"""
 
         # 调试取证：MVE_DEBUG_PROMPT=1 时把完整 prompt 落到 /tmp。
@@ -1283,7 +1293,7 @@ VLML 的 10 个报告工具已经封装好指标口径。能用报告工具拿�
         calls = last_plan.get("calls")
         if isinstance(calls, list):
             kept = [
-                c for c in calls[:3]
+                c for c in calls[:call_limit]
                 if isinstance(c, dict) and str(c.get("tool", "")) in TOOL_REGISTRY
             ]
             if kept:
@@ -1291,7 +1301,7 @@ VLML 的 10 个报告工具已经封装好指标口径。能用报告工具拿�
                 _apply_auto_fixes(last_plan, task, self.errors)
                 self.errors.append(
                     f"计划校验重试 {retries} 次未收敛，已降级放行 "
-                    f"{len(kept)} 个有效调用（丢弃 {len(calls[:3]) - len(kept)} 个）：{last_err}"[:220]
+                    f"{len(kept)} 个有效调用（丢弃 {len(calls[:call_limit]) - len(kept)} 个）：{last_err}"[:220]
                 )
                 self.last_thought = str(last_plan.get("thought", ""))
                 return last_plan
@@ -1378,9 +1388,25 @@ VLML 的 10 个报告工具已经封装好指标口径。能用报告工具拿�
             f"工具名不是表名，不能写在 FROM 后面。可用的表只有：{', '.join(names)}"
         )
 
-    async def _execute(self, plan: dict[str, Any]) -> list[dict[str, Any]]:
+    def _call_limit(self, task: Any) -> int:
+        """本轮最多跑几条调用 —— 必须由**评分点数**决定，不能写死。
+
+        写死 3 的直接后果（实测取证，88 轮日志）：
+            map_rounds_split      5 个评分点 → 最多覆盖 3 个 → 长期 60%
+            fb_conversion_analysis 4 个评分点 → 最多覆盖 3 个 → 长期 80%
+        而工具路径的题一次调用能带回多个维度，3 条够用 → 全 100%。
+        于是"SQL 类的题一直学不会"根本不是模型学不会，是**执行层截断了** ——
+        反馈写得再准也没用，第四条查询根本没机会发出去。
+
+        上限 8 只是防爆（一次跑几十条 SQL 会拖垮裁判），不是能力上限。
+        """
+        n = len(getattr(task, "rubric", None) or [])
+        return max(3, min(8, n)) if n else 3
+
+    async def _execute(self, plan: dict[str, Any],
+                       limit: int = 3) -> list[dict[str, Any]]:
         obs: list[dict[str, Any]] = []
-        for call in (plan.get("calls") or [])[:3]:
+        for call in (plan.get("calls") or [])[:limit]:
             tool = str(call.get("tool", ""))
             args = dict(call.get("args") or {})
             fn = TOOL_REGISTRY.get(tool)
@@ -1824,13 +1850,17 @@ VLML 的 10 个报告工具已经封装好指标口径。能用报告工具拿�
         # 缺口记在 run_log（持久化），不记在技能库 —— 技能库只放被裁判认可的做法。
         if not self.failed_dims:
             dim_by_point = {p.point: p.dimension for p in task.rubric}
+            last_missing = [str(m) for m in
+                            run_log.last_missing(getattr(task, "topic_id", ""))]
             self.failed_dims = sorted({
                 dim_by_point.get(m.split("(")[0].strip(), m)
-                for m in run_log.last_missing(getattr(task, "topic_id", ""))
+                for m in last_missing
             })
+            # 评分点级一起恢复：跨运行时维度级恢复不了"这个维度下哪条没交"
+            self.failed_points = sorted(set(last_missing))
 
-        plan = self._plan(task)
-        obs = await self._execute(plan)
+        plan = self._plan(task, call_limit=self._call_limit(task))
+        obs = await self._execute(plan, limit=self._call_limit(task))
         ok_obs = [o for o in obs if o.get("result") is not None]
 
         # 照 critic.py:39-42 —— onError 直接判失败。
@@ -1905,6 +1935,9 @@ VLML 的 10 个报告工具已经封装好指标口径。能用报告工具拿�
             covered=covered, missing=missing,
             rejected_low_base=list(rejected_low_base or []),
             dim_by_point=dim_by_point,
+            # subject 让 SQL 路径维度的反馈能说清「WHERE 必须带 map=Haven」
+            subj_by_point={str(p.point): dict(p.subject or {})
+                           for p in (task.rubric if task else [])},
             ref_plan=ref_plan, my_plan=my_plan,
             confidence=float(confidence or 0.0),
         )
@@ -1930,6 +1963,10 @@ VLML 的 10 个报告工具已经封装好指标口径。能用报告工具拿�
             )
             self._log_skill(action, key)
             self.failed_dims = [d for d in getattr(self, "failed_dims", []) if d not in miss_dims]
+            # 全覆盖了：缺口清空（与 failed_dims 同一套语义）。
+            # 注意不能写成 `[p for p in ... if p not in miss_pts]` —— 这条分支里
+            # missing 恒为空，那个过滤会把旧缺口**全留下**，下一轮继续报缺。
+            self.failed_points = []
             self._sync_memory()
             # 技能有效 → 记一笔，检索时会加权；无效技能会自然沉底
             skill_store.mark_result(self._injected_keys, True)
@@ -1956,6 +1993,9 @@ VLML 的 10 个报告工具已经封装好指标口径。能用报告工具拿�
 
         # 照 fork：失败要留下"缺口类型"，供下一题的 curriculum 读取
         self.failed_dims = sorted(set(getattr(self, "failed_dims", [])) | set(miss_dims))
+        # 评分点级：维度级只能说"哪个维度缺"，说不出"这个维度下哪一条没交"。
+        self.failed_points = sorted(
+            set(getattr(self, "failed_points", [])) | {str(m) for m in missing})
         self._sync_memory()
 
         # 错误假设单独留一条给因果时间线：维度级的 failed_dims 只能说"哪个维度缺"，

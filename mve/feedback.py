@@ -222,8 +222,55 @@ def reset_graph() -> None:
 # --------------------------------------------------------------------------
 # error_type → next_action（本模块的核心表：每条都要能直接执行）
 # --------------------------------------------------------------------------
+def _sql_recipe(dim: str, subject: dict[str, Any] | None = None) -> str:
+    """SQL 路径维度的「该查什么」—— 图谱里存着，反馈却一直没给出去。
+
+    **这是「跑再多轮也学不会」的根因**：
+    `map_fb_conv`（Haven 图首血转换率）23 轮一次都没取到、
+    `map_win_rate`（图上胜率）43 轮只取到 5 次。这两条都是 **SQL 路径**
+    维度 —— 图谱 `who_produces` 为空，于是反馈里 `producers=[]`，
+    模型每轮拿到的都是同一句「先确认哪个工具能出它，再补调」，
+    **一句可执行的信息都没有**，所以第 43 轮和第 1 轮拿到的一样多。
+
+    而图谱里其实存着完整的教学信息（`knowledge_graph.py:1258-1289`）：
+    `tables` / `columns_by_table` / `semantics` / `typical_errors` ——
+    事前渲染进了图谱提示，事后反馈一个字没用。这里补上。
+
+    给的是**结构不是答案**（跟 `action_code` 那条路同一个边界）：
+    表名、列名、易错点、口径形态；不含任何数值。
+    """
+    g = graph()
+    if g is None:
+        return ""
+    node = g.nodes.get(f"dim:{dim}")
+    det = dict(node.detail) if node else {}
+    tables = [str(t) for t in (det.get("tables") or []) if str(t)]
+    if not tables:
+        return ""
+    cols_map = det.get("columns_by_table") or {}
+    cols = [str(c) for c in (det.get("columns") or [])]
+    parts = [f"{dim} 是 **SQL 口径**（没有工具直接出它，得自己写 SQL）"]
+    for t in tables[:2]:
+        cs = [str(c) for c in (cols_map.get(t) or cols)]
+        parts.append(f"表 `{t}`" + (f"，相关列 {'、'.join(cs[:8])}" if cs else ""))
+    errs = [str(e) for e in (det.get("typical_errors") or [])][:2]
+    if errs:
+        parts.append("易错点：" + "；".join(errs))
+    if isinstance(subject, dict) and subject:
+        # subject 的每个键都必须在 WHERE 里出现 —— 这正是「漏查某张图」的解药
+        keys = "、".join(f"{k}={v}" for k, v in subject.items() if v not in (None, ""))
+        if keys:
+            parts.append(f"这个评分点的范围是 {{{keys}}} —— WHERE 必须逐个带上，"
+                         "不能只查整体再往下推算")
+    sem = str(det.get("semantics") or "")
+    if sem:
+        parts.append(f"口径形态：{sem}")
+    return "；".join(parts) + "。"
+
+
 def _next_action(item: MissingItem, *, ref_plan: list[str] | None = None,
-                 my_tools: list[str] | None = None) -> str:
+                 my_tools: list[str] | None = None,
+                 subject: dict[str, Any] | None = None) -> str:
     dim = item.dimension or item.point
     plan = " → ".join(ref_plan or [])
     tools = "、".join(my_tools or []) or "（没调任何工具）"
@@ -266,6 +313,11 @@ def _next_action(item: MissingItem, *, ref_plan: list[str] | None = None,
                             f"产出**（知识图谱声明），补调它。")
             except Exception:
                 pass
+        # 图谱说不出生产者 = 这是 SQL 路径维度。以前走到这里只给一句
+        # 「先确认哪个工具能出它」—— 对 SQL 维度是句空话，实测 43 轮没变过。
+        recipe = _sql_recipe(dim, subject)
+        if recipe:
+            return recipe
         tail = f"裁判的标准编排是 {plan}。" if plan else ""
         return f"{dim} 没有任何事实，连 null 都没交 —— 先确认哪个工具能出它，再补调。{tail}"
 
@@ -355,8 +407,14 @@ def build_feedback(
     ref_plan: list[str] | None = None,
     my_plan: list[str] | None = None,
     confidence: float = 0.0,
+    subj_by_point: dict[str, dict[str, Any]] | None = None,
 ) -> Feedback:
-    """从判定结果组装一包反馈。纯函数：同样的输入永远给同样的输出。"""
+    """从判定结果组装一包反馈。纯函数：同样的输入永远给同样的输出。
+
+    `subj_by_point`：评分点 → subject。SQL 路径维度漏掉时，要靠它说清
+    「WHERE 必须带上 map=Haven 这种过滤」—— 没有它反馈就是空话。
+    """
+    subj_by_point = subj_by_point or {}
     covered = [str(c) for c in (covered or [])]
     missing_raw = [str(m) for m in (missing or [])]
     dim_by_point = dim_by_point or {}
@@ -409,7 +467,8 @@ def build_feedback(
     # next_action：按严重度排，最多给两条（给多了等于没给）
     tops = ranked[:2]
     fb.next_action = " ".join(
-        _next_action(i, ref_plan=ref_plan, my_tools=my_plan) for i in tops
+        _next_action(i, ref_plan=ref_plan, my_tools=my_plan,
+                     subject=subj_by_point.get(i.point)) for i in tops
     )
 
     # misconceptions：把"我以为这样编排就能覆盖"这个错误假设挑明

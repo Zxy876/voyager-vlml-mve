@@ -155,11 +155,14 @@ dimension 要能看出方向：写 max_losing_streak（最长连败）这种，
 不要编造数据里没有的数字。"""
 
 
-async def _execute(calls: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+async def _execute(calls: list[dict[str, Any]],
+                   limit: int = 8) -> tuple[list[dict[str, Any]], list[str], list[str]]:
+    # limit 不能写死 3（与 voyager._execute 同一个坑）：评分点多于 3 个时，
+    # 第 4 条之后的调用会被静默丢弃，讲解就少一块。
     obs: list[dict[str, Any]] = []
     traj: list[str] = []
     errors: list[str] = []
-    for call in (calls or [])[:3]:
+    for call in (calls or [])[:limit]:
         tool = str(call.get("tool", ""))
         args = dict(call.get("args") or {})
         fn = TOOL_REGISTRY.get(tool)

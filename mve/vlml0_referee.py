@@ -165,10 +165,13 @@ def _extract_prompt(task: Any, obs: list[dict[str, Any]]) -> str:
 只输出 JSON：{{"facts":[...], "narrative":"一句话结论"}}"""
 
 
-async def _execute(calls: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+async def _execute(calls: list[dict[str, Any]],
+                   limit: int = 3) -> tuple[list[dict[str, Any]], list[str]]:
+    """跑调用。limit 必须由**评分点数**决定 —— 写死 3 会让多于 3 个评分点的题
+    永远凑不齐标准答案（与 voyager._execute 同一个坑）。"""
     obs: list[dict[str, Any]] = []
     traj: list[str] = []
-    for call in (calls or [])[:3]:
+    for call in (calls or [])[:limit]:
         tool = str(call.get("tool", ""))
         args = dict(call.get("args") or {})
         fn = TOOL_REGISTRY.get(tool)
@@ -314,7 +317,8 @@ async def answer(task: Any, *, force: bool = False) -> RefereeAnswer:
         {"role": "system", "content": "你是原版 VLML 分析引擎。你只取数，不做主观推断。"},
         {"role": "user", "content": _plan_prompt(sub)},
     ])
-    obs, traj = await _execute(plan.get("calls") or [])
+    obs, traj = await _execute(plan.get("calls") or [],
+                               limit=max(3, min(8, len(task.rubric or []))))
 
     llm_facts: list[dict[str, Any]] = []
     narrative = ""
