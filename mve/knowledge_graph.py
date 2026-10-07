@@ -756,7 +756,7 @@ class KnowledgeGraph:
         g = cls()
         if not path.exists():
             return g
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8", errors="replace"))
         # 过期守卫：图谱是 `build()` 的**落盘缓存**。加了一道新题却不重建，
         # 图谱里就永远没有那个维度 —— 实测 `kast_adr_check` 就是这样：
         # 图谱里没有 kast_pct / kd_ratio，提示整段为空，模型连着三轮在错分支
@@ -896,7 +896,7 @@ def _known_tables() -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
     if DATA_DICT.exists():
         try:
-            rows = json.loads(DATA_DICT.read_text(encoding="utf-8"))
+            rows = json.loads(DATA_DICT.read_text(encoding="utf-8", errors="replace"))
         except (json.JSONDecodeError, OSError):
             rows = []
         for row in rows if isinstance(rows, list) else []:
@@ -921,7 +921,11 @@ def _known_tables() -> dict[str, dict[str, Any]]:
             parsed: dict[str, list[str]] = {}
             try:
                 if sub == "schema":
-                    parsed = _create_table_columns(path.read_text(encoding="utf-8"))
+                    # 实测服务器上的 schema/*.sql 有一个是 GBK（0xa3 开头，
+                    # 中文注释），本地副本恰好全是 UTF-8 所以一直没暴露。
+                    # 列名全是 ASCII，坏字节换掉不影响解析结果。
+                    parsed = _create_table_columns(
+                        path.read_text(encoding="utf-8", errors="replace"))
             except OSError:
                 parsed = {}
             cols = parsed.get(name) or []

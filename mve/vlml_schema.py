@@ -174,7 +174,7 @@ def discover_lineage(known: set[str]) -> dict[str, list[str]]:
         return out
     for path in sorted(TRANSFORM_DIR.glob("*.sql")):
         target = re.sub(r"^\d+_", "", path.stem)
-        text = path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8", errors="replace")
         ups = {m.lower() for m in _RE_FROM.findall(text)}
         ups = {u for u in ups if u in known and u != target
                and u not in _FAKE_TABLES}
@@ -192,7 +192,7 @@ def discover_insights(known: set[str]) -> dict[str, dict[str, Any]]:
     owner = _sql_owner()
     for path in sorted(SQL_DIR.glob("*.sql")):
         name = path.stem
-        text = path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8", errors="replace")
         tbls = {m.lower() for m in _RE_FROM.findall(text)}
         tbls = {t for t in tbls if t in known and t not in _FAKE_TABLES}
         reports = sorted(owner.get(name) or [])
@@ -213,7 +213,7 @@ def _readme_purpose() -> dict[str, str]:
     readme = SQL_DIR / "README.md"
     if not readme.exists():
         return out
-    for line in readme.read_text(encoding="utf-8").splitlines():
+    for line in readme.read_text(encoding="utf-8", errors="replace").splitlines():
         m = re.match(r"\|\s*`([a-z0-9_]+)\.sql`\s*\|\s*`([^`]+)`\s*\|\s*([^|]+)\|", line)
         if m:
             out[m.group(1)] = m.group(3).strip()
@@ -232,7 +232,7 @@ def _sql_owner() -> dict[str, set[str]]:
     for path in list(REPORTS_DIR.glob("*.py")):
         report = module_to_report.get(path.name, "")
         for m in re.finditer(r'load_sql\(\s*"([a-z0-9_]+\.sql)"',
-                             path.read_text(encoding="utf-8")):
+                             path.read_text(encoding="utf-8", errors="replace")):
             out.setdefault(Path(m.group(1)).stem, set())
             if report:
                 out[Path(m.group(1)).stem].add(report)
@@ -255,7 +255,7 @@ def discover_tools() -> dict[str, dict[str, Any]]:
     # 关键信息就出不来。
     out: dict[str, dict[str, Any]] = {}
     for path in sorted(REPORTS_DIR.glob("*.py")):
-        text = path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8", errors="replace")
         for m in re.finditer(r"async def ([a-z0-9_]+)\(", text):
             func = m.group(1)
             if not func.endswith("_report"):
@@ -362,7 +362,7 @@ def section_insights() -> dict[str, dict[str, list[str]]]:
     graph: dict[str, dict[str, list[str]]] = {}
     texts: dict[str, str] = {}
     for path in sorted(REPORTS_DIR.glob("*.py")):
-        text = path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8", errors="replace")
         texts[path.name] = text
         for fn, node in _func_graph(text).items():
             slot = graph.setdefault(fn, {"sqls": [], "calls": []})
@@ -452,7 +452,7 @@ MODEL_FILES = (
 
 def _read(path: Path) -> str:
     try:
-        return path.read_text(encoding="utf-8")
+        return path.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return ""
 
@@ -633,6 +633,13 @@ def _layer_of(name: str, core: dict[str, dict[str, Any]],
     return "agg"
 
 
+def _rel(p: Path) -> str:
+    try:
+        return str(p.relative_to(VLML_ROOT))
+    except Exception:            # 路径不在 VLML 根下（比如被重定向过）就用绝对路径
+        return str(p)
+
+
 def model_specs() -> dict[str, Any]:
     """把四份建模文档解析成每张表的结构化声明。
 
@@ -723,7 +730,7 @@ def model_specs() -> dict[str, Any]:
     return {
         "tables": tables,
         "fingerprint": h.hexdigest()[:16],
-        "files": [str(p.relative_to(VLML_ROOT)) for p in MODEL_FILES],
+        "files": [_rel(p) for p in MODEL_FILES],
     }
 
 
