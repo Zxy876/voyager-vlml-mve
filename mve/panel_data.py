@@ -331,7 +331,17 @@ def build_state() -> dict[str, Any]:
             "skills": memory,
             "skill_stats": skill_stats,
             "skill_detail": skill_detail,
-            "hint": "还没有任何运行记录。先跑：python mve/run_mve.py --llm",
+            # 摸底/考核走的是 exam_log.jsonl，**不写** run_log.jsonl（有意分开：
+            # run_log 是带图谱的练习覆盖率，恒 100%，画出来是假平线）。
+            # 所以"run_log 为空"≠"没有任何数据" —— 摸底跑完了一样要给看。
+            # 漏掉这一条的实测后果：线上摸底跑完 7 道题，总览页仍显示
+            # 「还没有任何运行记录」，真实水平曲线根本不出现。
+            "exam_curve": _exam_view(),
+            # 导航上的「轨迹 N 轮」读它；不给就是 "undefined 轮"
+            "total_rounds": 0,
+            "topic_id": "",
+            "hint": ("还没有练习记录。摸底/考核不入 run_log（走 exam_log）——"
+                     "有裸考数据时下面会照常显示。"),
         }
 
     # ---- 全局进度序列（跨运行连续编号）----

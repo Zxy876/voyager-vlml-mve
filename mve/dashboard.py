@@ -526,10 +526,21 @@ function examCard(s){
 }
 
 function pOverview(s){
-  if(!s.has_data) return `<div class="panel"><div class="empty">${ESC(s.hint||'暂无运行记录')}</div>
-    <div class="note info">面板只读 run_log.jsonl，不会自己造数据。
+  // 空态分两种，不能混：run_log 为空 ≠ 没有任何数据。
+  // 摸底/考核走 exam_log.jsonl（有意不入 run_log），跑完了照样要给看 ——
+  // 否则就会出现"摸底明明跑完了，总览页却说还没有任何运行记录"。
+  if(!s.has_data){
+    const ex=s.exam_curve||{};
+    if(!ex.has_data) return `<div class="panel"><div class="empty">${ESC(s.hint||'暂无运行记录')}</div>
+    <div class="note info">面板只读 run_log.jsonl（练习），摸底/考核走 exam_log.jsonl。
       点顶部「▶ 启动 Voyager」，或先在命令行跑一次 <span class="mono">python mve/run_mve.py --llm</span>。</div></div>
     ${envCard(s)}`;
+    return `<div class="note info"><b>练习记录（run_log）为空</b> —— 这是正常的：
+      摸底不入 run_log。真实水平曲线在下面；下一步点「跑学习单元」，
+      练习曲线和重考曲线就会一起长出来。</div>
+    ${examCard(s)}
+    ${envCard(s)}`;
+  }
   const cov=s.series.filter(p=>p.coverage!==null).map(p=>({x:p.i,y:p.coverage,label:(p.coverage*100).toFixed(0)+'%'}));
   const mas=s.series.filter(p=>p.mastery!==null).map(p=>({x:p.i,y:p.mastery,label:p.mastery_pct}));
   const last=s.series[s.series.length-1];
