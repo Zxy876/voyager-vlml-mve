@@ -157,6 +157,9 @@ def _dim_specs() -> dict[str, dict[str, Any]]:
                 "example": "SQL 里自己算好百分比，另取一列作样本量",
                 "by_tool": bool(irec.get("tool")) and not bool(irec.get("sql")),
                 "by_sql": bool(irec.get("sql")),
+                # 人导入的维度没有 dim 节点，desc 不会从节点来 —— 这里直接用
+                # 人的原话，`_relevant` 才有得比对（见 `_human_desc` 的注释）
+                "desc": _human_desc(str(irec.get("question") or "")),
                 "origin": "human_import",
             }
     except Exception:                                        # pragma: no cover
@@ -167,7 +170,10 @@ def _dim_specs() -> dict[str, dict[str, Any]]:
             n = g.nodes.get(f"dim:{d}")
             pt = str((n.detail.get("point") if n else "") or "")
         # 只取括号前的主名：「手枪局胜率（0-100 的百分比数值，如 50.0）」→ 手枪局胜率
-        rec["desc"] = (pt.split("（")[0].split("(")[0].strip() or d)
+        # `or rec.get("desc")` —— 人导入的维度没有节点，desc 已经在上面用人的
+        # 原话填好了，这里不能把它退回英文原名（会把验题闸 0b 打回不相关）。
+        rec["desc"] = (rec.get("desc")
+                       or (pt.split("（")[0].split("(")[0].strip() or d))
         # 维度在图谱里的取值路径 —— 用来**按配方反查维度**（见 enforce）
         vp = ""
         if g is not None:
@@ -191,6 +197,27 @@ def _dim_specs() -> dict[str, dict[str, Any]]:
 _STOP = {"这个", "那个", "什么", "多少", "分别", "计算", "一共", "总共", "请问",
          "数据", "指标", "数值", "结果", "情况", "表现", "the", "and", "for",
          "with", "that", "this", "from", "team", "series"}
+
+
+def _human_desc(question: str) -> str:
+    """人导入的维度没有服务端定义 —— 用**人的原话**当它的定义。
+
+    不这么做，验题闸 0b（`_relevant`：题面与维度定义的关键词重合）必然判
+    不相关。实测（服务器 e2e）：维度 `plant_success_rate` 的 desc 退回英文
+    原名，题面是中文「Cloud9 在 Lotus 图上每回合的爆弹成功率」，中英文
+    token 零重合 → 两次生成 **2/2 全被这道闸拦下**，出题一次都没成功。
+
+    括号要**去掉而不是截断**：v1 的老教训 —— 截到括号前会把「成功率」
+    这个词弄丢，剩下的「…爆弹」照样跟题面对不上。
+    """
+    t = str(question or "").strip()
+    t = re.sub(r"[（(][^）)]*[）)]", "", t)          # 去括号及其中内容
+    t = re.sub(r"^(请问|帮我|我想知道|麻烦|请)[，,：:\s]*", "", t)
+    t = re.sub(r"[？?。！!]+$", "", t)
+    t = re.sub(r"(是多少[^，,。？?]{0,6}|是什么[^，,。？?]{0,6}"
+               r"|有多少[^，,。？?]{0,6}|怎么算|如何计算)$", "", t)
+    t = re.sub(r"\s+", " ", t).strip(" ，,、的")
+    return t
 
 
 def _relevant(point: str, desc: str) -> bool:
