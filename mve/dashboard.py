@@ -1012,12 +1012,16 @@ function fillTopics(s){
   // 驾驶舱已经没有「选题」下拉了（选题由练习范围决定），只剩人导入分区的归类下拉
   const sel=document.getElementById('topic');
   if(!sel) return;
-  if(sel.dataset.loaded) return;
+  // dataset.loaded 挡重复填充，但**也挡住了新题**：导入生成一道新题后，
+  // 下拉里永远没有它，直到手动刷新页面。改成「题数变了就重建」——
+  // 平时照旧不闪（4 秒轮询不重填），新题一出现立刻能选。
+  const n=(s.tasks||[]).filter(t=>t.topic_id&&t.topic_id!=='?').length;
+  if(sel.dataset.loaded && String(n)===sel.dataset.taskn) return;
   const keep=sel.value;
   sel.innerHTML='<option value="">自动匹配（按关键词归类）</option>'+
     (s.tasks||[]).filter(t=>t.topic_id&&t.topic_id!=='?').map(t=>
       `<option value="${ESC(t.topic_id)}">${ESC(t.topic_id)} · 难度${t.difficulty}</option>`).join('');
-  sel.value=keep; sel.dataset.loaded='1';
+  sel.value=keep; sel.dataset.loaded='1'; sel.dataset.taskn=String(n);
 }
 
 function importsList(s){
@@ -1221,27 +1225,36 @@ function render(s){
   window.__difficultyOf = id => window.__diff[id];
   renderHero(s);
   renderNav(s);
-  fillTopics(s);
   const stage=document.getElementById('stage');
-  // ---- 人导入分区正在被人使用时，不能整页重建 ----
-  // 轮询每 4 秒 render 一次，stage.innerHTML 一换，textarea 的值、焦点、
-  // 归类提示（#hit）、刚出的解释结果（#result）就全没了 —— 实测症状正是
-  // 「输入总是很快消失，闪回」。两个触发点：
-  //   a) 正在输入（#q 聚焦中）→ 跳过本轮重建
-  //   b) 提交进行中（busy）—— submitImport 里 renderImportResult 刚把结果
-  //      写进 #result，紧接着 await load() 又重建一次，结果被洗掉。
-  // 人点开别处（失焦）后，下一轮轮询照常刷新，数据不会少。
-  const qEl=document.getElementById('q');
-  const holdImport = busy || (qEl && document.activeElement===qEl);
-  if(!(TAB==='import' && holdImport)){
-    // 即便重建，也把已输入的草稿带过去 —— 焦点在别处时轮询照常刷，
-    // 不能因为刷新把人写到一半的问题清掉。
-    const draft = qEl ? qEl.value : null;
+  // ---- 有人在操作表单控件时，不能整页重建 ----
+  // 轮询每 4 秒 render 一次，stage.innerHTML 一换，所有控件的值都会被打回
+  // HTML 里的默认值。实测中招的控件（同一根因，一次修完）：
+  //   learnUnits / learnTransfer —— 永远弹回 4 和 3，选不了别的
+  //   q          —— 打到一半的问题消失（上一轮修的）
+  //   topic      —— 人导入手动指定的归类被清回「自动匹配」
+  //   dbPath     —— 数据库切换的路径输入被清空
+  //   刚出的解释结果（#result）也被洗掉 —— 提交进行中（busy）同样跳过。
+  // 人把焦点挪开（点了页面别处）后，下一轮轮询照常刷新，数据不会少。
+  const af=document.activeElement;
+  const FORM=['SELECT','INPUT','TEXTAREA'];
+  const holdingForm = af && af.tagName && FORM.includes(af.tagName)
+                      && stage.contains(af);
+  if(!(TAB==='import' && busy) && !holdingForm){
+    // 即便重建，也把用户改过的控件值带过去 —— 焦点在按钮上时轮询照常刷，
+    // 不能因为刷新把人刚选的单元数/迁移间隔/草稿重置掉。
+    const vals={}, afId=(af&&af.id&&stage.contains(af))?af.id:null;
+    stage.querySelectorAll('select[id],input[id],textarea[id]')
+      .forEach(el=>{ vals[el.id]=el.value; });
     stage.innerHTML=(PANELS[TAB]||pOverview)(s);
-    if(draft!==null){
-      const nq=document.getElementById('q');
-      if(nq){ nq.value=draft; if(document.activeElement===qEl){ nq.focus(); } }
+    Object.entries(vals).forEach(([id,v])=>{
+      const n=document.getElementById(id);
+      if(n && v) n.value=v;
+    });
+    if(afId){
+      const n=document.getElementById(afId);
+      if(n && n.tagName && FORM.includes(n.tagName)) n.focus();
     }
+    fillTopics(s);          // 重建后 #topic 是新元素，得重新填（在恢复值之后跑，keep 才保得住）
     const il=document.getElementById('implist');
     if(il) il.innerHTML=importsList(s);
 
