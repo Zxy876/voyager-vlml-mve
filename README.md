@@ -681,6 +681,27 @@ python mve/dashboard.py                  # 面板 http://127.0.0.1:8777
 
 **仓库不含**：`vlml/`（数据层，独立 git 仓库）、`voyager-fork/`、`study_companion/`
 （只读参照，不分发）、`mve/.env`、运行日志与状态文件。凭据全走 `os.getenv`，无硬编码。
+`mve/knowledge_graph.json` 也在 `.gitignore` 里 —— 它是 `build()` 的落盘缓存，
+每台机器自己建（三判据指纹守卫会让它在需要时自动重建，见八之五）。
+
+### 同步到服务器（**没有**自动同步）
+
+之前以为服务器会自动拉代码 —— **这是误判**，实测它一直停在旧的 `4562de7`。
+要手动三步，缺哪步都不算同步完：
+
+```bash
+ssh root@43.161.203.50
+cd /root/mve && git pull                       # 1. 拉代码
+.venv/bin/python mve/knowledge_graph.py --build  # 2. 重建图谱（缓存是各机自己的）
+systemctl restart mve-panel                    # 3. 重启面板（旧进程用的是旧代码）
+```
+
+第 2 步不能省：图谱是落盘缓存且被 gitignore，`git pull` 带不过去；
+不过就算省了，`load()` 的三判据守卫也会在下次访问时自动重建（只是那一刻慢一点）。
+
+**坑**：服务器上 `vlml/database/schema/*.sql` 有一个是 **GBK**（0xa3 开头，中文注释），
+本机副本恰好全是 UTF-8，所以 `read_text(encoding="utf-8")` 只在线上炸
+（`UnicodeDecodeError`，整个 build 失败）。列名全是 ASCII，加 `errors="replace"` 即可。
 
 ---
 
