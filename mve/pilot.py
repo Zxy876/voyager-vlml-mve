@@ -10,7 +10,12 @@
      │                   ↑                      │
      └── 读 pilot_state.json ──────────────────┘
 
-两种模式：
+三种任务（`--job`，面板上三个键钮）：
+  practice  —— 跑 run_mve.py：练题，**带**知识图谱
+  placement —— 跑 exam.py --all：**摸底**，全库撤掉图谱考一遍（~7 分钟）
+  learn     —— 跑 learn.py --units N：学习单元 = 练一题 + 撤图谱重考同一题
+
+两种模式（仅 practice 有）：
   once —— 跑一题就退出（出题器选题，或钉住指定题）
   loop —— 跑完一题**再问出题器要下一题**，一直跑到人点停止。
           这才是"自己接自适应出题"：选题权在出题器手里，不在人手里。
@@ -66,6 +71,13 @@ def _pick_python() -> str:
 
 
 PY = _pick_python()
+
+# 面板上三个键钮对应三种活。摸底 / 学习单元都要跑好几分钟，
+# 单题超时（15 分钟）对它们不够 —— 学习单元 8 个要 15 分钟以上。
+JOB_LABEL = {"practice": "练题（带图谱）",
+             "placement": "摸底（全库撤图谱考一遍）",
+             "learn": "学习单元（练一题 + 撤图谱重考）"}
+JOB_TIMEOUT = {"practice": 900, "placement": 1800, "learn": 5400}
 
 # 当前在跑的 run_mve 子进程（停止时要一起带走，否则会留孤儿）
 _CHILDREN: list[subprocess.Popen] = []
@@ -137,8 +149,18 @@ def _log(text: str) -> None:
 
 
 def start(*, mode: str = "once", topic: str = "", rounds: int = 3,
-          use_scope: bool = True) -> dict[str, Any]:
-    """启动驾驶舱（自己再起 run_mve）。
+          use_scope: bool = True, job: str = "practice",
+          units: int = 1, transfer: int = 0) -> dict[str, Any]:
+    """启动驾驶舱（自己再起子进程）。
+
+    job 决定**跑什么** —— 面板上三个键钮对应三种活：
+      practice  —— 跑 run_mve.py（练题，带知识图谱）
+      placement —— 跑 exam.py --all（**摸底**：全库撤掉图谱考一遍）
+      learn     —— 跑 learn.py --units N（学习单元：练一题 + 撤图谱重考）
+
+    为什么摸底必须做成后台任务而不是同步接口：全库 8 道题撤图谱考一遍要
+    ~7 分钟，HTTP 请求等不起，而且中途刷新页面不该丢进度。驾驶舱本来就
+    是这套机制（状态写文件 + 日志可 tail），直接复用，不另起一套。
 
     use_scope —— 没显式钉题时，按**练习范围**选题（practice_scope.py）。
     范围是在知识图谱页上点「练习此知识点」设的；设了范围，人就不用在驾驶舱里
@@ -146,13 +168,19 @@ def start(*, mode: str = "once", topic: str = "", rounds: int = 3,
     """
     cur = read()
     if cur.get("running"):
-        return {"ok": False, "error": f"已经在跑了（pid {cur.get('pid')}，模式 {cur.get('mode')}）"}
+        return {"ok": False, "error": f"已经在跑了（pid {cur.get('pid')}，"
+                                     f"任务 {cur.get('job') or 'practice'}）"}
 
     mode = "loop" if mode == "loop" else "once"
     rounds = max(1, min(10, int(rounds or 3)))
+    job = str(job or "practice")
+    if job not in ("practice", "placement", "learn"):
+        job = "practice"
+    units = max(1, min(20, int(units or 1)))
+    transfer = max(0, min(10, int(transfer or 0)))
 
     scope_label = ""
-    if use_scope and not topic:
+    if job == "practice" and use_scope and not topic:
         try:
             import practice_scope
             sc = practice_scope.get_scope()
@@ -162,7 +190,9 @@ def start(*, mode: str = "once", topic: str = "", rounds: int = 3,
         except Exception:
             scope_label = ""
 
-    cmd = [PY, str(ROOT / "pilot.py"), "_run", "--mode", mode, "--rounds", str(rounds)]
+    cmd = [PY, str(ROOT / "pilot.py"), "_run", "--mode", mode,
+           "--rounds", str(rounds), "--job", job,
+           "--units", str(units), "--transfer", str(transfer)]
     if topic:
         cmd += ["--topic", str(topic)]
 
@@ -172,15 +202,20 @@ def start(*, mode: str = "once", topic: str = "", rounds: int = 3,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     st = {
-        "running": True, "mode": mode, "topic": topic or "（出题器自选）",
+        "running": True, "mode": mode, "job": job, "units": units,
+        "transfer": transfer, "job_label": JOB_LABEL[job],
+        "topic": topic or ("（出题器自选）" if job == "practice" else "（全库 / 出题器自选）"),
         "rounds": rounds, "pid": proc.pid, "started_at": _now(),
         "stopped_at": "", "iterations": 0, "last_exit": None,
         "stop_requested": False, "why": "运行中",
         "scope": scope_label,
     }
     _write(st)
-    _log(f"\n===== 启动 {_now()} · 模式 {mode} · 轮数上限 {rounds} · "
-         f"选题 {st['topic']}"
+    _log(f"\n===== 启动 {_now()} · 任务 {JOB_LABEL[job]} · 模式 {mode} · "
+         f"轮数上限 {rounds}"
+         + (f" · 单元 {units}" if job == "learn" else "")
+         + (f" · 迁移对照每 {transfer} 单元" if job == "learn" and transfer else "")
+         + f" · 选题 {st['topic']}"
          + (f" · 来自练习范围「{scope_label}」" if scope_label else "")
          + f" · pid {proc.pid} =====\n")
     return {"ok": True, **st}
@@ -263,7 +298,8 @@ def _install_signal_handlers() -> None:
     signal.signal(signal.SIGINT, handler)
 
 
-def _run(mode: str, topic: str, rounds: int) -> int:
+def _run(mode: str, topic: str, rounds: int, job: str = "practice",
+         units: int = 1, transfer: int = 0) -> int:
     _install_signal_handlers()
 
     # 日志文件句柄必须**全程持有**：用 `with` 包住 Popen 会在它返回后立刻关掉 fd，
@@ -271,7 +307,7 @@ def _run(mode: str, topic: str, rounds: int) -> int:
     #   Fatal Python error: init_sys_streams: ... OSError: [Errno 9] Bad file descriptor
     logf = LOG.open("a", encoding="utf-8")
     try:
-        code = _loop(mode, topic, rounds, logf)
+        code = _loop(mode, topic, rounds, logf, job, units, transfer)
     finally:
         try:
             logf.close()
@@ -280,7 +316,8 @@ def _run(mode: str, topic: str, rounds: int) -> int:
     return code
 
 
-def _loop(mode: str, topic: str, rounds: int, logf) -> int:
+def _loop(mode: str, topic: str, rounds: int, logf, job: str = "practice",
+          units: int = 1, transfer: int = 0) -> int:
     pid = os.getpid()
 
     def mark(text: str) -> None:
@@ -290,7 +327,9 @@ def _loop(mode: str, topic: str, rounds: int, logf) -> int:
         logf.flush()
 
     _write({
-        "running": True, "mode": mode, "topic": topic or "（出题器自选）",
+        "running": True, "mode": mode, "job": job, "units": units,
+        "transfer": transfer, "job_label": JOB_LABEL.get(job, job),
+        "topic": topic or ("（出题器自选）" if job == "practice" else "（全库 / 出题器自选）"),
         "rounds": rounds, "pid": pid, "started_at": _now(),
         "stopped_at": "", "iterations": 0, "last_exit": None,
         "stop_requested": False, "why": "运行中",
@@ -304,15 +343,31 @@ def _loop(mode: str, topic: str, rounds: int, logf) -> int:
 
     code = 0
     iterations = 0
-    max_iterations = 200 if mode == "loop" else 1
+    # 摸底与学习单元**只跑一次**：它们自己内部就是一轮全库循环，
+    # 驾驶舱再套一层 loop 会变成"摸底完了又摸一遍"。
+    max_iterations = 1 if job != "practice" else (200 if mode == "loop" else 1)
+    timeout = JOB_TIMEOUT.get(job, 900)
 
     while iterations < max_iterations and not asked_to_stop():
         iterations += 1
-        cmd = [PY, str(ROOT / "run_mve.py"), "--llm", "--rounds", str(rounds)]
-        if topic:
-            cmd += ["--topic", topic]
+        if job == "placement":
+            cmd = [PY, str(ROOT / "exam.py"), "--all"]
+            what = f"摸底（全库撤图谱考一遍）· {_now()}"
+        elif job == "learn":
+            cmd = [PY, str(ROOT / "learn.py"), "--units", str(units),
+                   "--rounds", str(rounds)]
+            if transfer:
+                cmd += ["--transfer", str(transfer)]
+            what = (f"学习单元 {units} 个"
+                    + (f"（每 {transfer} 单元加考一道没练过的题）" if transfer else "")
+                    + f" · {_now()}")
+        else:
+            cmd = [PY, str(ROOT / "run_mve.py"), "--llm", "--rounds", str(rounds)]
+            if topic:
+                cmd += ["--topic", topic]
+            what = f"第 {iterations} 题 · {_now()} · {' '.join(cmd[-4:])}"
 
-        mark(f"\n----- 第 {iterations} 题 · {_now()} · {' '.join(cmd[-4:])} -----\n")
+        mark(f"\n----- {what} -----\n")
         try:
             cur = json.loads(STATE.read_text(encoding="utf-8"))
             cur["iterations"] = iterations
@@ -355,11 +410,11 @@ def _loop(mode: str, topic: str, rounds: int, logf) -> int:
                 except Exception:
                     pass
                 try:
-                    code = proc.wait(timeout=900)
+                    code = proc.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait()
-                    mark("\n[驾驶舱] 单题超过 15 分钟，已杀掉\n")
+                    mark(f"\n[驾驶舱] 单个任务超过 {timeout // 60} 分钟，已杀掉\n")
                     code = 124
                 _CHILDREN.remove(proc)
             finally:
@@ -380,9 +435,11 @@ def _loop(mode: str, topic: str, rounds: int, logf) -> int:
         if code != 0:
             # 非 0 就停，并把退出码摆到面板上 —— 反复重试一个结构性错误只会污染日志，
             # 而且如果不暴露 code，人会以为是"跑完了"而不是"崩了"
-            mark(f"\n[驾驶舱] run_mve 退出码 {code}（非 0 → 停止，不重试）\n")
+            mark(f"\n[驾驶舱] 「{JOB_LABEL.get(job, job)}」退出码 {code}"
+                 f"（非 0 → 停止，不重试）\n")
             break
 
+    label = JOB_LABEL.get(job, job)
     try:
         cur = json.loads(STATE.read_text(encoding="utf-8"))
     except Exception:
@@ -390,10 +447,11 @@ def _loop(mode: str, topic: str, rounds: int, logf) -> int:
     cur.update({
         "running": False, "stopped_at": _now(), "last_exit": code,
         "iterations": iterations, "child_pid": None,
-        "why": "已停止" if code == 0 else f"已停止（run_mve 退出码 {code}）",
+        "why": "已停止" if code == 0 else f"已停止（{label} 退出码 {code}）",
     })
     _write(cur)
-    mark(f"\n===== 驾驶舱结束 {_now()} · 共 {iterations} 题 · 退出码 {code} =====\n")
+    mark(f"\n===== 驾驶舱结束 {_now()} · 任务 {label} · "
+         f"共 {iterations} 次 · 退出码 {code} =====\n")
     return code
 
 
@@ -409,7 +467,14 @@ if __name__ == "__main__":
         t = ""
         if "--topic" in argv:
             t = argv[argv.index("--topic") + 1]
-        sys.exit(_run(m, t, r))
+
+        def _flag(name: str, default: str) -> str:
+            return argv[argv.index(name) + 1] if name in argv else default
+
+        job = _flag("--job", "practice")
+        units = int(_flag("--units", "1"))
+        transfer = int(_flag("--transfer", "0"))
+        sys.exit(_run(m, t, r, job, units, transfer))
 
     if argv and argv[0] == "status":
         st = read()

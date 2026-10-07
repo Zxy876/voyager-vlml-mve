@@ -166,16 +166,27 @@ async def run_units(n: int, *, rounds: int = 1, transfer_every: int = 0) -> None
     print()
 
 
-def _place() -> None:
+def _place() -> int:
+    # 摸底的前提是技能库为空（零基础上的水平）—— 这道闸是硬的，
+    # 因为假摸底会把真摸底覆盖掉，画像无声无息就废了（exam.placement_blocked）。
+    why = exam.placement_blocked()
+    if why:
+        print(f"摸底中止：{why}")
+        return 1
     ids = exam.unplaced()
     if not ids:
-        print("题库里每道题都已经有裸考记录了（要重测先 --clear）。")
-        return
+        print("题库里每道题都已经有裸考记录了（要重测先 --clear，并想清楚"
+              "重测会用「练过之后的水平」覆盖掉零基础的摸底值）。")
+        return 0
     print(f"摸底：{len(ids)} 道题，全部撤掉知识图谱考一遍\n")
     for t in ids:
-        asyncio.run(exam.exam(t, verbose=True, kind="placement"))
+        rec = asyncio.run(exam.exam(t, verbose=True, kind="placement"))
+        if rec.get("error"):
+            print(f"\n摸底中止：{rec['error']}")
+            return 1
     print()
     exam.print_profile()
+    return 0
 
 
 def _main() -> int:

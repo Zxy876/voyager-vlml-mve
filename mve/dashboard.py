@@ -473,10 +473,28 @@ function renderNav(s){
 /* 真实水平曲线：撤支架考核（学习曲线该看的那一列） */
 function examCard(s){
   const e=s.exam_curve||{};
+  const p=s.pilot||{};
+  const busy=!!p.running;
+  const runningJob=busy?(p.job_label||p.job||'任务'):'';
+  const ctl=`<div class="runctl">
+      <button class="btn btn-primary" id="btnPlacement" ${busy?'disabled':''}>摸底（全库撤图谱考一遍）</button>
+      <span class="lbl">单元</span>
+      <select id="learnUnits">${[2,4,6,8].map(n=>`<option value="${n}" ${n===4?'selected':''}>${n}</option>`).join('')}</select>
+      <span class="lbl">迁移对照每</span>
+      <select id="learnTransfer">${[0,2,3,4].map(n=>`<option value="${n}" ${n===3?'selected':''}>${n===0?'不考':n+' 单元'}</option>`).join('')}</select>
+      <button class="btn btn-secondary" id="btnLearn" ${busy?'disabled':''}>跑学习单元</button>
+      <button class="btn btn-danger" id="btnExamStop" ${busy?'':'disabled'}>■ 停止</button>
+    </div>
+    ${busy?`<div class="note info">正在跑：<b>${ESC(runningJob)}</b>
+      ${p.iterations?`（第 ${p.iterations} 次）`:''} —— 进度看「运行日志」页。
+      摸底 8 道题约 7 分钟，期间刷新页面不会丢。</div>`:''}`;
   if(!e.has_data) return `<div class="panel"><div class="panel__head"><h2>真实水平曲线 · 撤支架考核</h2>
       <span class="hint">练习那条线是带知识图谱跑的，量的是支架不是水平</span></div>
     <div class="empty">${ESC(e.hint||'还没有裸考记录')}</div>
-    <div class="note">跑法：<span class="mono">python mve/learn.py --go 8</span>（清库 → 摸底 → 8 个学习单元）。</div></div>`;
+    <div class="note">点「摸底」开始：把全库每道题**撤掉知识图谱**考一遍（约 7 分钟），
+      得出零基础的真实水平。它要求技能库为空 —— 带着技能库考出来的是
+      "练过之后的水平"，不是起点。</div>
+    ${ctl}</div>`;
   const rowsHtml=(e.tracks||[]).map(t=>{
     const after=t.after.length
       ? t.after.map(a=>`<span class="chip ${a.cov>=1?'ok':(a.cov>0?'warn':'bad')}">${ESC(a.pct)}</span>`).join(' ')
@@ -502,6 +520,7 @@ function examCard(s){
     <table><thead><tr><th>题</th><th>摸底（裸考）</th><th>练后重考</th><th>Δ</th></tr></thead>
       <tbody>${rowsHtml}</tbody></table>
     ${trHtml}
+    ${ctl}
     <div class="legend">摸底 = 清库后第一次全库裸考；重考 = 练完这一题后撤掉图谱再考。
       出题器按「最弱优先」选题，读的就是摸底那一列。</div></div>`;
 }
@@ -725,9 +744,10 @@ function pConsole(s){
     <div class="panel__head"><h2>驾驶舱</h2>
       <span class="hint">面板只负责起停与读日志，进程状态写在 mve/pilot_state.json</span>
       <span class="chip ${p.running?'ok':'grey'}">${p.running?'运行中':'未运行'}</span>
+      ${p.job_label?`<span class="chip ${p.running?'ok':'grey'}">${ESC(p.job_label)}</span>`:''}
       ${p.mode?`<span class="chip grey">${ESC(p.mode==='loop'?'连续自适应':'单题')}</span>`:''}
       ${p.topic?`<span class="chip grey">${ESC(p.topic)}</span>`:''}
-      ${p.iterations?`<span class="chip grey">已跑 ${p.iterations} 题</span>`:''}
+      ${p.iterations?`<span class="chip grey">已跑 ${p.iterations} 次</span>`:''}
       ${p.started_at?`<span class="chip grey">起于 ${ESC(String(p.started_at).slice(11,19))}</span>`:''}</div>
     ${p.why&&!p.running?`<div class="legend">${ESC(p.why)}</div>`:''}
     <div class="note info">loop 模式：跑完一题会<b>再问出题器要下一题</b>，一直跑到你点停止。
@@ -1089,34 +1109,55 @@ function uiEvent(kind, detail, result){
   }catch(e){}
 }
 
-async function pilotStart(){
-  const b=document.getElementById('runStart'); if(b.disabled) return;
-  // 没有难度 / 选题键钮了：选题由练习范围决定（伴学 onboarding.md:82）。
-  //   有范围 → once：把范围里最优的一题跑透（判对就停）
-  //   没范围 → loop：交给出题器连续自适应出题
-  const sc=window.__scope||{active:false};
-  const mode = sc.active ? 'once' : 'loop';
-  const rounds = 3;
-  b.disabled=true; b.innerHTML='<span class="spin"></span>启动中…';
+async function runJob(job, opts){
+  opts=opts||{};
+  const b=opts.btnId?document.getElementById(opts.btnId):null;
+  if(b&&b.disabled) return;
+  const body={job:job, mode:opts.mode||'once', rounds:opts.rounds||3,
+              units:+(opts.units||1), transfer:+(opts.transfer||0),
+              use_scope:opts.use_scope!==false};
+  if(b){ b.disabled=true; b.innerHTML='<span class="spin"></span>'+ESC(opts.busyText||'启动中…'); }
   try{
     const r=await fetch('/api/pilot/start',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({mode:mode, rounds:rounds, topic:'', use_scope:true})});
+      body:JSON.stringify(body)});
     const d=await r.json();
     uiEvent('pilot_start',
-      {模式: mode==='loop'?'连续自适应出题':'按练习范围练一题',
-       轮数上限: rounds,
-       练习范围: sc.active ? sc.label : '（无范围 · 出题器自选）',
-       范围关联题: sc.active ? (sc.topics||[]).join('、') : '全部',
-       选题: d.topic || '启动失败'},
-      d.ok ? ('启动成功 pid '+d.pid+' · 选题 '+(d.topic||'—')) : ('失败：'+(d.error||'未知')));
+      {任务:d.job_label||job, 单元:body.units, 迁移对照:body.transfer||'不考', 模式:body.mode},
+      d.ok?('启动成功 pid '+d.pid+' · '+(d.job_label||job)):('失败：'+(d.error||'未知')));
     if(!d.ok){ alert('启动失败：'+(d.error||'未知')); }
     else { TAB='console'; localStorage.setItem('mve_tab',TAB); }
     await load();
   }catch(e){
-    uiEvent('pilot_start',{模式:mode, 练习范围:sc.active?sc.label:'（无范围）'},'异常：'+e);
+    uiEvent('pilot_start',{任务:job},'异常：'+e);
     alert('启动失败：'+e);
   }
-  finally{ b.disabled=false; b.textContent='▶ 启动 Voyager'; }
+  finally{ if(b){ b.disabled=false; b.textContent=opts.btnText||'▶ 启动 Voyager'; } }
+}
+async function pilotStart(){
+  // 没有难度 / 选题键钮了：选题由练习范围决定（伴学 onboarding.md:82）。
+  //   有范围 → once：把范围里最优的一题跑透（判对就停）
+  //   没范围 → loop：交给出题器连续自适应出题
+  const sc=window.__scope||{active:false};
+  await runJob('practice',{mode: sc.active?'once':'loop', rounds:3, use_scope:true,
+    btnId:'runStart', btnText:'▶ 启动 Voyager', busyText:'启动中…'});
+}
+async function startPlacement(){
+  const n=window.__skills||0;
+  if(n>0){
+    const ok=confirm('技能库里已经有 '+n+' 条程序。\n\n'
+      +'摸底测的是「零基础上的真实水平」。带着技能库去考，考出来的是「练过之后的水平」，'
+      +'而且会覆盖掉原来那份零基础的摸底值（画像就废了）。\n\n'
+      +'点确定：先清库（自动备份到 mve/_backup_*）再摸底；点取消：不摸。');
+    if(!ok) return;
+    try{
+      const r=await fetch('/api/reset',{method:'POST'});
+      const d=await r.json();
+      if(!d.ok){ alert('清库失败：'+(d.error||'未知')); return; }
+      uiEvent('reset_all',{原因:'摸底前清库', 清库前技能数:n},'已清库（已备份）');
+    }catch(e){ alert('清库失败：'+e); return; }
+  }
+  await runJob('placement',{btnId:'btnPlacement',
+    btnText:'摸底（全库撤图谱考一遍）', busyText:'摸底中…'});
 }
 async function pilotStop(){
   const b=document.getElementById('runStop'); if(b.disabled) return;
@@ -1137,6 +1178,7 @@ async function pilotStop(){
 function render(s){
   window.__lastRec = s.recommend || {};
   window.__pilot   = s.pilot || {};
+  window.__skills  = (s.skill_stats||{}).skills || 0;
   // topic_id -> 难度（埋点里要把"选了什么难度"记下来）
   window.__diff = {};
   (s.tasks||[]).forEach(t=>{ if(t.topic_id) window.__diff[t.topic_id]=t.difficulty; });
@@ -1165,6 +1207,14 @@ function render(s){
     uiEvent('clear_log',{},'运行日志已清空');
     await load();
   };
+  const bp=document.getElementById('btnPlacement');
+  if(bp) bp.onclick=startPlacement;
+  const bl=document.getElementById('btnLearn');
+  if(bl) bl.onclick=()=>runJob('learn',{btnId:'btnLearn', btnText:'跑学习单元',
+    busyText:'学习中…',
+    units:+((document.getElementById('learnUnits')||{}).value||4),
+    transfer:+((document.getElementById('learnTransfer')||{}).value||0)});
+  const bes=document.getElementById('btnExamStop'); if(bes) bes.onclick=pilotStop;
   const rn=document.getElementById('refreshNow'); if(rn) rn.onclick=load;
   const ex=document.getElementById('btnExport'); if(ex) ex.onclick=exportMd;
   const dp=document.getElementById('dbProbe'); if(dp) dp.onclick=dbProbe;
@@ -1466,6 +1516,10 @@ class Handler(BaseHTTPRequestHandler):
                 topic="",
                 rounds=int(payload.get("rounds") or 3),
                 use_scope=bool(payload.get("use_scope", True)),
+                # 三种任务：practice（练题）/ placement（摸底）/ learn（学习单元）
+                job=str(payload.get("job") or "practice"),
+                units=int(payload.get("units") or 1),
+                transfer=int(payload.get("transfer") or 0),
             ))
             return
 
@@ -1476,6 +1530,22 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/pilot/clear-log":
             pilot.clear_log()
             self._json(200, {"ok": True})
+            return
+
+        # 清档：摸底前要先把技能库清空（否则考出来的是"练过之后的水平"）。
+        # reset_all 自己会先备份到 mve/_backup_* 再删，所以这个键钮不额外加确认。
+        if path == "/api/reset":
+            try:
+                import reset_all
+                _old = sys.argv[:]
+                sys.argv = ["reset_all.py"]       # reset_all.main() 自己读 argv
+                try:
+                    reset_all.main()
+                finally:
+                    sys.argv = _old
+                self._json(200, {"ok": True})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": f"{type(e).__name__}: {e}"[:300]})
             return
 
         self.send_error(404)

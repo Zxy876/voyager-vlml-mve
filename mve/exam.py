@@ -205,9 +205,40 @@ def print_profile() -> None:
           f"（掌握 ≥80% 的 {sum(1 for c in cov if c >= MASTERED_LIMIT)} 道）")
 
 
+def _skills_count() -> int:
+    try:
+        return int(skill_store.stats().get("skills") or 0)
+    except Exception:
+        return 0
+
+
+def placement_blocked(*, force: bool = False) -> str:
+    """摸底的前提：**技能库必须是空的**。返回空串表示可以摸，否则返回原因。
+
+    摸底测的是「零基础上的真实水平」。技能库里一旦有程序，考核轮就会重放它们
+    —— 考出来的是「练过之后的水平」，不是裸考。而 `profile()` 取的是每题
+    **最后一次**记录，所以这种假摸底会把真摸底**覆盖掉**，画像无声无息就废了。
+
+    实测踩过两次：
+      1) 第一次摸底时技能库残留 2 条 → max_losing_streak_map 摸出 100%，
+         清库后重摸才是 0%（那 8 行记录作废）。
+      2) 面板上点摸底又踩一次 → corrode_collapse 的摸底从 0% 被顶成 100%。
+
+    所以这道闸必须是**硬**的：不提供"我记得住就行"的软提示。
+    """
+    if force:
+        return ""
+    n = _skills_count()
+    if n:
+        return (f"技能库里已经有 {n} 条程序 —— 现在考出来的是「练过之后的水平」，"
+                f"不是裸考。要摸底先清库（python mve/reset_all.py，或面板上「清库」）")
+    return ""
+
+
 async def exam(topic_id: str, *, verbose: bool = True,
                kind: str = "practice_exam",
-               extra: dict[str, Any] | None = None) -> dict[str, Any]:
+               extra: dict[str, Any] | None = None,
+               force: bool = False) -> dict[str, Any]:
     """考一道题：撤掉图谱，只留题干 + 工具 + 自己的技能库。
 
     `kind` 区分三种考核，事后能对得上曲线是怎么涨的：
@@ -219,6 +250,13 @@ async def exam(topic_id: str, *, verbose: bool = True,
     task = tasks_mod.TASKS.get(topic_id)
     if task is None:
         return {"error": f"没有这道题：{topic_id}"}
+
+    if kind == "placement":
+        why = placement_blocked(force=force)
+        if why:
+            if verbose:
+                print(f"  ✗ 摸底中止：{why}")
+            return {"error": why, "blocked": True}
 
     prev = voyager_mod.GRAPH_STATE["on"]
     voyager_mod.GRAPH_STATE["on"] = False        # ← 撤支架
@@ -337,6 +375,8 @@ def _main() -> int:
     ap.add_argument("--profile", action="store_true", help="打印裸考画像（真实水平）")
     ap.add_argument("--curve", action="store_true", help="打印考核流水")
     ap.add_argument("--progress", action="store_true", help="打印学习进程（按题分行）")
+    ap.add_argument("--force", action="store_true",
+                    help="强制重测（不管有没有摸过底、不管技能库是不是空的）")
     ap.add_argument("--clear", action="store_true", help="清空考核记录")
     args = ap.parse_args()
 
@@ -356,12 +396,24 @@ def _main() -> int:
         return 0
 
     if args.all:
-        # 摸底只考**没裸考过**的题：重跑不会覆盖已有画像，
-        # 也避免把"练过之后的重考"和"零基础的摸底"混在同一条曲线里。
-        ids = unplaced() or sorted(tasks_mod.TASKS)
+        # 摸底只考**没裸考过**的题。全摸过了就**不再重考** ——
+        # `profile()` 取每题最后一次记录，重考会把"零基础的摸底"覆盖成
+        # "练过之后的水平"，画像无声无息就废了（实测踩过，见 placement_blocked）。
+        ids = unplaced()
+        if not ids and not args.force:
+            print("题库里每道题都已经有裸考记录了 —— 不再重考。")
+            print("  （重考会用「练过之后的水平」覆盖掉零基础的摸底值）")
+            print("  要强制重测：python mve/exam.py --all --force")
+            print("  要看现有画像：python mve/exam.py --profile")
+            return 0
+        if not ids:
+            ids = sorted(tasks_mod.TASKS)
         print(f"摸底：{len(ids)} 道题，全部撤图谱考一遍\n")
         for t in ids:
-            asyncio.run(exam(t, kind="placement"))
+            rec = asyncio.run(exam(t, kind="placement", force=args.force))
+            if rec.get("error"):
+                print(f"\n摸底中止：{rec['error']}")
+                return 1
         print()
         print_profile()
         return 0
