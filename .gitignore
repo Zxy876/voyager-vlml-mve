@@ -49,6 +49,8 @@ mve/practice_scope.json
 mve/tool_schemas.json
 mve/knowledge_graph.json
 mve/pilot.log
+# 学习单元日志（learn.py 每跑一个单元就往里追加练习轮的完整输出）
+mve/learn.log
 mve/db_config.json
 # 自动生成的题（运行时产物；带验题证据，可重算，不进仓库）
 mve/generated_tasks.json

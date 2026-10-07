@@ -117,6 +117,70 @@ def _pct(v: float | None) -> str | None:
     return None if v is None else f"{v * 100:.0f}%"
 
 
+def _exam_view() -> dict[str, Any]:
+    """**真实水平曲线** —— 撤支架考核（exam_log.jsonl）。
+
+    为什么面板上必须另画这一条：`coverage_track` 读的是 run_log，
+    那是**带着知识图谱**练出来的覆盖率 —— 实测给着图谱首轮就 100%，
+    连起来是一条从第一行就贴顶的平线。它量的是支架的高度，不是模型的水平。
+    撤掉图谱重考出来的数（`exam.py`）才是学习曲线该画的东西。
+
+    画法按**题分行**，不是首尾相连：第 3 个数据点可能是本来就会的题，
+    第 4 个是本来 0% 的题，连成线的话形状由选题顺序决定，不由学习决定。
+    """
+    try:
+        import exam
+    except Exception:
+        return {"has_data": False}
+    rows = exam.load()
+    if not rows:
+        return {"has_data": False,
+                "hint": "还没有裸考记录：python mve/exam.py --all（全库摸底）"}
+
+    by_topic: dict[str, list[dict[str, Any]]] = {}
+    for r in rows:
+        by_topic.setdefault(str(r.get("topic_id") or ""), []).append(r)
+
+    tracks: list[dict[str, Any]] = []
+    for t, seq in by_topic.items():
+        base = float(seq[0].get("coverage") or 0.0)
+        rest = [float(r.get("coverage") or 0.0) for r in seq[1:]]
+        tracks.append({
+            "topic_id": t,
+            "baseline": base,
+            "baseline_pct": _pct(base),
+            "level": exam.level_of(base),
+            "exam_count": len(seq),
+            "after": [{"cov": c, "pct": _pct(c),
+                       "kind": str(r.get("kind") or "")}
+                      for c, r in zip(rest, seq[1:])],
+            "delta_pp": round((rest[-1] - base) * 100) if rest else None,
+            # 练了裸考也不涨 → 已毕业让位（伴学没有这条，MVE 自有）
+            "exhausted": bool(exam.exhausted(t)),
+        })
+    tracks.sort(key=lambda x: (x["baseline"], x["topic_id"]))
+
+    deltas = [x["delta_pp"] for x in tracks if x["delta_pp"] is not None]
+    covs = [float(x["baseline"]) for x in tracks]
+    transfer = [r for r in rows if str(r.get("kind") or "") == "transfer"]
+    tseq = [float(r.get("coverage") or 0.0) for r in transfer]
+    return {
+        "has_data": True,
+        "tracks": tracks,
+        "avg_baseline": round(sum(covs) / len(covs) * 100) if covs else 0,
+        "retested": len(deltas),
+        "rose": sum(1 for d in deltas if d > 0),
+        "avg_delta_pp": round(sum(deltas) / len(deltas)) if deltas else None,
+        "mastered": sum(1 for c in covs if c >= 0.80),
+        # 迁移对照：没练过的题涨不涨 —— 分辨「记住了这道题」和「真学会了」
+        "transfer": {
+            "count": len(tseq),
+            "seq": [_pct(c) for c in tseq],
+            "rose": bool(len(tseq) >= 2 and tseq[-1] > tseq[0] + 0.001),
+        } if tseq else None,
+    }
+
+
 def _human_imports(limit: int = 10) -> list[dict[str, Any]]:
     """人导入的历史（直接读文件，不 import coach —— 那条会拉起整个 VLML）。
 
@@ -404,6 +468,8 @@ def build_state() -> dict[str, Any]:
             if prev_mastery is not None and last["mastery"] is not None
             else f"掌握度 {_pct(last['mastery'])}"
         ),
+        # 真实水平曲线（撤支架考核）—— 学习曲线该看的那一列
+        "exam_curve": _exam_view(),
     }
 
 

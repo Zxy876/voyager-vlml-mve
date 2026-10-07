@@ -463,6 +463,10 @@ GRAPH_WITH_RECIPE = os.environ.get("MVE_GRAPH_RECIPE", "1") != "0"
 # 存在的唯一理由是 A/B —— 想知道图谱到底有没有用，必须能把它关掉跑同一道题，
 # 否则"加了图谱之后好了"永远无法证伪（也可能是别的改动带来的）。
 GRAPH_ENABLED = os.environ.get("MVE_GRAPH", "1") != "0"
+# 可临时关掉（考核用）。为什么不用环境变量：环境变量是**进程级**的，
+# 而"练习一轮 → 考核一轮"要在同一个进程里来回切。考核 = 撤掉支架，
+# 看模型靠自己积累的技能库还能不能做对 —— 这才是学习曲线该测的东西。
+GRAPH_STATE: dict[str, bool] = {"on": GRAPH_ENABLED}
 
 # 图谱里两层的单独开关 —— 存在的唯一理由是 A/B。
 # 洞察层（"取工具的哪一段"）和数据分层（表在哪一层、上游是谁）是本轮新加的，
@@ -535,7 +539,7 @@ def _check_tool_params(tool: str, args: dict[str, Any]) -> str:
     四个评分点全空，覆盖率 0%。它"调对了工具"却什么都拿不到。
     提示（param_hint）写进 prompt 不够，照分层断言的先例做成硬校验。
     """
-    if not (GRAPH_ENABLED and ASSERT_ENABLED):
+    if not (GRAPH_STATE["on"] and ASSERT_ENABLED):
         return ""
     g = _load_graph()
     if g is None:
@@ -591,7 +595,7 @@ def _check_group_order(sql: str, task: Any) -> tuple[list[str], str]:
     最稳的写法是**每个分组一条 SQL**（裁判自己的 answer_spec 就是这么写的：
     `WHERE map_name='Corrode'`），所以驳回时把那条形同口径的骨架一起给出去。
     """
-    if not (GRAPH_ENABLED and ASSERT_ENABLED):
+    if not (GRAPH_STATE["on"] and ASSERT_ENABLED):
         return [], ""
     s = (sql or "").upper()
     if "GROUP BY" not in s or "ORDER BY" in s:
@@ -626,7 +630,7 @@ def _check_sql_layering(sql: str, task: Any) -> tuple[list[str], str]:
     一次只说一条时，模型改了 WHERE 就忘了 GROUP BY，下一轮又回到 WHERE，
     三次重试打转 → 整轮作废（覆盖率 0% 的波动就是这么来的）。
     """
-    if not (GRAPH_ENABLED and ASSERT_ENABLED):
+    if not (GRAPH_STATE["on"] and ASSERT_ENABLED):
         return [], ""
     if not sql or "PARTITION BY" not in sql.upper():
         return [], ""
@@ -679,7 +683,7 @@ def auto_fix_layering(sql: str, task: Any) -> tuple[str, str]:
     只做一种变换：**外层已有该条件时，删掉内层多余的那一份**。
     不改语义（过滤条件一个不少，只是挪层），也就不存在"把 SQL 改坏"的风险。
     """
-    if not (GRAPH_ENABLED and ASSERT_ENABLED):
+    if not (GRAPH_STATE["on"] and ASSERT_ENABLED):
         return sql, ""
     if not sql or "PARTITION BY" not in sql.upper():
         return sql, ""
@@ -735,7 +739,7 @@ def graph_context(task: Any, *, with_recipe: bool | None = None,
        没有这条兜底时，MVE 的图谱退化成"出过那几道题的备忘"——
        新题的图谱块是空的。
     """
-    if not GRAPH_ENABLED:
+    if not GRAPH_STATE["on"]:
         return ""
     g = _load_graph()
     if g is None:
@@ -1639,6 +1643,53 @@ VLML 的 10 个报告工具已经封装好指标口径。能用报告工具拿�
         return all(bool(getattr(s, "tool", "")) and not getattr(s, "sql", "")
                    for s in specs)
 
+    # ---- 重放自己攒下的程序（plan 路径上的「技能被 exec」）----
+    async def _replay_saved(self, task: Any) -> tuple[list[dict], dict] | None:
+        """重放技能库里存下来的调用序列；**维度取齐了才采用**。
+
+        为什么 plan 路径也必须有这一份（此前没有，是学习曲线涨不起来的根因）：
+        8 道题里 6 道是 SQL 类，走 plan 路径，而那条路**从来不产出
+        `program_code`** —— 于是"跑通了"对技能库零贡献，撤掉知识图谱重考时
+        只能从头再写一遍 SQL，然后再犯同一个口径错（实测 corrode_collapse
+        练完 100%、重考仍 0%，且缺的还是同一条 losing_team_name 放错层）。
+
+        原版 Voyager 的规矩是「自己写 → 跑通 → 存程序 → 下次直接跑」，
+        判据是**跑通了没有**，不是这段东西长什么样。此前 `voyager.py:1631-1634`
+        那条注释以"原版从不把 chat 字符串当程序学"为由把 SQL 类排除在外 ——
+        那是把表面形态当成了同构边界：原版的 `bot.chat()` 发的是自然语言指令，
+        而 MVE 的 SQL 是**结构化检索代码**，与"按路径 dig"是同一类东西
+        （都是"怎么把数据取出来"），只是写法不同。排除它的代价就是：
+        六成的题永远学不会。
+
+        只重放 `practice` 通道（自己跑通过的），且**维度不齐就不采用** ——
+        部分正确的程序拿去复用，等于把一个已知缺陷固化成默认行为。
+        """
+        try:
+            import skill_store
+        except Exception:                                    # pragma: no cover
+            return None
+        tid = str(getattr(task, "topic_id", "") or "")
+        dims = [str(getattr(p, "dimension", "") or "")
+                for p in (getattr(task, "rubric", None) or [])]
+        for s in skill_store.all_skills():
+            if str(s.get("topic") or "") != tid:
+                continue
+            if str(s.get("source") or "") != "practice":
+                continue
+            calls = list((s.get("blueprint") or {}).get("calls") or [])
+            if not calls:
+                continue
+            obs = await self._execute({"calls": calls}, limit=len(calls))
+            if not [o for o in obs if o.get("result") is not None]:
+                continue
+            facts = self._extract(task, obs)
+            facts = self._ground_facts(facts, obs)
+            got = {str(f.get("dimension")) for f in facts}
+            if dims and not all(d in got for d in dims):
+                continue                    # 没取全 → 不算数，让模型自己重写
+            return facts, s
+        return None
+
     async def _run_with_code(self, task: Any) -> dict[str, Any]:
         """代码化取证：模型写代码 → 解释器执行 → **值由代码产出**。
 
@@ -1858,6 +1909,26 @@ VLML 的 10 个报告工具已经封装好指标口径。能用报告工具拿�
             })
             # 评分点级一起恢复：跨运行时维度级恢复不了"这个维度下哪条没交"
             self.failed_points = sorted(set(last_missing))
+
+        # ---- 先跑库里的程序，跑通就直接采用（原版"技能被 exec"的本体）----
+        #
+        # 此前技能只被**拼进 prompt 让人读**，不会被运行 —— 这正是
+        # "技能库有内容但覆盖率不涨"的根因：模型每轮重写一遍，每次重写都是
+        # 一次新的翻错机会。原版 Voyager 是把 `program_code` 取出来直接 exec 的。
+        # plan 路径（SQL 类）没有 program_code，它的等价物是存下来的
+        # **调用序列** —— 见 `_replay_saved`。
+        replayed = await self._replay_saved(task)
+        if replayed is not None:
+            facts, skill = replayed
+            return {
+                "facts": facts,
+                "narrative": {"text": "", "comparable": False},
+                "skill_used": f"replay({skill.get('name', '')})",
+                "reused_skill": skill.get("name", ""),
+                "thought": "重放技能库里自己跑通过的调用序列（口径已由裁判验证）",
+                "errors": list(self.errors),
+                "hallucinations": list(self.hallucinations),
+            }
 
         plan = self._plan(task, call_limit=self._call_limit(task))
         obs = await self._execute(plan, limit=self._call_limit(task))

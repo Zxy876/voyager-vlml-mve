@@ -148,16 +148,28 @@ def _has_reusable_program(topic: str) -> bool:
 def _hint_for(topic: str, rec: dict[str, Any] | None, reason: str) -> dict[str, Any]:
     """这道题该给多少支架（照伴学 difficulty_policy.select 的同构物）。"""
     seed = TASKS[topic].difficulty if topic in TASKS else 2
+    # 支架的锚必须是**裸考水平**：练习覆盖率是带图谱拿的（实测恒 100%），
+    # 拿它当"会了"的判据 → 支架第一轮就被收掉 → 一撤图谱就崩回 0%。
+    # 取 min（谁低听谁的）：裸考 0% 而练习 100% → 说明全靠支架，继续扶。
+    true = _true_level(topic)
+    m = float((rec or {}).get("last_mastery") or 0.0)
+    cov = (rec or {}).get("last_coverage")
+    cov = None if cov is None else float(cov)
+    if true is not None:
+        m = min(m, true)
+        cov = true if cov is None else min(cov, true)
     d = difficulty.select(
         seed,
-        mastery=(rec or {}).get("last_mastery") or 0.0,
-        coverage=(rec or {}).get("last_coverage"),
+        mastery=m,
+        coverage=cov,
         attempts=(rec or {}).get("attempts") or 0,
         confidence=(rec or {}).get("confidence") or 0.0,
         flags=(rec or {}).get("flags") or (),
         recent_verdicts=(rec or {}).get("recent_verdicts") or (),
         reason=reason,
     )
+    if true is not None:
+        d["why"] += f"；裸考 {true:.0%}（真实水平）才是支架的锚，练习覆盖率带图谱不作数"
     # 收支架的前提：库里有能直接跑的程序。没有就按 full 兜底。
     if d["hint"] != difficulty.HINT_FULL and not _has_reusable_program(topic):
         d["hint"] = difficulty.HINT_FULL
@@ -186,22 +198,56 @@ def _used_tools() -> set[str]:
     return used
 
 
+def _true_level(topic: str) -> float | None:
+    """这道题的**真实水平**（最近一次撤支架考核的覆盖率）；没考过返回 None。
+
+    为什么必须有这一层：`mastery` 里的 `last_coverage` 是**带着知识图谱**练出来的。
+    图谱把口径、列含义、结构骨架全喂进 prompt —— 实测给着图谱首轮就 100%，
+    撤掉图谱平均只有 29%。所以练习覆盖率量的是**支架的高度**，不是模型的水平。
+    出题器要"匹配水平"，就必须读裸考（`exam.true_level`），不能读练习日志。
+
+    同构位置：伴学 `difficulty_policy.select()` 里那个 `mastery` 参数
+    （difficulty_policy.py:94）—— 它那边 mastery 是干净的，因为伴学的题不喂
+    知识图谱；MVE 多了图谱这一层支架，所以必须换成裸考值才等价。
+    """
+    try:
+        import exam
+        return exam.true_level(topic)
+    except Exception:                                        # pragma: no cover
+        return None
+
+
 def _global_target(mastery: dict[str, Any]) -> tuple[int, str]:
-    """全局目标难度：**会做的题越多，接下来该啃越难的**。
+    """全局目标难度：**真实水平越高，接下来该啃越难的**。
 
     伴学不需要这一条 —— 它的难度是按 (知识点, 难度) 生成题目时直接算出来的
     （`difficulty_policy.select`）。MVE 的题是硬编码的、每题一个写死的难度，
     所以梯度只能落在"从哪道题往上走"上。
 
     规则（MVE 自创，伴学没有同构物）：
-        目标难度 = 1 + 已满分（覆盖率 100%）的题数，clamp [1, 4]
-    一道都没拿下 → 出最基础的；拿下 1 道 → 上难度 2；拿下 3 道 → 上难度 4。
-    它把「掌握度」直接翻译成「下一步往哪走」，而不只是排序。
+        目标难度 = 1 + 真实水平已「掌握」的题数，clamp [1, 4]
+
+    **判据必须用裸考，不能用练习覆盖率** —— 这是本轮修的断口：
+    练习是带图谱做的，恒 100%，于是 `cleared` 在第一轮就等于全库、
+    `target` 第一轮就顶到 4，梯度根本没展开就被压平了。
+    换成裸考之后：摸底平均 29%、掌握 1 道 → target = 2，梯度从底下开始爬。
+
+    一道都没考过 → target=1（照伴学：新知识点初始掌握度硬 0.0，从最基础的开始）。
     """
-    cleared = sum(1 for t, m in mastery.items()
-                  if t in TASKS and float(m.get("last_coverage") or 0) >= 1.0)
-    target = min(4, max(1, 1 + cleared))
-    return target, f"已拿下 {cleared} 道 → 目标难度 {target}"
+    try:
+        import exam
+        prof = exam.profile()
+    except Exception:                                        # pragma: no cover
+        prof = {}
+    known = [t for t in TASKS if t in prof]
+    if not known:
+        return 1, "还没摸底（一道都没裸考过）→ 从最基础的开始"
+    covs = [float(prof[t]["coverage"]) for t in known]
+    mastered = sum(1 for c in covs if c >= 0.80)
+    avg = sum(covs) / len(covs)
+    target = min(4, max(1, 1 + mastered))
+    return target, (f"裸考 {len(known)}/{len(TASKS)} 道 · 平均 {avg:.0%} · "
+                    f"已掌握 {mastered} 道 → 目标难度 {target}")
 
 
 def _by_gradient(candidates: list[str], target: int) -> str:
@@ -372,6 +418,59 @@ def _select_raw(*, explicit_topic_id: str, mastery: dict[str, Any],
             "reason": "due_review",
             "explanation": f"已练 {m['attempts']} 次但覆盖率停在 "
                            f"{m['last_coverage']:.0%}，该回头复习而不是开新题",
+            "blocked": False,
+        }
+
+    # ---- 2.5) exam_weak：照伴学 weak_topic —— 挑**真实水平最低**的那道题 ----
+    #
+    #     这一支是「清库摸底 → 匹配水平 → 推符合水平的题」的落点，本轮新增。
+    #     为什么必须新开：上面几支判的全是**练习日志**，而练习是带知识图谱做的
+    #     —— 实测给着图谱首轮就 100%。于是 wrong_retry（`wrongs>0`）永不触发、
+    #     due_review（`<1.0`）也永不触发，出题器一路掉到 recommended / default，
+    #     而它们只按「练没练过 + 离目标难度近不近」排序 —— **跟模型会不会做
+    #     毫无关系**。这就是此前「自适应接了梯度、梯度却没接水平」的断口。
+    #
+    #     判据照抄伴学 `get_weak_topics()`（knowledge_tracker.py:2073-2084）：
+    #       · 只收真实水平 < 0.60（伴学的 weak 线）
+    #       · **升序取最低** —— 最弱优先，不是"最接近阈值"优先
+    #       · 练了裸考不涨的（`exam.exhausted`）→ 毕业让位，别把算力砸在死题上
+    try:
+        import exam
+        weak = [(t, c) for t, c in exam.weakest() if t in TASKS
+                and not exam.exhausted(t)]
+    except Exception:                                        # pragma: no cover
+        weak = []
+    if weak:
+        topic, lv = weak[0]
+        return {
+            "topic_id": topic,
+            "reason": "exam_weak",
+            "explanation": f"裸考（撤掉知识图谱）只有 {lv:.0%}，是全库最弱的一题 —— "
+                           f"照伴学「最弱优先」先推它（不是挑最接近及格的）"
+                           + (f"；让位给它的：{', '.join(f'{t}({c:.0%})' for t, c in weak[1:3])}"
+                              if len(weak) > 1 else ""),
+            "blocked": False,
+        }
+
+    # ---- 2.6) unplaced：还有题**没裸考过** → 水平未知，先把它测出来 ----
+    #     同构伴学「未练过的排前面，按 depth → difficulty 升序」
+    #     （planner.py:174-205）：没有先验时不能瞎猜，从最浅最容易的下手。
+    #     典型情形是刚清库还没摸底 —— 那时这一支就是唯一的依据。
+    try:
+        import exam
+        pending = [t for t in exam.unplaced() if t in TASKS]
+    except Exception:                                        # pragma: no cover
+        pending = []
+    if pending:
+        topic = min(pending, key=lambda t: (int(getattr(TASKS[t], "difficulty", 2) or 2),
+                                            t))
+        return {
+            "topic_id": topic,
+            "reason": "unplaced",
+            "explanation": f"这道题还没裸考过，真实水平未知（题库里还有 "
+                           f"{len(pending)} 道没测） —— 照伴学「未练过的排前面」"
+                           f"先拿它开刀，难度 {TASKS[topic].difficulty} 是这批里最低的。"
+                           f"要一次测完全库：python mve/exam.py --all",
             "blocked": False,
         }
 
@@ -561,6 +660,8 @@ REASON_LABEL = {
     "blocked_diagnostic": "拿不到证据·重复",
     "all_stalled": "全部停滞·生成新题",
     "all_cleared": "全被拿下·上一档生成新题",
+    "exam_weak": "裸考最弱·匹配水平",
+    "unplaced": "未摸底·先测水平",
     "recommended": "推进新题",
     "default": "补最弱的",
     "cold_start": "冷启动",

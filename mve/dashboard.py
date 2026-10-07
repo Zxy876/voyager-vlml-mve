@@ -470,6 +470,42 @@ function renderNav(s){
 }
 
 /* ---------------- 各分区 ---------------- */
+/* 真实水平曲线：撤支架考核（学习曲线该看的那一列） */
+function examCard(s){
+  const e=s.exam_curve||{};
+  if(!e.has_data) return `<div class="panel"><div class="panel__head"><h2>真实水平曲线 · 撤支架考核</h2>
+      <span class="hint">练习那条线是带知识图谱跑的，量的是支架不是水平</span></div>
+    <div class="empty">${ESC(e.hint||'还没有裸考记录')}</div>
+    <div class="note">跑法：<span class="mono">python mve/learn.py --go 8</span>（清库 → 摸底 → 8 个学习单元）。</div></div>`;
+  const rowsHtml=(e.tracks||[]).map(t=>{
+    const after=t.after.length
+      ? t.after.map(a=>`<span class="chip ${a.cov>=1?'ok':(a.cov>0?'warn':'bad')}">${ESC(a.pct)}</span>`).join(' ')
+      : '<span class="hint">还没重考过</span>';
+    const d=t.delta_pp===null?'':(t.delta_pp>0
+      ? `<span class="chip ok">+${t.delta_pp}pp</span>`
+      : (t.delta_pp<0?`<span class="chip bad">${t.delta_pp}pp</span>`:'<span class="chip grey">持平</span>'));
+    return `<tr><td class="mono">${ESC(t.topic_id)}${t.exhausted?' <span class="chip grey">已毕业让位</span>':''}</td>
+      <td>${ESC(t.baseline_pct)} <span class="hint">${ESC(t.level)}</span></td>
+      <td>${after}</td><td>${d}</td></tr>`;
+  }).join('');
+  const tr=e.transfer;
+  const trHtml=tr?`<div class="note"><b>迁移对照（${tr.count} 次未练题考核）：</b>${ESC((tr.seq||[]).join(' → '))} ——
+    ${tr.rose?'涨了，说明是真学会而不只是记住了这道题。':'<b>没涨</b>：上升的是「记住了这道题的解法」，不是可迁移的能力。'}</div>`:'';
+  return `<div class="panel"><div class="panel__head"><h2>真实水平曲线 · 撤支架考核</h2>
+      <span class="hint">练习给图谱 / 考核撤图谱 —— 按题分行，不首尾相连</span></div>
+    <div class="kpis">
+      <div class="kpi"><div class="label">摸底均值</div><div class="value">${e.avg_baseline}%</div></div>
+      <div class="kpi"><div class="label">已掌握（≥80%）</div><div class="value">${e.mastered}</div></div>
+      <div class="kpi"><div class="label">重考过 / 涨了</div><div class="value">${e.retested} / ${e.rose}</div></div>
+      <div class="kpi"><div class="label">平均涨幅</div><div class="value">${e.avg_delta_pp===null?'—':(e.avg_delta_pp>0?'+':'')+e.avg_delta_pp+'pp'}</div></div>
+    </div>
+    <table><thead><tr><th>题</th><th>摸底（裸考）</th><th>练后重考</th><th>Δ</th></tr></thead>
+      <tbody>${rowsHtml}</tbody></table>
+    ${trHtml}
+    <div class="legend">摸底 = 清库后第一次全库裸考；重考 = 练完这一题后撤掉图谱再考。
+      出题器按「最弱优先」选题，读的就是摸底那一列。</div></div>`;
+}
+
 function pOverview(s){
   if(!s.has_data) return `<div class="panel"><div class="empty">${ESC(s.hint||'暂无运行记录')}</div>
     <div class="note info">面板只读 run_log.jsonl，不会自己造数据。
@@ -492,6 +528,7 @@ function pOverview(s){
     <div style="margin-top:10px">${chips(last.flags.map(f=>f.label),'warn')}</div>
     <div class="note ${s.reading==='learned'?'info':''}"><b>判读：</b>${ESC(s.reading_text)}</div>
   </div>
+  ${examCard(s)}
   <div class="grid2">
     <div class="panel"><div class="panel__head"><h2>覆盖率轨迹 · 判据</h2></div>
       ${lineChart(cov,{color:'#2f7d57'})}

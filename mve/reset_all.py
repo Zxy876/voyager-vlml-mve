@@ -35,6 +35,11 @@ TARGETS = [
     ("causal_timeline.jsonl", "行动因果时间线"),
     ("coach_log.jsonl", "人导入历史"),
     ("referee_store.json", "裁判标准答案缓存"),
+    # 裸考记录（exam_log.jsonl）：**学习曲线的真正数据源**。
+    # 不清它，清档后"真实水平"还留着上一轮的成绩 —— 摸底就白摸了，
+    # 出题器会照着旧画像选题，而技能库是空的，两条线对不上。
+    ("exam_log.jsonl", "裸考记录（真实水平 · 学习曲线数据源）"),
+    ("learn.log", "学习单元日志"),
     # 保持度（baseline + 半衰期）。不清它，清档后"学会了多少、能撑多久"
     # 还留着上一轮的参数 —— 又是一条对不上的曲线。
     ("mastery_retention.jsonl", "掌握度保持度（baseline / 半衰期）"),

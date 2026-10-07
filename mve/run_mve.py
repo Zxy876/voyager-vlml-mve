@@ -59,6 +59,42 @@ def _stable_skill_name(task: Any) -> str:
     return f"{getattr(task, 'topic_id', '') or 'task'}解法"
 
 
+def _plan_program(topic_id: str, calls: list[dict[str, Any]]) -> tuple[str, str]:
+    """把 plan 路径跑通的**调用序列**渲染成一段可读的程序（可 exec 形态）。
+
+    为什么需要它：SQL 类题走 plan 路径，那条路不产出 `program_code`，
+    于是"跑通了"对技能库零贡献。它的程序就是这串调用 —— 存下来才能重放。
+    渲染成人能读的样子，是为了复盘时能一眼看出"当时到底怎么取的"；
+    真正复用走的是 `blueprint.calls`（`voyager._replay_saved`）。
+    """
+    fn = "".join(ch if (ch.isalnum() or ch == "_") else "_"
+                 for ch in str(topic_id)) + "_solve"
+    lines = [f"# 自己跑通的编排（{topic_id}）—— 重放即可，口径已由裁判验证",
+             f"async def {fn}(mcp):", "    obs = []"]
+    for i, c in enumerate(calls):
+        args = ", ".join(f"{k}={v!r}" for k, v in (c.get("args") or {}).items())
+        lines.append(f"    r{i} = await mcp.{c.get('tool')}({args})")
+        lines.append(f"    obs.append(r{i})")
+    lines.append("    return {'_obs': obs}")
+    return "\n".join(lines), fn
+
+
+def _successful_calls(voyager: Any) -> list[dict[str, Any]]:
+    """本轮**真正调成功了**的调用（只留 tool + args，不带返回值）。
+
+    trajectory 的每项还带着工具的原始返回（`result`）—— 那是整张表，
+    存进技能库会把 json 撑到几 MB，而且复用时根本用不到。
+    """
+    out: list[dict[str, Any]] = []
+    for t in (getattr(voyager, "trajectory", None) or []):
+        if not isinstance(t, dict) or not t.get("tool"):
+            continue
+        args = {k: v for k, v in (t.get("args") or {}).items()
+                if isinstance(v, (str, int, float, bool))}
+        out.append({"tool": str(t["tool"]), "args": args})
+    return out
+
+
 def _deterministic_ratio(ref_facts: list[dict[str, Any]]) -> float:
     """裁判事实里「确定性来源」占多少 —— V2 证据权重的 evaluator_confidence 用它。
 
@@ -445,6 +481,30 @@ async def main() -> None:
                     source="practice")
                 print(f"  学会技能  : {_saved[0]} "
                       f"（自己写的程序 {len(prog)} 字符已入库）")
+            elif ev.coverage >= PRACTICE_SAVE_COVERAGE:
+                # ---- plan 路径：没有 program_code，但**跑通了的调用序列就是它的程序** ----
+                #
+                # 8 道题里 6 道是 SQL 类，走 plan 路径，那条路永远不产出代码 ——
+                # 于是这六成的题"跑通了"对技能库零贡献：撤掉图谱重考时只能
+                # 从头再写一遍 SQL，然后再犯同一个口径错（实测 corrode_collapse
+                # 练完 100%、重考仍 0%，缺的还是同一条 losing_team_name 放错层）。
+                # 原版的判据是**跑通了没有**，不是这段东西长什么样。
+                calls = _successful_calls(voyager)
+                if calls:
+                    code, fn = _plan_program(str(task.topic_id), calls)
+                    _saved = skill_store.add(
+                        task.topic_id,
+                        _stable_skill_name(task),
+                        f"自己跑通的编排（覆盖率 {ev.coverage:.0%}）："
+                        f"{' → '.join(str(c['tool']) for c in calls)}",
+                        code=code,
+                        blueprint={"source": "practice",
+                                   "coverage": ev.coverage,
+                                   "program_name": fn,
+                                   "calls": calls},
+                        source="practice")
+                    print(f"  学会技能  : {_saved[0]} "
+                          f"（跑通的调用序列 {len(calls)} 步已入库，可重放）")
         except Exception as e:                # pragma: no cover
             print(f"  （存程序失败：{type(e).__name__}: {e}）")
 
