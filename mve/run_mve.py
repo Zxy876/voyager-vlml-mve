@@ -163,6 +163,7 @@ async def main() -> None:
                 rec, _ = await question_gen.generate_adopt(
                     about=str(sug.get("about") or ""),
                     difficulty=int(sug.get("difficulty") or 2),
+                    focus_dimension=str(sug.get("focus_dimension") or ""),
                     tries=3, do_adopt=True, verbose=True)
             except Exception as exc:                         # pragma: no cover
                 print(f"  ⚠ 自动出题失败（继续用现有题）：{type(exc).__name__}: {exc}")

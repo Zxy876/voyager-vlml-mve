@@ -566,6 +566,81 @@ lotus_win_rate / corrode_collapse）**无回退**。保持度开始真的落盘
 
 ---
 
+### 八之四：出题器照**知识图谱**出题（2026-10-07）
+
+用户追问：「伴学插件是不是根据知识图谱出的题？去查查，然后改」——
+去伴学取证后确认：**是，而且比 MVE 做到的彻底得多。**
+
+#### 伴学的做法（取证自 `static/knowledge_seeds/math.json`，457 个数学知识点）
+
+图谱节点**每个都自带**（出现率均 100%）：
+`difficulty`（节点自带难度，如 0.25）· `question_types`（该知识点该出什么题型）·
+`typical_misconceptions`（典型错误）· `prerequisites` / `related` / `depth`（依赖与图谱深度）·
+`skills` / `examples` / `unit`。
+
+`question_type_mapping.py:131` 的 docstring 是最直白的证据：
+
+> "Choose the first declared teaching style and **map it without LLM input**.
+> Seed ordering is preserved as the **author-provided priority**."
+
+**题型由节点声明决定，不交给 LLM；难度是节点自带的，不是生成时要求模型"出个难度 4 的题"。
+伴学的题库是「知识点 × 难度」二维铺开（892 个知识点），不是靠生成时临时发挥。**
+
+#### MVE 此前的差距
+
+| 环节 | 伴学 | MVE（此前） |
+|---|---|---|
+| 难度从哪来 | 图谱节点自带 | 梯度算出来了，但**只用于选旧题**，进不了出题器 |
+| 题型从哪来 | 节点 `question_types` 声明 | LLM 自由发挥 |
+| 出题点谁选 | 图谱 | LLM 自由发挥 → 编造表名、把维度名当列名 |
+
+#### 改了什么
+
+1. **新题难度接上梯度**：`_new_topic_suggestion(settled, target=..., mode=...)`。
+   此前是 `int(task.difficulty)` 抄停滞题的种子难度 —— 梯度算出的 `target`
+   到这里就断了。`cleared`（全被拿下）时难度 = `min(4, target + 1)`，即**推进一档**。
+2. **难度分档下了定义并真的去数**：`DIFFICULTY_RUBRIC` 把每档写成**可数的 SQL 特征**
+   （1=单表聚合，2=分组，3=JOIN/条件分支，4=窗口函数/嵌套子查询），生成后逐条数，
+   不达标就判废。**判废独立于其它闸** —— 否则模型在"表名写错"那道闸就先挂了，
+   永远收不到"难度不达标"这句反馈（实测三次生成全挂在同一个错上）。
+3. **`_server_skeleton` 把图谱声明渲染出来**：SQL 维度此前只给一句
+   「需自己写 SQL，取第 N 列」，把 detail 里**本来就有的**
+   `tables` / `columns_by_table` / `semantics` / `typical_errors` 全吞了。
+   现在给出 `FROM **rounds`，可用列…，口径形态…，典型错法…。
+4. **服务端从图谱挑出题点**（`_graph_blueprint`）：照伴学，题点归服务端、
+   题面归模型。挑定 (维度 × subject 键 × 表 × 列 × 口径) 后**写死进 prompt**，
+   模型只填 WHERE 的值和题面文案。
+
+   为什么必须走到这一步（实测教训）：只把「真实列清单」放进 critique **不够** ——
+   三次生成里 critique 每次都把 `fb_player` 列在真实列中，模型照样坚持写不存在的
+   `player_name`。**让它挑，它就会按常识编**；唯一可靠的办法是不让它挑。
+5. **`about` 与出题点冲突时以出题点为准**：planner 说"用队员级范围"，
+   而图谱挑中的 `max_losing_streak` 是**回合级**口径（rounds 表没有队员列），
+   模型夹在中间把 `fb_player` 写进了 rounds 表，三次全挂。
+
+#### 实测（同一条链路跑通）
+
+```
+⚠ 这道题连着 13 次满分（全库 3 道已被拿下，目标难度 4）→ 往上一档出题
+图谱出题点 : max_losing_streak × map｜表 rounds｜列 losing_team_name、map_name、round_number、series_id
+第 1 次 ❌ SQL 里这些不是 rounds 的列：team_name → 筛队伍用 winning_team_name
+第 2 次 ✅ 验题通过（跑出 'Haven'，base=8）→ 新题已入闱
+```
+
+新题（难度 4，gaps-and-islands）交给 Voyager：**第 1 轮 0%**，
+计划校验两次拦下经典陷阱（把 `losing_team_name` 写在最内层 WHERE —— 编号前就筛掉队伍，
+剩下的回合编号必然连续，整段会被当成一块）。
+
+**这才是关键结果：不再是「首轮即满分」，学习曲线终于有的测了。**
+此前那个"题库太简单测不出学习"的死结，靠的是**系统自己上难度**解开的。
+
+顺手修的三处：`topic_id` 中文（会进日志/面板 URL）→ 服务端规范化成英文小写下划线；
+取值不是数字（取到过 `'Haven'` —— `value_column` 指到了标签列）→ 判废而非放行；
+`_bad_columns` 把 `over` / `partition` / `subquery` 等 SQL 关键字当成列名报给模型，
+属于误导性反馈 → 补进关键字表。
+
+---
+
 ## 九、跑法
 
 ```bash
@@ -624,11 +699,18 @@ python mve/dashboard.py                  # 面板 http://127.0.0.1:8777
    **SQL 路径类**（靠自己写 SQL 的题）没有等价护栏。
 5. **题目不再写死，但生成成功率有限。** `question_gen.py` 已能自动生成题目
    （生成的是**取数配方**不是答案，裁判跑一遍拿真值），并能在「没有可推进的题」
-   时自动生成（见五之二）。实测：生成的 `lotus_win_rate` 被判 100% 正确。
-   但当前 LLM 走 **SQL 路径**出题约三分之一能过（最常见：把工具名当表名、
-   造一个不存在的列）；走**工具路径**则一次就能写对。
+   与「全被拿下」两种情形自动生成（见五之二、八之四）。实测：
+   生成的 `lotus_win_rate` 被判 100% 正确；生成的 `max_losing_streak_map`
+   （难度 4）让 Voyager 首轮 0% —— 后者正是能测出学习曲线的题。
+   出题点现由**服务端从图谱挑定**（`_graph_blueprint`），模型只填 WHERE 与题面，
+   所以"编造表名/列名"这类错误已基本消失；剩下的失败主要是
+   **口径写错**（如 gaps-and-islands 的过滤层级），会被计划校验与验题拦下并回灌。
    另外生成的题默认 `validated_target=False`（**不进掌握度**）——
    照伴学：生成 ≠ 生效，先要被确认口径。
+   **未解**：MVE 的图谱维度节点 `attrs` 仍是空的（`{}`），`tables` / `columns` /
+   `semantics` / `typical_errors` 只存在于 `detail`（由 tasks.py 派生，不持久化）。
+   伴学那 457 个节点是**每个都自带 17 个声明字段**的。要把 MVE 的图谱补成
+   伴学那样（含 `difficulty` / `question_types` / `prerequisites`），未做。
 6. 面板的求助按钮与 help_decision 展示还没做。
 7. **~~SQL 路径的「编排漏条」~~ （2026-10-07 已解，见八之三）** —— 曾是 60% / 80% 长期卡死，
    根因是执行层 `[:3]` 硬截断 + critique 永远为 None + 反馈只点维度不点评分点。

@@ -45,6 +45,11 @@ RETRY_COOLDOWN = 2
 # 出口必须是"没进展就毕业"。覆盖率一变（哪怕只涨一点）就重新进错题池。
 STALE_LIMIT = 3
 
+# 连续满分多少次算「这道题已经被拿下」。拿下之后不该再反复考它，
+# 而该把它当成"可以往上走一档"的信号 —— 见 `_mastery_by_topic` 里
+# `cleared` 那条注释（缺了它就是一个全库满分的死循环）。
+CLEAR_RUN = 3
+
 
 def _mastery_by_topic() -> dict[str, dict[str, Any]]:
     """每题最近的掌握度 + 是否答错过 + 冷却进度。"""
@@ -89,7 +94,18 @@ def _mastery_by_topic() -> dict[str, dict[str, Any]]:
             else:
                 break
         rec["stale_run"] = run
+        # 卡住了：连续 N 次覆盖率一字不差，**且还没满分** → 再练也是重复。
         rec["stalled"] = run >= STALE_LIMIT and rec["last_coverage"] < 1.0
+        # 拿下了：连续 N 次满分 → 该上难度了（此前这一档根本不存在）。
+        #
+        # 缺了它的后果是一个隐蔽的死循环：全库满分时 stalled 恒为 False
+        # （`last_coverage < 1.0` 不满足），于是 `all_stalled` 分支永不触发，
+        # 出题器**永远不会去生成更难的题** —— 实测 kast 连对 10 次、
+        # pistol 连对 6 次，stale_run 远超阈值却一个都不算停滞。
+        # 换言之：「做错了卡住」是信号，「做对了」压根不是信号。
+        # 而伴学恰恰相反 —— 掌握一档就推进下一档（`difficulty_policy` +
+        # 82 个知识点 × 3 档难度的题库铺开），做对了才是上难度的触发条件。
+        rec["cleared"] = run >= CLEAR_RUN and rec["last_coverage"] >= 1.0
 
     # 难度自适应要用的三个字段（`difficulty.py` 的判据照伴学 difficulty_policy）。
     # 只取**最近一次**的快照：掌握度是序列的投影，用历史累计会把"曾经很好"
@@ -210,8 +226,30 @@ def select_next(*, explicit_topic_id: str = "") -> dict[str, Any]:
     return sel
 
 
+def _sql_dims() -> set[str]:
+    """能自己写 SQL 的维度（服务端声明 `by_sql=True`）。
+
+    为什么必须区分：工具路径的维度受工具签名限制（`kast_pct` 只有
+    `match_analysis_report` 的队伍级口径），既换不了 subject 粒度，
+    也写不出窗口函数 —— 拿它当"难度 4 的新题方向"必然失败。
+    实测就是这样：`_new_topic_suggestion` 挑了 kast_pct 当 focus，
+    要求「用队员级范围出题」，模型只能硬去查 match_players_report
+    （那是工具名不是表），三次全挂在同一个错上。
+    """
+    try:
+        import question_gen
+        specs = question_gen._dim_specs()
+    except Exception:                                        # pragma: no cover
+        return set()
+    return {str(d) for d, s in (specs or {}).items()
+            if isinstance(s, dict) and s.get("by_sql")}
+
+
 def _new_topic_suggestion(
-    stalled: list[tuple[str, dict[str, Any]]],
+    settled: list[tuple[str, dict[str, Any]]],
+    *,
+    target: int = 2,
+    mode: str = "stalled",
 ) -> dict[str, Any]:
     """照伴学 `weak_topic`：先确定「练什么」，再交给出题器去出题。
 
@@ -224,14 +262,37 @@ def _new_topic_suggestion(
     为什么必须补这一层：伴学在「没有可推进的题」时会走 `weak_topic` 去**生成**一道
     新题；MVE 原版走到 `all_stalled` 就只会标 blocked 卡住 —— 这正是
     「连着 10 次停在 50%、没有可推进的题了」那个症状的根因。
+
+    **难度必须接梯度**（此前不接，是这条闭环最大的断口）：
+      stalled（卡住）→ 新题难度 = max(全局目标, 薄弱题难度) —— 补薄弱点，别出更简单的
+      cleared（拿下）→ 新题难度 = min(4, 全局目标 + 1) —— 这是**推进一档**，
+                       否则全库满分时永远只会生成同档题，题库涨了但难度不涨。
+    此前一律 `int(task.difficulty)` 抄停滞题的种子难度，梯度算出的 `target`
+    到这里就断了 —— 于是「自适应梯度」只作用在"选哪道旧题"，进不了"出什么新题"。
     """
-    if not stalled:
+    if not settled:
         return {}
-    topic, m = min(stalled, key=lambda kv: (kv[1]["last_coverage"],
+    topic, m = min(settled, key=lambda kv: (kv[1]["last_coverage"],
                                             -kv[1]["stale_run"]))
     task = TASKS.get(topic)
+    seed = int(getattr(task, "difficulty", 2) or 2)
+    if mode == "cleared":
+        # 全被拿下 → 往上推一档（clamp 到 4：题库上限，再往上没有口径可出）
+        difficulty = min(4, max(1, int(target or 2) + 1))
+    else:
+        # 卡住了 → 至少不低于全局目标，也不低于薄弱题本身的难度
+        difficulty = min(4, max(1, max(int(target or 2), seed)))
     dims = [str(p.dimension) for p in (task.rubric if task else [])]
-    focus = dims[0] if dims else ""
+    # focus 必须是**能自己写 SQL** 的维度：工具维度换不了 subject 粒度，
+    # 也写不出难度 3+ 要求的结构（JOIN / 窗口函数）。
+    # 此前直接取 dims[0]，于是挑中了 kast_pct（by_tool、无队员级口径）
+    # 去出一道难度 4 的题 —— 那个方向在数据里根本无解，三次生成全挂。
+    sql_dims = _sql_dims()
+    focus = next((d for d in dims if d in sql_dims), "")
+    if not focus:
+        # 本题全是工具维度 → 从题库里另挑一个 SQL 维度当方向，
+        # 否则「出一道难度 {difficulty} 的题」这个要求无从落地。
+        focus = next(iter(sorted(sql_dims)), "") or (dims[0] if dims else "")
     # 已有题的 subject 用过哪些键 —— 新题必须换一个键，否则撞「与已有题重复」闸
     used: set[str] = set()
     for t in TASKS.values():
@@ -248,9 +309,13 @@ def _new_topic_suggestion(
                  + (f"（subject 带上 {want} 键）" if want else "（换一个 subject）"),
         "focus_dimension": focus,
         "subject_key": want,
-        "difficulty": int(getattr(task, "difficulty", 2) or 2),
-        "why": (f"{topic} 连着 {m['stale_run']} 次停在 {m['last_coverage']:.0%}，"
-                f"它考的口径（{focus or '未知'}）就是当前的薄弱点"),
+        "difficulty": difficulty,
+        "why": ((f"{topic} 连着 {m['stale_run']} 次满分（全库已被拿下）→ "
+                 f"往上推一档，按难度 {difficulty} 出题"
+                 f"（全局目标 {target}）") if mode == "cleared" else
+                (f"{topic} 连着 {m['stale_run']} 次停在 {m['last_coverage']:.0%}，"
+                 f"它考的口径（{focus or '未知'}）就是当前的薄弱点"
+                 f" → 按难度 {difficulty} 出（全局目标 {target}）")),
     }
 
 
@@ -290,6 +355,8 @@ def _select_raw(*, explicit_topic_id: str, mastery: dict[str, Any],
         }
 
     stalled = [(t, m) for t, m in mastery.items() if t in TASKS and m["stalled"]]
+    # 已被拿下的题（连续满分）：它们不再需要练，但**是上难度的信号**。
+    cleared = [(t, m) for t, m in mastery.items() if t in TASKS and m["cleared"]]
 
     # 2) due_review：练够了但还没满分 → 回头复习（照 FSRS）
     due = [
@@ -407,8 +474,16 @@ def _select_raw(*, explicit_topic_id: str, mastery: dict[str, Any],
             "blocked": False,
         }
 
-    # 5.5) all_stalled：能推进的题一个都没有了 —— 如实说清，别假装还在自适应。
-    #     这时候该做的是补题目口径 / 换题，而不是继续硬跑同一道。
+    # 5.5) 没有可推进的题了 —— 如实说清，别假装还在自适应。
+    #     两种"推不动"，性质相反，措辞与出法都必须分开：
+    #
+    #       all_stalled  = 卡住了（没满分，再练也是重复）→ 补薄弱点，难度跟着薄弱题走
+    #       all_cleared  = 拿下了（全满分）→ **该上难度了**，难度比目标再推一档
+    #
+    #     后者此前根本不存在：`stalled` 判据要求 `last_coverage < 1.0`，
+    #     于是全库满分时出题器只会掉到冷启动兜底，在几道满分的题里来回挑，
+    #     永远不去生成更难的题 —— "做对了"压根不是信号。而伴学的做法恰恰
+    #     相反：掌握一档就推进下一档（82 个知识点 × 3 档难度铺开的题库）。
     if stalled:
         topic, m = min(stalled, key=lambda kv: (kv[1]["last_coverage"], -kv[1]["stale_run"]))
         return {
@@ -421,7 +496,29 @@ def _select_raw(*, explicit_topic_id: str, mastery: dict[str, Any],
             # 伴学在这里走 weak_topic 去**生成**一道新题（entry_tutor_answer_entries
             # .py:174：reason != due_review 就 action=generate_question）。
             # MVE 补齐这一环：planner 只给「练什么」，生成由 entry 层做。
-            "suggestion": _new_topic_suggestion(stalled),
+            "suggestion": _new_topic_suggestion(stalled, target=target,
+                                                mode="stalled"),
+            "action": "generate_question",
+        }
+
+    # 5.6) 全被拿下：这是**上难度**的信号，不是"没事可做"。
+    #     此前没有这一支，所以题库永远停在 6 道、难度永远上不去。
+    #    判据要收紧：必须**全库都满分**才算"该上难度"。只有一两道拿下、
+    #    其余还停在低覆盖率时，正确的做法是回去补缺口，不是跳档。
+    unfinished = [t for t, m in mastery.items()
+                  if t in TASKS and m["last_coverage"] < 1.0]
+    if cleared and not unfinished:
+        # 拿下次数最多的那道 —— 它最能代表「这个口径已经会了，可以往上走」
+        topic, m = max(cleared, key=lambda kv: kv[1]["stale_run"])
+        return {
+            "topic_id": topic,
+            "reason": "all_cleared",
+            "explanation": (
+                f"这道题连着 {m['stale_run']} 次满分（全库 {len(cleared)} 道已被拿下，"
+                f"目标难度 {target}）—— 再考它测不出东西，往上一档出题"),
+            "blocked": True,
+            "suggestion": _new_topic_suggestion(cleared, target=target,
+                                                mode="cleared"),
             "action": "generate_question",
         }
 
@@ -463,6 +560,7 @@ REASON_LABEL = {
     "tool_coverage": "补工具覆盖",
     "blocked_diagnostic": "拿不到证据·重复",
     "all_stalled": "全部停滞·生成新题",
+    "all_cleared": "全被拿下·上一档生成新题",
     "recommended": "推进新题",
     "default": "补最弱的",
     "cold_start": "冷启动",

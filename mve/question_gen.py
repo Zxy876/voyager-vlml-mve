@@ -264,6 +264,10 @@ _SQL_KEYS = frozenset("""
 select from where and or as count sum avg round case when then else end
 group order by limit in not null is on join left inner distinct min max
 having asc desc between like cast integer double varchar true false
+over partition row_number lag lead rank dense_rank union intersect except
+with exists all any some cross outer full natural using offset fetch
+first last nulls rows range preceding following current unbounded
+subquery subquery1 subquery2 subquery3 derived alias
 """.split())
 
 
@@ -315,17 +319,38 @@ async def _server_skeleton() -> str:
         for d in sorted(g.dimensions()):
             prod = g.who_produces(d)
             node = g.nodes.get(f"dim:{d}")
-            vp = str((node.detail.get("value_path") if node else "") or "")
-            cols = (node.detail.get("value_columns") if node else None) or []
+            det = (getattr(node, "detail", None) or {})
+            vp = str(det.get("value_path") or "")
+            cols = det.get("value_columns") or []
             tag = _dim_tag(d, specs)
             if prod and vp:
                 lines.append(f"  {d} → 工具 {'/'.join(prod)}，路径 {vp} {tag}")
             elif prod:
                 lines.append(f"  {d} → 工具 {'/'.join(prod)} {tag}")
-            elif cols:
-                lines.append(f"  {d} → 需自己写 SQL，取第 {cols[0]} 列 {tag}")
             else:
-                lines.append(f"  {d} {tag}")
+                # SQL 维度：必须把**表 / 列 / 口径形态 / 典型错法**全给出来。
+                #
+                # 此前这里只写一句「需自己写 SQL，取第 N 列」，把 detail 里
+                # 已经存在的 tables / columns_by_table / semantics /
+                # typical_errors 全吞了。于是模型只能靠猜 —— 实测三次生成
+                # 全部写成 `FROM match_summary_report`（那是**工具名**）
+                # 和 `MAX(conversion.fb_conv)`（把**维度名**当列名）。
+                # 声明一直都在图谱里，只是没给它看。
+                #
+                # 同构：伴学的知识点节点自带 question_types 与
+                # typical_misconceptions，出题时**照节点声明走**
+                # （question_type_mapping.py:131 "map it without LLM input"）。
+                tbl = (det.get("tables") or ["?"])[0]
+                cbt = det.get("columns_by_table") or {}
+                cols_txt = "、".join((cbt.get(tbl) or det.get("columns") or []))
+                sem = str(det.get("semantics") or "").strip()
+                lines.append(
+                    f"  {d} → 自己写 SQL：FROM **{tbl}**"
+                    + (f"，可用列：{cols_txt}" if cols_txt else "")
+                    + (f"；口径形态：{sem[:80]}" if sem else "")
+                    + f" {tag}")
+                for e in (det.get("typical_errors") or [])[:2]:
+                    lines.append(f"      典型错法：{str(e)[:90]}")
     except Exception as e:                                   # pragma: no cover
         lines.append(f"（图谱不可用：{type(e).__name__}）")
 
@@ -415,8 +440,105 @@ subject 的键只能是 series / team / map / player 这类真实维度，不要
 """
 
 
+def _subject_key_of(col: str) -> str:
+    """列名 → 能当 subject 键的语义（照图谱里已有的 subject 命名）。"""
+    c = str(col or "").lower()
+    if "player" in c:
+        return "player"
+    if c.startswith("map") or c.endswith("_map"):
+        return "map"
+    if "team" in c:
+        return "team"
+    if "series" in c:
+        return "series"
+    if "game" in c:
+        return "game"
+    return ""
+
+
+def _graph_blueprint(difficulty: int = 2,
+                     avoid: set[tuple[str, str]] | None = None,
+                     prefer: str = "") -> dict[str, Any]:
+    """服务端**从图谱挑出题点** —— 照伴学，题点不由 LLM 选。
+
+    伴学的做法（`question_type_mapping.py:131` 的 docstring 说得最直白）：
+        "Choose the first declared teaching style and **map it without
+         LLM input**. Seed ordering is preserved as the author-provided
+         priority."
+    即：**知识点节点自带 question_types / difficulty / typical_misconceptions，
+    出题器选中那个节点，题型与口径由节点声明决定**，模型只负责把题面写出来。
+
+    MVE 同构：图谱的维度节点 detail 里已经有 `tables` / `columns_by_table` /
+    `semantics` / `recipe` / `typical_errors`，服务端据此挑定
+    「哪个维度 × 哪个 subject 键 × 哪张表 × 哪些列 × 什么口径形态」，
+    把这些**写死进 prompt**，模型只填 WHERE 的值和题面文案。
+
+    为什么必须做到这一步（实测教训）：只把"真实列清单"放进 critique 是不够的
+    —— 三次生成里 critique 每次都把 `fb_player` 列在真实列里，模型照样坚持写
+    不存在的 `player_name`。**让它挑，它就会按常识编**；唯一可靠的办法是不让它挑。
+    """
+    avoid = avoid or set()
+    try:
+        import knowledge_graph
+        g = knowledge_graph.KnowledgeGraph.load()
+    except Exception:                                        # pragma: no cover
+        return {}
+    specs = _dim_specs()
+    cands: list[tuple[int, str, dict[str, Any]]] = []
+    for d in sorted(g.dimensions()):
+        node = g.nodes.get(f"dim:{d}")
+        det = getattr(node, "detail", None) or {}
+        tables = det.get("tables") or []
+        if not tables:
+            continue                     # 工具维度：口径受工具签名限制，先不拿来出新题
+        if not specs.get(d, {}).get("by_sql"):
+            continue
+        tbl = tables[0]
+        cols = ((det.get("columns_by_table") or {}).get(tbl)
+                or det.get("columns") or [])
+        # 这个维度能撑起哪些还没用过的 subject 键
+        keys = [k for k in (_subject_key_of(c) for c in cols) if k]
+        for k in dict.fromkeys(keys):
+            subj = {"series": SERIES, "team": C9}
+            if k in ("series", "team"):
+                continue                 # 已有题都是这个粒度，换它才叫新题
+            subj[k] = "?"
+            key = (json.dumps(subj, sort_keys=True), d)
+            if key in avoid:
+                continue
+            score = 0
+            if prefer and d == prefer:
+                score -= 10              # planner 指定的方向优先
+            # 难度匹配：该维度的参考配方本身是什么档
+            recipe = str(det.get("recipe") or det.get("semantics") or "")
+            low = recipe.lower()
+            own = 1
+            if "over (" in low or "over(" in low or "from (select" in low:
+                own = 4
+            elif " join " in low or "case when" in low:
+                own = 3
+            elif "group by" in low:
+                own = 2
+            score += abs(own - int(difficulty or 2)) * 3
+            cands.append((score, d, {
+                "dimension": d,
+                "subject": subj,
+                "subject_key": k,
+                "table": tbl,
+                "columns": list(cols),
+                "semantics": str(det.get("semantics") or ""),
+                "typical_errors": list(det.get("typical_errors") or [])[:2],
+                "own_difficulty": own,
+            }))
+    if not cands:
+        return {}
+    cands.sort(key=lambda x: (x[0], x[1]))
+    return cands[0][2]
+
+
 async def propose(*, about: str = "", difficulty: int = 2,
-                  critique: str = "", avoid: str = "") -> dict[str, Any]:
+                  critique: str = "", avoid: str = "",
+                  blueprint: dict[str, Any] | None = None) -> dict[str, Any]:
     """第 2 段：LLM 出题面 + 取数配方（**不含答案数值**）。
 
     `critique` 是**上一轮验题的失败原因**，原样喂回去 —— 这是原版 Voyager 的
@@ -426,8 +548,33 @@ async def propose(*, about: str = "", difficulty: int = 2,
     `avoid` 是**已经出过的 (subject, dimension) 清单**。事前给比事后挡便宜：
     实测不给的话，模型每轮都撞已有题，白烧两次调用。
     """
+    band = DIFFICULTY_RUBRIC.get(int(difficulty) or 2) or {}
+    band_txt = ""
+    if band:
+        band_txt = (
+            f"\n\n难度 {difficulty} 的含义（服务端会**照这条逐字数**你的 SQL，"
+            f"不达标就判废）：{band.get('needs', '')}。"
+            f"配方里必须出现 {' / '.join(band.get('any_of') or {})} 之一。")
     user = (f"围绕「{about or '本场比赛'}」出一道题，难度 {difficulty}。"
-            "记住：给取数配方，不要给答案数值。")
+            "记住：给取数配方，不要给答案数值。" + band_txt)
+    if blueprint:
+        # 服务端已挑定出题点 —— 模型**不许改**，只许把值填进去。
+        # 这是伴学 `resolve_target_question_type` + `enforce_mapped_question_type`
+        # 那一对的同构物：题点归服务端，题面归模型。
+        bp = (
+            f"\n\n【服务端已挑定的出题点 —— 不许改动，照它出题】"
+            f"\n  维度 dimension 必须写：{blueprint.get('dimension')}"
+            f"\n  subject 必须写：{json.dumps(blueprint.get('subject') or {}, ensure_ascii=False)}"
+            f"  （其中 {blueprint.get('subject_key')} 的值你去库里查一个真实存在的填进去）"
+            f"\n  FROM 必须是这张表：{blueprint.get('table')}"
+            f"\n  只能用这些列：{'、'.join(blueprint.get('columns') or [])}"
+            f"\n  口径形态照这个：{str(blueprint.get('semantics') or '')[:160]}"
+            f"\n  **不要**写上面没出现的列名，也不要换表。表里的列就是这些，"
+            f"没有 player_name / team_name 这种常识列 —— 队员列是 fb_player，队伍列是 fb_team。"
+        )
+        for e in (blueprint.get("typical_errors") or []):
+            bp += f"\n  典型错法：{e}"
+        user += bp
     if avoid:
         user += ("\n\n下面这些 (subject, dimension) 组合**已经有题了，不要再出**：\n"
                  + avoid)
@@ -579,6 +726,67 @@ def _empty(value: Any) -> bool:
     if isinstance(value, (list, dict)):
         return len(value) == 0
     return False
+
+
+def _difficulty_gap(candidate: dict[str, Any], want: int) -> str:
+    """这道题的配方配不配得上它自称的难度？返回缺口说明，配得上返回空串。
+
+    判据必须**可数**（数 SQL 里的关键字），不能靠模型自评 ——
+    自评等于让它自己给自己打分。
+    """
+    need = DIFFICULTY_RUBRIC.get(int(want) or 2)
+    if not need:
+        return ""
+    rubric = [rp for rp in (candidate.get("rubric") or []) if isinstance(rp, dict)]
+    sqls = []
+    for rp in rubric:
+        spec = rp.get("answer_spec") if isinstance(rp, dict) else None
+        if isinstance(spec, dict):
+            s = str(spec.get("sql") or "")
+            if s:
+                sqls.append(s.lower())
+    if not sqls:
+        # 工具路径：没有 SQL 可数，只能看评分点数量（弱判据，不拦）
+        return ""
+    joined = " \n ".join(sqls)
+    has_group = "group by" in joined
+    for feat, kws in (need.get("any_of") or {}).items():
+        if any(k in joined for k in kws):
+            return ""
+    # 弱判据：同一档也可以靠"拆得更细"达到 —— 分组 + 足够的评分点数。
+    # 少了这一条，难度 2 会误杀「两个评分点但没 GROUP BY」的题（实测
+    # `SELECT COUNT(*)...` 被判不达标，其实那就是一道正经的 2 档题）。
+    alt = int(need.get("or_points") or 0)
+    if alt and len(rubric) >= alt and (has_group or not need.get("or_points_need_group")):
+        return ""
+    return f"需要出现 {' / '.join(need.get('any_of') or {})} 之一" \
+           + (f"，或分组且不少于 {alt} 个评分点" if alt else "")
+
+
+# 难度分档：每档写清"什么样才算这个难度"。
+#
+# 为什么必须写死：此前 prompt 里只有一句 `难度 {n}`，schema 里只有
+# `"difficulty": 1-4` —— 模型自由解读，服务端从不校验。于是出题器把
+# 梯度算出来的难度传过来，生成出的题却可能还是一条 `SELECT COUNT(*)`，
+# "按难度生成不同的题"名存实亡。
+#
+# 照伴学的同构：伴学的难度是**题库铺开**的（82 个知识点 × 3 档，每档的题
+# 面与评分点数量都不同），不是靠生成时临时发挥。MVE 没有那份题库，
+# 就把"每档长什么样"压缩成可数的 SQL 特征，生成后逐条数。
+DIFFICULTY_RUBRIC: dict[int, dict[str, Any]] = {
+    1: {"needs": "单表单指标聚合",
+        "any_of": {"聚合函数": ["count(", "avg(", "sum(", "max(", "min("]}},
+    2: {"needs": "分组聚合（GROUP BY）或多个评分点",
+        "any_of": {"分组": ["group by"]},
+        "or_points": 2},
+    3: {"needs": "分组 + 条件过滤，或多表 JOIN",
+        "any_of": {"多表 JOIN": [" join "],
+                   "条件分支": ["case when", " having ", "coalesce("]},
+        "or_points": 3, "or_points_need_group": True},
+    4: {"needs": "窗口函数 / 自连接 / 嵌套子查询（gaps-and-islands、最长连续、排名）",
+        "any_of": {"窗口函数": ["over (", "over("],
+                   "嵌套子查询": ["from (select", "from(select"]}},
+}
 
 
 async def validate(candidate: dict[str, Any], *,
@@ -770,7 +978,17 @@ async def validate(candidate: dict[str, Any], *,
             try:
                 v = float(got.get("value"))
             except (TypeError, ValueError):
-                pass
+                # 取出来的不是数（实测取到过 'Haven' —— value_column 指到了
+                # map_name 那列）。此时不能 pass 放行：一个地图名当"最长连败
+                # 回合数"混进题库，裁判会拿它当真值，整道题的评分就废了。
+                row["ok"] = False
+                row["fix"] = (f"配方取出来的值是 {got.get('value')!r}，不是数字 —— "
+                              "value_column 指错列了（多半指到了 map_name / "
+                              "player_name 这类标签列）。把它改成数值那一列。")
+                row["why"] = f"取出的值 {got.get('value')!r} 不是数字"
+                checks.append(row)
+                reasons.append(f"「{point}」取出的值不是数字（{got.get('value')!r}）")
+                continue
             else:
                 cap = await _max_rounds()
                 if v > cap:
@@ -791,7 +1009,26 @@ async def validate(candidate: dict[str, Any], *,
         checks.append(row)
 
     ok = bool(checks) and all(c.get("ok") for c in checks)
-    return {"ok": ok, "checks": checks, "reasons": reasons}
+
+    # ---- 闸 8（题级）：难度达标 ----
+    # 光把「难度 4」这句话塞进 prompt 是没用的：模型不知道 4 意味着什么，
+    # 生成完也没有人检查 —— 于是"按难度生成不同的题"名存实亡，题库涨了
+    # 难度不涨。这里两件事一起做：
+    #   (a) 把每档的**可验证特征**写死在服务端（见 DIFFICULTY_RUBRIC）；
+    #   (b) 生成后**真的去数**：SQL 里有没有窗口函数 / 子查询 / JOIN。
+    #
+    # **独立于 ok 计算**：此前把它放在 `if ok:` 里，结果模型在前面几道闸
+    # （表名写错、评分点重复）就先挂了，永远收不到"难度不达标"这句反馈 ——
+    # 实测三次生成全是 `GROUP BY player_name`，没有任何难度 4 该有的结构，
+    # 而 critique 里一个字没提。难度缺口必须**每次都算、每次都回灌**，
+    # 让模型同时改"表名"和"难度形态"，而不是改完一个才知道还有下一个。
+    gap = _difficulty_gap(candidate, int(candidate.get("difficulty") or 2))
+    if gap:
+        reasons.append(f"难度不达标（要求 {candidate.get('difficulty')} 档）：{gap}")
+
+    return {"ok": ok, "checks": checks, "reasons": reasons,
+            "difficulty": candidate.get("difficulty"),
+            "difficulty_gap": gap}
 
 
 # --------------------------------------------------------------------------
@@ -832,6 +1069,17 @@ def enforce(candidate: dict[str, Any]) -> dict[str, Any]:
     tool_args 必须是 dict（否则工具调用直接崩）。
     """
     out = dict(candidate)
+    # topic_id 必须是英文小写下划线 —— 模型会给中文（实测给了
+    # `max_losing_streak_map粒度`），这个 id 会进题库、进日志、进面板 URL，
+    # 不能留中文。服务端能补的就不废题（照伴学 enforce 精神）。
+    tid = str(out.get("topic_id") or "").strip()
+    if tid:
+        slug = re.sub(r"[^a-z0-9_]+", "_", tid.lower()).strip("_")
+        slug = re.sub(r"_+", "_", slug)
+        if not slug:
+            slug = "gen_" + re.sub(r"[^a-z0-9]+", "", str(
+                out.get("question") or "").lower())[:24] or "gen_topic"
+        out["topic_id"] = slug
     specs = _dim_specs()
     rubric = []
     for rp in (out.get("rubric") or []):
@@ -1032,27 +1280,54 @@ def _critique_of(vr: dict[str, Any]) -> str:
     原样塞进 `generation_feedback`。MVE 同构，但多给一句「怎么改」——
     只报症状实测三轮都改不动（模型会换一种方式犯同一个错）。
     """
-    return "\n".join(
+    lines = [
         f"  - 评分点「{c.get('point')}」错在：{c.get('why')}"
         + (f"\n      怎么改：{c['fix']}" if c.get("fix") else "")
-        for c in vr.get("checks") or [] if not c.get("ok"))
+        for c in vr.get("checks") or [] if not c.get("ok")
+    ]
+    # 难度缺口独立于评分点闸 —— 见 `validate` 闸 8 的注释：
+    # 放在 `if ok:` 里的话，模型永远收不到这句反馈。
+    gap = str(vr.get("difficulty_gap") or "").strip()
+    if gap:
+        lines.append(
+            f"  - 【难度不达标】要求 {vr.get('difficulty')} 档：{gap}。"
+            "要么把 SQL 改写成该档的形态，要么如实把 difficulty 调低 —— "
+            "不要靠改题面文案蒙过去。")
+    return "\n".join(lines)
 
 
 async def generate_adopt(*, about: str = "", difficulty: int = 2,
                          tries: int = 3, do_adopt: bool = False,
-                         verbose: bool = True) -> tuple[dict[str, Any] | None,
-                                                        list[dict[str, Any]]]:
+                         verbose: bool = True,
+                         focus_dimension: str = "") -> tuple[dict[str, Any] | None,
+                                                             list[dict[str, Any]]]:
     """出题编排的**唯一入口**：生成 → 强制 → 验题 →（失败就回灌重试）→ 落盘。
 
     CLI 和 `run_mve` 都走这里 —— 编排只有一份，不会两边跑偏。
     返回 (落盘记录 or None, 每一轮的验题明细)。
     """
-    existing, avoid = existing_pairs()
+    existing, avoid_txt = existing_pairs()
+    # 出题点由**服务端从图谱挑定**，不交给模型（照伴学：题型由知识点节点声明）。
+    bp = _graph_blueprint(difficulty, avoid=existing,
+                          prefer=str(focus_dimension or ""))
+    if bp:
+        # 服务端既已挑定，`about` 里 planner 给的"范围"要求就必须让位 ——
+        # 实测两者打架：`about` 说"用队员级范围"，而图谱挑中的
+        # max_losing_streak 是**回合级**口径（rounds 表根本没有队员列），
+        # 模型夹在中间，把 fb_player 写进了 rounds 表，三次全挂。
+        # 题点归服务端，题面归模型 —— 不能两头都听。
+        about = (f"围绕「{bp.get('dimension')}」这个口径，按 "
+                 f"{bp.get('subject_key')} 的粒度出一道新题")
+        if verbose:
+            print(f"  图谱出题点 : {bp.get('dimension')} × {bp.get('subject_key')}"
+                  f"｜表 {bp.get('table')}"
+                  f"｜列 {'、'.join(bp.get('columns') or [])[:80]}")
     critique = ""
     trace: list[dict[str, Any]] = []
     for i in range(1, tries + 1):
         cand = enforce(await propose(about=about, difficulty=difficulty,
-                                     critique=critique, avoid=avoid))
+                                     critique=critique, avoid=avoid_txt,
+                                     blueprint=bp))
         if not cand:
             if verbose:
                 print(f"第 {i} 次：模型没返回可用 JSON")
@@ -1101,6 +1376,17 @@ async def generate_adopt(*, about: str = "", difficulty: int = 2,
         if verbose:
             print("  ❌ 验题未过：" + "；".join(vr["reasons"])[:300])
         critique = _critique_of(vr)
+        # 同一个方向连着撞墙两次 → 换个方向，别在一条死路上耗完次数。
+        # 实测：出题器给的 about 是「围绕 kast_pct，用队员级范围出题」，
+        # 而 kast_pct 的服务端口径是**队伍级**的 —— 模型只能硬去查
+        # match_players_report（那是工具名不是表），三次全挂在同一个错上。
+        # 只说"再改一次"它就会换个措辞重犯；必须显式让它换方向。
+        if i >= 2:
+            critique += ("\n  - 【换方向】这个角度已经连着失败了 "
+                         f"{i} 次，很可能它在当前数据里根本不成立"
+                         "（比如某个维度只支持队伍/比赛级，没有队员级口径）。"
+                         "请换一个**服务端确实声明过**的维度或 subject 键重新出题，"
+                         "不要在原方向上改措辞。")
     return None, trace
 
 
