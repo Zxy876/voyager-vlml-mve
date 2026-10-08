@@ -39,8 +39,17 @@ from loop_core import from_key_metrics, from_sql_result, make_fact  # noqa: E402
 from llm_client import chat, chat_json  # noqa: E402
 import feedback as feedback_mod  # noqa: E402
 
-SERIES = "2843069"
-C9, NRG = "Cloud9", "NRG"
+# ⚠️ 不再写死：换库（GRID → vlr.gg → rib.gg）后 2843069 / Cloud9 在新库里
+# **根本不存在** —— 实测 rib 库上种子题 17 个评分点 **0 个跑得出数**。
+# 锚点跟着库走，从库实查（见 anchor.py）。旧库挑出来的仍是这两个值。
+try:
+    import anchor as _anchor
+    SERIES = _anchor.series()
+    C9 = _anchor.team()
+except Exception:                                        # pragma: no cover
+    SERIES = "2843069"
+    C9 = "Cloud9"
+NRG = "NRG"
 
 
 class Skill:

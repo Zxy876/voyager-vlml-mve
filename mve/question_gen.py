@@ -73,8 +73,16 @@ TOOL_NAMES = [
     "player_profile_report", "scouting_report", "query_sql", "get_database_info",
 ]
 
-SERIES = "2843069"
-C9 = "Cloud9"
+# ⚠️ 不再写死：换库（GRID → vlr.gg → rib.gg）后 2843069 / Cloud9 在新库里
+# **根本不存在** —— 实测 rib 库上种子题 17 个评分点 **0 个跑得出数**。
+# 锚点跟着库走，从库实查（见 anchor.py）。旧库挑出来的仍是这两个值。
+try:
+    import anchor as _anchor
+    SERIES = _anchor.series()
+    C9 = _anchor.team()
+except Exception:                                        # pragma: no cover
+    SERIES = "2843069"
+    C9 = "Cloud9"
 
 
 # --------------------------------------------------------------------------
@@ -172,8 +180,11 @@ def _dim_specs() -> dict[str, dict[str, Any]]:
         # 只取括号前的主名：「手枪局胜率（0-100 的百分比数值，如 50.0）」→ 手枪局胜率
         # `or rec.get("desc")` —— 人导入的维度没有节点，desc 已经在上面用人的
         # 原话填好了，这里不能把它退回英文原名（会把验题闸 0b 打回不相关）。
+        # ⚠️ `point` 是**那道题的评分点文案**，绑死了具体值（"Corrode 上 Cloud9
+        # 的胜率"）—— 不能直接当维度定义，否则换值出的新题全被闸 0b 判不相关。
+        # 抽象化：剥掉具体实体值，只留口径。人导入的 desc 已是人的原话，不动。
         rec["desc"] = (rec.get("desc")
-                       or (pt.split("（")[0].split("(")[0].strip() or d))
+                       or _abstract_desc(pt.split("（")[0].split("(")[0].strip(), d))
         # 维度在图谱里的取值路径 —— 用来**按配方反查维度**（见 enforce）
         vp = ""
         if g is not None:
@@ -266,6 +277,65 @@ def _relevant(point: str, desc: str) -> bool:
         grams = {zh[i:i + 2] for i in range(max(0, len(zh) - 1))}
         return (en | grams) - _STOP
     return bool(toks(point) & toks(desc))
+
+
+def _known_entity_values() -> set[str]:
+    """库里出现过的**具体实体值**（图名/队名/选手/赛事号），用来抽象化维度定义。"""
+    out: set[str] = set()
+    try:
+        import json as _json
+        from pathlib import Path as _P
+        cat = _json.loads((_P(__file__).resolve().parent / "entity_catalog.json")
+                          .read_text(encoding="utf-8"))
+        for vals in (cat.get("entities") or {}).values():
+            if isinstance(vals, list):
+                out |= {str(v) for v in vals if str(v)}
+    except Exception:
+        pass
+    return out
+
+
+def _abstract_desc(pt: str, d: str) -> str:
+    """把评分点文案里的**具体实体值**剥掉，只留抽象口径。
+
+    ⚠️ 踩到的坑：维度定义直接拿种子题 rubric 的 `point`（如
+    「Corrode 上 Cloud9 的胜率」「Corrode 回合数」），那是**绑定了 GRID 那场
+    数据**的文案。换库出题后，题面是「Karmine Corp 在 Abyss 的回合胜率」，
+    跟定义**一个词都不重合** → 验题闸 0b 判"不相关"，连出 2 次全废。
+
+    维度定义必须是**抽象口径**（"某队在某图的胜率"），不能是某道题的评分点。
+    剥值后仍能挡真错配（题面说"强起局胜率"、维度填"置信度标签"照样不相关）。
+    """
+    out = str(pt or "")
+    for v in _known_entity_values():
+        if len(v) >= 3 and v in out:
+            out = out.replace(v, "")
+    # 兜底规则：**大写开头 / 含数字的英文词**基本都是实体名（Corrode、Cloud9、
+    # NRG、2843069），而口径词是中文。用它剥 catalog 里没有的旧实体
+    # （换库后 GRID 那批图名/队名已不在 catalog 里，上面那步剥不掉）。
+    out = re.sub(r"\b[A-Z][A-Za-z0-9_]{2,}\b", "", out)
+    out = re.sub(r"\b\d{4,}\b", "", out)
+    # 顺带剥掉当前锚点（可能不在 catalog 里，比如刚换的库）
+    try:
+        import anchor as _anc
+        for v in (_anc.series(), _anc.team(), _anc.map_name()):
+            if v and len(str(v)) >= 3:
+                out = out.replace(str(v), "")
+    except Exception:
+        pass
+    out = re.sub(r"[（(]\s*[）)]", "", out)          # 剥空的括号
+    out = re.sub(r"\s+", " ", out).strip()
+    # ⚠️ 第二层坑：剥完实体会**留下孤立虚词**，定义退化成「上 的胜率」——
+    # 看上去还在，实际关键词只剩"上/的"，闸 0b 拿它跟题面比 bigram 照样
+    # 判不相关（实测连废 2 次）。虚词必须一并清掉，只留口径实词。
+    for _ in range(3):
+        out2 = re.sub(r"(^| )[在的上中里下与和及为对把被而、，,](?= |$)", " ", out)
+        out2 = re.sub(r"\s+", " ", out2).strip()
+        if out2 == out:
+            break
+        out = out2
+    out = re.sub(r"\s+", " ", out).strip(" 的·、，,。-—")
+    return out or d
 
 
 def _suggest_dims(point: str, specs: dict[str, dict[str, Any]],
@@ -557,6 +627,137 @@ def _subject_key_of(col: str) -> str:
     return ""
 
 
+_ROWS_CACHE: dict[str, int] = {}
+
+
+def _table_rows(table: str) -> int:
+    """当前库里这张表有几行（带缓存，一个进程只查一次）。
+
+    ⚠️ 换数据源后**图谱里指向的表可能是空的**：rib/vlr 没有 kill 事件，
+    于是 `agg_first_blood_stats` 0 行、`base_events.is_kill` 0 行 —— 而图谱
+    是 GRID 时代建的，维度节点照旧指向它。挑空表出题，模型写得再对也跑不出数
+    （实测连出 2 次全被验题以"配方跑出来是空"判废）。
+    所以挑题点前必须先确认这张表在当前库里**真的有数据**。
+    """
+    t = str(table or "").strip()
+    if not t:
+        return 0
+    if t in _ROWS_CACHE:
+        return _ROWS_CACHE[t]
+    n = 0
+    try:
+        import duckdb
+        import anchor as _anc
+        con = duckdb.connect(str(_anc._db_path()), read_only=True)
+        try:
+            n = int(con.execute(f'SELECT COUNT(*) FROM "{t}"').fetchone()[0])
+        finally:
+            con.close()
+    except Exception:
+        n = 0
+    _ROWS_CACHE[t] = n
+    return n
+
+
+_SEED_SQL_CACHE: dict[str, str] = {}
+
+
+def _seed_skeleton(dim: str) -> str:
+    """图谱没 recipe 时的**骨架兜底**：取种子题里那条人审过的正确 SQL。
+
+    ⚠️ 这是伴学 `examples` 的同构位 —— **给正确例题让模型照抄**，而不是事后
+    拦它。此前走岔了：图谱的 `recipe` 只有部分维度有（map_win_rate 是空），
+    骨架一空模型就只能自己发明 WHERE，于是把 `winning_team_name` 写进
+    WHERE、胜率恒 100%，题是废的；我为此加了一道"口径自噬"闸去事后拦，
+    结果模型连着两轮写出**一模一样**的 SQL —— 事后拦不动，只能事前给对。
+
+    而**正确写法一直在种子题里**（tasks.py:229）：
+        SELECT ROUND(AVG(CASE WHEN winning_team_name='<队伍>' ...)), COUNT(*)
+        FROM rounds WHERE series_id='<赛事>' AND map_name='<图>'
+    WHERE 里干干净净，胜负交给 CASE 判。它是人审过、跑得出数的。
+    """
+    d = str(dim or "").strip()
+    if not d:
+        return ""
+    if d in _SEED_SQL_CACHE:
+        return _SEED_SQL_CACHE[d]
+    out = ""
+    try:
+        from tasks import TASKS
+        best = ""
+        for _t in TASKS.values():
+            for _p in (getattr(_t, "rubric", None) or []):
+                if str(getattr(_p, "dimension", "") or "") != d:
+                    continue
+                _s = str(getattr(getattr(_p, "answer_spec", None), "sql", "") or "")
+                if len(_s) > len(best):
+                    best = _s
+        if best:
+            out = best
+            # 脱敏：具体实体值换成 '?'（骨架只给形状，值要模型自己去库里查）
+            try:
+                import anchor as _anc
+                for v in (_anc.series(), _anc.team(), _anc.map_name(), SERIES, C9):
+                    if v and len(str(v)) >= 3:
+                        out = out.replace(str(v), "?")
+            except Exception:
+                pass
+            for v in _known_entity_values():
+                if len(v) >= 3 and v in out:
+                    out = out.replace(v, "?")
+            out = re.sub(r"'[A-Z][^']{2,}'", "'?'", out)
+    except Exception:                                        # pragma: no cover
+        out = ""
+    _SEED_SQL_CACHE[d] = out
+    return out
+
+
+_SCOPED_CACHE: dict[tuple[str, str], list[str] | None] = {}
+
+
+def _scoped_values(kind: str, series_id: str) -> list[str] | None:
+    """**这场比赛里真有的**实体值。查不到/不适用就返回 None（表示不限定）。
+
+    ⚠️ 第三道可解性校验（前两道：表非空、列存在）。`_subject_values()` 给的
+    是**全库**的值域，不等于这场比赛打过 —— 实测：1058 只打了 Sunset /
+    Haven / Summit，却从全库 7 张图里挑出 **Abyss**，于是
+    `WHERE series_id='1058' AND map_name='Abyss'` 0 回合 → 题无解，连出 3 次
+    全废。所以值必须再按 series 收一次口。
+    """
+    k = str(kind or "").strip()
+    sid = str(series_id or "").strip()
+    if not k or not sid:
+        return None
+    if (k, sid) in _SCOPED_CACHE:
+        return _SCOPED_CACHE[(k, sid)]
+    out: list[str] | None = None
+    if k in ("map", "team"):
+        try:
+            import duckdb
+            import anchor as _anc
+            con = duckdb.connect(str(_anc._db_path()), read_only=True)
+            try:
+                if k == "map":
+                    rows = con.execute(
+                        "SELECT DISTINCT map_name FROM rounds "
+                        "WHERE CAST(series_id AS VARCHAR)=? "
+                        "AND map_name IS NOT NULL", [sid]).fetchall()
+                else:
+                    rows = con.execute(
+                        "SELECT DISTINCT t FROM (SELECT winning_team_name AS t "
+                        "FROM rounds WHERE CAST(series_id AS VARCHAR)=? "
+                        "UNION ALL SELECT losing_team_name FROM rounds "
+                        "WHERE CAST(series_id AS VARCHAR)=?) "
+                        "WHERE t IS NOT NULL AND t<>''", [sid, sid]).fetchall()
+                out = [str(r[0]) for r in rows if r[0]]
+            finally:
+                con.close()
+        except Exception:
+            out = None
+    _SCOPED_CACHE[(k, sid)] = out
+    return out
+
+
 def _graph_blueprint(difficulty: int = 2,
                      avoid: set[tuple[str, str]] | None = None,
                      prefer: str = "") -> dict[str, Any]:
@@ -594,9 +795,17 @@ def _graph_blueprint(difficulty: int = 2,
             continue                     # 工具维度：口径受工具签名限制，先不拿来出新题
         if not specs.get(d, {}).get("by_sql"):
             continue
-        tbl = tables[0]
-        cols = ((det.get("columns_by_table") or {}).get(tbl)
-                or det.get("columns") or [])
+        # 挑**当前库里真有数据**的那张表，不是照图谱顺序取第一张
+        tbl, cols = "", []
+        for t in tables:
+            if _table_rows(t) == 0:
+                continue
+            tbl = t
+            cols = ((det.get("columns_by_table") or {}).get(t)
+                    or det.get("columns") or [])
+            break
+        if not tbl or not cols:
+            continue                 # 这个维度在当前库里没有可解的表
         # 这个维度能撑起哪些还没用过的 subject 键
         keys = [k for k in (_subject_key_of(c) for c in cols) if k]
         for k in dict.fromkeys(keys):
@@ -613,6 +822,18 @@ def _graph_blueprint(difficulty: int = 2,
             for v in vals:
                 subj = {"series": SERIES, "team": C9}
                 subj[k] = v
+                # ---- 第三道可解性校验：值必须**这场比赛里真有** ----
+                _sid = str(subj.get("series") or SERIES)
+                if k == "series":
+                    # 换的是**另一场比赛**，队伍也得跟着换 —— 否则
+                    # `WHERE series_id=<新场> AND team_name=Cloud9` 直接 0 行
+                    _teams = _scoped_values("team", str(v)) or []
+                    if _teams:
+                        subj["team"] = C9 if C9 in _teams else _teams[0]
+                else:
+                    _sc = _scoped_values(k, _sid)
+                    if _sc and str(v) not in _sc:
+                        continue        # 这场没打过这张图 / 没这个队
                 key = (json.dumps(subj, sort_keys=True), d)
                 if key in avoid:
                     continue
@@ -641,7 +862,20 @@ def _graph_blueprint(difficulty: int = 2,
                     "table": tbl,
                     "columns": list(cols),
                     "semantics": str(det.get("semantics") or ""),
-                    "typical_errors": list(det.get("typical_errors") or [])[:2],
+                    # ↓↓↓ 伴学 `project_target_topic_evidence()` 的 KNOWLEDGE 组。
+                    # 这四个字段**早就随脚手架照搬进图谱了**（question_types 15/15、
+                    # examples 15/15、typical_misconceptions 13/15、skills 9/15 有值），
+                    # 但出题器一直没读 —— 等于素材搬来了没人用。
+                    "question_types": list(det.get("question_types") or []),
+                    "skills": list(det.get("skills") or []),
+                    "examples": list(det.get("examples") or [])[:2],
+                    # ⚠️ 误区必须用 `typical_misconceptions`（**完整版**），不是
+                    # `typical_errors`（裁过的）。实测差一条，而漏的正是最容易
+                    # 踩的那条：fb_conv 的 "agg_first_blood_stats 已是 round_id
+                    # 一行，别再 JOIN rounds 去重，会放大行数"。
+                    "misconceptions": list(
+                        det.get("typical_misconceptions")
+                        or det.get("typical_errors") or [])[:4],
                     # 结构骨架：**难度 4 能不能出出来，全靠给不给它**。
                     # 实测不给骨架连试 4 次，模型每次都写成
                     # `COUNT(*) OVER (ORDER BY ...)`（累计计数，不是连续段数）
@@ -649,7 +883,8 @@ def _graph_blueprint(difficulty: int = 2,
                     # 而 gaps-and-islands 的正确形状**就在图谱里**（脱敏过的
                     # recipe，还标了 WHERE 该放哪一层）。让模型照骨架改值，
                     # 而不是让它从零发明 —— 这正是"题点归服务端"该覆盖的最后一层。
-                    "skeleton": str(det.get("recipe") or "")[:700],
+                    # 图谱没 recipe 的维度，退回种子题里那条人审过的 SQL。
+                    "skeleton": str(det.get("recipe") or _seed_skeleton(d))[:700],
                     "own_difficulty": own,
                     # 百分比维度要连样本量一起取（见 propose 里的 require_base 提示）
                     "require_base": bool(specs.get(d, {}).get("needs_base")),
@@ -676,6 +911,11 @@ def _graph_blueprint(difficulty: int = 2,
             tbl = shape["tables"][0]
             cols = (shape["columns_by_table"].get(tbl)
                     or shape["columns"] or [])
+            # 人导入的边本身不带教学素材；维度名若对得上已有节点就借用它的
+            lk_det: dict[str, Any] = {}
+            _node = g.nodes.get(f"dim:{d}")
+            if _node is not None:
+                lk_det = getattr(_node, "detail", None) or {}
             # 人的题面自带 subject（那次取数的粒度），它才是"新"的地方
             subj = dict(lk.get("subject") or {}) or {"series": SERIES}
             key = (json.dumps(subj, sort_keys=True), d)
@@ -694,7 +934,15 @@ def _graph_blueprint(difficulty: int = 2,
                 "table": tbl,
                 "columns": list(cols),
                 "semantics": shape["semantics"],
-                "typical_errors": [],
+                # 边上没有教学素材字段（它记的是那次真跑过的 SQL）。但人的题
+                # 常常落在**已有维度**上 —— 那就把那个节点的素材补过来，
+                # 否则人导入的方向永远是"裸骨架出题"，比种子方向少一层。
+                "question_types": list(lk_det.get("question_types") or []),
+                "skills": list(lk_det.get("skills") or []),
+                "examples": list(lk_det.get("examples") or [])[:2],
+                "misconceptions": list(
+                    lk_det.get("typical_misconceptions")
+                    or lk_det.get("typical_errors") or [])[:4],
                 "skeleton": str(shape["recipe"] or "")[:700],
                 "own_difficulty": own,
                 "require_base": bool(specs.get(d, {}).get("needs_base")),
@@ -748,8 +996,27 @@ async def propose(*, about: str = "", difficulty: int = 2,
             f"\n  **不要**写上面没出现的列名，也不要换表。表里的列就是这些，"
             f"没有 player_name / team_name 这种常识列 —— 队员列是 fb_player，队伍列是 fb_team。"
         )
-        for e in (blueprint.get("typical_errors") or []):
-            bp += f"\n  典型错法：{e}"
+        # ── 题型由**知识点节点声明**决定，不经模型 ──
+        # 伴学 `question_type_mapping.py:131`：取节点自带的 question_types
+        # 第一项映射到机器题型，"map it without LLM input"。
+        qt = [str(x) for x in (blueprint.get("question_types") or []) if x]
+        if qt:
+            kind = ("写 SQL" if "sql" in qt[0]
+                    else "调工具取值" if "tool" in qt[0] else qt[0])
+            bp += (f"\n  答案配方类型（**由知识点节点声明，不许改**）：{qt[0]}"
+                   f" → answer_spec 里必须给 {kind}")
+        sk = [str(x) for x in (blueprint.get("skills") or []) if x]
+        if sk:
+            bp += f"\n  这个点考的技能：{'、'.join(sk[:4])}"
+
+        # 误区用**完整版**（typical_misconceptions），不是裁过的 typical_errors。
+        # 出题时该"引出"这些错法，而不是在题面里把答案说破。
+        mis = [str(x) for x in (blueprint.get("misconceptions") or []) if x]
+        if mis:
+            bp += "\n  ★ 这个知识点的**典型误区**（你的题要能区分「真会」和「蒙对」，"
+            bp += "别在题面里直接把答案说出来）："
+            for m in mis:
+                bp += f"\n    - {m}"
         # 百分比口径必须**额外取一列**当样本量。不写这条，模型每次都只取
         # 分子（实测：连续 4 次被验题以"取不到分母/样本量"判废，白烧 4 次调用）。
         # 事前说清楚比事后回灌 critique 便宜。
@@ -766,6 +1033,21 @@ async def propose(*, about: str = "", difficulty: int = 2,
                 "形状不许改）：\n" + skel +
                 "\n  骨架里 WHERE 的**位置就是口径**：内层先编号、外层再筛。"
                 "不要把过滤条件全塞进最内层 —— 塞进去段就断了。")
+        # ⚠️ 实测踩到：口径用 CASE WHEN 判胜负时，模型把那一列**又写进 WHERE**
+        # （`WHERE winning_team_name='X'`）→ 只剩赢的回合，胜率恒为 100 或直接
+        # 空。WHERE 只筛范围（series/map），胜负必须交给 CASE 判。
+        if "case when" in (str(blueprint.get("semantics") or "")
+                           + str(blueprint.get("skeleton") or "")).lower():
+            bp += ("\n  ★★ 胜/负必须交给 **CASE WHEN** 判，"
+                   "**不要**把判定胜负的那列再写进 WHERE —— 写进去就只剩赢的"
+                   "回合，胜率恒为 100 或直接跑空。WHERE 只用来限定范围"
+                   "（series_id / map_name），胜负在 SELECT 里判。")
+        # 例题：节点自带的**正确口径长什么样**。骨架是脱敏形状，例题带真实值，
+        # 两个合起来模型才既有形状又有落法（值仍要它自己去库里查）。
+        ex = [str(x) for x in (blueprint.get("examples") or []) if x]
+        if ex:
+            bp += ("\n  参考例题（**口径形状**照它，值换成你查到的真实值，"
+                   "不要照抄字面量）：\n" + str(ex[0])[:320])
         user += bp
     if avoid:
         user += ("\n\n下面这些 (subject, dimension) 组合**已经有题了，不要再出**：\n"
@@ -981,9 +1263,30 @@ DIFFICULTY_RUBRIC: dict[int, dict[str, Any]] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# 一道题**合不合格**的判据（2026-10-08 定的，别再加闸）
+# ---------------------------------------------------------------------------
+#   合格线只有一条：**让 VLML 跑一遍，跑得出非空值**。
+#
+# 为什么是这一条：题是给 Voyager 做的，Voyager 的答案要跟"VLML 跑出来的真值"
+# 比。跑不出值的题根本没有真值，等于给 Voyager 一道无法判分的题 —— 这才是
+# 唯一必须挡的。
+#
+# 伴学的同构位是 `answer_supported`（答案能被材料支撑），它靠**第二个 LLM
+# 的意见**判；MVE 有真实数据源，可以**确定性**地判 —— 跑一遍就行，不必问
+# 模型。这是 MVE 比伴学强的那一处，不是要向它看齐的地方。
+#
+# 下面 `STRICT_MODE` 里的几条（百分比越界 / 量纲 / 非数字值 / "连续"形状）
+# 是**合理性兜底**，不是合格线。它们是踩坑时一条条加上去的（每条的注释里
+# 都记着当时废了哪道题），但**正确用法是让它们逐步退场**：骨架给对之后
+# 模型不再乱写，这几条就该拦不到东西。要只用合格线，跑 `--loose`。
+# ---------------------------------------------------------------------------
+STRICT_MODE = True
+
+
 async def validate(candidate: dict[str, Any], *,
                    existing: set[tuple[str, str]] | None = None) -> dict[str, Any]:
-    """验题。**不问模型**，只问数据。
+    """验题。**不问模型**，只问数据 —— 让 VLML 跑一遍，跑得出非空值就算过。
 
     返回 {ok, checks, reasons}。`checks` 逐条列出每个评分点的验证结果 ——
     验题结论必须可复盘，不能只给一个布尔。
@@ -1157,7 +1460,7 @@ async def validate(candidate: dict[str, Any], *,
                 checks.append(row)
                 reasons.append(f"「{point}」百分比口径算不出数值")
                 continue
-            if not (0.0 <= pct <= 100.0):
+            if STRICT_MODE and not (0.0 <= pct <= 100.0):
                 row["ok"] = False
                 row["why"] = f"百分比算出来 {round(pct, 1)} 不在 0-100 —— 口径取错了"
                 checks.append(row)
@@ -1165,8 +1468,8 @@ async def validate(candidate: dict[str, Any], *,
                 continue
             row["truth"] = round(pct, 1)
 
-        # 闸 3：量纲闸 —— 计数型维度的值不能超过全场总回合数
-        if str(dspec.get("kind")) == "count":
+        # 闸 3（严格档）：量纲 —— 计数型维度的值不能超过全场总回合数
+        if STRICT_MODE and str(dspec.get("kind")) == "count":
             try:
                 v = float(got.get("value"))
             except (TypeError, ValueError):
@@ -1204,7 +1507,7 @@ async def validate(candidate: dict[str, Any], *,
         # 裁判拿 'Lotus' 当真值，模型交任何数字都判错 → 连跑 5 轮全 0%，
         # critique 一字不变。那不是"学不会"，是**题是坏的**。
         # 坏题比没有题更糟：它会伪装成"学习曲线没起来"，把人引向错的方向。
-        if str(dspec.get("kind")) != "count" and spec.get("sql"):
+        if STRICT_MODE and str(dspec.get("kind")) != "count" and spec.get("sql"):
             try:
                 float(got.get("value"))
             except (TypeError, ValueError):
@@ -1243,7 +1546,7 @@ async def validate(candidate: dict[str, Any], *,
     if gap:
         reasons.append(f"难度不达标（要求 {candidate.get('difficulty')} 档）：{gap}")
 
-    # ---- 闸 9（题级）："连续"语义必须有 gaps-and-islands 的可数形状 ----
+    # ---- 闸 9（题级·严格档）："连续"语义必须有 gaps-and-islands 的可数形状 ----
     # `COUNT(*) OVER (ORDER BY ...)` 也是窗口函数，能过闸 8，但它算的是
     # **累计计数**（到当前行为止一共输了多少），MAX 出来 = 总共输了几个回合，
     # 根本不是"最长**连续**连败"。实测 `max_losing_streak_map` 就是这么生成的：
@@ -1258,7 +1561,7 @@ async def validate(candidate: dict[str, Any], *,
         + [str(rp.get("point") or "")
            for rp in (candidate.get("rubric") or []) if isinstance(rp, dict)]
     ).lower()
-    if any(k in text for k in ("连续", "连败", "连胜", "streak")):
+    if STRICT_MODE and any(k in text for k in ("连续", "连败", "连胜", "streak")):
         sqls = " \n ".join(
             str((rp.get("answer_spec") or {}).get("sql") or "").lower()
             for rp in (candidate.get("rubric") or []) if isinstance(rp, dict))
@@ -1701,9 +2004,14 @@ def _main() -> int:
     ap.add_argument("--adopt", action="store_true", help="验过就并入库")
     ap.add_argument("--revalidate", action="store_true",
                     help="回头复核已入库的生成题，在新的验题规则下过不了的标记判废")
+    ap.add_argument("--loose", action="store_true",
+                    help="只用合格线（VLML 跑一遍跑得出非空值），关掉合理性兜底闸")
     args = ap.parse_args()
 
     if args.revalidate:
+        if args.loose:
+            global STRICT_MODE
+            STRICT_MODE = False
         bad = asyncio.run(revalidate_store())
         if not bad:
             print("存量复核：全部通过（没有被判废的题）")
@@ -1713,6 +2021,9 @@ def _main() -> int:
             print(f"  ✗ {r.get('topic_id')}：{str(r.get('invalid_reason'))[:200]}")
         return 1
 
+    if args.loose:
+        STRICT_MODE = False
+        print("（--loose：只用合格线 —— VLML 跑一遍跑得出非空值即合格）")
     rec, _ = asyncio.run(generate_adopt(
         about=args.about, difficulty=args.difficulty,
         tries=args.tries, do_adopt=args.adopt))
