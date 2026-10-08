@@ -59,6 +59,21 @@ def failed_counts() -> dict[str, int]:
     return out
 
 
+def undone_counts() -> dict[str, int]:
+    """每题「任务未完成」次数 —— **Voyager 尺子的 failed 账本**（照原版 failed_tasks）。
+
+    done = 跑通编排 + 拿到数 + 没翻车（loop_core.task_done），**不算覆盖点**。
+    出题器（planner）据此决定「这道没完成的任务还要不要给」—— 课程规划的
+    依据是 Voyager 自己的学习质量（completed / failed 账本），不是 VLML 覆盖点。
+    """
+    out: dict[str, int] = {}
+    for r in load_all():
+        t = str(r.get("topic_id") or "")
+        if t and not r.get("done"):
+            out[t] = out.get(t, 0) + 1
+    return out
+
+
 def unresolved_wrongs(topic_id: str) -> int:
     """这道题**还没消化**的错题数（照伴学 mastery_v2 的 unresolved_wrong_count）。
 

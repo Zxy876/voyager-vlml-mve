@@ -412,25 +412,29 @@ def _select_raw(*, explicit_topic_id: str, mastery: dict[str, Any],
             "blocked": False,
         }
 
-    # 1) wrong_retry：有未消化的错题（伴学 retry_wrong_question 优先级最高）
+    # 1) wrong_retry：有「任务没完成」的题优先 —— **Voyager 尺子的 failed 账本**
+    #    （照原版 failed_tasks；done = 跑通编排 + 拿到数 + 没翻车，不数覆盖点）。
+    #    伴学 retry_wrong_question 的同构：错误 = 没完成任务，不是 VLML 覆盖点。
     #    但有冷却闸：刚重试过、中间还没做过别的题的，先让位 —— 否则就是无限
     #    硬磕同一道难题（实测 corrode_collapse 连错 12 次，别的题永远轮不到）。
-    # 停滞的题不算"可重试"：连着 STALE_LIMIT 次覆盖率一字不差，再排它只是重复。
-    # 伴学里对应的是错题重做**做对了才消除**；这里多做一条"没进展就毕业"，
-    # 否则错题池只增不减，算力全砸在死题上（实测 79%）。
+    #    停滞的题不算"可重试"：连着 STALE_LIMIT 次结果一字不差，再排它只是重复。
+    #    伴学里对应的是错题重做**做对了才消除**；这里多做一条"没进展就毕业"，
+    #    否则错题池只增不减，算力全砸在死题上（实测 79%）。
+    undone = run_log.undone_counts()
     wrongs = [
         (t, m) for t, m in mastery.items()
-        if t in TASKS and m["wrongs"] > 0 and m["last_coverage"] < 1.0
+        if t in TASKS and undone.get(t, 0) > 0
         and m["cooling"] >= RETRY_COOLDOWN and not m["stalled"]
     ]
     if wrongs:
-        # 错得最多次、且覆盖率最低的优先
-        topic, m = min(wrongs, key=lambda kv: (kv[1]["last_coverage"], -kv[1]["wrongs"]))
+        # 未完成次数最多的优先（Voyager 尺子；不按覆盖率排）
+        topic, m = min(wrongs, key=lambda kv: -undone[kv[0]])
         return {
             "topic_id": topic,
             "reason": "wrong_retry",
-            "explanation": f"这道题错过 {m['wrongs']} 次、最近覆盖率只有 "
-                           f"{m['last_coverage']:.0%}，先把它补上再推进"
+            "explanation": f"这道题任务未完成 {undone[topic]} 次"
+                           f"（跑通 + 拿到数 + 没翻车才算完成，不数覆盖点），"
+                           f"先把它补上再推进"
                            f"（冷却 {m['cooling']}/{RETRY_COOLDOWN} 已过）",
             "blocked": False,
         }

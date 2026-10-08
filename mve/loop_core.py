@@ -444,6 +444,29 @@ def evaluate_vs_referee(
     )
 
 
+def task_done(
+    facts: list[dict[str, Any]],
+    *,
+    tool_calls: int = 0,
+    errors: list[str] | None = None,
+) -> bool:
+    """Voyager 尺子：任务完成（=一道题的目标达成）。
+
+    照原版 critic.check_task_success（critic.py:116）：判的是「环境里可观测的
+    目标达成」，不是「覆盖了多少评分点」。MVE 里任务=回答问题，目标达成 =
+    跑通编排（有成功工具调用）+ 拿到数（facts 非空）+ 没翻车（无工具错误）。
+    **不算覆盖点** —— 覆盖点是 VLML 的尺子，只用于考核（exam transfer/final）
+    与掌握度证据；学习阶段（存技能 / 停止同题 / 推进换题）只认这个布尔。
+    """
+    if tool_calls <= 0:
+        return False
+    if not facts:
+        return False
+    if errors:
+        return False
+    return True
+
+
 def evaluate(
     facts: list[dict[str, Any]],
     rubric: list[RubricPoint],

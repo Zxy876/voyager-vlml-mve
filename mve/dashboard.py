@@ -423,8 +423,9 @@ function lineChart(pts, opts){
           stroke-dasharray="${opts.dash||''}" stroke-linejoin="round"/>
     ${dots}${xlab}</svg>`;
 }
-/* 判据区：self-verification 布尔轨迹（绿=全部评分点达成，红=未达成）。
-   存技能/停止/推进只认这条线，覆盖率只是它的连续观测。 */
+/* 判据区：布尔轨迹（绿=达成，红=未达成）。
+   判据层用 done（Voyager 尺子：任务完成=跑通+拿到数+没翻车，不数覆盖点）；
+   VLML 的 success（全评分点达成）是蓝灰观测线，不驱动学习。 */
 function stepChart(pts, opts){
   const W=560,H=120,P={l:38,r:14,t:14,b:26};
   if(!pts.length) return '<div class="empty">无数据</div>';
@@ -434,7 +435,7 @@ function stepChart(pts, opts){
   const cells=pts.map((p,i)=>{
     const x0=X(i), x1=i<pts.length-1?X(i+1):X(i)+10;
     return `<rect x="${x0.toFixed(1)}" y="${Y(p.v).toFixed(1)}" width="${(x1-x0).toFixed(1)}" height="${ih}" fill="${p.v?opts.yes:opts.no}" opacity="0.9">
-      <title>第${p.x}次 · ${p.v?'success':'未达成（有评分点缺失/不符）'}</title></rect>`;
+      <title>第${p.x}次 · ${p.v?'达成':'未达成'}</title></rect>`;
   }).join('');
   const xlab=pts.map((p,i)=>
     `<text x="${X(i).toFixed(1)}" y="${H-8}" font-size="10" fill="#9ca3af" text-anchor="middle">${p.x}</text>`).join('');
@@ -599,8 +600,12 @@ function pOverview(s){
   }
   const cov=s.series.filter(p=>p.coverage!==null).map(p=>({x:p.i,y:p.coverage,label:(p.coverage*100).toFixed(0)+'%'}));
   const mas=s.series.filter(p=>p.mastery!==null).map(p=>({x:p.i,y:p.mastery,label:p.mastery_pct}));
-  const suc=s.series.filter(p=>p.success!==null && p.success!==undefined)
-                     .map(p=>({x:p.i,v:!!p.success}));
+  // 判据层：任务完成（Voyager 尺子：跑通 + 拿到数 + 没翻车，不数覆盖点）
+  const suc=s.series.filter(p=>p.done!==null && p.done!==undefined)
+                     .map(p=>({x:p.i,v:!!p.done}));
+  // VLML 观测：全部评分点达成（考核尺子，不驱动学习）
+  const vlm=s.series.filter(p=>p.success!==null && p.success!==undefined)
+                    .map(p=>({x:p.i,v:!!p.success}));
   const last=s.series[s.series.length-1];
   const cls={'weak':'m-weak','progress':'m-progress','good':'m-good','mastered':'m-mastered','unassessed':'m-new'};
   const rc=s.recommend||{};
@@ -608,10 +613,12 @@ function pOverview(s){
     ${ESC(rc.reason_label||rc.reason)} —— ${ESC(rc.explanation)}</div>`:'';
   return `<div class="panel">
     <div class="panel__head"><h2>当前状态 · 判据区</h2>
-      <span class="hint">判读看判据层 success（self-verification），不是覆盖率，更不是掌握度</span></div>
+      <span class="hint">判读看判据层 done（Voyager 尺子：任务完成），不是覆盖率，更不是掌握度</span></div>
     <div class="kpis">
       <div class="kpi"><div class="label">当前题判据</div>
-        <div class="value">${s.last_success?'<span class="chip ok">success · 全部评分点达成</span>':'<span class="chip bad">未达成 · 有评分点缺失/不符</span>'}</div></div>
+        <div class="value">${s.last_done?'<span class="chip ok">done · 任务完成（跑通+拿到数+没翻车）</span>':'<span class="chip bad">未完成 · 没跑通/没拿到数/翻车</span>'}</div></div>
+      <div class="kpi"><div class="label">VLML 观测</div>
+        <div class="value">${s.last_success?'<span class="chip ok">success · 全评分点达成</span>':'<span class="chip dim">未全达成</span>'}</div></div>
       <div class="kpi"><div class="label">掌握度变化</div><div class="value">${ESC(s.mastery_delta)}</div></div>
       <div class="kpi"><div class="label">状态</div>
         <div class="value"><span class="chip ${cls[last.ui_status]||'m-new'}">${ESC(last.status_label)}</span></div></div>
@@ -623,11 +630,13 @@ function pOverview(s){
   </div>
   ${examCard(s)}
   <div class="grid2">
-    <div class="panel"><div class="panel__head"><h2>判据区 · self-verification（success）</h2>
-      <span class="hint">存技能 / 停止同题 / 推进换题只认这条布尔线</span></div>
+    <div class="panel"><div class="panel__head"><h2>判据区 · 任务完成（Voyager 尺子）</h2>
+      <span class="hint">存技能 / 停止同题 / 推进换题只认这条布尔线；不数覆盖点</span></div>
       ${stepChart(suc,{yes:'#2f7d57',no:'#e5484d'})}
-      <div class="legend">绿＝全部评分点达成（success）；红＝未达成（有 missing / 值不符 / 裁判缺答）。
-        覆盖率只是它的达成度观测 ↓</div>
+      <div class="legend">绿＝任务完成（跑通编排 + 拿到数 + 没翻车）；红＝未完成。
+        VLML 的 success（全评分点达成）只是观测 ↓</div>
+      ${stepChart(vlm,{yes:'#3b82f6',no:'#c7ccd4'})}
+      <div class="legend">蓝＝VLML 观测 success（考核尺子，不驱动学习）。覆盖率观测 ↓</div>
       ${lineChart(cov,{color:'#8a8f98',dash:'4 3'})}
       <div class="legend">虚线＝覆盖率观测（喂掌握度证据，不当判据）。</div></div>
     <div class="panel"><div class="panel__head"><h2>掌握度区 · 独立评估</h2>
@@ -747,6 +756,7 @@ function pTrace(s){
       <td>${p.rejected.length?chips(p.rejected,'warn'):'<span class="chip grey">无</span>'}</td></tr>`).join('');
   const rows=s.series.map(p=>`
     <tr><td class="num">${p.i}</td><td class="mono">${ESC(p.mode)}</td><td class="num">${p.round}</td>
+      <td>${p.done?'<span class="chip ok">✓</span>':'<span class="chip bad">✗</span>'}</td>
       <td>${p.success?'<span class="chip ok">✓</span>':'<span class="chip bad">✗</span>'}</td>
       <td><b>${ESC(p.verdict)}</b></td>
       <td class="num">${p.coverage===null?'—':(p.coverage*100).toFixed(0)+'%'}</td>
@@ -779,7 +789,7 @@ function pTrace(s){
     </div>
     <div class="panel">
       <div class="panel__head"><h2>轮次明细</h2></div>
-      <table><thead><tr><th>#</th><th>模式</th><th>轮</th><th>success</th><th>verdict</th><th>覆盖率</th><th>得分</th>
+      <table><thead><tr><th>#</th><th>模式</th><th>轮</th><th>done</th><th>success</th><th>verdict</th><th>覆盖率</th><th>得分</th>
         <th>事实数</th><th>flags</th><th>证据状态</th><th>判据</th><th>溯源</th><th>幻觉拦截</th></tr></thead>
         <tbody>${rows}</tbody></table>
     </div>

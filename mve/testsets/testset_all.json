@@ -1,0 +1,333 @@
+[
+  {
+    "source_topic_id": "series_totals",
+    "topic_id": "series_totals__1067",
+    "target_series": "1067",
+    "entity_map": {
+      "series": {
+        "1058": "1067"
+      },
+      "team": {
+        "Karmine Corp": "Paper Rex"
+      }
+    },
+    "question": "Cloud9 这场比赛总共打了多少个回合？其中赢下了多少个回合？",
+    "validated": {
+      "ok": true,
+      "facts": 2,
+      "trajectory": 4,
+      "covered_dims": [
+        "total_rounds",
+        "rounds_won"
+      ],
+      "missing_dims": [],
+      "cover": 1.0
+    },
+    "task": {
+      "topic_id": "series_totals__1067",
+      "question": "Cloud9 这场比赛总共打了多少个回合？其中赢下了多少个回合？",
+      "difficulty": 1,
+      "validated_target": true,
+      "requires_tools": [
+        "query_sql"
+      ],
+      "key_points": [
+        "全场总回合数（一个整数）",
+        "Cloud9 赢下的回合数（一个整数）"
+      ],
+      "rubric": {
+        "全场总回合数（一个整数）": 50,
+        "Cloud9 赢下的回合数（一个整数）": 50
+      }
+    }
+  },
+  {
+    "source_topic_id": "map_rounds_split",
+    "topic_id": "map_rounds_split__1067",
+    "target_series": "1067",
+    "entity_map": {
+      "series": {
+        "1058": "1067"
+      },
+      "team": {
+        "Karmine Corp": "LOUD"
+      },
+      "map": {
+        "Corrode": "Sunset",
+        "Haven": "Split",
+        "Lotus": "Lotus"
+      }
+    },
+    "question": "三张图各自打了多少回合？Cloud9 在每张图上的胜率分别是多少？",
+    "validated": {
+      "ok": true,
+      "facts": 5,
+      "trajectory": 3,
+      "covered_dims": [
+        "map_rounds",
+        "map_rounds",
+        "map_rounds",
+        "map_win_rate",
+        "map_win_rate"
+      ],
+      "missing_dims": [],
+      "cover": 1.0
+    },
+    "task": {
+      "topic_id": "map_rounds_split__1067",
+      "question": "三张图各自打了多少回合？Cloud9 在每张图上的胜率分别是多少？",
+      "difficulty": 2,
+      "validated_target": true,
+      "requires_tools": [
+        "query_sql"
+      ],
+      "key_points": [
+        "Sunset 回合数",
+        "Split 回合数",
+        "Lotus 回合数",
+        "Sunset 上 Cloud9 的胜率",
+        "Split 上 Cloud9 的胜率"
+      ],
+      "rubric": {
+        "Sunset 回合数": 20,
+        "Split 回合数": 20,
+        "Lotus 回合数": 20,
+        "Sunset 上 Cloud9 的胜率": 20,
+        "Split 上 Cloud9 的胜率": 20
+      }
+    }
+  },
+  {
+    "source_topic_id": "fb_conversion_analysis",
+    "topic_id": "fb_conversion_analysis__1067",
+    "target_series": "1067",
+    "entity_map": {
+      "series": {
+        "1058": "1067"
+      },
+      "team": {
+        "Karmine Corp": "LOUD"
+      },
+      "map": {
+        "Corrode": "Sunset",
+        "Haven": "Split"
+      }
+    },
+    "question": "Cloud9 输掉这个 series，首血转换上出了什么问题？",
+    "validated": {
+      "ok": true,
+      "facts": 4,
+      "trajectory": 5,
+      "covered_dims": [
+        "opening_duels.fb",
+        "conversion.fb_conv",
+        "map_fb_conv",
+        "map_fb_conv"
+      ],
+      "missing_dims": [],
+      "cover": 1.0
+    },
+    "task": {
+      "topic_id": "fb_conversion_analysis__1067",
+      "question": "Cloud9 输掉这个 series，首血转换上出了什么问题？",
+      "difficulty": 3,
+      "validated_target": true,
+      "requires_tools": [
+        "match_summary_report",
+        "query_sql"
+      ],
+      "key_points": [
+        "整体首血次数",
+        "整体首血转换率",
+        "Sunset 图首血转换率",
+        "Split 图首血转换率"
+      ],
+      "rubric": {
+        "整体首血次数": 25,
+        "整体首血转换率": 25,
+        "Sunset 图首血转换率": 30,
+        "Split 图首血转换率": 20
+      }
+    }
+  },
+  {
+    "source_topic_id": "corrode_collapse",
+    "topic_id": "corrode_collapse__1067",
+    "target_series": "1067",
+    "entity_map": {
+      "series": {
+        "1058": "1067"
+      },
+      "team": {
+        "Karmine Corp": "Paper Rex"
+      },
+      "map": {
+        "Corrode": "Sunset"
+      }
+    },
+    "question": "Cloud9 在这场 series 里，单张图上最长的一段连续丢分发生在哪张图？这一段一共有多少回合、从哪个回合号开始？（连败口径：**只在同一张图内**按回合号顺序计算，中间只要赢下一回合就算断开；不按半场重置，也不是「全场一共输了多少回合」。）另外给出 Cloud9 在这张图上的首血转换率。",
+    "validated": {
+      "ok": true,
+      "facts": 3,
+      "trajectory": 4,
+      "covered_dims": [
+        "map_fb_conv",
+        "max_losing_streak",
+        "streak_start_round"
+      ],
+      "missing_dims": [],
+      "cover": 1.0
+    },
+    "task": {
+      "topic_id": "corrode_collapse__1067",
+      "question": "Cloud9 在这场 series 里，单张图上最长的一段连续丢分发生在哪张图？这一段一共有多少回合、从哪个回合号开始？（连败口径：**只在同一张图内**按回合号顺序计算，中间只要赢下一回合就算断开；不按半场重置，也不是「全场一共输了多少回合」。）另外给出 Cloud9 在这张图上的首血转换率。",
+      "difficulty": 4,
+      "validated_target": true,
+      "requires_tools": [
+        "query_sql"
+      ],
+      "key_points": [
+        "失分最严重那张图的首血转换率（subject 里指出是哪张图）",
+        "最长连败回合数（同图内按回合号连续，赢一回合即断开，不按半场重置）",
+        "连败起始回合号（最长那一段的第一个回合号，不是全场最小回合号）"
+      ],
+      "rubric": {
+        "失分最严重那张图的首血转换率（subject 里指出是哪张图）": 20,
+        "最长连败回合数（同图内按回合号连续，赢一回合即断开，不按半场重置）": 40,
+        "连败起始回合号（最长那一段的第一个回合号，不是全场最小回合号）": 40
+      }
+    }
+  },
+  {
+    "source_topic_id": "pistol_eco_pattern",
+    "topic_id": "pistol_eco_pattern__1067",
+    "target_series": "1067",
+    "entity_map": {
+      "series": {
+        "1058": "1067"
+      },
+      "team": {
+        "Karmine Corp": "LOUD"
+      }
+    },
+    "question": "Cloud9 的手枪局（pistol round）和 eco 局表现怎么样？另外，就现有数据量而言，这个结论的置信度是多少？",
+    "validated": {
+      "ok": true,
+      "facts": 4,
+      "trajectory": 3,
+      "covered_dims": [
+        "pistol_win_rate",
+        "eco_win_rate",
+        "pattern_rounds",
+        "pattern_confidence"
+      ],
+      "missing_dims": [],
+      "cover": 1.0
+    },
+    "task": {
+      "topic_id": "pistol_eco_pattern__1067",
+      "question": "Cloud9 的手枪局（pistol round）和 eco 局表现怎么样？另外，就现有数据量而言，这个结论的置信度是多少？",
+      "difficulty": 3,
+      "validated_target": true,
+      "requires_tools": [
+        "pattern_detection_report"
+      ],
+      "key_points": [
+        "手枪局胜率（0-100 的百分比数值，如 50.0）",
+        "eco 局胜率（0-100 的百分比数值，如 42.9）",
+        "支撑这个结论的样本回合数（整数）",
+        "置信度标签（只填 moderate / strong / weak / insufficient 之一，原样取自工具返回的 scope.confidence）"
+      ],
+      "rubric": {
+        "手枪局胜率（0-100 的百分比数值，如 50.0）": 25,
+        "eco 局胜率（0-100 的百分比数值，如 42.9）": 20,
+        "支撑这个结论的样本回合数（整数）": 25,
+        "置信度标签（只填 moderate / strong / weak / insufficient 之一，原样取自工具返回的 scope.confidence）": 30
+      }
+    }
+  },
+  {
+    "source_topic_id": "kast_adr_check",
+    "topic_id": "kast_adr_check__1067",
+    "target_series": "1067",
+    "entity_map": {
+      "series": {
+        "1058": "1067"
+      },
+      "team": {
+        "Karmine Corp": "LOUD"
+      }
+    },
+    "question": "Cloud9 这场比赛的 KAST 和 K/D 各是多少？（口径：**队伍整体**，取 match_analysis_report 的 team 段，不是 opponent，也不是某个选手。）",
+    "validated": {
+      "ok": true,
+      "facts": 2,
+      "trajectory": 2,
+      "covered_dims": [
+        "kast_pct",
+        "kd_ratio"
+      ],
+      "missing_dims": [],
+      "cover": 1.0
+    },
+    "task": {
+      "topic_id": "kast_adr_check__1067",
+      "question": "Cloud9 这场比赛的 KAST 和 K/D 各是多少？（口径：**队伍整体**，取 match_analysis_report 的 team 段，不是 opponent，也不是某个选手。）",
+      "difficulty": 2,
+      "validated_target": true,
+      "requires_tools": [
+        "match_analysis_report"
+      ],
+      "key_points": [
+        "KAST（0-100 的百分比，如 100.0）",
+        "K/D（比值，如 1.24）"
+      ],
+      "rubric": {
+        "KAST（0-100 的百分比，如 100.0）": 50,
+        "K/D（比值，如 1.24）": 50
+      }
+    }
+  },
+  {
+    "source_topic_id": "map_win_rate_summit",
+    "topic_id": "map_win_rate_summit__1067",
+    "target_series": "1067",
+    "entity_map": {
+      "series": {
+        "1058": "1067"
+      },
+      "team": {
+        "Karmine Corp": "LOUD"
+      },
+      "map": {
+        "Summit": "Sunset"
+      }
+    },
+    "question": "在系列编号为1067，队伍为LOUD的对局中，Sunset地图的回合胜率是多少？请按地图粒度计算。",
+    "validated": {
+      "ok": true,
+      "facts": 1,
+      "trajectory": 2,
+      "covered_dims": [
+        "map_win_rate"
+      ],
+      "missing_dims": [],
+      "cover": 1.0
+    },
+    "task": {
+      "topic_id": "map_win_rate_summit__1067",
+      "question": "在系列编号为1067，队伍为LOUD的对局中，Sunset地图的回合胜率是多少？请按地图粒度计算。",
+      "difficulty": 3,
+      "validated_target": false,
+      "requires_tools": [
+        "query_sql"
+      ],
+      "key_points": [
+        "正确计算回合胜率"
+      ],
+      "rubric": {
+        "正确计算回合胜率": 50.0
+      }
+    }
+  }
+]

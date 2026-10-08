@@ -1,0 +1,55 @@
+[
+  {
+    "source_topic_id": "fb_conversion_analysis",
+    "topic_id": "fb_conversion_analysis__1067",
+    "target_series": "1067",
+    "entity_map": {
+      "series": {
+        "1058": "1067"
+      },
+      "team": {
+        "Karmine Corp": "LOUD"
+      },
+      "map": {
+        "Corrode": "Sunset",
+        "Haven": "Split"
+      }
+    },
+    "question": "Cloud9 输掉这个 series，首血转换上出了什么问题？",
+    "validated": {
+      "ok": true,
+      "facts": 4,
+      "trajectory": 5,
+      "covered_dims": [
+        "opening_duels.fb",
+        "conversion.fb_conv",
+        "map_fb_conv",
+        "map_fb_conv"
+      ],
+      "missing_dims": [],
+      "cover": 1.0
+    },
+    "task": {
+      "topic_id": "fb_conversion_analysis__1067",
+      "question": "Cloud9 输掉这个 series，首血转换上出了什么问题？",
+      "difficulty": 3,
+      "validated_target": true,
+      "requires_tools": [
+        "match_summary_report",
+        "query_sql"
+      ],
+      "key_points": [
+        "整体首血次数",
+        "整体首血转换率",
+        "Sunset 图首血转换率",
+        "Split 图首血转换率"
+      ],
+      "rubric": {
+        "整体首血次数": 25,
+        "整体首血转换率": 25,
+        "Sunset 图首血转换率": 30,
+        "Split 图首血转换率": 20
+      }
+    }
+  }
+]

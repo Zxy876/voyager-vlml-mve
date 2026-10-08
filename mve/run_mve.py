@@ -36,17 +36,19 @@ from loop_core import (  # noqa: E402
     Task,
     evaluate_vs_referee,
     fact_key,
+    task_done,
     update_mastery,
 )
 from voyager import LLMVoyager, ScriptedVoyager  # noqa: E402
 
 from tasks import SERIES, TASKS, TASK, TASK_HARD, TASK_MID, TASK_PATTERN, next_topic  # noqa: E402
 
-# 「跑通」的判据（照原版 Voyager 的 self-verification）：
-#   success = 裁判确认**全部评分点**都覆盖、值正确（布尔）。
-# 不再用「覆盖率 ≥0.95」当判据 —— 95% 在原版眼里就是"没全达成 = 不 success"，
-# 不存技能、照样算失败。覆盖率只降级为观测（达成度的连续读数，喂掌握度）。
-# 判据统一读 `ev.success`（loop_core.evaluate_vs_referee 的布尔 self-verification）。
+# 「任务完成」的判据（照原版 Voyager 的 self-verification）：
+#   done = Voyager 自己的尺子：跑通编排（有成功工具调用）+ 拿到数（facts 非空）
+#          + 没翻车（无工具错误）—— **不数覆盖点**。
+# 用户拍板：学习阶段（存技能 / 停止同题 / 推进换题）不算覆盖点 —— 覆盖点是
+# VLML 的尺子，只用于考核（exam transfer/final）与掌握度证据。原版 critic
+# 判的就是「环境里可观测的任务目标达成」，不是「覆盖了多少评分点」。
 
 
 def _stable_skill_name(task: Any) -> str:
@@ -244,7 +246,8 @@ async def main() -> None:
     evidence: list[mastery_model.MasteryEvidence] = run_log.evidence_rows(task.topic_id)
     snapshots = []
     coverages: list[float] = []
-    successes: list[bool] = []   # 判据层：每轮 self-verification 的布尔结果
+    successes: list[bool] = []   # VLML 观测：每轮是否全部评分点达成（考核尺子）
+    dones: list[bool] = []       # 判据层：每轮任务是否完成（Voyager 尺子，不数覆盖点）
 
     print("=" * 72)
     print(f"  MVE：Voyager 在 VLML 上做题   [{mode}]  裁判=VLML0(原版)")
@@ -287,6 +290,8 @@ async def main() -> None:
         # 只数「真调成功了」的工具调用；失败的不算证据
         tool_calls = sum(1 for t in voyager.trajectory if not str(t.get("error") or ""))
         ev = evaluate_vs_referee(facts, task.rubric, ref.facts, tool_calls=tool_calls)
+        # Voyager 尺子：任务完成 = 跑通编排 + 拿到数 + 没翻车（**不数覆盖点**）
+        done = task_done(facts, tool_calls=tool_calls, errors=result.get("errors"))
 
         for e in (result.get("errors") or []):
             print(f"  ⚠ 工具错误  : {e[:150]}")
@@ -465,11 +470,12 @@ async def main() -> None:
         #   原版：自己写 JS → 跑通 → 存 program_code → 下次直接跑
         # 此前 MVE 只存 VLML0 的解法（观摩来的），自己跑通的那段
         # 从来没存过 —— 于是"跑通"这件事对技能库没有任何贡献。
-        # 判据照原版：任务完成（这里用覆盖率达标）才存，
-        # 没跑通的存进去等于把错误做法固化下来。
+        # 判据照原版：任务完成（Voyager 尺子 = 跑通编排 + 拿到数 + 没翻车，
+        # **不算覆盖点** —— 覆盖点是 VLML 的尺子，只用于考核与掌握度证据）
+        # 才存；没跑通的存进去等于把错误做法固化下来。
         try:
             prog = str(result.get("program_code") or "")
-            if prog and ev.success:
+            if prog and done:
                 _saved = skill_store.add(
                     task.topic_id,
                     _stable_skill_name(task),
@@ -484,7 +490,7 @@ async def main() -> None:
                     source="practice")
                 print(f"  学会技能  : {_saved[0]} "
                       f"（自己写的程序 {len(prog)} 字符已入库）")
-            elif ev.success:
+            elif done:
                 # ---- plan 路径：没有 program_code，但**跑通了的调用序列就是它的程序** ----
                 #
                 # 8 道题里 6 道是 SQL 类，走 plan 路径，那条路永远不产出代码 ——
@@ -577,7 +583,8 @@ async def main() -> None:
             "coverage": round(ev.coverage, 4),
             "score": round(ev.score, 4),
             "verdict": ev.verdict,
-            "success": bool(ev.success),   # 判据层布尔：全部评分点达成（self-verification）
+            "success": bool(ev.success),   # VLML 观测：全部评分点达成（考核尺子）
+            "done": bool(done),            # 判据层布尔：任务完成（Voyager 尺子，不数覆盖点）
             "evidence_status": ev.evidence_status,
             "judge": ev.judge,
             "no_tool_calls": ev.no_tool_calls,
@@ -629,27 +636,30 @@ async def main() -> None:
 
         coverages.append(ev.coverage)
         successes.append(ev.success)
+        dones.append(done)
         print()
 
         # 照 Voyager rollout（voyager.py:269-273）：
         #   done = (rollout_num_iter >= action_agent_task_max_retries or success)
-        # **做对了就停**。之前是硬跑满 3 轮 —— 做对了还在重做，既浪费，
+        # **任务完成了就停**。之前是硬跑满 3 轮 —— 做对了还在重做，既浪费，
         # 又会让后面几轮的"失败教训"继续往技能库里写。
-        # 判据用 success（全部评分点达成），不是 verdict=="correct"
-        # （coverage≥0.95 仍可能 missing 一个点，那在原版眼里就是没达成）。
-        if ev.success:
-            print("  ✅ self-verification 通过（全部评分点达成）"
+        # 判据用 done（Voyager 尺子：跑通编排 + 拿到数 + 没翻车），
+        # **不是 VLML 覆盖点**（覆盖率只作考核尺子 / 掌握度证据）。
+        if done:
+            print("  ✅ 任务完成（Voyager 尺子：跑通 + 拿到数 + 没翻车）"
                   "—— 照 Voyager rollout 的 `done = success`，本题不再重做。")
             break
 
     print("=" * 72)
     print("  结论")
     print("=" * 72)
-    # 判据层（Voyager）：success = self-verification 布尔，存技能/停止/推进都只认它。
+    # 判据层（Voyager）：done = 任务完成布尔（跑通编排 + 拿到数 + 没翻车，
+    # 不数覆盖点），存技能/停止/推进都只认它。
     # 掌握度（伴学）不能当学习判据：V2 里 confidence 随证据权重之和上升
     # （权重会被时间衰减、评价可信度拉低），但反复作答照样能把它推高，
     # 用它判断「学会了」会得出假阳性 —— 掌握度只做独立评估。
-    print(f"  success轨迹: {[str(s) for s in successes]}  ← 判据层（self-verification）")
+    print(f"  done轨迹  : {[str(d) for d in dones]}  ← 判据层（Voyager 尺子）")
+    print(f"  success   : {[str(s) for s in successes]}  ← VLML 观测（全部评分点达成）")
     # 覆盖率降级为观测：达成度的连续读数，喂掌握度证据，不进对错判断
     print(f"  覆盖率观测 : {[f'{c:.0%}' for c in coverages]}  ← 仅作达成度观测")
     if snapshots:
@@ -675,17 +685,18 @@ async def main() -> None:
     else:
         print(f"  技能库     : {[s.name for s in voyager.skills]}")
     print()
-    # 学习是否发生的判据：success 从 False → True（全部评分点从没达成到达成）。
-    # 覆盖率只作观测提示，不再当「学会了」的判据。
-    learned = len(successes) >= 2 and (successes[-1] and not successes[0])
+    # 学习是否发生的判据：done 从 False → True（任务从没完成 → 完成，
+    # Voyager 尺子，不数覆盖点）。覆盖率只作观测提示。
+    learned = len(dones) >= 2 and (dones[-1] and not dones[0])
     if coverages and coverages[0] >= 1.0:
         print("  ⚠️ 首轮即满分 —— 这个任务对模型太简单，测不出学习曲线。")
         print("     这不说明「学不会」，只说明「不需要学」。要测学习必须上更难的题（--hard）。")
     elif learned:
-        print(f"  ✅ success: {successes[0]} → {successes[-1]}"
+        print(f"  ✅ done: {dones[0]} → {dones[-1]}"
               f"（覆盖率观测 {coverages[0]:.0%} → {coverages[-1]:.0%}）：")
-        print("     Voyager 把教训写进技能库后，同一道题达成了全部评分点。")
-        print("     这是「学会编排」在本原型里的可观测形态。")
+        print("     Voyager 把教训写进技能库后，同一道题从「跑不通」变成了"
+              "「跑通 + 拿到数 + 没翻车」。")
+        print("     这是「学会编排」在本原型里的可观测形态（不数覆盖点）。")
     elif use_llm and len(voyager.memory) >= 2 and coverages[-1] <= coverages[0]:
         print("  ⚠️ 技能库有内容但覆盖率没提升 —— 模型读了经验却没改变行为")
     elif not use_llm and any(s.name == "分图下钻" for s in voyager.skills):

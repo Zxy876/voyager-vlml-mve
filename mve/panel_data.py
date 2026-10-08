@@ -416,9 +416,11 @@ def build_state() -> dict[str, Any]:
             "coverage": r.get("coverage"),
             "score": r.get("score"),
             "verdict": r.get("verdict", ""),
-            # 判据层布尔：全部评分点达成（self-verification）。
-            # 旧日志没有这一列 → 按 False 处理（覆盖率时代的记录语义不同）。
+            # VLML 观测：全部评分点达成（考核尺子）。旧日志没有这一列 → False
             "success": bool(r.get("success")),
+            # 判据层布尔：任务完成（Voyager 尺子：跑通编排 + 拿到数 + 没翻车，
+            # 不数覆盖点）。旧日志没有这一列 → False。
+            "done": bool(r.get("done")),
             "evidence": r.get("evidence_status", ""),
             "mastery": m,
             "mastery_pct": _pct(m),
@@ -561,6 +563,10 @@ def build_state() -> dict[str, Any]:
         "mastery_warning": mas_warning,
         "coverage_track": [_pct(c) for c in cov],
         # 判据层轨迹：每轮 self-verification 的布尔（存技能/停止/推进只认它）
+        # 判据层轨迹：每轮任务完成布尔（Voyager 尺子，存技能/停止/推进只认它）
+        "done_track": [bool(s["done"]) for s in series],
+        "last_done": bool(series[-1]["done"]),
+        # VLML 观测轨迹：每轮是否全部评分点达成（考核尺子）
         "success_track": [bool(s["success"]) for s in series],
         "last_success": bool(series[-1]["success"]),
         "mastery_track": [_pct(m) for m in mas],
