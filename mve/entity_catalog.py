@@ -33,15 +33,21 @@ CATALOG = HERE / "entity_catalog.json"
 #
 # ⚠️ `player` 有**两个候选表**，按顺序试到有值为止：
 #   `agg_player_series_stats` 是 VLML 从**逐事件**派生的（GRID 源有）；
-#   `ext_player_game_stats` 是 vlr.gg 给的**聚合级**统计。
-#   接了 vlr 之后没有 kill 事件，前者就是空的 —— 这时要退到后者，
+#   `ext_player_game_stats` 是 vlr.gg / rib.gg 给的**聚合级**统计。
+#   接了公开源之后没有 kill 事件，前者就是空的 —— 这时要退到后者，
 #   否则"选手"这一栏会显示 0 个，而实际上选手数据是有的（只是粒度不同）。
+#
+# rib.gg 那两张（`ext_player_round_stats` / `ext_player_side_stats`）只在
+# `vlml_rib.duckdb` 里存在，放在最后当兜底：库里没有这张表会记 warning，
+# 不影响前面命中。同一类别**先到先得**，所以顺序不能乱。
 PROBES: list[tuple[str, str, str, list[str]]] = [
     # 类别       表名                         取值列          附带
     ("series", "series", "series_id", ["tournament_name"]),
     ("team", "agg_team_series_stats", "team_name", []),
+    ("team", "ext_game_economy", "team_name", []),
     ("player", "agg_player_series_stats", "player_name", []),
     ("player", "ext_player_game_stats", "player_name", []),
+    ("player", "ext_player_round_stats", "player_name", []),
     ("map", "games", "map_name", []),
 ]
 

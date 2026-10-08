@@ -80,7 +80,8 @@ KIND_LABEL = {"series": "赛事", "team": "团队", "map": "地图", "player": "
 DEFAULT_FAMILY = "vlml0"
 # 已知库文件名 → 代号（换数据源时在这里加一行；认不出就用文件名本身）
 _FAMILY_BY_STEM = {"vlml_events": "vlml0",        # GRID 切片（逐事件，key 过期）
-                   "vlml_vlr": "vlr.gg"}          # 公开源（回合级 + 聚合级）
+                   "vlml_vlr": "vlr.gg",         # 公开源 A（回合级 + 聚合级）
+                   "vlml_rib": "rib.gg"}         # 公开源 B（+ 逐回合×逐选手/经济）
 
 
 # --------------------------------------------------------------------------

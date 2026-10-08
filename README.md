@@ -563,6 +563,99 @@ FK/FD，没有"这回合谁先开的枪"。选手一栏在 `entity_catalog` 里�
 
 ---
 
+## 八之九、vlr.gg + rib.gg 双源（2026-10-08）
+
+vlr 接完之后还剩两个洞：**没有"这回合谁先开的枪"**、**没有经济局**。问了
+「rib.gg 还是 PandaScore 好申请」，实测结论如下：
+
+| 源 | 申请难度 | 免费能给到哪一层 | 结论 |
+|---|---|---|---|
+| **rib.gg** | **不用申请**（没有官方 API key） | 网页里就带着 `roundStats`（每回合×每选手，含 `firstKill`）、`roundEconomy`（bank/loadout/buyTier）、`economy` | ✅ **选它**，网页抓取即可 |
+| PandaScore | **最容易申请**（注册即得 token，不要信用卡） | 免费只有 **Fixtures**（赛程/结果，1000 req/hr）；逐图与选手统计在 **Historical plan €400/月起/每游戏** | ❌ 申请容易，但**补不了我们缺的那一层** |
+| henrikdev | `HTTP 401` | — | 现在也要 key |
+| esport.is | 空响应 | — | 用不了 |
+
+**合规依据（这是能不能做的前提）**：rib.gg 的 `robots.txt` 是 `Allow: /`，只
+`Disallow: /admin` 与 `/api/`。我们抓的是 `/matches/{id}` 的 HTML 页面，**不在
+禁止列表里**（对 ClaudeBot / GPTBot 同样 `Allow: /`）。这跟"绕过访问控制"是
+两回事。仍按 vlr 同款礼貌抓取：1.2 秒一个请求、正常 UA、403/429 退避。
+
+### 双源分工
+
+| 层 | vlr.gg | rib.gg |
+|---|---|---|
+| 赛事 / 图 / 回合（`series`/`games`/`rounds`） | ✅ | ✅ |
+| 整图聚合选手统计 | ✅ | ✅（还多 `firstKills`/`firstDeaths`/`clutches`/`multiKills`/`opKills`） |
+| **每回合 × 每选手** | ❌ | ✅ `ext_player_round_stats` |
+| **每回合 × 每队经济** | ❌ | ✅ `ext_round_economy` |
+| **每图经济汇总** | ❌ | ✅ `ext_game_economy` |
+| **攻防拆分** | ❌ | ✅ `ext_player_side_stats` |
+| 逐击杀事件（kill/伤害/技能） | ❌ | ❌ **都不造** |
+
+⚠️ **仍然不造 `player-killed-player`**：rib 的 `firstKill` 只说**这回合谁拿了首杀**，
+没说**杀了谁**（payload 里没有 killer→victim 配对）。首血走
+`ext_player_round_stats.first_kill` 这个布尔位。
+
+### 一个源一个库，raw 目录也要分开
+
+`knowledge_graph.data_source()` 是**按库文件名**判源的（`vlml_vlr` → `vlr.gg`、
+`vlml_rib` → `rib.gg`），混库会让这个字段只能二选一，等于丢信息。所以：
+
+```
+vlml/data/vlml_vlr.duckdb ← vlr.gg        vlml/data/vlml_rib.duckdb ← rib.gg
+```
+
+而 `load_data.py:47` 把 raw 目录**写死**成 `data/raw_events`（不可配）。若两个源
+的 jsonl 堆在同一棵树里，跑 rib 的库会把 vlr 的 series 一起吃进去。做法是
+**每源一个暂存目录 + `raw_events` 软链指向当前源**：
+
+```
+vlml/data/raw_events       → raw_events_rib   （软链，管线只认这个路径）
+vlml/data/raw_events_vlr/
+vlml/data/raw_events_rib/  ← jsonl + _parsed 解析缓存
+```
+
+第一次跑会把已有的 `raw_events/` 改名为 `raw_events_vlr/`（都是脚本自己抓的、
+可再生成的数据，且 `load_data` 按 series_id 幂等）。
+
+```bash
+python mve/vlml_source/ingest.py --discover --source rib     # 赛事列表
+python mve/vlml_source/ingest.py --source rib --event 151 --max 12
+python mve/vlml_source/ingest.py --source vlr --repair-game-ids
+```
+
+⚠️ rib 的赛事页把**未开打**的比赛排在前面（Champions 2026 头三场 `status` 全是
+`upcoming`、maps 全是 TBD）。所以 `--max` 只数**抓到的**，不是"试过的" ——
+否则取前 N 场会一场数据都拿不到。
+
+### 顺手修掉的一个老 bug（两个源都中招）
+
+VLML 的 `db_loader` **自己生成** `game_id`（`{series_id}_game_{n}`），**不看**
+我们塞进 `platformGameId` 的源站 id。于是 ext 表里若存源站那套（rib
+`map-392a29c1` / vlr `275080`），跟 `games` / `rounds` **一行都 join 不上**。
+修法：落 ext 表时反查 `games` 表换成 VLML 的 id（已验证 `game_number` ==
+我们建的 `sequence`）；老数据用 `--repair-game-ids` 修（vlr 库 210/210 行修好）。
+
+### 实测（rib.gg，Champions 2026）
+
+| 项 | 数 |
+|---|---|
+| 落 `ext_player_round_stats` | 1400 行（每回合 10 人） |
+| 落 `ext_round_economy` | 280 行 |
+| 落 `ext_game_economy` / `ext_player_side_stats` | 12 / 120 行 |
+
+修好 join 之后才查得出的两条因果轴：
+
+| 轴 | 结果 |
+|---|---|
+| 经济局转化率 | eco 36.1%（36 回合）/ semi_buy 53.2% / full_buy 54.4%（均装备值 3288 → 23164） |
+| 首血 → 回合胜率 | 拿到首血 **70.0%** vs 没拿 **30.0%**（140/140 完美对分） |
+| 攻防 | attack 55.0% / defense 45.0% |
+
+`base_events` 里**依然没有一行 kill** —— 这是两个公开源共同的上限，不是 bug。
+
+---
+
 ## 六、面板上可观测的状态清单
 
 | 状态 | 判定 | 依据 |
