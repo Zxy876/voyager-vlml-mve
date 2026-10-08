@@ -780,6 +780,46 @@ MineDojo/Voyager `main` 分支；伴学按本地 `study_companion/`；VLML 按�
 
 ---
 
+## 八之十二、同构设计逐条对照（Voyager × 猫娘伴学 × VLML → MVE）
+
+**总纲一句话**：判据层照原版 Voyager（success 布尔、成功固化、失败账本、
+迁移考核），掌握度层照猫娘伴学（mastery_v2 五档，只做独立评估、不当调度器），
+裁判分工照 VLML（指标与证据由工具出、洞察由 LLM 出）。世界观统一为
+「问题即任务」：一道题 = 一个知识点练习 = 一个 task。
+
+| # | 机制 | 原版 Voyager 依据 | 你的世界观 | MVE 落点 | 状态 |
+|---|---|---|---|---|---|
+| ① | 学习单元 | `curriculum.propose_next_task()` 每次新任务（curriculum.py:240,292） | 问题即任务：一道题 = 一个知识点练习 | `Task`（loop_core.py:562） | 世界观映射 |
+| ② | 判据 | `critic.check_task_success` 返回布尔 success（critic.py:116，LLM 看环境观察） | answer_evaluate 判分契约 | `ev.success`（missing/rejected/unjudgeable 全空且拿到证据，loop_core.py） | 照抄 + VLML0 数据实查更硬 |
+| ③ | 成功固化 | `if info["success"]: add_new_skill`（voyager.py 主循环）；失败 "Skipping to next task"（curriculum.py） | mastered → 掌握度到位 | `ev.success → skill_store.add`；失败不写技能库（防污染） | 照抄 |
+| ④ | 技能库 | `program_name` 主键 + 同名 Rewriting（skill.py:53-55）；`retrieval_top_k=5`（:25）；Chroma 语义向量（:67-75） | 技能是图谱节点的"会做" | `{topic_id}解法` 覆盖主键；`RETRIEVAL_TOP_K=5`；词面 Jaccard 近似 | 照抄 + 自标近似（见八之十一 D） |
+| ⑤ | 进度 | `progress = len(completed_tasks)`（curriculum.py:80） | 掌握进度 = 独立做对 | 裸考画像 `exam.true_level` | 照抄 |
+| ⑥ | 失败处理 | 失败即跳过（curriculum.py "Skipping to next task"） | 错题进 wrong_retry / due_review（间隔复习） | failed 账本 + mastery/半衰期调度重做时机 | 融合换维（原版管"换不换题"，伴学管"何时重做"） |
+| ⑦ | 自适应出题 | curriculum 读 progress/completed/failed/skills，**不读掌握度** | 自适应依据 = 它学到哪了 | planner 优先级链（explicit > wrong_retry > transfer_weak > due_review > exam_weak > unplaced…），读判据层信号 | 照抄方向（八之十落地） |
+| ⑧ | 终极判据 | README "Run Voyager with a learned skill library"：`skill_library_dir` + `resume=False`，注释 "this is not learning" | 举一反三：相邻知识点/新库首轮做对 | exam.py transfer/final；vlr/rib 双源当"新世界"；`transfer_weak` 调度补漏 | 照抄（八之十落地） |
+| ⑨ | 掌握度 | 原版无掌握度概念 | mastery_v2 五档衡量"学得多牢" | mastery_model.py 逐条照抄伴学（系数、confidence/consistency/mastery 公式、五档线 0.20/0.40/0.60/0.80） | 照抄伴学，只做独立评估 |
+| ⑩ | 裁判分工 | —（VLML：README:9/17/97 工具只回指标、LLM 生成洞察） | 指标由工具出，洞察由 LLM 出 | VLML0 判指标；narrative 只建于"已通过裁判核对"的事实 | 照抄 VLML |
+| ⑪ | 支架 | `default_warmup` 信息量收放（curriculum.py） | 讲解四段 / 支架教学 | 支架档位 full/partial/none（difficulty.py:29 自标换维） | 同构换维 |
+
+**三个换维点（不是照抄，是伴学世界观下的同构平移，全部有注释）**：
+
+- **④ 检索**：原版是语义向量天然跨题；MVE 无向量库，用词面 Jaccard + 加权
+  打分（同题 score=3.0 / 跨题下限 0.12 / 上限 2 条），并加"值在调用点传"
+  的参数化注入让技能跨题可用（voyager.py `_replay_saved` / `_reuse_skill`）。
+- **⑥ 失败**：原版失败即跳过，但伴学世界观里错题必须进复习队列；MVE 用
+  掌握度 + 半衰期（mastery_retention.py:46-51）决定**何时值得重做**，
+  既保留原版"不刷分"，又保留伴学"间隔复习"。
+- **⑪ 支架**：原版调"喂给 agent 的环境信息量"（warm_up），伴学调题目难度；
+  MVE 调支架档位（错题给足 / 证据不足给足 / 连对收档 / mastered 放开），
+  判据逐条照伴学（difficulty.py:44）。
+
+**为什么这不算"破坏伴学同构"**：四步全部复用伴学既有机制（问题即任务、
+mastery 调度、五档、weak_topic 取弱、due_review、图谱相邻出题），零新增概念；
+只是把学习判据从"同题覆盖率"换回原版 Voyager 的 self-verification 定义
+（这是对伴学本意的**恢复**——举一反三在伴学里本就内建）。
+
+---
+
 ## 六、面板上可观测的状态清单
 
 | 状态 | 判定 | 依据 |
