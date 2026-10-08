@@ -618,6 +618,11 @@ vlml/data/raw_events_rib/  ← jsonl + _parsed 解析缓存
 第一次跑会把已有的 `raw_events/` 改名为 `raw_events_vlr/`（都是脚本自己抓的、
 可再生成的数据，且 `load_data` 按 series_id 幂等）。
 
+⚠️ **软链跟着 `--source` 翻**：跑 `--source vlr` 会把它指向 `raw_events_vlr`，
+再跑 `--source rib` 才翻回来。盘上看到软链指向哪个源，就是**最后一次跑的源**，
+跟 `db_config.json` 里连的库不一定一致 —— 无所谓，因为每次 `ingest` 都会先翻链
+再入库。但手动跑 `run_pipeline.py` 时要注意自己翻对了。
+
 ```bash
 python mve/vlml_source/ingest.py --discover --source rib     # 赛事列表
 python mve/vlml_source/ingest.py --source rib --event 151 --max 12
