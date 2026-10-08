@@ -206,12 +206,26 @@ def _subject_values(key: str) -> list[str]:
     `db_config.json` 指向的库（默认 vlml/data/vlml_events.duckdb）把
     series / team / map / player 的实际取值查出来并缓存。
     查不到就返回空（该学科出不了题），**绝不编一个值出来**。
+
+    再叠一层**人登记的学科**（`subjects.py`）：换数据源（接新的公开源）后，
+    人先填一个学科，出题器就得能往这个学科上出题 —— 否则换了源，出题器
+    还在出老库里那一批值。⚠️ 如实说明：人填的值若数据源里没有对应数据，
+    这道题跑不出数值，会被验题闸拦下，不会混进题库。
     """
+    vals: list[str] = []
     try:
         import entity_catalog
-        return [v for v in entity_catalog.options(key) if v]
+        vals = [v for v in entity_catalog.options(key) if v]
     except Exception:
-        return []
+        vals = []
+    try:
+        import subjects
+        for v in subjects.values(key):
+            if v and v not in vals:
+                vals.append(v)
+    except Exception:
+        pass
+    return vals
 
 
 def _human_desc(question: str) -> str:

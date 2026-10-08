@@ -1346,6 +1346,13 @@ def build(*, observe: bool = False, with_schema: bool = True) -> KnowledgeGraph:
                         "at": datetime.now().isoformat(timespec="seconds"),
                         "source": "runtime",
                     }
+                    # 待审维度也是"VLML / Voyager 跑出来的条目"，同样要挂到学科下
+                    try:
+                        import subjects
+                        pending[dim]["entities"] = subjects.entities_in_sql(sql0)
+                        pending[dim]["subject_ids"] = _attach_entry(pending[dim])
+                    except Exception:
+                        pass
                     continue
             dim_here.append(dim)
 
@@ -1804,6 +1811,40 @@ def sql_shape(sql: str, tables: list[str] | None = None) -> dict[str, Any]:
     }
 
 
+def _entry_id(rec: dict[str, Any]) -> str:
+    """条目在学科登记册里的稳定 id —— 重建图谱 / 换库都要能认出是同一条。
+
+    两类条目分开前缀：运行期题带进来的待审维度（source="runtime"）走
+    `pending:`，人导入落下的边走 `human:` —— 同一个维度名两边都出现时
+    不该被并成一条。
+    """
+    dim = str(rec.get("dimension") or "").strip()
+    q = str(rec.get("question") or "").strip()
+    prefix = "pending" if str(rec.get("source") or "") == "runtime" else "human"
+    return f"{prefix}:{dim or q[:24] or '?'}"
+
+
+def _attach_entry(rec: dict[str, Any], entry_id: str = "") -> list[str]:
+    """把这个条目挂到它能挂上的学科下。
+
+    挂不上就登记成**未归属**（空列表），等人在面板上填那个学科 ——
+    绝不硬塞进某个默认学科：那会让"学科"重新退化成枚举。
+    同构伴学 `store.py:1506`：非 seed 条目的 subject 允许被后来的写入改，
+    所以这里重复 attach 是幂等且可升级的。
+    """
+    try:
+        import subjects
+        ents = dict(rec.get("entities") or {})
+        if not ents:
+            for k, v in subjects.entities_in_sql(str(rec.get("sql") or "")).items():
+                ents.setdefault(k, v)
+        sids = subjects.resolve(ents)
+        subjects.attach(entry_id or _entry_id(rec), sids)
+        return sids
+    except Exception:
+        return []
+
+
 def link_import(*, question: str, dimension: str = "", sql: str = "",
                 tool: str = "", tables: list[str] | None = None,
                 topic_id: str = "", value: Any = None,
@@ -1836,13 +1877,30 @@ def link_import(*, question: str, dimension: str = "", sql: str = "",
         "linked_at": datetime.now().isoformat(timespec="seconds"),
         "origin": "human_import",
     }
+    # --- 归属到学科（人填的容器）---
+    # 实体有两个来源：出题器显式传的 subject={"team": "NRG"}，和这次真实
+    # 跑过的 SQL 里的字面量。两个合并再去登记册里找学科。
+    ents = {str(k).lower(): str(v) for k, v in (subject or {}).items()
+            if k and v}
+    try:
+        import subjects
+        for k, v in subjects.entities_in_sql(sql).items():
+            ents.setdefault(k, v)
+    except Exception:
+        pass
+    rec["entities"] = ents
     if not rec["covered"]:
         rec["adopted"] = False
         rec["reason"] = ("工具集覆盖不到：这次取数读的表 "
                          f"{sorted(set(tbls)) or '（没解析出表）'} "
                          "既不在任何 insight 覆盖范围里、也不全在图内 "
                          "→ 不收录，也不建节点")
+        # ⚠️ 归属必须**在确认收录之后**再写。覆盖不到的题不落盘，若这里先
+        # attach，`subjects.json` 就会留下一条没有对应记录的幽灵条目，
+        # 之后重建图谱永远认不回来（实测踩过）。
+        rec["subject_ids"] = []
         return rec
+    rec["subject_ids"] = _attach_entry(rec)
 
     items = [it for it in load_imported_links()
              if not (str(it.get("question") or "") == rec["question"]
@@ -1879,6 +1937,12 @@ def _merge_imported_links(g: KnowledgeGraph) -> int:
     """
     added = 0
     for rec in load_imported_links():
+        # --- 归属到学科：每次合并都重算 ---
+        # 人后来填了一个学科（或换了数据源、同步了新的可填值），**旧条目要
+        # 自动挂上去** —— 这才是"学科是容器"而不是"枚举"的意义所在。
+        # 与覆盖同理：判据的输入都在记录里，重算是免费的。
+        # 同样放在覆盖判定**之后**：覆盖不到的条目根本不落盘，先 attach 只会
+        # 留下没有对应记录的幽灵条目（实测踩过，见 link_import 里的注释）。
         # **覆盖要在合并时重算，不能信落盘时的旧结论**。实测：图谱重建前
         # 服务器上 insight 层是空的，一条人导入被判成 table 级；重建后
         # insight 补齐了，可那条记录还写着 table 级 —— 边就永远停在低置信上。
@@ -1887,6 +1951,7 @@ def _merge_imported_links(g: KnowledgeGraph) -> int:
         cov = coverage_of(tables=tbls0, tool=str(rec.get("tool") or ""), g=g)
         if not cov["covered"]:
             continue                     # 覆盖不到的不进图（伴学：映射不上不硬造）
+        rec["subject_ids"] = _attach_entry(rec)
         dim = str(rec.get("dimension") or "").strip()
         q = str(rec.get("question") or "")[:40]
         tag = f"人导入「{q}」"
@@ -2156,20 +2221,55 @@ CHAPTER_SUBJECT = {
 }
 
 
+def _course_family() -> str:
+    """当前接的是哪个**数据源** —— 伴学 `course_family`（课程族）的同构物。
+
+    伴学 `store.py:1498` 的 topics 表里，`course_family` 与 `subject` 是两个
+    独立字段：前者是"用的是哪套教材"，后者是"属于哪门学科"。
+    MVE 同构：`course_family` = 接的是哪个库（vlml0 / 将来换的公开源），
+    `subject` = 赛事 / 团队 / 选手（人可填的归属容器）。
+
+    换数据源不该改写学科，只改这一个字段 —— 所以从 `db_config.json` 派生，
+    不手写（写了就会腐坏）。
+    """
+    try:
+        import subjects
+        return subjects.course_family()
+    except Exception:
+        return "vlml0"
+
+
 def _entity_values(kind: str) -> list[str]:
     """这个学科下**可填入的具体值**（赛事号 / 团队名 / 地图名 / 选手名）。
 
-    只读 `entity_catalog.json` 那份**落盘缓存**，不在这里连库 ——
+    只读两份**落盘缓存**，不在这里连库 ——
     图谱必须保持"不连库、面板秒开"。缓存由 `entity_catalog.py` 刷新。
+
+    学科是**人可填写的归属容器**（`subjects.py`），不是从库里枚举出来的：
+    接入新数据源（换一个公开源）后，人先填一个学科（比如某赛事 / 某战队域），
+    之后 VLML / Voyager 跑出来的条目就挂到它下面。所以这里是
+    「实查到的」+「人登记的」两份合并 —— 只取前者，换库就空、没接库就没得选。
     """
     if not kind:
         return []
+    vals: list[str] = []
     try:
         raw = json.loads((HERE / "entity_catalog.json").read_text(encoding="utf-8"))
     except Exception:
-        return []
+        raw = {}
     items = (raw.get("entities") or {}).get(kind) or []
-    return [str(it.get("value") or "") for it in items if it.get("value")]
+    for it in items:
+        v = str(it.get("value") or "")
+        if v and v not in vals:
+            vals.append(v)
+    try:
+        import subjects
+        for v in subjects.values(kind):
+            if v and v not in vals:
+                vals.append(v)
+    except Exception:
+        pass
+    return vals
 
 
 def _subject_key_of(col: str) -> str:
@@ -2402,7 +2502,12 @@ def _add_dimension_declarations(g: KnowledgeGraph, specs: dict[str, Any]) -> Non
         if ex:
             d["examples"] = ex[:2]
         d["name"] = dim
-        d["subject"] = "vlml0"
+        # ⚠️ 这里**原来写的是 `d["subject"] = "vlml0"`**，把上面 2322 行算出来
+        # 的真实学科（赛事/团队/选手）整个覆盖掉了 —— 学科位被"数据源"占了。
+        # 照伴学 `store.py:1498` 的字段表：数据源是 **course_family（课程族）**，
+        # 学科位是 subject。各归各位：换数据源时 course_family 变，
+        # 学科（人填的归属容器）不动。
+        d["course_family"] = _course_family()
         d["declared_by"] = ("VLML 建模文档 + tasks.py 的 answer_spec"
                             "（难度/单位/先修由文档推，口径由 answer_spec 定）")
 

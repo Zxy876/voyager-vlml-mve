@@ -421,13 +421,67 @@ VLML 工具里写死的默认库会被换掉），然后 `python mve/entity_cata
 2843069 那一道。现在每个可填值都是一个独立候选 —— 实测出题点已经能挑到
 `team=NRG`（换队伍 = 迁移）、`map=Corrode`（换地图）。
 
+### 学科是**人可填写的归属容器**（不是从库里枚举出来的）
+
+用户要求：「mcp 接入公开数据源（类似 grid 但不是 grid）后学科可以是自己填写的；
+到时候 vlml 或者 voyager 跑完增加到该学科下的条目就有了归属」。
+
+先去两边取证，再动手：
+
+**伴学侧**（`study_companion/`）
+
+| 取证位置 | 结论 |
+|---|---|
+| `store.py:1504-1506` | `subject = CASE WHEN topics.source='seed' THEN topics.subject ELSE excluded.subject END` —— **seed 的学科锁死，运行期条目的学科可写可改**，条目就是这样挂到学科下的 |
+| `store.py:1498, 1538` | 字段表里有 `course_family`（课程族），且 seed 空了可补 → **数据源 = 伴学的课程族**，与学科是两个独立字段 |
+| `_semantic_routing.py:23` | `ALLOWED_SUBJECTS` 是硬编码 frozenset（11 学科 + unknown），路由层强制白名单 → 伴学的学科是**预置枚举** |
+
+**VLML 侧**（换公开数据源要动哪一层）
+
+| 取证位置 | 结论 |
+|---|---|
+| `database/scripts/ingestion/download_raw_events.py:140` | 落盘结构 `data/raw_events/{year}/{tournament}/{series_id}.jsonl` |
+| `database/scripts/ingestion/parsers.py:29` | **`series_id = file_path.stem`（文件名即 id）**，year / tournament 取目录名 |
+| `database/scripts/ingestion/load_data.py` | 扫 `*.jsonl` → `process_series_bulk`，**幂等**（跳过已加载 series） |
+| `database/scripts/orchestration/run_pipeline.py` | 建表 → 载原始 → 跑变换 → 校验，四步串起来 |
+| `src/vlml/client/grid_client.py:11` | `GRIDClient(api_key, api_url)` —— 数据源就这一层，**换成别的公开源只要产出同构 jsonl，下游全不用改** |
+
+所以通路是：换掉 GRID 那一层下载器 → 文件按 `.../{year}/{tournament}/{series_id}.jsonl` 落盘 →
+`run_pipeline` 增量入库（幂等）→ 新赛事自动出现在 `series` 表 → 人在面板填（或一键同步）成学科
+→ VLML / Voyager 跑出的条目挂进去。
+
+**MVE 的实现**：新增 `mve/subjects.py`（登记册落盘 `subjects.json`）
+
+- `register(kind, value)` 人填一个学科；`sync_from_catalog()` 把库里实查到的值登记成「实查」
+  —— **人填的不会被同步覆盖**（同构伴学 `source='seed'` 那条 CASE）
+- 归属判据：条目 SQL 里的实体字面量（`team_name='NRG'` / `series_id='2843069'`）+
+  出题器显式传的 `subject={"team":…}`，去登记册里找同类别同值的学科
+- **`course_family` 归位**：此前 `knowledge_graph.py:2405` 写死 `d["subject"] = "vlml0"`，
+  把学科位被数据源占了（四层改造漏改的半步）。现在数据源回 `course_family`，
+  学科位回到赛事 / 团队 / 选手
+
+**实测（本地）**
+
+```
+1) 导入一条题（实体 Fnatic，登记册里还没有）→ 收录 True，归属 []  → 未归属 1 个
+2) 面板填学科 team=Fnatic                                        → {"ok":true,"moved":1}
+3) 重建图谱 --build（merge 重算归属）                              → Fnatic 下 1 个条目，未归属清空
+```
+
+也就是说：**先跑出条目、后填学科也成立** —— 填完当场把没归位的旧条目补挂上去
+（`_merge_imported_links` 每次合并都重算，判据输入都在记录里，重算是免费的）。
+
+⚠️ 与伴学**故意不同的一点**：伴学的学科是预置枚举（白名单校验），MVE 这里**不做白名单** ——
+数据源是会换的，预置枚举必然腐坏。代价是人填的值若在数据源里没有对应数据，
+这道题跑不出数值，会被验题闸拦下（不会混进题库）。
+
 ### 诚实的限制
 
 - **覆盖不到就不收**：表不在图谱里（或 SQL 里解析不出表）→ `adopted=False`，
   如实返回、不建节点、也不据此出题。伴学同款：映射不上不硬造，交回人处理。
-- **题一旦被采纳进题库，照旧会派生出 `dim:` 节点**（`build()` 从 `TASKS[].rubric`
-  派生，这条规则本轮没动）。所以"不建节点"指的是**收录动作**不建节点，
-  不是图谱里永远不会出现这个维度 —— 实测导入「爆弹成功率」后维度节点 15 → 16。
+- ~~**题一旦被采纳进题库，照旧会派生出 `dim:` 节点**~~ （2026-10-08 已改，见
+  「维度层不由题目派生」）：运行期题的维度先解析到已有维度，解析不到就**不建节点**，
+  只登记待审候选（照伴学 `knowledge_tracker.py:1555`）。服务器实测维度 **16 → 15**。
 - **验题闸仍然是硬门槛**：实测同一条导入第一次 **2/2 全被闸 0b（题面与维度相关）**
   拦下 —— 原因是没有 dim 节点时 `desc` 退回英文原名，中文题面对英文维度 token
   零重合。已修（`desc` 用人的原话），但这类门禁失败仍会正常发生。

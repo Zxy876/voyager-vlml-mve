@@ -42,6 +42,9 @@ DB_SWITCH = "db_switch"        # 点「切换」：写 db_config.json（要重�
 RESET = "reset_all"            # 点「清空学习状态」
 PRACTICE_SCOPE_SET = "practice_scope_set"      # 知识图谱页点「练习此知识点」
 PRACTICE_SCOPE_CLEAR = "practice_scope_clear"  # 点「清除范围」
+SUBJECT_ADD = "subject_add"        # 学科登记册：人填一个学科（换数据源后填赛事/战队）
+SUBJECT_SYNC = "subject_sync"      # 点「从数据源同步」：把库里实查到的值登记成学科
+SUBJECT_DEL = "subject_del"        # 删掉一个（人填的）学科
 
 # kind -> 人话（导出 md 里直接显示）
 ACTION_LABEL = {
@@ -56,6 +59,9 @@ ACTION_LABEL = {
     RESET: "点「清空学习状态」",
     PRACTICE_SCOPE_SET: "点「练习此知识点」（设练习范围）",
     PRACTICE_SCOPE_CLEAR: "点「清除范围」",
+    SUBJECT_ADD: "登记一个学科（人填）",
+    SUBJECT_SYNC: "点「从数据源同步学科」",
+    SUBJECT_DEL: "删除一个学科",
 }
 
 

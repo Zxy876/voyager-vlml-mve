@@ -61,6 +61,18 @@ def _graph_json() -> str:
         out["pending_dims"] = knowledge_graph.load_pending_dimensions()
     except Exception:
         out["pending_dims"] = []
+    # 学科登记册：人可填写的归属容器（换数据源后填赛事/战队，跑出的条目挂进去）
+    try:
+        import subjects
+        subs = subjects.all_subjects()
+        out["subjects"] = subs
+        out["subject_counts"] = {s["id"]: len(subjects.entries_of(s["id"]))
+                                 for s in subs}
+        out["subject_unassigned"] = subjects.unassigned()
+        out["course_family"] = subjects.course_family()
+    except Exception:
+        out["subjects"] = []
+        out["subject_unassigned"] = []
     return json.dumps(out, ensure_ascii=False)
 
 def _scope_json() -> str:
@@ -969,7 +981,53 @@ ${ESC(REL[e.relation]&&REL[e.relation][1]||e.relation)}${e.origin==='observed'?'
       层级照伴学 <b>阶段 → 学科 → 章节 → 知识点</b>：
       <b>阶段</b>＝拿下这个知识点最低要动用哪一级工具集（原始事件表 → 派生聚合
       → 洞察 SQL → 报告工具）；<b>学科</b>＝赛事 / 团队 / 选手 / 地图（从真实列
-      派生，不手写）；<b>章节</b>＝实体域下的主题域（首血 / 经济 / 手枪局 / 连败…）。</div>`;
+      派生，不手写）；<b>章节</b>＝实体域下的主题域（首血 / 经济 / 手枪局 / 连败…）。</div>
+    ${subjectHtml(g)}`;
+}
+
+/* 学科登记册：学科是**人可填写的归属容器**，不是从库里枚举出来的。
+   伴学对照：store.py:1504-1506 —— seed 的 subject 锁死、运行期条目的 subject
+   可写可改，条目就是这样挂到学科下的；_semantic_routing.py:23 的
+   ALLOWED_SUBJECTS 是预置枚举，MVE 这里故意更宽松（数据源会换，枚举必腐坏）。 */
+function subjectHtml(g){
+  const subs=g.subjects||[], sCnt=g.subject_counts||{}, sUn=g.subject_unassigned||[];
+  const KIND={series:'赛事',team:'团队',map:'地图',player:'选手',
+              tournament:'赛事总览',custom:'自定义'};
+  const rows=subs.map(s=>`<tr>
+      <td>${ESC(KIND[s.kind]||s.kind)}</td>
+      <td class="mono">${ESC(s.value)}</td>
+      <td>${s.source==='human'
+            ?'<span class="chip ok">人填</span>'
+            :'<span class="chip grey">实查</span>'}</td>
+      <td>${s.note?ESC(s.note):'<span style="opacity:.5">—</span>'}</td>
+      <td>${(sCnt[s.id]||0)||'<span style="opacity:.5">0</span>'}</td>
+      <td>${s.source==='human'?`<button class="btn btn-secondary" data-subject-del="${ESC(s.id)}"
+            style="padding:3px 8px;font-size:11px">删</button>`:''}</td></tr>`).join('');
+  const un=sUn.length?`<div class="note warn" style="margin-top:8px">
+      <b>未归属 ${sUn.length} 个</b>（跑出来过，但登记册里还没有它那个学科 ——
+      在上面填一个，会当场归位）：
+      ${sUn.slice(0,12).map(x=>`<span class="chip grey">${ESC(x)}</span>`).join(' ')}</div>`:'';
+  return `<div style="margin-top:16px">
+    <div class="panel__head"><h2>学科登记册</h2>
+      <span class="hint">数据源 <span class="chip grey">${ESC(g.course_family||'—')}</span>
+        · ${subs.length} 个学科 · ${sUn.length} 个未归属条目</span></div>
+    <div class="note info" style="margin-bottom:10px">
+      学科是<b>人可填写的归属容器</b>：换数据源（接新的公开源）后自己填一个学科
+      （某赛事 / 某战队域），之后 VLML / Voyager 跑出来的条目会按它 SQL 里的实体值
+      （<span class="mono">team_name='…'</span> / <span class="mono">series_id='…'</span>）
+      挂到该学科下。<b>先跑出条目、后填学科也行</b> —— 填完当场把没归位的旧条目补挂上去。
+      <br>「实查」是从当前库里查到的；「人填」是你自己登记的（换库不会被同步覆盖）。</div>
+    <table class="tbl"><thead><tr><th>类别</th><th>取值</th><th>来源</th>
+      <th>说明</th><th>条目</th><th></th></tr></thead>
+      <tbody>${rows||'<tr><td colspan="6" style="opacity:.6">（空 —— 先「从数据源同步」，或自己填一个）</td></tr>'}</tbody></table>
+    <div style="display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap">
+      <select id="subjKind">${['series','team','map','player','custom']
+        .map(k=>`<option value="${k}">${KIND[k]}</option>`).join('')}</select>
+      <input id="subjValue" placeholder="取值，如 NRG / VCT 2026" style="width:200px">
+      <input id="subjNote" placeholder="说明（可选）" style="width:200px">
+      <button class="btn btn-primary" data-subject-add="1" style="padding:5px 12px">登记学科</button>
+      <button class="btn btn-secondary" data-subject-sync="1" style="padding:5px 12px">从数据源同步</button>
+    </div>${un}</div>`;
 }
 
 /* 图谱页顶部的练习范围条：照伴学 i18n
@@ -1035,11 +1093,53 @@ async function clearScope(){
   }catch(e){ alert('清除失败：'+e); }
   finally{ await load(); }
 }
+async function addSubject(){
+  const kind=(document.getElementById('subjKind')||{}).value||'';
+  const value=((document.getElementById('subjValue')||{}).value||'').trim();
+  const note=((document.getElementById('subjNote')||{}).value||'').trim();
+  if(!value){ alert('先填学科取值（比如 NRG、某个赛事号）'); return; }
+  try{
+    const r=await fetch('/api/subject/add',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({kind:kind,value:value,note:note})});
+    const d=await r.json();
+    uiEvent('subject_add',{学科:kind+'='+value,补归属条目:d.moved||0},
+      d.ok?('已登记'+(d.existed?'（已存在）':'')
+           +((d.moved)?'，顺带把 '+d.moved+' 个旧条目归位':'')
+           +(!d.ok?('失败：'+(d.error||'')):''))
+      :('失败：'+(d.error||'未知')));
+    if(!d.ok) alert('登记失败：'+(d.error||'未知'));
+  }catch(e){ alert('登记失败：'+e); }
+  finally{ await load(); }
+}
+async function syncSubjects(){
+  try{
+    const r=await fetch('/api/subject/sync',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({})});
+    const d=await r.json();
+    uiEvent('subject_sync',{新登记:d.added||0},
+      d.ok?('新增 '+d.added+' 个，共 '+d.total+' 个'):('失败：'+(d.reason||'')));
+    if(!d.ok) alert('同步失败：'+(d.reason||'未知'));
+  }catch(e){ alert('同步失败：'+e); }
+  finally{ await load(); }
+}
+async function delSubject(id){
+  try{
+    const r=await fetch('/api/subject/del',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({id:id})});
+    const d=await r.json();
+    uiEvent('subject_del',{学科:id}, d.ok?'已删除':'没找到');
+  }catch(e){ alert('删除失败：'+e); }
+  finally{ await load(); }
+}
 document.addEventListener('click',e=>{
   const s=e.target.closest('[data-scope-set]');
   if(s){ setScope(s.dataset.scopeSet); return; }
   if(e.target.closest('[data-scope-clear]')){ clearScope(); return; }
   if(e.target.closest('[data-scope-practice]')){ pilotStart(); return; }
+  if(e.target.closest('[data-subject-add]')){ addSubject(); return; }
+  if(e.target.closest('[data-subject-sync]')){ syncSubjects(); return; }
+  const sd=e.target.closest('[data-subject-del]');
+  if(sd){ delSubject(sd.dataset.subjectDel); return; }
 });
 
 const PANELS={overview:pOverview,practice:pPractice,import:pImport,trace:pTrace,skill:pSkill,graph:pGraph,console:pConsole};
@@ -1563,6 +1663,54 @@ class Handler(BaseHTTPRequestHandler):
                         detail["顺带"] = "清档失败（数据库已切换）"
                 ui_events.append(ui_events.DB_SWITCH, detail=detail, result="ok")
                 self._json(200, {**res, "need_restart": True})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": f"{type(e).__name__}: {e}"[:300]})
+            return
+
+        if path in ("/api/subject/add", "/api/subject/sync", "/api/subject/del"):
+            # 学科登记册：人是**自己填**学科（换数据源后填新赛事 / 新战队域），
+            # 之后 VLML / Voyager 跑出来的条目按实体值挂到该学科下。
+            try:
+                import subjects
+                import knowledge_graph
+                import ui_events
+                if path.endswith("/sync"):
+                    res = subjects.sync_from_catalog()
+                    ui_events.append(ui_events.SUBJECT_SYNC,
+                                     detail={"新登记": res.get("added", 0)},
+                                     result="ok" if res.get("ok") else "失败")
+                    self._json(200, res)
+                    return
+                if path.endswith("/del"):
+                    sid = str(payload.get("id") or "")
+                    ok = subjects.unregister(sid)
+                    ui_events.append(ui_events.SUBJECT_DEL, detail={"学科": sid},
+                                     result="已删除" if ok else "没找到")
+                    self._json(200, {"ok": ok, "id": sid})
+                    return
+                kind = str(payload.get("kind") or "").strip()
+                value = str(payload.get("value") or "").strip()
+                res = subjects.register(kind, value,
+                                        note=str(payload.get("note") or ""))
+                # 填完**立刻重算归属**：此前跑出来却没归位的条目（人还没填这个
+                # 学科时的那些）要当场挂上去 —— 不用等人去跑 --build。
+                # moved 只数"这次**新**归位的"：重算后仍归位的旧条目不算，
+                # 否则这个数字永远等于已归属总数，没有信息量。
+                moved = 0
+                if res.get("ok"):
+                    try:
+                        before = set(subjects.unassigned())
+                        for r in (knowledge_graph.load_imported_links()
+                                  + knowledge_graph.load_pending_dimensions()):
+                            knowledge_graph._attach_entry(r)
+                        moved = len(before - set(subjects.unassigned()))
+                    except Exception:
+                        pass
+                ui_events.append(ui_events.SUBJECT_ADD,
+                                 detail={"学科": f"{kind}={value}",
+                                         "补归属条目": moved},
+                                 result="已登记" if res.get("ok") else "失败")
+                self._json(200, {**res, "moved": moved})
             except Exception as e:
                 self._json(500, {"ok": False, "error": f"{type(e).__name__}: {e}"[:300]})
             return
