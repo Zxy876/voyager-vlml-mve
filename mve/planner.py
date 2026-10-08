@@ -146,18 +146,34 @@ def _has_reusable_program(topic: str) -> bool:
 
 
 def _hint_for(topic: str, rec: dict[str, Any] | None, reason: str) -> dict[str, Any]:
-    """这道题该给多少支架（照伴学 difficulty_policy.select 的同构物）。"""
+    """这道题该给多少支架（照伴学 difficulty_policy.select 的同构物）。
+
+    裸考锚的用法改过一版（2026-10-08）。原先：
+        m = min(m, true); cov = min(cov, true)
+    裸考低就把一切压回 full —— 结果是**死锁**：裸考 16% → 永远 full
+    → 练习永远带全量图谱 → 模型只学会照抄 → 裸考永远 16% → 永远 full。
+    **partial 档从来没被练过**，曲线自然没有中间态（实测面板：
+    摸底 16% → 练后重考 16% → 结业 0%）。
+
+    现在改成**两端起作用、中间交给档位递进**：
+      · 裸考已达标（≥0.8）→ 直接 none（会了就别扶，这是裸考唯一该"收"的时刻）
+      · 库里没有可复用程序 → full（没学会走就别撤拐杖，兜底保留）
+      · 中间状态 → 交给 `difficulty.select()` 的档位平滑：
+        **同档表现决定收/放，每轮最多 ±1 档**（伴学：never drop more than
+        one level）。full 连对两轮 → partial；partial 连对两轮 → none。
+        这样 partial 档必然被练到，裸考水平才会真正爬上去。
+    """
     seed = TASKS[topic].difficulty if topic in TASKS else 2
-    # 支架的锚必须是**裸考水平**：练习覆盖率是带图谱拿的（实测恒 100%），
-    # 拿它当"会了"的判据 → 支架第一轮就被收掉 → 一撤图谱就崩回 0%。
-    # 取 min（谁低听谁的）：裸考 0% 而练习 100% → 说明全靠支架，继续扶。
     true = _true_level(topic)
     m = float((rec or {}).get("last_mastery") or 0.0)
     cov = (rec or {}).get("last_coverage")
     cov = None if cov is None else float(cov)
-    if true is not None:
-        m = min(m, true)
-        cov = true if cov is None else min(cov, true)
+    # 裸考已达标：唯一允许"直接跳到 none"的情形（会了就别扶）
+    if true is not None and true >= 0.80:
+        m = max(m, true)
+        cov = true if cov is None else max(cov, true)
+    # 裸考很差**不再压平档位** —— 否则就是上面的死锁。它只通过
+    # "没有可复用程序 → full" 这条兜底起作用（见函数末尾）。
     d = difficulty.select(
         seed,
         mastery=m,
@@ -167,14 +183,33 @@ def _hint_for(topic: str, rec: dict[str, Any] | None, reason: str) -> dict[str, 
         flags=(rec or {}).get("flags") or (),
         recent_verdicts=(rec or {}).get("recent_verdicts") or (),
         reason=reason,
+        prev_hint=_prev_hint(topic),
     )
     if true is not None:
-        d["why"] += f"；裸考 {true:.0%}（真实水平）才是支架的锚，练习覆盖率带图谱不作数"
+        d["why"] += f"；裸考 {true:.0%}"
     # 收支架的前提：库里有能直接跑的程序。没有就按 full 兜底。
     if d["hint"] != difficulty.HINT_FULL and not _has_reusable_program(topic):
         d["hint"] = difficulty.HINT_FULL
         d["why"] += "；但这题还没有可复用的程序 → 支架先不收"
     return d
+
+
+def _prev_hint(topic: str) -> str:
+    """这道题**上一轮练习**用的支架档位（跨进程读 run_log）。
+
+    档位平滑是相对"上一轮"的 —— 而每一单元都是新进程，不落盘就等于
+    每轮都从零开始判断，平滑约束形同虚设。
+    """
+    try:
+        rows = [r for r in run_log.load_all()
+                if str(r.get("topic_id") or "") == topic]
+    except Exception:
+        return ""
+    for r in reversed(rows):
+        h = str(r.get("hint") or "").strip().lower()
+        if h:
+            return h
+    return ""
 
 
 def _with_hint(sel: dict[str, Any], mastery: dict[str, Any]) -> dict[str, Any]:

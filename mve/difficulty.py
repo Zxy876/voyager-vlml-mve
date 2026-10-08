@@ -128,6 +128,7 @@ def select(
     recent_verdicts: Any = (),
     reason: str = "",
     blockers: Sequence[Any] = (),
+    prev_hint: Any = "",
 ) -> dict[str, Any]:
     """算出这题该出到什么难度、给多少支架。返回 {difficulty, hint, why}。"""
     m = _unit(mastery, default=0.0)
@@ -198,6 +199,27 @@ def select(
 
     difficulty = min(MAX_DIFFICULTY, max(MIN_DIFFICULTY, difficulty))
     hits = min(len(HINT_ORDER) - 1, max(0, hits))
+    # ---- 档位平滑：**每轮最多收/放一档**（照伴学） ----
+    #
+    # 伴学原文（`difficulty_policy.py:117-120`）：
+    #     "A retry already has its one-step decrease.  Do not stack a recent
+    #      wrong streak onto it: a retry must never drop more than one level."
+    # 连对 → 难度 +1 也一样是一档。**梯度是走出来的，不是跳出来的。**
+    #
+    # 没有这条约束的实测后果：判据是"本轮覆盖率"，full 档带图谱一做就 100%
+    # → 直接跳到 none → 一撤图谱就崩回 0% → 连错又跳回 full —— 档位在
+    # full↔none 之间振荡，**partial 档从来没被练过**。这就是面板上
+    # 「摸底 16% → 练后重考 16%（持平）→ 结业 0%」的机制：模型从头到尾
+    # 只体验过"全给"和"全撤"两种世界，渐进水平无从谈起。
+    ph = str(prev_hint or "").strip().lower()
+    if ph in HINT_ORDER:
+        pi = HINT_ORDER.index(ph)
+        if hits > pi + 1:
+            hits = pi + 1
+            why.append(f"上一轮支架是 {ph}，每轮最多收一档 → {HINT_ORDER[hits]}")
+        elif hits < pi - 1:
+            hits = pi - 1
+            why.append(f"上一轮支架是 {ph}，每轮最多放一档 → {HINT_ORDER[hits]}")
     return {"difficulty": difficulty, "hint": HINT_ORDER[hits], "why": "；".join(why)}
 
 

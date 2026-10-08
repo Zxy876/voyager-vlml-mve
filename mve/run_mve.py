@@ -568,6 +568,9 @@ async def main() -> None:
             "task": topic_id,
             "question": task.question,
             "round": round_no,
+            # 本轮的支架档位 —— 档位递进（每轮最多 ±1）要跨进程对比
+            # "上一轮用的什么档"，不落盘这个约束就是空谈（见 planner._prev_hint）。
+            "hint": str(getattr(voyager, "hint_level", "") or ""),
             "coverage": round(ev.coverage, 4),
             "score": round(ev.score, 4),
             "verdict": ev.verdict,
