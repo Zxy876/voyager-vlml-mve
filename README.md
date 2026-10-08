@@ -383,6 +383,44 @@ v1 的做法是「匹配不到就往图谱加一个维度节点」，被实测�
 落的边（`source=human_link`，带 `seed_question` / 表 / 列 / 骨架）。于是
 **即使验题没过、题没进题库，人的方向照样驱动出题** —— 这是 v1 建节点方案给不了的。
 
+### 图谱的四层组织：阶段 → 学科 → 章节 → 知识点（照搬伴学）
+
+伴学 `static/knowledge_seeds/math.json` 实测的层级：
+
+| 伴学 | 取值 | MVE 映射 |
+|---|---|---|
+| **stage** | 学段 primary/junior_high/senior_high/college（**梯度**） | **工具集梯度**：`raw`(原始事件表) → `agg`(派生聚合) → `insight`(洞察 SQL) → `tool`(报告工具) |
+| **subject** | 学科（11 个 seed 文件） | **实体域**：选手 / 地图 / 团队 / 赛事，**且可填入具体值**（赛事号 / 团队名 / 选手名） |
+| **chapter** | 学科内章节（math 一个学科就 37 个） | **主题域**：首血 / 经济 / 手枪局 / 连败 / 爆弹 / 模式识别 |
+| **topic** | 知识点 | 维度节点 = VLML 对数据的建模 |
+
+两个必须点明的坑：
+
+1. **语义错位（已修）**：此前 `chapter` 存的是 `LAYER_LABEL`（主干表/派生表/聚合表），
+   那其实是**梯度**，占着伴学 `stage` 的位。现在 stage 接手梯度，chapter 回主题域。
+2. **学科的值必须实查，不能手写**：`entity_catalog.py` 连库把 series / team /
+   map / player 的实际取值查出来落盘，图谱只读缓存（不连库，面板要秒开）。
+   手写一张清单换一次库就全错。
+
+### 数据源实测：能填的实体只有这些
+
+当前 `db_config.json` 指向 `vlml/data/vlml_events.duckdb`（14MB），实查结果：
+
+| 学科 | 可填值 | 数量 |
+|---|---|---|
+| 赛事 series | `2843069`（VCT Americas 2025 Stage 2） | **1** |
+| 团队 team | `Cloud9`、`NRG` | **2** |
+| 地图 map | `Corrode`、`Haven`、`Lotus` | **3** |
+| 选手 player | OXY / Xeppaa / mitch / neT / v1c / Ethan / brawk / mada / s0m / skuba | **10** |
+
+**这是一个单场系列赛的切片**（298 条事件 / 59 回合 / 3 场），**查不到别的赛事**。
+要换数据源：写 `mve/db_config.json` 的 `db_path` 即可（`vlml_env.py:52` 打了补丁，
+VLML 工具里写死的默认库会被换掉），然后 `python mve/entity_catalog.py` 刷新目录。
+
+出题器以前把 subject 取值权交给模型（`subj[k] = "?"`），于是永远只出 Cloud9 /
+2843069 那一道。现在每个可填值都是一个独立候选 —— 实测出题点已经能挑到
+`team=NRG`（换队伍 = 迁移）、`map=Corrode`（换地图）。
+
 ### 诚实的限制
 
 - **覆盖不到就不收**：表不在图谱里（或 SQL 里解析不出表）→ `adopted=False`，

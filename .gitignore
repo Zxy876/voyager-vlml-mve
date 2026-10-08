@@ -51,3 +51,4 @@ mve/referee_store.json
 mve/skill_store.json
 mve/tool_schemas.json
 venv/
+mve/entity_catalog.json

@@ -199,6 +199,21 @@ _STOP = {"这个", "那个", "什么", "多少", "分别", "计算", "一共", "
          "with", "that", "this", "from", "team", "series"}
 
 
+def _subject_values(key: str) -> list[str]:
+    """这个学科下**可填入的具体值** —— 连数据源实查，不手写。
+
+    为什么要实查：手写一张清单换一次库就全错。`entity_catalog` 会连
+    `db_config.json` 指向的库（默认 vlml/data/vlml_events.duckdb）把
+    series / team / map / player 的实际取值查出来并缓存。
+    查不到就返回空（该学科出不了题），**绝不编一个值出来**。
+    """
+    try:
+        import entity_catalog
+        return [v for v in entity_catalog.options(key) if v]
+    except Exception:
+        return []
+
+
 def _human_desc(question: str) -> str:
     """人导入的维度没有服务端定义 —— 用**人的原话**当它的定义。
 
@@ -571,50 +586,60 @@ def _graph_blueprint(difficulty: int = 2,
         # 这个维度能撑起哪些还没用过的 subject 键
         keys = [k for k in (_subject_key_of(c) for c in cols) if k]
         for k in dict.fromkeys(keys):
-            subj = {"series": SERIES, "team": C9}
+            # subject 的**值**从数据源实查（entity_catalog），不手写 ——
+            # 以前这里写 `subj[k] = "?"` 把取值权交给模型，于是永远出
+            # Cloud9 / 2843069 那一道；现在每个可填值都是一个独立候选。
+            vals = _subject_values(k)
             if k in ("series", "team"):
-                continue                 # 已有题都是这个粒度，换它才叫新题
-            subj[k] = "?"
-            key = (json.dumps(subj, sort_keys=True), d)
-            if key in avoid:
+                # 已有题固定用 series=2843069 / team=Cloud9。
+                # 换**别的实体**才叫新题（也是迁移：同一知识点换个队伍算不算得出）
+                vals = [v for v in vals if v not in (SERIES, C9)]
+            if not vals:
                 continue
-            score = 0
-            if prefer and d == prefer:
-                score -= 10              # planner 指定的方向优先
-            # 难度匹配：读**图谱自带**的 difficulty（伴学的难度长在知识点节点
-            # 上，不在出题器里）。以前这里自己数 recipe 的关键字，而 recipe
-            # 只是脱敏骨架、常常没有 GROUP BY，于是明明要分组的题被判成 1 档。
-            own = int(det.get("difficulty") or 0)
-            if not own:                      # 老图没这个字段才退回数关键字
-                low = str(det.get("recipe") or det.get("semantics") or "").lower()
-                own = 1
-                if "over (" in low or "over(" in low or "from (select" in low:
-                    own = 4
-                elif " join " in low or "case when" in low:
-                    own = 3
-                elif "group by" in low:
-                    own = 2
-            score += abs(own - int(difficulty or 2)) * 3
-            cands.append((score, d, {
-                "dimension": d,
-                "subject": subj,
-                "subject_key": k,
-                "table": tbl,
-                "columns": list(cols),
-                "semantics": str(det.get("semantics") or ""),
-                "typical_errors": list(det.get("typical_errors") or [])[:2],
-                # 结构骨架：**难度 4 能不能出出来，全靠给不给它**。
-                # 实测不给骨架连试 4 次，模型每次都写成
-                # `COUNT(*) OVER (ORDER BY ...)`（累计计数，不是连续段数）
-                # 或把 `team_name` 写进没有这列的 rounds 表 —— 4/4 全废。
-                # 而 gaps-and-islands 的正确形状**就在图谱里**（脱敏过的
-                # recipe，还标了 WHERE 该放哪一层）。让模型照骨架改值，
-                # 而不是让它从零发明 —— 这正是"题点归服务端"该覆盖的最后一层。
-                "skeleton": str(det.get("recipe") or "")[:700],
-                "own_difficulty": own,
-                # 百分比维度要连样本量一起取（见 propose 里的 require_base 提示）
-                "require_base": bool(specs.get(d, {}).get("needs_base")),
-            }))
+            for v in vals:
+                subj = {"series": SERIES, "team": C9}
+                subj[k] = v
+                key = (json.dumps(subj, sort_keys=True), d)
+                if key in avoid:
+                    continue
+                score = 0
+                if prefer and d == prefer:
+                    score -= 10          # planner 指定的方向优先
+                # 难度匹配：读**图谱自带**的 difficulty（伴学的难度长在知识点
+                # 节点上，不在出题器里）。以前这里自己数 recipe 的关键字，而
+                # recipe 只是脱敏骨架、常常没有 GROUP BY，于是明明要分组的题
+                # 被判成 1 档。
+                own = int(det.get("difficulty") or 0)
+                if not own:                  # 老图没这个字段才退回数关键字
+                    low = str(det.get("recipe") or det.get("semantics") or "").lower()
+                    own = 1
+                    if "over (" in low or "over(" in low or "from (select" in low:
+                        own = 4
+                    elif " join " in low or "case when" in low:
+                        own = 3
+                    elif "group by" in low:
+                        own = 2
+                score += abs(own - int(difficulty or 2)) * 3
+                cands.append((score, d, {
+                    "dimension": d,
+                    "subject": subj,
+                    "subject_key": k,
+                    "table": tbl,
+                    "columns": list(cols),
+                    "semantics": str(det.get("semantics") or ""),
+                    "typical_errors": list(det.get("typical_errors") or [])[:2],
+                    # 结构骨架：**难度 4 能不能出出来，全靠给不给它**。
+                    # 实测不给骨架连试 4 次，模型每次都写成
+                    # `COUNT(*) OVER (ORDER BY ...)`（累计计数，不是连续段数）
+                    # 或把 `team_name` 写进没有这列的 rounds 表 —— 4/4 全废。
+                    # 而 gaps-and-islands 的正确形状**就在图谱里**（脱敏过的
+                    # recipe，还标了 WHERE 该放哪一层）。让模型照骨架改值，
+                    # 而不是让它从零发明 —— 这正是"题点归服务端"该覆盖的最后一层。
+                    "skeleton": str(det.get("recipe") or "")[:700],
+                    "own_difficulty": own,
+                    # 百分比维度要连样本量一起取（见 propose 里的 require_base 提示）
+                    "require_base": bool(specs.get(d, {}).get("needs_base")),
+                }))
 
     # ---- 候选来源 2：人导入落的**边**（不建节点，见 knowledge_graph.link_import）----
     #

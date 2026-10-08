@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""数据源里**实际有哪些实体**（赛事 / 团队 / 地图 / 选手）—— 实查，不手写。
+
+为什么要有这个模块
+------------------
+「学科」层要绑具体实体（赛事号 / 团队名 / 选手名），那就必须知道库里到底
+有哪些值可填。手写一张清单是最容易腐坏的东西：换一次库就全错。所以这里是
+**连库实查**，查不到就返回空并说明原因，绝不猜。
+
+为什么不在 `knowledge_graph.py` 里做
+------------------------------------
+图谱必须保持"只 import 标准库、不连库"的轻量性质（面板要秒开）。连库的活
+放这里，落盘成 `entity_catalog.json`，图谱和其它模块只读缓存。
+
+跑法
+----
+    python mve/entity_catalog.py            # 刷新并打印
+    python mve/entity_catalog.py --json     # 只输出 JSON
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
+DB_CONFIG = HERE / "db_config.json"
+CATALOG = HERE / "entity_catalog.json"
+
+# 每张表怎么取 (实体类别, 取值列, 附带展示列)
+PROBES: list[tuple[str, str, str, list[str]]] = [
+    # 类别       表名                     取值列          附带
+    ("series", "series", "series_id", ["tournament_name", "tournament_year"]),
+    ("team", "agg_team_series_stats", "team_name", ["series_id"]),
+    ("map", "games", "map_name", ["series_id"]),
+    ("player", "agg_player_series_stats", "player_name", ["team_name"]),
+]
+
+KIND_LABEL = {"series": "赛事", "team": "团队", "map": "地图",
+              "player": "选手"}
+
+
+def _db_path() -> Path:
+    """当前连的是哪个库 —— `db_config.json` 可切换（见 vlml_env.py:52）。"""
+    try:
+        cfg = json.loads(DB_CONFIG.read_text(encoding="utf-8"))
+        p = str((cfg or {}).get("db_path") or "").strip()
+        if p:
+            return Path(p)
+    except Exception:
+        pass
+    return ROOT / "vlml" / "data" / "vlml_events.duckdb"
+
+
+def refresh() -> dict:
+    """连库实查所有实体类别的可选值。失败就返回带 error 的空壳，不猜。"""
+    path = _db_path()
+    out: dict = {"db_path": str(path), "entities": {}, "counts": {}}
+    try:
+        import duckdb
+    except Exception as exc:
+        out["error"] = f"duckdb 不可用：{type(exc).__name__}: {exc}"[:200]
+        return out
+    if not path.exists():
+        out["error"] = f"库文件不存在：{path}"
+        return out
+    try:
+        con = duckdb.connect(str(path), read_only=True)
+    except Exception as exc:
+        out["error"] = f"连库失败：{type(exc).__name__}: {exc}"[:200]
+        return out
+    try:
+        for kind, table, col, extra in PROBES:
+            try:
+                cols = ", ".join([col, *extra])
+                rows = con.execute(
+                    f'SELECT DISTINCT {cols} FROM "{table}" '
+                    f'WHERE "{col}" IS NOT NULL ORDER BY 1').fetchall()
+            except Exception as exc:
+                out.setdefault("warnings", []).append(
+                    f"{table}.{col} 查不到：{type(exc).__name__}: {str(exc)[:80]}")
+                continue
+            items = []
+            for r in rows:
+                d = {"value": str(r[0])}
+                for i, e in enumerate(extra, start=1):
+                    if i < len(r) and r[i] is not None:
+                        d[e] = str(r[i])
+                items.append(d)
+            out["entities"][kind] = items
+            out["counts"][kind] = len(items)
+    finally:
+        con.close()
+    return out
+
+
+def catalog(*, force: bool = False) -> dict:
+    """读缓存；没有或 `force` 就先刷新。"""
+    if not force and CATALOG.exists():
+        try:
+            cached = json.loads(CATALOG.read_text(encoding="utf-8"))
+            if isinstance(cached, dict) and cached.get("entities"):
+                return cached
+        except Exception:
+            pass
+    data = refresh()
+    try:
+        CATALOG.write_text(json.dumps(data, ensure_ascii=False, indent=1),
+                           encoding="utf-8")
+    except Exception:
+        pass
+    return data
+
+
+def options(kind: str) -> list[str]:
+    """某个学科类别下**可填入的具体值**（给 UI 下拉 / 出题器用）。"""
+    return [str(it.get("value") or "")
+            for it in (catalog().get("entities") or {}).get(kind, [])
+            if it.get("value")]
+
+
+def _main() -> int:
+    as_json = "--json" in sys.argv
+    data = catalog(force=True)
+    if as_json:
+        print(json.dumps(data, ensure_ascii=False, indent=1))
+        return 0
+    if data.get("error"):
+        print(f"❌ {data['error']}")
+        return 1
+    print(f"数据源：{data['db_path']}")
+    for kind, items in (data.get("entities") or {}).items():
+        vals = [str(it.get("value")) for it in items]
+        print(f"\n{KIND_LABEL.get(kind, kind)}（{kind}）· {len(vals)} 个")
+        print("  " + ("、".join(vals) if vals else "（无）"))
+    for w in data.get("warnings") or []:
+        print(f"⚠ {w}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

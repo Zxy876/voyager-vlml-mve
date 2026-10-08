@@ -940,8 +940,10 @@ ${ESC(REL[e.relation]&&REL[e.relation][1]||e.relation)}${e.origin==='observed'?'
     const isNow = window.__scope && window.__scope.active && window.__scope.label===d;
     // 伴学四层：阶段（工具集梯度）/ 学科（实体域）/ 章节（主题域）→ 知识点
     const dt=(byId['dim:'+d]||{}).detail||{};
+    const sv=(dt.subject_values||[]);
     const layer=`<td>${dt.stage_label?ESC(dt.stage_label):'—'}</td>`
-      + `<td>${dt.subject_label?`<span class="chip grey">${ESC(dt.subject_label)}</span>`:'—'}</td>`
+      + `<td>${dt.subject_label?`<span class="chip grey" title="${ESC(sv.join('、')||'无可填值')}">${ESC(dt.subject_label)}`
+          + (sv.length?` · ${sv.length} 个可填`:'')+`</span>`:'—'}</td>`
       + `<td>${dt.chapter?ESC(dt.chapter):'—'}</td>`;
     return `<tr${isNow?' class="now"':''}><td class="mono">${ESC(d)}</td>${layer}<td>${src}</td>
       <td>${conf.length?conf.map(c=>`<span class="chip warn">${ESC(c)}</span>`).join(''):'<span class="chip grey">—</span>'}</td>

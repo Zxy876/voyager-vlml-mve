@@ -2156,6 +2156,22 @@ CHAPTER_SUBJECT = {
 }
 
 
+def _entity_values(kind: str) -> list[str]:
+    """这个学科下**可填入的具体值**（赛事号 / 团队名 / 地图名 / 选手名）。
+
+    只读 `entity_catalog.json` 那份**落盘缓存**，不在这里连库 ——
+    图谱必须保持"不连库、面板秒开"。缓存由 `entity_catalog.py` 刷新。
+    """
+    if not kind:
+        return []
+    try:
+        raw = json.loads((HERE / "entity_catalog.json").read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    items = (raw.get("entities") or {}).get(kind) or []
+    return [str(it.get("value") or "") for it in items if it.get("value")]
+
+
 def _subject_key_of(col: str) -> str:
     """列名 → 实体域（赛事/团队/选手/…）。照 `question_gen._subject_key_of`。
 
@@ -2312,6 +2328,11 @@ def _add_dimension_declarations(g: KnowledgeGraph, specs: dict[str, Any]) -> Non
             # 从章节反推学科 —— 宁可粗，也不留空（伴学每个知识点都有 subject）。
             d["subject"] = CHAPTER_SUBJECT.get(d["chapter"], "")
         d["subject_label"] = SUBJECT_LABEL.get(d["subject"], d["subject"])
+        # 这一栏**可填什么值**（赛事号 / 团队名 / …）：人导入或出题时填它，
+        # 换一个值就是一道新题，也是一次迁移（同一知识点换个队伍算不算得出）。
+        # 实测：数据源只有 1 赛事 / 2 队伍 / 3 地图 / 10 选手，所以赛事这一栏
+        # 换不了值 —— 如实呈现，不假装有得选。
+        d["subject_values"] = _entity_values(d["subject"])
         primary = tables[0] if tables else ""
         d["depth"] = (1 + max((_table_depth(g, t) for t in tables), default=0)
                       if tables else 0)
