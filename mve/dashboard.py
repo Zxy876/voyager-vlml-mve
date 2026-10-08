@@ -69,7 +69,7 @@ def _graph_json() -> str:
         out["subject_counts"] = {s["id"]: len(subjects.entries_of(s["id"]))
                                  for s in subs}
         out["subject_unassigned"] = subjects.unassigned()
-        out["course_family"] = subjects.course_family()
+        out["data_source"] = subjects.data_source()
     except Exception:
         out["subjects"] = []
         out["subject_unassigned"] = []
@@ -985,10 +985,17 @@ ${ESC(REL[e.relation]&&REL[e.relation][1]||e.relation)}${e.origin==='observed'?'
     ${subjectHtml(g)}`;
 }
 
-/* 学科登记册：学科是**人可填写的归属容器**，不是从库里枚举出来的。
-   伴学对照：store.py:1504-1506 —— seed 的 subject 锁死、运行期条目的 subject
-   可写可改，条目就是这样挂到学科下的；_semantic_routing.py:23 的
-   ALLOWED_SUBJECTS 是预置枚举，MVE 这里故意更宽松（数据源会换，枚举必腐坏）。 */
+/* 可填值清单（**不是**"学科登记册"）
+   ------------------------------------------------------------------
+   伴学 `entry_tutor_question_entries.py:1043-1051`：
+       store.list_topics(5000, scope.subject, scope.stage,
+                         chapter=scope.chapter, unit=scope.unit,
+                         course_family=scope.course_family)
+   → 这些键**全是 list_topics 的筛选参数**，知识点库是共享的一份。
+   所以换赛事 / 换队伍只是**换一次筛选**（也是迁移：同一知识点换个队伍
+   算不算得出），**知识点与工具集不重建、不重新整理**。
+   赛事号 ≈ 伴学 course_family（版本/来源）；队伍/选手/地图的具体值 ≈
+   伴学运行期 `entity`（可空、不进 topics 表）。 */
 function subjectHtml(g){
   const subs=g.subjects||[], sCnt=g.subject_counts||{}, sUn=g.subject_unassigned||[];
   const KIND={series:'赛事',team:'团队',map:'地图',player:'选手',
@@ -1004,29 +1011,31 @@ function subjectHtml(g){
       <td>${s.source==='human'?`<button class="btn btn-secondary" data-subject-del="${ESC(s.id)}"
             style="padding:3px 8px;font-size:11px">删</button>`:''}</td></tr>`).join('');
   const un=sUn.length?`<div class="note warn" style="margin-top:8px">
-      <b>未归属 ${sUn.length} 个</b>（跑出来过，但登记册里还没有它那个学科 ——
-      在上面填一个，会当场归位）：
+      <b>未标记范围 ${sUn.length} 个</b>（跑出来过，但清单里还没有它那个值 ——
+      在上面填一个，会当场补上）：
       ${sUn.slice(0,12).map(x=>`<span class="chip grey">${ESC(x)}</span>`).join(' ')}</div>`:'';
   return `<div style="margin-top:16px">
-    <div class="panel__head"><h2>学科登记册</h2>
-      <span class="hint">数据源 <span class="chip grey">${ESC(g.course_family||'—')}</span>
-        · ${subs.length} 个学科 · ${sUn.length} 个未归属条目</span></div>
+    <div class="panel__head"><h2>可填值（分析范围）</h2>
+      <span class="hint">库 <span class="chip grey">${ESC(g.data_source||'—')}</span>
+        · ${subs.length} 个可填值 · ${sUn.length} 个未标记范围</span></div>
     <div class="note info" style="margin-bottom:10px">
-      学科是<b>人可填写的归属容器</b>：换数据源（接新的公开源）后自己填一个学科
-      （某赛事 / 某战队域），之后 VLML / Voyager 跑出来的条目会按它 SQL 里的实体值
-      （<span class="mono">team_name='…'</span> / <span class="mono">series_id='…'</span>）
-      挂到该学科下。<b>先跑出条目、后填学科也行</b> —— 填完当场把没归位的旧条目补挂上去。
-      <br>「实查」是从当前库里查到的；「人填」是你自己登记的（换库不会被同步覆盖）。</div>
+      这些是<b>筛选用的可填值</b>，不是学科层级：换赛事 / 换队伍只换一次取数范围
+      （也是一次迁移：同一知识点换个队伍还算不算得出），
+      <b>知识点与工具集是共享的一份，不会重建、也不需要重新整理</b>。
+      <br>伴学对照：<span class="mono">list_topics(subject, stage, chapter, unit,
+      course_family)</span> 全是<b>筛选参数</b>；团队/选手这类具体值同伴学运行期
+      <span class="mono">entity</span>（可空、不进知识结构）。
+      <br>「实查」是从当前库里查到的；「人填」是你自己加的（换库不会被同步覆盖）。</div>
     <table class="tbl"><thead><tr><th>类别</th><th>取值</th><th>来源</th>
       <th>说明</th><th>条目</th><th></th></tr></thead>
       <tbody>${rows||'<tr><td colspan="6" style="opacity:.6">（空 —— 先「从数据源同步」，或自己填一个）</td></tr>'}</tbody></table>
     <div style="display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap">
       <select id="subjKind">${['series','team','map','player','custom']
         .map(k=>`<option value="${k}">${KIND[k]}</option>`).join('')}</select>
-      <input id="subjValue" placeholder="取值，如 NRG / VCT 2026" style="width:200px">
+      <input id="subjValue" placeholder="取值，如 NRG / 706349" style="width:200px">
       <input id="subjNote" placeholder="说明（可选）" style="width:200px">
-      <button class="btn btn-primary" data-subject-add="1" style="padding:5px 12px">登记学科</button>
-      <button class="btn btn-secondary" data-subject-sync="1" style="padding:5px 12px">从数据源同步</button>
+      <button class="btn btn-primary" data-subject-add="1" style="padding:5px 12px">加为可填值</button>
+      <button class="btn btn-secondary" data-subject-sync="1" style="padding:5px 12px">从当前库同步</button>
     </div>${un}</div>`;
 }
 

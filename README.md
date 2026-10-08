@@ -402,26 +402,55 @@ v1 的做法是「匹配不到就往图谱加一个维度节点」，被实测�
    map / player 的实际取值查出来落盘，图谱只读缓存（不连库，面板要秒开）。
    手写一张清单换一次库就全错。
 
-### 数据源实测：能填的实体只有这些
+### 数据源实测
 
-当前 `db_config.json` 指向 `vlml/data/vlml_events.duckdb`（14MB），实查结果：
-
-| 学科 | 可填值 | 数量 |
+| | GRID 切片（`vlml_events.duckdb`，key 已过期） | **vlr.gg（`vlml_vlr.duckdb`，现在用这个）** |
 |---|---|---|
-| 赛事 series | `2843069`（VCT Americas 2025 Stage 2） | **1** |
-| 团队 team | `Cloud9`、`NRG` | **2** |
-| 地图 map | `Corrode`、`Haven`、`Lotus` | **3** |
-| 选手 player | OXY / Xeppaa / mitch / neT / v1c / Ethan / brawk / mada / s0m / skuba | **10** |
+| 赛事 series | `2843069` → **1** | 8 场系列赛 → **8** |
+| 团队 team | Cloud9、NRG → **2** | 100T / C9 / ENVY / EG / FUR / G2 / KRÜ / LEV / LOUD / MIBR / NRG / SEN → **12** |
+| 地图 map | Corrode、Haven、Lotus → **3** | Ascent/Breeze/Haven/Lotus/Split/Summit/Sunset → **7** |
+| 选手 player | **10** | **60**（vlr 的聚合统计，见下） |
+| 回合数 | 59 | **438** |
 
-**这是一个单场系列赛的切片**（298 条事件 / 59 回合 / 3 场），**查不到别的赛事**。
-要换数据源：写 `mve/db_config.json` 的 `db_path` 即可（`vlml_env.py:52` 打了补丁，
-VLML 工具里写死的默认库会被换掉），然后 `python mve/entity_catalog.py` 刷新目录。
+GRID 那个库是**单场系列赛切片**（298 事件 / 59 回合 / 3 场），查不到别的赛事，
+"换赛事"这条迁移轴当时根本没有数据支撑。接 vlr.gg 之后这条轴才活过来。
+
+换库：写 `mve/db_config.json` 的 `db_path`（`vlml_env.py:52` 打了补丁，VLML
+工具里写死的默认库会被换掉），然后 `python mve/entity_catalog.py` 刷新目录。
 
 出题器以前把 subject 取值权交给模型（`subj[k] = "?"`），于是永远只出 Cloud9 /
 2843069 那一道。现在每个可填值都是一个独立候选 —— 实测出题点已经能挑到
 `team=NRG`（换队伍 = 迁移）、`map=Corrode`（换地图）。
 
-### 学科是**人可填写的归属容器**（不是从库里枚举出来的）
+### ⚠️ 2026-10-08 纠了一次方向：赛事号 / 团队名**不是**"学科"
+
+上一版把它做成「学科登记册」（人填赛事/战队 → 条目归属到该学科下）。用户指出：
+「学科下的这些知识点/这些工具集都是一样的啊，没有必要填完学科之后自己再整理工具集呀」
+—— 去伴学取证，这条批评是对的，`entry_tutor_question_entries.py:1043-1051`：
+
+```python
+topics = store.list_topics(
+    5000,
+    scope.subject or None, scope.stage or None,
+    chapter=scope.chapter or None, unit=scope.unit or None,
+    course_family=scope.course_family or None,
+)
+```
+
+**subject / stage / chapter / unit / course_family 全是 `list_topics` 的筛选参数，
+不是知识点身上的层级归属。** 知识点库是共享的一份，换这些只是"筛哪些出来练"，
+知识点与工具集本身**不重建**。所以正确的映射是：
+
+| MVE 的东西 | 伴学对应 | 性质 |
+|---|---|---|
+| 赛事号（系列赛 / 来源版本） | `course_family`（哪套教材） | 作用域**筛选参数**，知识点共享 |
+| 团队 / 选手 / 地图的具体值 | `_semantic_routing.py:149` 的 `entity`（`"max 120 chars; empty when absent"`，**不在 topics 表里**） | 运行期取数参数，**不进知识结构** |
+| 接的是哪个库 | 伴学没有对应物 | MVE 自己的 `data_source` |
+
+于是 `subjects.py` 的定位从"学科登记册"改成**可填值清单**：提供筛选候选，
+并记下"这条目这次是在哪个范围下跑出来的"。换值不重建工具集 —— 实测换到
+vlr.gg 库后：**维度仍 15、工具仍 9**（一个没变），只是可填值从 2/3/1 涨到
+**12 队 / 7 图 / 60 选手 / 8 赛事**。
 
 用户要求：「mcp 接入公开数据源（类似 grid 但不是 grid）后学科可以是自己填写的；
 到时候 vlml 或者 voyager 跑完增加到该学科下的条目就有了归属」。
@@ -485,6 +514,52 @@ VLML 工具里写死的默认库会被换掉），然后 `python mve/entity_cata
 - **验题闸仍然是硬门槛**：实测同一条导入第一次 **2/2 全被闸 0b（题面与维度相关）**
   拦下 —— 原因是没有 dim 节点时 `desc` 退回英文原名，中文题面对英文维度 token
   零重合。已修（`desc` 用人的原话），但这类门禁失败仍会正常发生。
+
+---
+
+## 八之八、GRID 过期之后：接 vlr.gg 公开源（2026-10-08）
+
+GRID 要付费 key，过期就没得下。实测了几个候选：
+
+| 源 | 实测 | 结论 |
+|---|---|---|
+| **vlr.gg** | `HTTP 200`，赛事/赛程/比赛页都能公开抓 | ✅ **选它**，无需 key |
+| PandaScore | `HTTP 403`（要 token） | 要注册 |
+| henrikdev | `HTTP 401` | 现在也要 key 了 |
+| esport.is | 空响应 | 用不了 |
+
+**做法：只换"下载那一层"**（`mve/vlml_source/`），下游一行不改：
+
+```
+vlr_client.py    抓 vlr.gg（赛事 → 赛程 → 比赛详情），标准库解析（不装 bs4）
+vlr_to_grid.py   翻译成 GRID 形态的 jsonl
+ingest.py        CLI：抓 → 落 jsonl → 跑 VLML 原管线入库 → 建聚合统计表
+```
+
+落盘位置照 GRID 的约定 `data/raw_events/{year}/{tournament}/{series_id}.jsonl`
+（`parsers.py:29`：**series_id 就是文件名**），于是 `load_data.py`（幂等）和
+`run_pipeline.py` 一行不用改。
+
+```bash
+python mve/vlml_source/ingest.py --discover              # 看看有哪些赛事
+python mve/vlml_source/ingest.py --event 2977 --max 8 \
+    --db vlml/data/vlml_vlr.duckdb                       # 抓 + 入库到新库
+```
+
+⚠️ **能力差（不能装作等价）**：GRID 是逐事件流，vlr.gg 只有回合级 + 聚合级。
+
+| VLML 表 | vlr.gg | 说明 |
+|---|---|---|
+| `series` / `games` / `rounds` | ✅ 全填 | 438 回合，含 `end_reason`（eliminated 302 / defused 70 / detonated 59 / time 7） |
+| `base_events` | ⚠️ 只有回合级事件（934 条），**`is_kill` = 0** | vlr 没有 kill/技能/伤害/坐标/装备净值。**不造假事件填进去** |
+| 选手统计 | ✅ 聚合级 → 另建 `ext_player_game_stats`（210 行，含 FK/FD） | 不塞进事件流：那是整图汇总，不是逐事件 |
+
+所以接完之后：**回合 / 图 / 赛事 / 队伍层分析照跑**；首血分析只能用聚合的
+FK/FD，没有"这回合谁先开的枪"。选手一栏在 `entity_catalog` 里会回退到
+`ext_player_game_stats`（否则显示 0 个，而数据其实有）。
+
+旧库（`vlml_events.duckdb`）**原样保留**，随时能切回去 —— 它里面有 GRID 的
+逐事件流，两个源粒度不同，混在一张表里会让"这列为什么一半是空"说不清。
 
 ---
 

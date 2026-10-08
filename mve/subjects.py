@@ -1,41 +1,62 @@
 #!/usr/bin/env python3
-"""**学科登记册**：学科是「人可填写的归属容器」，不是从列派生的枚举。
+"""**可填值清单**：换赛事 / 换队伍时，能往里填什么值。
 
-为什么要有这个模块
-------------------
-用户原话：「mcp 接入公开数据源（类似 grid 但不是 grid）后学科可以是自己
-填写的；到时候 vlml 或者 voyager 跑完增加到该学科下的条目就有了归属」。
+⚠️ 2026-10-08 纠了一次方向 —— 这里**不是**"学科登记册"
+--------------------------------------------------------
+用户原话：「其实学科下的这些知识点/这些工具集都是一样的啊，没有必要填完
+学科之后自己再整理工具集呀，参考一下猫娘伴学里真正改映射到赛事号和团队
+的键是什么吧」。
 
-之前 `knowledge_graph._entity_values()` 只把库里**实查到的**实体值当可填
-值 —— 那是"枚举"，换库就变、没接库就空。学科应该是**容器**：先有人填（或
-从库里登记）一个学科，之后 VLML / Voyager 跑出来的条目按它的实体值挂进去。
+去伴学取证，答案是 `entry_tutor_question_entries.py:1043-1051`：
+
+    store.list_topics(5000, scope.subject, scope.stage,
+                      chapter=scope.chapter, unit=scope.unit,
+                      course_family=scope.course_family)
+
+→ subject / stage / chapter / unit / course_family **全是 `list_topics`
+的筛选参数**，不是知识点身上的层级归属。知识点库是**共享的一份**，
+换学科、换课程族只是"筛哪些出来练"，**知识点与工具集本身不重建**。
+
+所以赛事号 / 团队名不是"学科"，而是：
+
+| MVE 的值 | 伴学对应 | 性质 |
+|---|---|---|
+| **赛事号（系列赛 / 数据源版本）** | `course_family`（哪套教材/版本） | 作用域筛选参数，知识点共享 |
+| **团队 / 选手 / 地图的具体值** | `_semantic_routing.py:149` 的 `entity`（`"max 120 chars; empty when absent"`，**不在 topics 表里**） | 运行期取数参数，不进知识结构 |
+| **接的是哪个库** | 伴学没有对应物 | MVE 自己的 `data_source` |
+
+于是这个模块的定位是**"可填值清单"**：给作用域（course_family / entity）
+提供候选值，并记下"这条目**这次**是在哪个范围下跑出来的"。它不定义知识
+结构 —— 换值不会、也不需要重建工具集。
 
 同构对照（伴学源码取证）
 ------------------------
 * `study_companion/store.py:1504-1506`
       subject = CASE WHEN topics.source='seed' THEN topics.subject
                      ELSE excluded.subject END
-  → seed 的学科锁死，运行期条目的学科**可写可改**。这就是"条目挂到学科下"。
+  → seed 的学科锁死，运行期条目的学科**可写可改**（这是学科字段本身可改，
+    与"换值要重建工具集"是两回事）。
 * `study_companion/_semantic_routing.py:23` `ALLOWED_SUBJECTS` 是硬编码
   frozenset：伴学的学科是**预置枚举**，人不能随便填。
-  MVE 这里**故意更宽松**：数据源是会换的（GRID → 别的公开源），
-  预置枚举必然腐坏。所以学科可人填，只做空值/去重校验，不做白名单。
-* `study_companion/store.py:1498` 字段列表里有 `course_family`（课程族），
-  1538 行"seed 空了可补" → **数据源 = 伴学的课程族**，学科位要让出来。
-  （此前 MVE 把 `d["subject"] = "vlml0"` 写死，把学科位占了 —— 已修正。）
+  MVE 这里**故意更宽松**：数据源是会换的（GRID → vlr.gg → …），
+  预置枚举必然腐坏。所以值可人填，只做空值/去重校验，不做白名单。
+* `study_companion/_semantic_routing.py:149` `"entity": "string, max 120
+  chars; empty when absent"` → entity 是**运行期**字段，可空、**不进 topics
+  表**。团队/选手/地图的具体值就是这一档。
 
-归属判据
---------
+范围标记（不是"归属"）
+----------------------
 条目（人导入的边 / Voyager 跑出的待审维度）携带的 SQL 里有实体字面量
 （`series_id = 'xxx'` / `team_name = 'NRG'`），或出题器显式传的
-`subject={"team": "NRG"}`。拿这些值去登记册里找同 kind 同 value 的学科；
-找不到 → 记为**未归属**，等人填，不硬塞。
+`subject={"team": "NRG"}`。拿这些值去清单里找同 kind 同 value 的项；
+找不到 → 记为**未标记范围**，等人填，不硬塞。
+这只是"这条目这次跑的范围"，**不改变它在知识结构里的位置**。
 
 跑法
 ----
-    python mve/subjects.py                 # 列出登记册 + 未归属
+    python mve/subjects.py                 # 列出可填值 + 未标记范围的条目
     python mve/subjects.py --sync          # 从 entity_catalog 登记实查到的值
-    python mve/subjects.py --add team NRG --note "…"   # 人填一个学科
+    python mve/subjects.py --add team NRG --note "…"   # 人填一个可填值
 """
 
 from __future__ import annotations
@@ -57,8 +78,9 @@ KIND_LABEL = {"series": "赛事", "team": "团队", "map": "地图", "player": "
 
 # 默认值：当前接的是 VLML 的 duckdb 切片
 DEFAULT_FAMILY = "vlml0"
-# 已知库文件名 → 数据源代号（换数据源时在这里加一行；认不出就用文件名本身）
-_FAMILY_BY_STEM = {"vlml_events": "vlml0"}
+# 已知库文件名 → 代号（换数据源时在这里加一行；认不出就用文件名本身）
+_FAMILY_BY_STEM = {"vlml_events": "vlml0",        # GRID 切片（逐事件，key 过期）
+                   "vlml_vlr": "vlr.gg"}          # 公开源（回合级 + 聚合级）
 
 
 # --------------------------------------------------------------------------
@@ -256,10 +278,15 @@ def unassigned(entry_ids: list[str] | None = None) -> list[str]:
 
 
 # --------------------------------------------------------------------------
-# 数据源 = 伴学的 course_family
+# 接的是哪个库（MVE 自己的键，伴学没有对应物）
 # --------------------------------------------------------------------------
-def course_family() -> str:
-    """当前接的是哪个数据源。换库它自己变，不手写。"""
+def data_source() -> str:
+    """当前接的是哪个库。换库它自己变，不手写。
+
+    不叫 `course_family`：伴学的 course_family 是"哪套教材/版本"，是
+    **筛选参数**，对应我们的**赛事号**；"接的哪个库"是更外面一层
+    （vlml0 = GRID 切片 / vlml_vlr = vlr.gg），伴学里没有这个东西。
+    """
     path = ""
     try:
         cfg = json.loads(DB_CONFIG.read_text(encoding="utf-8"))
@@ -270,6 +297,11 @@ def course_family() -> str:
         return DEFAULT_FAMILY
     stem = Path(path).stem
     return _FAMILY_BY_STEM.get(stem, stem or DEFAULT_FAMILY)
+
+
+def course_family() -> str:
+    """兼容旧调用：== `data_source()`。新代码请用 `data_source()`。"""
+    return data_source()
 
 
 def _main() -> int:
@@ -301,7 +333,7 @@ def _main() -> int:
         return 0
 
     data = _load()
-    print(f"数据源（course_family）：{course_family()}")
+    print(f"数据源（data_source）：{data_source()}")
     subs = data.get("subjects") or []
     if not subs:
         print("\n（登记册为空 —— 跑 `--sync` 从库里登记，或 `--add series xxx`）")

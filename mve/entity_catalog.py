@@ -30,12 +30,19 @@ DB_CONFIG = HERE / "db_config.json"
 CATALOG = HERE / "entity_catalog.json"
 
 # 每张表怎么取 (实体类别, 取值列, 附带展示列)
+#
+# ⚠️ `player` 有**两个候选表**，按顺序试到有值为止：
+#   `agg_player_series_stats` 是 VLML 从**逐事件**派生的（GRID 源有）；
+#   `ext_player_game_stats` 是 vlr.gg 给的**聚合级**统计。
+#   接了 vlr 之后没有 kill 事件，前者就是空的 —— 这时要退到后者，
+#   否则"选手"这一栏会显示 0 个，而实际上选手数据是有的（只是粒度不同）。
 PROBES: list[tuple[str, str, str, list[str]]] = [
-    # 类别       表名                     取值列          附带
-    ("series", "series", "series_id", ["tournament_name", "tournament_year"]),
-    ("team", "agg_team_series_stats", "team_name", ["series_id"]),
-    ("map", "games", "map_name", ["series_id"]),
-    ("player", "agg_player_series_stats", "player_name", ["team_name"]),
+    # 类别       表名                         取值列          附带
+    ("series", "series", "series_id", ["tournament_name"]),
+    ("team", "agg_team_series_stats", "team_name", []),
+    ("player", "agg_player_series_stats", "player_name", []),
+    ("player", "ext_player_game_stats", "player_name", []),
+    ("map", "games", "map_name", []),
 ]
 
 KIND_LABEL = {"series": "赛事", "team": "团队", "map": "地图",
@@ -73,6 +80,10 @@ def refresh() -> dict:
         return out
     try:
         for kind, table, col, extra in PROBES:
+            # 同一类别有多个候选表时，**先到先得**：前一个表里查到了就不换
+            # （见 PROBES 里 player 的两档回退）。
+            if out["entities"].get(kind):
+                continue
             try:
                 cols = ", ".join([col, *extra])
                 rows = con.execute(
@@ -83,14 +94,22 @@ def refresh() -> dict:
                     f"{table}.{col} 查不到：{type(exc).__name__}: {str(exc)[:80]}")
                 continue
             items = []
+            seen: set[str] = set()
             for r in rows:
-                d = {"value": str(r[0])}
+                v = str(r[0])
+                # DISTINCT 带上附带列时同一个值会出现多次（实测：队伍 12 个
+                # 被查成 16 个、地图 21 张查成 7 张的重复）—— 按取值去重。
+                if not v or v in seen:
+                    continue
+                seen.add(v)
+                d = {"value": v}
                 for i, e in enumerate(extra, start=1):
                     if i < len(r) and r[i] is not None:
                         d[e] = str(r[i])
                 items.append(d)
             out["entities"][kind] = items
             out["counts"][kind] = len(items)
+            out.setdefault("sources", {})[kind] = table
     finally:
         con.close()
     return out

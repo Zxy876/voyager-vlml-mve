@@ -2221,20 +2221,29 @@ CHAPTER_SUBJECT = {
 }
 
 
-def _course_family() -> str:
-    """当前接的是哪个**数据源** —— 伴学 `course_family`（课程族）的同构物。
+def _data_source() -> str:
+    """当前接的是哪个**库**（vlml0 / vlml_vlr / 将来别的源）。
 
-    伴学 `store.py:1498` 的 topics 表里，`course_family` 与 `subject` 是两个
-    独立字段：前者是"用的是哪套教材"，后者是"属于哪门学科"。
-    MVE 同构：`course_family` = 接的是哪个库（vlml0 / 将来换的公开源），
-    `subject` = 赛事 / 团队 / 选手（人可填的归属容器）。
+    ⚠️ 2026-10-08 改过一次映射：原先把它当作伴学的 `course_family`（课程族），
+    那是**错的**。看伴学 `entry_tutor_question_entries.py:1043-1051`：
 
-    换数据源不该改写学科，只改这一个字段 —— 所以从 `db_config.json` 派生，
-    不手写（写了就会腐坏）。
+        store.list_topics(5000, scope.subject, scope.stage,
+                          chapter=scope.chapter, unit=scope.unit,
+                          course_family=scope.course_family)
+
+    —— subject / stage / chapter / unit / course_family **全是 `list_topics`
+    的筛选参数**，不是知识点身上的层级归属。知识点库是**共享的一份**，
+    换课程族只是"筛哪些来练"，知识点本身不重建。
+
+    所以：
+      * 赛事号（系列赛）= 伴学 `course_family`（来源/版本，知识点照旧共享）
+      * 团队 / 选手 / 地图的具体值 = 伴学 `_semantic_routing.py:149` 的
+        `entity`（运行期字段，**不在 topics 表里**，不进知识结构）
+      * 接的是哪个库 = **MVE 自己的 `data_source`**，伴学没有对应物
     """
     try:
         import subjects
-        return subjects.course_family()
+        return subjects.data_source()
     except Exception:
         return "vlml0"
 
@@ -2504,10 +2513,17 @@ def _add_dimension_declarations(g: KnowledgeGraph, specs: dict[str, Any]) -> Non
         d["name"] = dim
         # ⚠️ 这里**原来写的是 `d["subject"] = "vlml0"`**，把上面 2322 行算出来
         # 的真实学科（赛事/团队/选手）整个覆盖掉了 —— 学科位被"数据源"占了。
-        # 照伴学 `store.py:1498` 的字段表：数据源是 **course_family（课程族）**，
-        # 学科位是 subject。各归各位：换数据源时 course_family 变，
-        # 学科（人填的归属容器）不动。
-        d["course_family"] = _course_family()
+        # 现在：接哪个库 = `data_source`（MVE 自己的键），学科位回到实体域。
+        #
+        # 知识点**不写死某个赛事/团队**：照伴学
+        # `entry_tutor_question_entries.py:1043-1051`，subject / chapter /
+        # course_family 都是 **list_topics 的筛选参数**，知识点库是共享的一份。
+        # 把赛事号写进知识点 = 换一次赛事就重建一次工具集，那是白做功 ——
+        # 用户原话：「学科下的这些知识点/这些工具集都是一样的啊」。
+        d["data_source"] = _data_source()
+        # 这个知识点**可以用哪些值去筛**（赛事号 / 队伍名 / …）—— 可空，
+        # 语义同伴学运行期 `entity`：只影响这次取数，不改变知识结构。
+        d["entity_values"] = _entity_values(d["subject"])
         d["declared_by"] = ("VLML 建模文档 + tasks.py 的 answer_spec"
                             "（难度/单位/先修由文档推，口径由 answer_spec 定）")
 

@@ -53,3 +53,5 @@ mve/tool_schemas.json
 venv/
 mve/entity_catalog.json
 mve/subjects.json
+vlml/data/raw_events/
+vlml/data/vlml_vlr.duckdb
