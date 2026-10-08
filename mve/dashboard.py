@@ -53,7 +53,15 @@ def _graph_json() -> str:
     if not g.nodes:
         return json.dumps({"empty": True, "error": "图谱未构建，先跑 python mve/knowledge_graph.py --build"},
                           ensure_ascii=False)
-    return json.dumps(g.to_dict(), ensure_ascii=False)
+    out = g.to_dict()
+    # 待审候选：运行期题带进来的新维度名，**不建节点**（照伴学：运行期新建的
+    # 知识点不进权威层）。单独返回，前端据此在图谱页顶上显示一条。
+    try:
+        import knowledge_graph
+        out["pending_dims"] = knowledge_graph.load_pending_dimensions()
+    except Exception:
+        out["pending_dims"] = []
+    return json.dumps(out, ensure_ascii=False)
 
 def _scope_json() -> str:
     """当前练习范围（只读）。照伴学 study_get_practice_scope。"""
@@ -859,6 +867,16 @@ function renderGraph(g){
   ['table','tool','dimension'].forEach(k=>cols[k].sort((a,b)=>a.label.localeCompare(b.label)));
   if(!cols.dimension.length) return `<div class="empty">图谱里还没有连上边的维度</div>`;
 
+  // 待审候选条：运行期题带来的新维度名**不占节点位**（照伴学：运行期新建的
+  // 知识点不进权威层，只登记待审）。维度层只由种子题的 rubric 派生。
+  const pendHtml = (g.pending_dims||[]).length ? `<div class="note info" style="margin-bottom:8px">
+    <b>待审候选 ${(g.pending_dims||[]).length} 个</b>（运行期题带来的新维度，
+    <b>未建节点</b>，只落在边上 —— 维度层只由种子题派生，不随出题增长）：
+    ${(g.pending_dims||[]).map(p=>`<span class="chip grey">${ESC(p.dimension)}`
+      + (p.nearest?` <span style="opacity:.7">≈ ${ESC(p.nearest)}</span>`:'')
+      + `</span>`).join(' ')}
+  </div>` : '';
+
   const COLW=262, ROW=30, PADX=54, PADY=26, NW=168, NH=22;
   const order=['table','tool','dimension'];
   const pos={};
@@ -927,7 +945,7 @@ ${ESC(REL[e.relation]&&REL[e.relation][1]||e.relation)}${e.origin==='observed'?'
   }).join('');
 
   const sm=g.summary||{};
-  return scopeBarHtml() + `<div class="panel__head"><h2>维度 → 工具 → 表</h2>
+  return scopeBarHtml() + pendHtml + `<div class="panel__head"><h2>维度 → 工具 → 表</h2>
       <span class="hint">${sm.dimensions||0} 维度 · ${sm.tools||0} 工具 · ${sm.tables||0} 表 · ${sm.edges||0} 边</span></div>
     <svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px;background:#fff;border-radius:8px">
       ${colTitle}${es}${ns}

@@ -418,6 +418,11 @@ TASKS: dict[str, Task] = {
     TASK_NEW.topic_id: TASK_NEW,
 }
 
+# **种子题** = 写死在 tasks.py 里的这几道。伴学的同构物是
+# `static/knowledge_seeds/*.json`：知识点由**作者声明**，先于题目存在、
+# 不随做题/出题增长。只有种子的 rubric 有权在图谱里派生维度节点。
+SEED_TOPICS: set[str] = set(TASKS.keys())
+
 
 def _merge_generated() -> int:
     """把 `question_gen` 验过的题并入 TASKS。
@@ -457,6 +462,15 @@ def _merge_generated() -> int:
 
 
 GENERATED_COUNT = _merge_generated()
+
+# **运行期题** = 出题器/人导入跑出来、验题通过后被采纳的题。它们与种子题的
+# 关键区别：**它们的 rubric 没有权限在图谱里派生维度节点**。
+# 照伴学 `knowledge_tracker.py:1555`：运行期新建的知识点
+# （`_ensure_topic` 解析不到已有知识点时才建的那个）不进答题记录、不参与
+# 掌握度，只进待审候选队列。MVE 把这条规矩收得更紧 —— 连空壳节点都不建，
+# 运行期的新维度一律落在**边**上（`knowledge_graph.link_import`）。
+# 不这么做的话，每采纳一道新题维度层就多一个节点，等于"题目派生图谱"。
+RUNTIME_TOPICS: set[str] = set(TASKS.keys()) - SEED_TOPICS
 
 
 # ---------------------------------------------------------------------------

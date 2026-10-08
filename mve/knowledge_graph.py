@@ -1297,6 +1297,25 @@ def build(*, observe: bool = False, with_schema: bool = True) -> KnowledgeGraph:
             node.detail["required_by"] = sorted(req)
 
     # --- 维度节点 + produced_by / derived_from / co_occurs / confusable ---
+    #
+    # ⚠️ 运行期题（generated_tasks.json 采纳的）的维度**不建节点**。
+    # 照伴学 `knowledge_tracker.py:1548/1555`：
+    #     topic_id = self._ensure_topic(...)          # 先解析，解析不到才建
+    #     is_known_topic = bool(self.store.get_topic(topic_id))
+    #     qa_topic_id = topic_id if is_known_topic else ""     ← 新建的不进答题记录
+    # 即伴学运行期新建的知识点是**空壳（source=runtime，声明全空）+ 不进掌握度
+    # + 进待审候选队列**（`upsert_candidate`, evidence=MENTIONED）。
+    # MVE 更严：连空壳都不建 —— 维度层的权威来源是**种子题的 rubric**，
+    # 运行期的新名字一律走**边**（`link_import`），不占节点位。
+    # 不这么做的话，每采纳一道新题就多一个维度节点（实测 15 → 16），
+    # 等于"题目派生图谱"，正好是伴学的反面。
+    try:
+        from tasks import RUNTIME_TOPICS
+        runtime_topics = set(RUNTIME_TOPICS)
+    except Exception:                                        # pragma: no cover
+        runtime_topics = set()
+    pending: dict[str, dict[str, Any]] = {}
+
     dims_by_topic: dict[str, list[str]] = {}
     for topic_id, task in TASKS.items():
         dim_here: list[str] = []
@@ -1304,6 +1323,26 @@ def build(*, observe: bool = False, with_schema: bool = True) -> KnowledgeGraph:
             dim = str(p.dimension)
             if not dim:
                 continue
+            if topic_id in runtime_topics:
+                resolved = _resolve_existing_dim(dim, g)
+                if resolved:
+                    dim = resolved                  # 复用已有维度（同构 _resolve_topic_id）
+                else:
+                    # 不建节点，只记待审候选 —— 面板可查，人来决定要不要转正
+                    spec0 = getattr(p, "answer_spec", None)
+                    sql0 = str(getattr(spec0, "sql", "") or "")
+                    pending[dim] = {
+                        "dimension": dim,
+                        "topic_id": topic_id,
+                        "question": str(getattr(task, "question", ""))[:300],
+                        "point": str(getattr(p, "point", "") or ""),
+                        "nearest": _nearest_dim(dim, g),
+                        "tables": (_tables_in_sql(sql0, known_tables)
+                                   if sql0 else []),
+                        "at": datetime.now().isoformat(timespec="seconds"),
+                        "source": "runtime",
+                    }
+                    continue
             dim_here.append(dim)
 
             # 维度节点：把"这个指标是什么、怎么算、用哪些列"一次写全
@@ -1443,6 +1482,11 @@ def build(*, observe: bool = False, with_schema: bool = True) -> KnowledgeGraph:
     if observe:
         asyncio.run(_observe_procedure(g))
     _merge_imported_links(g)
+    # 运行期题带进来的新维度名：登记为待审候选，不进维度层
+    n_pending = _save_pending_dimensions(pending)
+    if n_pending:
+        print(f"（运行期题的新维度 {n_pending} 个 → 待审候选，未建节点："
+              f"{'、'.join(sorted(pending))[:120]}）")
     return g
 
 
@@ -1605,6 +1649,82 @@ def coverage_of(*, tables: list[str] | set[str], tool: str = "",
                 "insights_total": 0, "tables": sorted(tset)}
     return {"covered": False, "level": "none", "insights": [],
             "insights_total": 0, "tables": sorted(tset)}
+
+
+# --------------------------------------------------------------------------
+# 运行期题的维度 → 待审候选（伴学 `upsert_candidate` 的同构物，**不建节点**）
+# --------------------------------------------------------------------------
+PENDING_DIMS = HERE / "pending_dimensions.json"
+
+
+def load_pending_dimensions() -> list[dict[str, Any]]:
+    """运行期题带进来、但没解析到已有维度的维度名 —— 只登记，不进维度层。"""
+    try:
+        raw = json.loads(PENDING_DIMS.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, list) else []
+    except Exception:
+        return []
+
+
+def _norm_dim(d: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(d or "").lower())
+
+
+def _dim_tokens(d: str) -> set[str]:
+    return {t for t in re.split(r"[^a-zA-Z0-9]+", str(d or "").lower()) if len(t) >= 2}
+
+
+def _resolve_existing_dim(dim: str, g: KnowledgeGraph) -> str:
+    """运行期题的维度名先解析到**已有**维度 —— 伴学 `_resolve_topic_id` 的同构。
+
+    只认两档硬匹配：完全同名 / 归一化同名（去标点与大小写）。
+    **不做模糊匹配**：把两个不同的量并成一个，比多留一个待审候选
+    代价大得多 —— 那会直接污染掌握度与出题口径。
+    """
+    if f"dim:{dim}" in g.nodes:
+        return dim
+    norm = _norm_dim(dim)
+    for d in g.dimensions():
+        if _norm_dim(d) == norm:
+            return d
+    return ""
+
+
+def _nearest_dim(dim: str, g: KnowledgeGraph) -> str:
+    """给待审候选一个"最像的已有维度"建议 —— 只用于提示，不自动合并。
+
+    照伴学 `_suggest_dims`（只说"换一个维度"模型换不对，要给候选）。
+    """
+    toks = _dim_tokens(dim)
+    if not toks:
+        return ""
+    best, score = "", 0.0
+    for d in g.dimensions():
+        t = _dim_tokens(d)
+        if not t:
+            continue
+        s = len(toks & t) / len(toks | t)
+        if s > score:
+            best, score = d, s
+    return best if score >= 0.34 else ""
+
+
+def _save_pending_dimensions(pending: dict[str, dict[str, Any]]) -> int:
+    """待审候选落盘。仍"运行期且未解析"的才留着，其余自然消失。"""
+    if not pending:
+        return 0
+    try:
+        old = {str(r.get("dimension") or ""): r for r in load_pending_dimensions()}
+    except Exception:
+        old = {}
+    old.update(pending)
+    try:
+        PENDING_DIMS.write_text(
+            json.dumps(sorted(old.values(), key=lambda r: str(r.get("dimension"))),
+                       ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception:
+        return 0
+    return len(pending)
 
 
 def sql_shape(sql: str, tables: list[str] | None = None) -> dict[str, Any]:
