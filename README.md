@@ -722,6 +722,64 @@ panel_data 带出 success_track）；`node --check` 面板 JS 语法通过。
 
 ---
 
+## 八之十一、数值与公式溯源（ABA）—— 每个数字都有原项目背书
+
+原则：**MVE 里出现的公式与数值，要么直接照抄原项目（给出文档/源码出处），
+要么是标注过的同构换维（给出原项 + 为什么换），要么如实标注"自定/近似"。
+没有一条是随手拍的。** 行号依据：Voyager 按 2026-10-08 fetch 的
+MineDojo/Voyager `main` 分支；伴学按本地 `study_companion/`；VLML 按本地 `vlml/`。
+
+### A. 照原版 Voyager（MineDojo/Voyager）
+
+| MVE 里的值/机制 | 原版出处（A） | 说明（B → 回引 A） |
+|---|---|---|
+| `RETRIEVAL_TOP_K = 5`（skill_store.py:41） | `skill.py:25` `retrieval_top_k=5`；`voyager.py` 参数 `skill_manager_retrieval_top_k: int = 5` | 每题最多注入 top_k 条技能，**照抄**原版默认 5 |
+| 技能主键 + 同名覆盖（`{topic_id}解法`） | `skill.py:53-55` "Skill {program_name} already exists. Rewriting!"；主键 = program_name | **照抄**：同名走 Rewriting（覆盖旧版，不无限累积） |
+| 检索命中即直接 exec（`_reuse_skill` / `_replay_saved`） | `skill.py:67-75` `similarity_search_with_score` 取 code 直接执行 | 检索语义同构；**MVE 自标近似**：无向量库，用词面 Jaccard + 加权打分（skill_store.py:254），非 Chroma 语义向量 |
+| 成功才固化技能（`ev.success` → `skill_store.add`） | `voyager.py` 主循环 `if info["success"]: self.skill_manager.add_new_skill(info)`；`update_exploration_progress` 同读 success | **照抄**：失败不存（防污染）。`success` 布尔本身照 `critic.py` `response["success"]`（self-verification） |
+| 失败即跳过换新任务（failed 账本） | `curriculum.py` `update_exploration_progress`：失败打印 "Failed to complete task {task}. Skipping to next task." 并记入 `failed_tasks` | MVE planner 的 failed_topic / wrong_retry / due_review 账本，**同构**（MVE 用 mastery 调度重做时机，见八之十） |
+| `progress = 完成数`（裸考画像） | `curriculum.py:80` `progress = len(self.completed_tasks)` | MVE 的 exam.true_level / completed 统计，**照抄**这个定义 |
+| warm-up 收放（支架档位） | `curriculum.py` `default_warmup`（context 15 / biome 10 …）+ 完成数达标才放开信息 | **同构换维**：伴学/原版调"信息量"，MVE 调"支架档位"（difficulty.py:29 自标） |
+| 同题重试上限 `rounds=3`（run_mve.py:159） | `voyager.py` `done = (action_agent_rollout_num_iter >= action_agent_task_max_retries or success)`，默认 `action_agent_task_max_retries=4` | **MVE 自定简化**：原版 rollout 上限是 4，MVE 取 3（可 `--rounds` 调到 10）——如实标注，不是照抄 |
+| 迁移考核（exam.py transfer / final） | README "Run Voyager with a learned skill library"：`skill_library_dir` + `resume=False`，注释 "this is not learning"；摘要 "utilize the learned skill library in a new Minecraft world to solve novel tasks from scratch" | **照抄**原版"停学习→技能库迁移到新世界/新任务"的终极判据；MVE 用 vlr/rib 双源当"新世界" |
+
+### B. 照猫娘伴学（study_companion，本地源码）
+
+| MVE 里的值/公式 | 伴学出处（A） | 说明（B → 回引 A） |
+|---|---|---|
+| `MasteryPolicy` 全部系数（mastery_model.py:54-86） | `mastery_v2.py:31-51` `MasteryV2Policy`（correct 1.0 / partial 0.5 / wrong 0.0；难度 0.9–1.1；hint 0.85；评估置信 0.75；作答可靠性 0.6；半衰期 60 天；consistency 0.7/0.3；confidence 4.0/0.5/0.5；mastered 0.8；未消化错题封顶 0.79） | **逐条照抄**；`__post_init__` 校验也照伴学（mastery_v2.py:72-95） |
+| `confidence = 1 − exp(−Σ权重/4)` | `mastery_v2.py:278` | **照抄**（confidence_evidence_scale=4.0） |
+| `consistency = clamp(1 − 2·√variance)` | `mastery_v2.py:276` | **照抄** |
+| `mastery = clamp(quality × consistency_factor × confidence_factor)` | `mastery_v2.py:281`；factor = `0.7+0.3·consistency`、`0.5+0.5·confidence`（:279-280） | **照抄** |
+| 时间衰减 `exp(−ln2·age/半衰期)` | `mastery_v2.py:424` `_time_decay`（半衰期 60 天） | **同构换维**：伴学按天（学习者隔天复习）；Voyager 一晚跑几十轮，按天恒等于 1 —— MVE 改按会话（half_life=3 会话、gap 2h，mastery_model.py:76-78 自标差异） |
+| `used_hint` 打 0.85 折 | `mastery_v2.py:36` `hint_used_modifier: float = 0.85` | **照抄**；MVE 另照 `mastery_retention.py:46-51`：求助答对不加速遗忘（run_mve.py:364 注释） |
+| 五档：<0.20 未接触 / <0.40 薄弱 / <0.60 进行中 / <0.80 熟练 / ≥0.80 掌握 | `knowledge_tracker.py:242-250` `get_level`（value <0.20 未接触 / <0.40 薄弱 / <0.60 进行中 / <0.80 熟练 / else 掌握） | **照抄**；MVE exam.py:96-98 的 LEVELS 同此 |
+| 薄弱线 `WEAK_LIMIT=0.60` | `knowledge_tracker.py:2076` `get_weak_topics`：只收 `mastery < 0.60 或 false_mastery`，升序取最弱 | **照抄**（exam.py:100 注释同）；`get_weak_topics` 定义在 :2066-2084 |
+| 掌握线 `MASTERED_LIMIT=0.80` | `mastery_v2.py:49` `mastered_threshold: float = 0.8`；`difficulty_policy.py` 同用 0.80 | **照抄** |
+| `false_mastery`（平均分不低但波动大） | `knowledge_tracker.py:299` `accuracy > 0.6 and consistency < 0.5` | **照抄**判定形状；面板显示照 `ui_api.py:62`（false_mastery 或 <0.40 显示 weak） |
+| `attempts < 3 → low_confidence` | `knowledge_tracker.py:274`；三态 `insufficient_evidence/progressing/mastered` 照 `practice_outcome.py:7-9` | **照抄**（MVE mastery_min_attempts=3） |
+| 出题输入结构（weak_topics / due_reviews / retry_wrong / blockers / candidate_evidence） | `knowledge_tracker.py:1811-1824` 出题参数构造 | MVE planner 优先级链**同构**自这套输入 |
+| 遗忘：答对无帮助半衰期×(1+conf·w)、答错×(1−0.5·conf·w) | `mastery_retention.py:46-51` | **照抄**（run_mve.py:360-366 引用） |
+
+### C. 照 VLML（vlml/ 本地仓库）
+
+| MVE 里的机制 | VLML 出处（A） | 说明（B → 回引 A） |
+|---|---|---|
+| 裁判 VLML0 = 确定性 SQL/工具比对（不是 LLM 看观察） | README:17-18 "Tools that return structured metrics only — no narratives, no opinions"；README:97 "All reports return metrics and evidence only" | **照抄 VLML 的分工**：指标与证据由工具出；比原版 critic（LLM 看观察，会编）更强，见八之十 |
+| 叙事/洞察由 LLM 生成 | README:9 "the AI generates the coaching insights, not the server" | **照抄**：MVE 的 narrative 只建在"已通过裁判核对"的事实上（dashboard pTrace） |
+| 工具集 query_sql / get_database_info | README:64-66（Database tools） | **照抄**工具面 |
+
+### D. 如实标注：MVE 自定项（无原项目背书，全部有注释）
+
+| 项 | 值 | 说明 |
+|---|---|---|
+| `CROSS_TOPIC_MIN_SIM=0.12` / `CROSS_TOPIC_MAX=2` / 同题 `score=3.0`（skill_store.py:50-51,254） | MVE 自定 | 原版无"跨题相关度"参数（原版是语义向量，天然跨题）；MVE 词面近似需要显式门槛防带偏 |
+| `RETRY_COOLDOWN=2`（planner.py:37） | MVE 自定 | 原版失败即跳过无冷却概念；MVE 照伴学 wrong_retry 需要重做冷却 |
+| difficulty 七个信号（difficulty.py:44） | MVE 自定 | 同构换维（伴学调题目难度，MVE 调支架档位），见 README 五之二 |
+| 同题连考上限取 3 | MVE 自定简化 | 原版 `action_agent_task_max_retries=4`，见上表 A |
+
+---
+
 ## 六、面板上可观测的状态清单
 
 | 状态 | 判定 | 依据 |
