@@ -1346,6 +1346,61 @@ systemctl restart mve-panel                    # 3. 重启面板（旧进程用�
 
 ---
 
+## 八之十三、学习判据 = Voyager 尺子（done，不数覆盖点）+ 同构生成测试题
+
+**用户拍板（2026-10-08，会议纪要「黄海路25之17号 3」驱动）：**
+出题器给不给题，取决于 **Voyager 那个维度的学习质量**（Voyager 的尺子）——
+课程规划照原仓库学习主循环：跑一通有积累（completed/failed 账本、技能增长），
+且检验「技能能达到课程」；Voyager 就想方设法去达到这个目标。**不要求和
+VLML 的过程一样，也不计算覆盖点** —— 这就是 Voyager 的学习时指标。
+
+### 学习阶段判据：`done`（Voyager 尺子）
+
+```
+任务完成 done = 跑通编排（有成功工具调用） + 拿到数（facts 非空） + 没翻车（无工具错误）
+```
+
+- 照原版 `critic.check_task_success`（critic.py:116）：判「环境里可观测的任务
+  目标达成」，不是「覆盖了多少评分点」。
+- **存技能 / 停止同题 / 推进换题** 只认 `done`（loop_core.task_done）。
+  实测：覆盖率 25% 但只要跑通 + 拿到数，就算任务完成 —— 存技能、推进，
+  不再为涨分连考（对照此前「同题连考 3 轮看覆盖率」）。
+- **VLML 的 success / coverage 降级为观测**：只用于考核（exam transfer/final）
+  与掌握度证据，不驱动学习。
+- 出题器（planner）的 `wrong_retry` 改读 **Voyager failed 账本**
+  （`run_log.undone_counts()`：任务没完成的题），不再读 `verdict` 错题数。
+
+### 同构生成测试题：`mve/gen_testset.py`
+
+照会议纪要：「测试题目均从已跑通的项目中同构生成，仅替换赛事编号、成员名称
+等数据，题目逻辑严谨，不存在不合理的泛化要求。」
+
+```
+python mve/gen_testset.py --topic fb_conversion_analysis   # 生成一道
+python mve/gen_testset.py --all                            # 全部题
+python mve/gen_testset.py --topic X --emit-code            # 打印可入闱 Task 代码
+```
+
+做法（确定性，不经模型）：
+1. 取源题（已跑通）的逻辑骨架 = rubric 评分点 + answer_spec（服务端私有）
+2. 从当前库实查目标实体：新 series（回合数最多且 ≠ 源）、该 series 的 team/map
+3. 同构替换 subject / question / answer_spec.sql 引号内实体值 / tool_args
+   —— 只换「数据」，不换「逻辑」
+4. 跑 VLML0 裁判校验：每个评分点的 dimension 都要在标准答案 facts 里出数
+   （min_cover 门槛）才算成立；出不了数的直接丢弃（防「换库就查不到数」的假题）
+
+实测（vlr/rib 双库）：**7/7 全部成立**（series=1067，维度覆盖 100%）——
+testsets/testset_all.json 已入库，可直接当迁移考核的测试集。
+
+### 面板判据区改版
+
+- 判据区主曲线 = **done 轨迹**（Voyager 尺子，绿=任务完成 / 红=未完成）
+- VLML `success` 降为蓝灰**观测线**（考核尺子，不驱动学习）
+- 覆盖率 = 灰色虚线达成度观测（喂掌握度证据）
+- 轮次明细加 `done` 列；KPI 显示「当前题判据 done / VLML 观测 success」
+
+---
+
 ## 十一、已知缺口（含与设计的失配）
 
 1. **掌握度挂在 `topic_id` 上，不是「组合归档成的类」。**
