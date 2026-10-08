@@ -284,6 +284,12 @@ class Evaluation:
     judge: str = "referee"       # referee（VLML0 裁判）| rubric（旧的自带答案，已弃用）
     unjudgeable: list[str] = field(default_factory=list)   # 裁判也没答案的评分点
     no_tool_calls: bool = False  # True = 本轮没调成功任何工具，事实无来源
+    # **Voyager 判据层的布尔 self-verification**（照原版 critic.check_task_success）：
+    #   任务（=一道题）目标达成 ⇔ 全部评分点都被裁判确认覆盖、值正确。
+    #   与 verdict 的分工：verdict 是伴学判分四档（correct 由 coverage≥0.95 推出，
+    #   95% 在原版眼里就是"没全达成 = 不 success"）；success 才是「存技能 /
+    #   停止同题 / 推进换题 / 迁移考核」唯一认的判据。两者不再混用。
+    success: bool = False
 
 
 def evaluate_vs_referee(
@@ -410,6 +416,19 @@ def evaluate_vs_referee(
     else:
         verdict = "wrong"
 
+    # ---- Voyager 判据层的 success（self-verification）----
+    # 与 verdict 解耦：coverage≥0.95 可判 correct，但只要还有评分点 missing /
+    # rejected / unjudgeable，任务就没「全达成」，success 必须为 False。
+    # 照原版：success = critic 确认环境里的任务目标真的达成（布尔），
+    # 95% 达成 = 没达成。unjudgeable（裁判自己没答出来）同样不算达成 ——
+    # 那道题的目标无法被验证，不能让「题目有问题」变成「Voyager 成功」。
+    success = (
+        evidence == "collected"
+        and not missing
+        and not rejected
+        and not unjudgeable
+    )
+
     return Evaluation(
         verdict=verdict,
         score=int(round(coverage * 100)),
@@ -421,6 +440,7 @@ def evaluate_vs_referee(
         facts_count=len(facts),
         judge="referee",
         unjudgeable=unjudgeable,
+        success=success,
     )
 
 

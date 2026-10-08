@@ -32,7 +32,7 @@
 
 | 分区 | 判定 | 依据 |
 |---|---|---|
-| 📈 概览（掌握度 / 覆盖率轨迹） | 继承结构 + 新写内容 | 五档状态与 flags 徽标照 `ui_api.py`；内容换成 Voyager 的覆盖率与掌握度 |
+| 📈 概览（**判据区 / 掌握度区**） | 继承结构 + 新写内容 | 五档状态与 flags 徽标照 `ui_api.py`；内容换成 **Voyager 判据层的 success 轨迹**（self-verification，见八之十）+ **伴学掌握度独立评估**，两区分离：判据区驱动学习、掌握度区只做评估 |
 | 🎯 练习（出题器派发） | 继承结构 + 新写触发者 | 照伴学 `practice_scope`：人在图谱上钉范围，界面上只剩开始/停止；触发者变成「给 Voyager 出题」 |
 | ✍️ 人导入 | **替换** | 记忆与解释的供应方换成 VLML 与其系统 LLM，不是让 Voyager 跑 |
 | 🧭 轨迹（行动序列） | **新写** | 伴学没有「工具调用序列」这个概念 |
@@ -680,6 +680,48 @@ VLML 那 46 个洞察 SQL 一样不认我们的表 —— 所以新数据**不�
 
 ---
 
+## 八之十、判据层改造：success 布尔 + 两层分工 + 面板分区（2026-10-08）
+
+上一节（八之七）的迁移对照只证明了「换值重跑能对」；这次把**「做对没做对」和
+「学得多牢」彻底拆成两层** —— 这是照原版 Voyager 的定义做的：
+
+**照原版，success 才是判据。** 原版 `critic.check_task_success` 是布尔 self-verification：
+环境里任务目标真的达成 = 成功；95% 达成 = **没达成**。此前 MVE 用「覆盖率 ≥0.95」
+既当判据又当掌握度证据，一个数干两件事：`verdict=correct` 但 missing 一个评分点
+照样存技能 —— 这在原版眼里就是「没全达成 = 不 success」。本次一刀切开：
+
+| 层 | 归属 | 读什么 | 用途 |
+|---|---|---|---|
+| **判据层** | Voyager（它在学习） | `ev.success` 布尔：`missing / rejected / unjudgeable` 全空 **且** 拿到证据才 True | **存技能 / 停止同题 / 推进换题 / 迁移考核**，只认它 |
+| **掌握度层** | 伴学（评估量尺） | mastery_v2 五档 + 覆盖率（仅作达成度观测喂证据） | 只衡量「独立面对公开库时运用得多好」，**不决定练什么** |
+
+**自适应出题依据切到判据层。** `planner.select_next` 的优先级链在 `wrong_retry`
+之后新增 `transfer_weak` 分支（读 `exam.transfer_weakest()`）：迁移考核（未练题
+独立重考）覆盖率 < 0.8 的知识点优先补 —— 「接下来练什么」由它学到哪了决定，
+不再混用伴学掌握度当调度器。
+
+**SQL/plan 路径打通跨题复用。** `_replay_saved` 原来 `topic == tid` 才重放，6/8
+道 SQL 题全卡在这。现在候选集改用 `skill_store.retrieve()`（同题优先 + 跨题相关度
+门槛），跨题重放时把当前题实体（series/team/map）注入调用参数 —— 代码路径早就
+「值在调用点传」了，plan 路径这次补上（voyager.py）。
+
+**面板分区。** 概览页拆两块：**判据区**（success 阶梯图、当前题判据、
+迁移成功率 `transfer.ok_count/count`、出题依据 reason+explanation）与
+**掌握度区**（mastery 独立评估，明确标注「不决定练什么」）；覆盖率降为判据区里的
+达成度观测虚线；轮次明细表加 success 列。
+
+**落地文件**：`loop_core.py`（Evaluation.success）、`run_mve.py`（删
+`PRACTICE_SAVE_COVERAGE`，判据统一读 `ev.success`，run_log 落 success 字段）、
+`voyager.py`（_replay_saved 跨题参数化）、`planner.py` + `exam.py`
+（transfer_weakest 判据层信号）、`panel_data.py` + `dashboard.py`（分区展示）。
+
+**验证**：success 布尔 6 场景冒烟全过（含关键用例：覆盖率 98% 但缺一个评分点 →
+`verdict=correct` 且 `success=False`，不放行）；真实状态文件冒烟
+（transfer_weakest 识别出 `map_rounds_split` 迁移薄弱 0.0、planner 正常出题、
+panel_data 带出 success_track）；`node --check` 面板 JS 语法通过。
+
+---
+
 ## 六、面板上可观测的状态清单
 
 | 状态 | 判定 | 依据 |
@@ -798,7 +840,7 @@ pistol_eco_pattern   verdict=dont_know  evidence=none  no_tool_calls=true  facts
 
 | 原版 | 此前 MVE | 现在 |
 |---|---|---|
-| 任务完成才 `add_new_skill` | 自己跑通的那段代码从来没存过，只存观摩来的解法 | 覆盖率 ≥ 0.95 就存**自己写的程序**（`PRACTICE_SAVE_COVERAGE`），连主函数名一起存进 blueprint |
+| 任务完成才 `add_new_skill` | 自己跑通的那段代码从来没存过，只存观摩来的解法 | **`ev.success`（self-verification 布尔，全部评分点达成）就存**自己写的程序（原判据 `PRACTICE_SAVE_COVERAGE` 已删，见八之十），连主函数名一起存进 blueprint |
 | 主键是函数名（稳定，同名走 Rewriting） | 主键是 LLM 每轮生成的一句话（「按 team 下钻」/「按 team 拆分」）→ 永远算新技能，versions 49、膨胀率 17.5 | 主键固定为 `{topic_id}解法`；`learn()` 那条文字经验也改用同一个 key，两条通道覆盖同一条 |
 | 检索出来直接 exec | 检索出来拼进 prompt 让人**读**，模型每轮重写一遍（每次重写都是新的翻错机会） | `_reuse_skill()`：先直接执行库里的程序，维度齐全就采用（`复用技能` 打印），跑不通才让模型重写 |
 
@@ -840,8 +882,11 @@ Corrode/Haven/Lotus = 21/24/14，真值是 14/21/24 —— **数字全对，只�
 
 支架档位不是摆设：`--hint=full / partial / none` 三档 A/B，覆盖率随档位下降。
 （同构换了一维：伴学按 `depth/difficulty` 排序选题，MVE 按**覆盖率**收放支架 ——
-主判据用覆盖率而不是掌握度，因为掌握度低可能只是「证据还少」，
-用它会误收已会的题的支架。）
+支架收放看覆盖率而不是掌握度，因为掌握度低可能只是「证据还少」，
+用它会误收已会的题的支架。
+注意这是**支架档位的观测口径**；「做对没做对 / 存技能 / 停止 / 推进换题」
+的判据是判据层的 `success` 布尔 —— 覆盖率 100% 才放开支架 ≠ 判据是覆盖率，
+见八之十。）
 
 ### ② 看日志：不是学不会，是三个 bug
 

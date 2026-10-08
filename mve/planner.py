@@ -435,6 +435,34 @@ def _select_raw(*, explicit_topic_id: str, mastery: dict[str, Any],
             "blocked": False,
         }
 
+    # 1.5) transfer_weak：迁移考核失败的知识点优先 —— **判据层信号**。
+    #
+    #     自适应学习依据照用户的决策归 Voyager 判据层（它在学习，所以
+    #     "接下来练什么"读它学到哪了），不读伴学掌握度（那是独立评估量尺）。
+    #     判据层的硬信号之一就是迁移考核：transfer（未练题独立重考）
+    #     覆盖率低于掌握线 = 技能积累没能迁移到这道题 = 它没学会。
+    #     `exam_weak` 读的是摸底基线，`transfer_weak` 读的是学习后的
+    #     迁移考核 —— 后者失败才说明「学了，但没学会怎么用」。
+    #     同样走「升序取最低」（最弱优先）与 exhausted 毕业让位，防死磕。
+    try:
+        import exam as exam_mod
+        tweak = [(t, c) for t, c in exam_mod.transfer_weakest()
+                 if t in TASKS and not exam_mod.exhausted(t)]
+    except Exception:                                        # pragma: no cover
+        tweak = []
+    if tweak:
+        topic, lv = tweak[0]
+        return {
+            "topic_id": topic,
+            "reason": "transfer_weak",
+            "explanation": f"迁移考核（未练题独立重考）只有 {lv:.0%}，低于掌握线 —— "
+                           f"技能积累没能迁移到这道题，先把它补上"
+                           + (f"；其余迁移薄弱："
+                              f"{', '.join(f'{t}({c:.0%})' for t, c in tweak[1:3])}"
+                              if len(tweak) > 1 else ""),
+            "blocked": False,
+        }
+
     stalled = [(t, m) for t, m in mastery.items() if t in TASKS and m["stalled"]]
     # 已被拿下的题（连续满分）：它们不再需要练，但**是上难度的信号**。
     cleared = [(t, m) for t, m in mastery.items() if t in TASKS and m["cleared"]]
@@ -688,6 +716,7 @@ def _select_raw(*, explicit_topic_id: str, mastery: dict[str, Any],
 REASON_LABEL = {
     "explicit_topic": "钉住指定",
     "wrong_retry": "错题重试",
+    "transfer_weak": "迁移考核薄弱",
     "due_review": "到期复习",
     "human_focus": "人导入方向",
     "weak_topic": "人导入方向",

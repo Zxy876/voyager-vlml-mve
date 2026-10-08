@@ -204,6 +204,10 @@ def _exam_view() -> dict[str, Any]:
             "count": len(tseq),
             "seq": [_pct(c) for c in tseq],
             "rose": bool(len(tseq) >= 2 and tseq[-1] > tseq[0] + 0.001),
+            # 迁移成功率：未练题独立考核里真正「独立做对」的占比。
+            # 考核记录没有 success 布尔，coverage≥1.0 就是它的达成形态
+            # （全部评分点覆盖且值正确）。这是判据区最硬的信号。
+            "ok_count": sum(1 for c in tseq if c >= 1.0),
         } if tseq else None,
     }
 
@@ -412,6 +416,9 @@ def build_state() -> dict[str, Any]:
             "coverage": r.get("coverage"),
             "score": r.get("score"),
             "verdict": r.get("verdict", ""),
+            # 判据层布尔：全部评分点达成（self-verification）。
+            # 旧日志没有这一列 → 按 False 处理（覆盖率时代的记录语义不同）。
+            "success": bool(r.get("success")),
             "evidence": r.get("evidence_status", ""),
             "mastery": m,
             "mastery_pct": _pct(m),
@@ -507,9 +514,11 @@ def build_state() -> dict[str, Any]:
 
     # mastery 上升不能当证据：V2 里 confidence 随**证据权重之和**上升，
     # 权重会被时间衰减和评价可信度拉低，但**刷轮次依然能把它推高**。
+    # 判据必须用判据层的 success（self-verification 布尔），不用覆盖率，
+    # 更不用 mastery —— 掌握度只做独立评估，不当学习判据。
     mas_warning = (
         "mastery 的 confidence = 1-exp(-证据权重和/4)，反复作答仍会把它推高；"
-        "只看它判定「学会了」会得出假阳性。判据必须用覆盖率。"
+        "它只做独立评估。判据看判据区的 success（全部评分点达成）。"
         if len(mas) >= 2 else None
     )
 
@@ -551,6 +560,9 @@ def build_state() -> dict[str, Any]:
         "reading_text": reading_text,
         "mastery_warning": mas_warning,
         "coverage_track": [_pct(c) for c in cov],
+        # 判据层轨迹：每轮 self-verification 的布尔（存技能/停止/推进只认它）
+        "success_track": [bool(s["success"]) for s in series],
+        "last_success": bool(series[-1]["success"]),
         "mastery_track": [_pct(m) for m in mas],
         "trajectory_sizes": traj_sizes,
         "new_tools": sorted(set(new_tools)),

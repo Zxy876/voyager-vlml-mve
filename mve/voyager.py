@@ -1741,14 +1741,41 @@ VLML 的 10 个报告工具已经封装好指标口径。能用报告工具拿�
         tid = str(getattr(task, "topic_id", "") or "")
         dims = [str(getattr(p, "dimension", "") or "")
                 for p in (getattr(task, "rubric", None) or [])]
-        for s in skill_store.all_skills():
-            if str(s.get("topic") or "") != tid:
-                continue
+        # 当前题实体（值在调用点传）—— 跨题复用同一编排时按它覆盖调用参数。
+        # 与代码路径 `_run_with_code` 的 `_cur_subject` 同一套口径：
+        # 技能函数带参，值在调用点传（原版同构），不沿用技能当年写死的实体。
+        cur: dict[str, Any] = {}
+        for _p in getattr(task, "rubric", []) or []:
+            for _k, _v in ((getattr(_p, "subject", None) or {}) or {}).items():
+                if isinstance(_v, (list, tuple)):
+                    _v = _v[0] if _v else None
+                if _v not in (None, ""):
+                    cur.setdefault(str(_k), _v)
+        # 候选集用 retrieve() 的排序（同题优先 + 词面相关 + 有效性加权）：
+        # 全库遍历会把不相关的跨题技能也拉来重放，成本高且容易被带偏。
+        # retrieve 已实现「同题优先」与「跨题最多 2 条、相关度下限」两道门槛。
+        try:
+            candidates = skill_store.retrieve(
+                tid, str(getattr(task, "question", "") or ""),
+                top_k=skill_store.RETRIEVAL_TOP_K)
+        except Exception:                                    # pragma: no cover
+            candidates = []
+        for s in candidates:
             if str(s.get("source") or "") != "practice":
                 continue
             calls = list((s.get("blueprint") or {}).get("calls") or [])
             if not calls:
                 continue
+            # 跨题复用：把当前题实体覆盖进调用参数 —— 只覆盖调用里**已有的键**，
+            # 不凭空新增（否则 execute_custom_sql 会收到多余的 series=… 参数）。
+            # 这正是「同一个编排，换 series/team/map」的举一反三形态，
+            # 也是原版「停学习→技能库迁移到新任务」在 plan 路径上的落地。
+            if str(s.get("topic") or "") != tid and cur:
+                calls = [dict(c, args=dict((c.get("args") or {}))) for c in calls]
+                for c in calls:
+                    for k, v in cur.items():
+                        if k in c["args"]:
+                            c["args"][k] = v
             obs = await self._execute({"calls": calls}, limit=len(calls))
             if not [o for o in obs if o.get("result") is not None]:
                 continue

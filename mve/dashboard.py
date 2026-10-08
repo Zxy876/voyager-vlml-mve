@@ -386,7 +386,7 @@ li{margin:3px 0}
 const ESC = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
 const TABS = [
-  {id:'overview', icon:'📈', label:'概览',   status:s=>'掌握度 / 覆盖率轨迹'},
+  {id:'overview', icon:'📈', label:'概览',   status:s=>'判据区 / 掌握度区'},
   {id:'practice', icon:'🎯', label:'练习',   status:s=>s.topic_id||'—'},
   {id:'import',   icon:'✍️', label:'人导入', status:s=>(s.imports||[]).length+' 条导入'},
   {id:'trace',    icon:'🧭', label:'轨迹',   status:s=>s.total_rounds+' 轮'},
@@ -423,6 +423,25 @@ function lineChart(pts, opts){
           stroke-dasharray="${opts.dash||''}" stroke-linejoin="round"/>
     ${dots}${xlab}</svg>`;
 }
+/* 判据区：self-verification 布尔轨迹（绿=全部评分点达成，红=未达成）。
+   存技能/停止/推进只认这条线，覆盖率只是它的连续观测。 */
+function stepChart(pts, opts){
+  const W=560,H=120,P={l:38,r:14,t:14,b:26};
+  if(!pts.length) return '<div class="empty">无数据</div>';
+  const iw=W-P.l-P.r, ih=H-P.t-P.b;
+  const X=i=>P.l+(pts.length===1?iw/2:iw*i/(pts.length-1));
+  const Y=v=>P.t+(v?0:ih);              // true 在顶，false 在底
+  const cells=pts.map((p,i)=>{
+    const x0=X(i), x1=i<pts.length-1?X(i+1):X(i)+10;
+    return `<rect x="${x0.toFixed(1)}" y="${Y(p.v).toFixed(1)}" width="${(x1-x0).toFixed(1)}" height="${ih}" fill="${p.v?opts.yes:opts.no}" opacity="0.9">
+      <title>第${p.x}次 · ${p.v?'success':'未达成（有评分点缺失/不符）'}</title></rect>`;
+  }).join('');
+  const xlab=pts.map((p,i)=>
+    `<text x="${X(i).toFixed(1)}" y="${H-8}" font-size="10" fill="#9ca3af" text-anchor="middle">${p.x}</text>`).join('');
+  const labels=`<text x="${P.l+4}" y="${P.t+10}" font-size="10" fill="${opts.yes}">✓ 达成</text>
+               <text x="${P.l+4}" y="${P.t+ih-4}" font-size="10" fill="${opts.no}">✗ 未达成</text>`;
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px">${cells}${labels}${xlab}</svg>`;
+}
 
 /* ---------------- hero ---------------- */
 function renderHero(s){
@@ -430,6 +449,12 @@ function renderHero(s){
   const cls={'weak':'m-weak','progress':'m-progress','good':'m-good','mastered':'m-mastered','unassessed':'m-new'};
   const pills=[];
   if(s.has_data){
+    const tr=(s.exam_curve||{}).transfer;
+    const lastOk = s.last_success ? '<span class="chip ok">success</span>'
+                                  : '<span class="chip bad">未达成</span>';
+    // 判据区 KPI：当前题 self-verification 结果（不是覆盖率、不是掌握度）
+    pills.push(['当前题判据', lastOk]);
+    pills.push(['迁移成功率', tr ? (tr.ok_count+' / '+tr.count) : '—']);
     pills.push(['掌握度变化', s.mastery_delta||'—']);
     pills.push(['状态', `<span class="chip ${cls[last.ui_status]||'m-new'}">${ESC(last.status_label)}</span>`]);
     pills.push(['累计轮次', s.total_rounds]);
@@ -574,29 +599,41 @@ function pOverview(s){
   }
   const cov=s.series.filter(p=>p.coverage!==null).map(p=>({x:p.i,y:p.coverage,label:(p.coverage*100).toFixed(0)+'%'}));
   const mas=s.series.filter(p=>p.mastery!==null).map(p=>({x:p.i,y:p.mastery,label:p.mastery_pct}));
+  const suc=s.series.filter(p=>p.success!==null && p.success!==undefined)
+                     .map(p=>({x:p.i,v:!!p.success}));
   const last=s.series[s.series.length-1];
   const cls={'weak':'m-weak','progress':'m-progress','good':'m-good','mastered':'m-mastered','unassessed':'m-new'};
+  const rc=s.recommend||{};
+  const whyHtml=rc.topic_id?`<div class="note info"><b>出题依据（判据层）：</b>
+    ${ESC(rc.reason_label||rc.reason)} —— ${ESC(rc.explanation)}</div>`:'';
   return `<div class="panel">
-    <div class="panel__head"><h2>当前状态</h2>
-      <span class="hint">判读必须看覆盖率，不能看掌握度</span></div>
+    <div class="panel__head"><h2>当前状态 · 判据区</h2>
+      <span class="hint">判读看判据层 success（self-verification），不是覆盖率，更不是掌握度</span></div>
     <div class="kpis">
+      <div class="kpi"><div class="label">当前题判据</div>
+        <div class="value">${s.last_success?'<span class="chip ok">success · 全部评分点达成</span>':'<span class="chip bad">未达成 · 有评分点缺失/不符</span>'}</div></div>
       <div class="kpi"><div class="label">掌握度变化</div><div class="value">${ESC(s.mastery_delta)}</div></div>
       <div class="kpi"><div class="label">状态</div>
         <div class="value"><span class="chip ${cls[last.ui_status]||'m-new'}">${ESC(last.status_label)}</span></div></div>
-      <div class="kpi"><div class="label">等级</div><div class="value">${ESC(last.level||'—')}</div></div>
       <div class="kpi"><div class="label">累计轮次</div><div class="value">${s.total_rounds}</div></div>
     </div>
     <div style="margin-top:10px">${chips(last.flags.map(f=>f.label),'warn')}</div>
     <div class="note ${s.reading==='learned'?'info':''}"><b>判读：</b>${ESC(s.reading_text)}</div>
+    ${whyHtml}
   </div>
   ${examCard(s)}
   <div class="grid2">
-    <div class="panel"><div class="panel__head"><h2>覆盖率轨迹 · 判据</h2></div>
-      ${lineChart(cov,{color:'#2f7d57'})}
-      <div class="legend">实线＝事实集命中 rubric 的加权比例，这个数才说明「做全了没有」。</div></div>
-    <div class="panel"><div class="panel__head"><h2>掌握度轨迹 · 仅供参考</h2></div>
+    <div class="panel"><div class="panel__head"><h2>判据区 · self-verification（success）</h2>
+      <span class="hint">存技能 / 停止同题 / 推进换题只认这条布尔线</span></div>
+      ${stepChart(suc,{yes:'#2f7d57',no:'#e5484d'})}
+      <div class="legend">绿＝全部评分点达成（success）；红＝未达成（有 missing / 值不符 / 裁判缺答）。
+        覆盖率只是它的达成度观测 ↓</div>
+      ${lineChart(cov,{color:'#8a8f98',dash:'4 3'})}
+      <div class="legend">虚线＝覆盖率观测（喂掌握度证据，不当判据）。</div></div>
+    <div class="panel"><div class="panel__head"><h2>掌握度区 · 独立评估</h2>
+      <span class="hint">伴学 mastery 只衡量「独立运用得多好」，不决定练什么</span></div>
       ${lineChart(mas,{color:'#9ca3af',dash:'5 4'})}
-      <div class="legend">虚线＝不可作为学习证据。</div>
+      <div class="legend">虚线＝独立评估量尺，不可作为学习判据（自适应出题读判据区）。</div>
       ${s.mastery_warning?`<div class="note">${ESC(s.mastery_warning)}</div>`:''}</div>
   </div>
   ${envCard(s)}`;
@@ -710,6 +747,7 @@ function pTrace(s){
       <td>${p.rejected.length?chips(p.rejected,'warn'):'<span class="chip grey">无</span>'}</td></tr>`).join('');
   const rows=s.series.map(p=>`
     <tr><td class="num">${p.i}</td><td class="mono">${ESC(p.mode)}</td><td class="num">${p.round}</td>
+      <td>${p.success?'<span class="chip ok">✓</span>':'<span class="chip bad">✗</span>'}</td>
       <td><b>${ESC(p.verdict)}</b></td>
       <td class="num">${p.coverage===null?'—':(p.coverage*100).toFixed(0)+'%'}</td>
       <td class="num">${p.score===null?'—':p.score}</td>
@@ -741,7 +779,7 @@ function pTrace(s){
     </div>
     <div class="panel">
       <div class="panel__head"><h2>轮次明细</h2></div>
-      <table><thead><tr><th>#</th><th>模式</th><th>轮</th><th>verdict</th><th>覆盖率</th><th>得分</th>
+      <table><thead><tr><th>#</th><th>模式</th><th>轮</th><th>success</th><th>verdict</th><th>覆盖率</th><th>得分</th>
         <th>事实数</th><th>flags</th><th>证据状态</th><th>判据</th><th>溯源</th><th>幻觉拦截</th></tr></thead>
         <tbody>${rows}</tbody></table>
     </div>

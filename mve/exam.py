@@ -210,6 +210,29 @@ def weakest(limit: float = WEAK_LIMIT) -> list[tuple[str, float]]:
     return rows
 
 
+def transfer_weakest(limit: float = MASTERED_LIMIT) -> list[tuple[str, float]]:
+    """迁移考核失败的知识点 —— **判据层信号**（Voyager 学到哪了）。
+
+    transfer（未练题独立考核）考的是「练了别的题之后，这道**没练过**的题
+    能不能独立做对」。覆盖率 < 掌握线 = 技能积累没能迁移到它 = 它正是当前
+    最该补的薄弱点。与 `weakest()` 的区别：
+      · weakest 读 placement/最新裸考 —— 学习前/后的基线水平
+      · transfer_weakest 读 kind=="transfer" —— **学习后的迁移考核**，
+        它失败才说明「学了，但没学会怎么用」。
+
+    升序取最低（同 weakest：最弱优先，不挑最接近及格的）。
+    """
+    rows = [r for r in load() if str(r.get("kind") or "") == "transfer"]
+    by: dict[str, float] = {}
+    for r in rows:
+        t = str(r.get("topic_id") or "")
+        if t:
+            by[t] = float(r.get("coverage") or 0.0)   # 后写覆盖先写 = 最近一次
+    out = [(t, c) for t, c in by.items() if c < limit]
+    out.sort(key=lambda kv: (kv[1], kv[0]))
+    return out
+
+
 def exhausted(topic_id: str) -> bool:
     """这道题**练了也没涨** → 该毕业让位，别把算力全砸在死题上。
 
