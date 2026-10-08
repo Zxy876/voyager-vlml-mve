@@ -84,6 +84,15 @@ TOOL_NAMES = [
 
 SERIES = "2843069"
 C9 = "Cloud9"
+# 图名锚点。以前只有 SERIES / C9，于是模型把图名**写死**在 SQL 里 ——
+# 换库后那张图根本不存在，技能复用全部跑 0 行（见 `stale_literals` 的实测）。
+try:                                                     # pragma: no cover
+    import anchor as _anchor
+    MAP = str(_anchor.map_name() or "")
+    SERIES = str(_anchor.series() or SERIES)
+    C9 = str(_anchor.team() or C9)
+except Exception:
+    MAP = ""
 
 
 def _tool_signatures() -> dict[str, str]:
@@ -577,13 +586,24 @@ def render_system_message(tool_docs: str = "", dim_hints: str = "",
 已预置的常量（直接用，不要再自己定义）：
     SERIES = "{SERIES}"      # 本场 series_id
     C9     = "{C9}"          # 队伍名
+    MAP    = "{MAP}"         # 图名
 {dim_hints}
 {skills_text}
 硬性要求：
 1. 主函数必须是 async，且**唯一参数名为 mcp**；
 2. 用 return 返回一个 dict，key 是维度名，value 是从工具返回里**取出来的原值**；
 3. **不要把数字手写在代码里** —— 所有值必须来自工具返回；
-4. 取不到就让它返回 None —— 那表示"这个维度不在观测里"，比编一个数有用得多。
+4. 取不到就让它返回 None —— 那表示"这个维度不在观测里"，比编一个数有用得多；
+5. **实体值一律用上面的常量，不要写死字面量** —— 这是"技能能不能复用"的
+   分水岭。原版 Voyager 的技能函数是可带参数的（`mineBlock(bot, name,
+   count)`，值在调用点传），所以同一个技能换个材料照样能用；写死了值，
+   技能就退化成"那一次的答案"。实测：技能里写死
+   `series_id=2843069 / winning_team_name='Cloud9' / map_name='Lotus'`，
+   换库之后这些值一个都不存在 → 复用时全部 0 行 → 考核覆盖率回 0
+   （面板：摸底 16% → 结业 0%）。
+   正确写法（用 f-string 拼进 SQL）：
+       f"... WHERE series_id='{{SERIES}}' AND map_name='{{MAP}}'"
+   错误写法：`... WHERE series_id='2843069'`
 
 输出格式：
 {RESPONSE_FORMAT}"""
@@ -758,18 +778,142 @@ def pct(obj: Any, num_path: str, den_path: str = "") -> dict[str, Any]:
     return {"num": num, "denom": den}
 
 
-async def execute(program_code: str, program_name: str) -> dict[str, Any]:
+# 全大写的 SQL 关键字/函数名：它们长得像"大写开头的实体名"，但根本不是值。
+# 少了这张表，`ORDER BY cnt DESC` 里的 'DESC' 会被当成图名去查库、查不到
+# 就整条技能判过期 —— 那是误杀。
+_SQL_STOPWORDS = frozenset("""
+SELECT FROM WHERE GROUP ORDER BY HAVING LIMIT OFFSET JOIN LEFT RIGHT INNER
+OUTER ON AS AND OR NOT IN IS NULL LIKE BETWEEN CASE WHEN THEN ELSE END
+ASC DESC COUNT SUM AVG MIN MAX DISTINCT OVER PARTITION ROW_NUMBER RANK LAG
+LEAD COALESCE CAST ROUND TRUE FALSE UNION ALL WITH INTERVAL DATE EXTRACT
+""".split())
+
+_IN_DB_CACHE: dict[str, bool] = {}
+
+
+def _value_in_db(value: str) -> bool:
+    """这个实体值在**当前库**里到底有没有（带缓存）。"""
+    v = str(value or "").strip()
+    if not v or v in _IN_DB_CACHE:
+        return _IN_DB_CACHE.get(v, False)
+    ok = False
+    try:
+        import duckdb
+        import anchor as _anc
+        con = duckdb.connect(str(_anc._db_path()), read_only=True)
+        try:
+            n = int(con.execute(
+                "SELECT COUNT(*) FROM rounds WHERE "
+                "CAST(series_id AS VARCHAR)=? OR winning_team_name=? "
+                "OR losing_team_name=? OR map_name=?",
+                [v, v, v, v]).fetchone()[0])
+            ok = n > 0
+        finally:
+            con.close()
+    except Exception:
+        ok = True          # 查不动就别误杀，交给执行结果去判
+    _IN_DB_CACHE[v] = ok
+    return ok
+
+
+def stale_literals(code: str) -> list[str]:
+    """技能代码里**写死但当前库已经没有**的实体值 —— 空列表表示没过期。
+
+    为什么必须有这条：技能库里存的是"当时跑通的那段代码"，值写死在里面。
+    换数据源（events → vlr → rib）之后，旧值（2843069 / Cloud9 / Lotus /
+    Corrode）在当前库里**一个都不存在**，但检索照样会把这条技能捞出来、
+    照样 exec、照样跑完不报错 —— 只是**每一行都是 0 行**。
+    实测：考核 26 次里 16 次复用了技能，覆盖率却还是
+    `0.0, 0.25, 0.0, ...` 一路回零 —— 复用成功 ≠ 做得对。
+
+    判据（"这个字面量像不像实体值"）：
+      · 4 位以上纯数字 → 赛事号
+      · 大写开头的英文串 → 队名 / 图名（排除 SQL 关键字）
+      · entity_catalog 里登记过的值
+    **不能只认 catalog**：换库之后 GRID 那批队名图名（Cloud9 / Lotus /
+    Corrode）已经从 catalog 里消失了，只查 catalog 会一条都检不出来
+    （第一版就是这个毛病，实测 8 条技能判出 0 条过期）。
+    """
+    s = str(code or "")
+    if not s:
+        return []
+    known: set[str] = set()
+    try:
+        cat = json.loads((Path(__file__).resolve().parent
+                          / "entity_catalog.json").read_text(encoding="utf-8"))
+        for vals in (cat.get("entities") or {}).values():
+            if isinstance(vals, list):
+                known |= {str(v) for v in vals if str(v)}
+    except Exception:
+        pass
+    out: list[str] = []
+    # 裸数字也要查：实测 `series_id=2843069` 是**不带引号**写的，
+    # 只扫引号会整条漏掉（lotus_win_rate 就只判出 'Cloud9' 一个）。
+    lits = set(re.findall(r"'([^']{3,40})'", s)) \
+        | set(re.findall(r'"([^"]{3,40})"', s)) \
+        | set(re.findall(r"\b(\d{4,})\b", s))
+    for lit in lits:
+        if lit in _SQL_STOPWORDS:
+            continue
+        looks_entity = (re.fullmatch(r"\d{4,}", lit) is not None
+                        or re.fullmatch(r"[A-Z][A-Za-z0-9 .'\-]{2,}", lit) is not None
+                        or lit in known)
+        if not looks_entity:
+            continue                       # 'num' / 'denom' 这类路径，不查
+        if not _value_in_db(lit):
+            out.append(lit)
+    return sorted(out)
+
+
+def _subject_of(task: Any) -> dict[str, Any]:
+    """从题的 rubric 里收集当前实体（series / team / map）。"""
+    out: dict[str, Any] = {}
+    for p in (getattr(task, "rubric", None) or []):
+        for k, v in ((getattr(p, "subject", None) or {}) or {}).items():
+            if isinstance(v, (list, tuple)):
+                v = v[0] if v else None
+            if v not in (None, ""):
+                out.setdefault(str(k), v)
+    return out
+
+
+def _subject_env(subject: dict[str, Any] | None) -> dict[str, str]:
+    """把当前这道题的 subject 翻成注入常量。
+
+    原版 Voyager 是两层：主函数 `main(bot)` 每次生成，**技能函数可带参数**
+    （`mineBlock(bot, name, count)`，值在调用点传）—— 所以技能是通用方法。
+    MVE 的主函数被硬约束成单参 `mcp`（`_parse` 里 `params != ["mcp"]` 就报
+    错），改签名要动整条链路。同构的等价做法是：**把值放进exec 的命名空间**，
+    技能代码引用 `SERIES` / `C9` / `MAP`，值由**调用方**注入 —— 同样是
+    "值在调用点给"，只是载体从参数换成环境。
+    """
+    env = {"SERIES": SERIES, "C9": C9, "MAP": MAP}
+    for k, name in (("series", "SERIES"), ("team", "C9"), ("map", "MAP")):
+        v = (subject or {}).get(k)
+        if isinstance(v, (list, tuple)):
+            v = v[0] if v else None
+        if v not in (None, ""):
+            env[name] = str(v)
+    return env
+
+
+async def execute(program_code: str, program_name: str,
+                  subject: dict[str, Any] | None = None) -> dict[str, Any]:
     """执行模型产出的代码，返回它 return 的原始 dict。
 
     照原版：执行结果由**解释器**产出，不经过任何模型加工。
+
+    `subject` = 当前题的实体（series / team / map）。传了就按它覆盖注入
+    常量 —— 同一个技能换个队伍/换张图也能跑，这才是"学会了"而不是"背下了"。
     """
     mcp = MCPHandle()
+    env = _subject_env(subject)
     ns: dict[str, Any] = {"__builtins__": dict(_SAFE_BUILTINS),
                           "mcp": mcp, "dig": dig,
                           "scalar": scalar, "pct": pct,
                           # 预置常量：不预置的话模型会自己写 `series_id=...`
                           # 然后 NameError（实测踩过）。
-                          "SERIES": SERIES, "C9": C9}
+                          **env}
     exec(program_code, ns)  # noqa: S102  —— 原版就是这样执行模型代码的
     fn = ns.get(program_name)
     if fn is None:
@@ -855,7 +999,8 @@ async def collect(task: Any, *, dims: list[str] | None = None,
                              "content": f"解析失败：{last_err}\n请重新输出，注意格式要求。"})
             continue
         try:
-            out = await execute(parsed["program_code"], parsed["program_name"])
+            out = await execute(parsed["program_code"], parsed["program_name"],
+                                subject=_subject_of(task))
         except CodeParseError as e:
             last_err = str(e)
             messages.append({"role": "assistant", "content": text})

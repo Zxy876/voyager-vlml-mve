@@ -1778,6 +1778,15 @@ VLML 的 10 个报告工具已经封装好指标口径。能用报告工具拿�
 
         dims = sorted({str(p.dimension) for p in getattr(task, "rubric", [])
                        if getattr(p, "dimension", "")})
+        # 当前题的实体（series / team / map）—— 复用技能时按它注入，
+        # 而不是沿用技能当年写死的那组（原版：值在调用点传）。
+        self._cur_subject = {}
+        for _p in getattr(task, "rubric", []) or []:
+            for _k, _v in ((getattr(_p, "subject", None) or {}) or {}).items():
+                if isinstance(_v, (list, tuple)):
+                    _v = _v[0] if _v else None
+                if _v not in (None, ""):
+                    self._cur_subject.setdefault(str(_k), _v)
         # 技能库里学到的解法源码要进 system（照原版 `+ skills`）——
         # 不然旁路学到的东西在写代码时一句都看不见。
         skills_text = ""
@@ -1891,6 +1900,9 @@ VLML 的 10 个报告工具已经封装好指标口径。能用报告工具拿�
         这是原版 `SkillManager.retrieve_skills` → `exec` 那一段的同构物。
         判据用「维度齐不齐」而不是「有没有异常」：程序能跑完但路径取错时
         不会抛异常（dig 取不到就返回 None），只看异常会把错的也当成对的。
+
+        注入的实体值取自**当前这道题**（`self._cur_subject`），不是技能当年
+        写死的那组 —— 原版同构：技能函数带参，值在调用点传。
         """
         import action_code
         for s in top or []:
@@ -1900,8 +1912,14 @@ VLML 的 10 个报告工具已经封装好指标口径。能用报告工具拿�
             name = str((s.get("blueprint") or {}).get("program_name") or "")
             if not code or not name:
                 continue
+            # 过期技能不复用：值写死在里头、而那些值在当前库里已经不存在。
+            # 不拦的话它会"跑通"（0 行不算报错），只是交上来一片空 ——
+            # 实测 26 次考核复用 16 次，覆盖率照样回零，就是这批技能干的。
+            dead = action_code.stale_literals(code)
+            if dead:
+                continue
             try:
-                out = await action_code.execute(code, name)
+                out = await action_code.execute(code, name, subject=self._cur_subject)
             except Exception:
                 continue
             vals = out.get("values") or {}
