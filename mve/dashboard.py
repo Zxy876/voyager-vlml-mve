@@ -938,7 +938,12 @@ ${ESC(REL[e.relation]&&REL[e.relation][1]||e.relation)}${e.origin==='observed'?'
                          :(tbl.length?`<span class="chip grey">表 ${tbl.map(ESC).join('、')}</span>`
                                      :`<span class="chip warn">无来源</span>`);
     const isNow = window.__scope && window.__scope.active && window.__scope.label===d;
-    return `<tr${isNow?' class="now"':''}><td class="mono">${ESC(d)}</td><td>${src}</td>
+    // 伴学四层：阶段（工具集梯度）/ 学科（实体域）/ 章节（主题域）→ 知识点
+    const dt=(byId['dim:'+d]||{}).detail||{};
+    const layer=`<td>${dt.stage_label?ESC(dt.stage_label):'—'}</td>`
+      + `<td>${dt.subject_label?`<span class="chip grey">${ESC(dt.subject_label)}</span>`:'—'}</td>`
+      + `<td>${dt.chapter?ESC(dt.chapter):'—'}</td>`;
+    return `<tr${isNow?' class="now"':''}><td class="mono">${ESC(d)}</td>${layer}<td>${src}</td>
       <td>${conf.length?conf.map(c=>`<span class="chip warn">${ESC(c)}</span>`).join(''):'<span class="chip grey">—</span>'}</td>
       <td><button class="btn ${isNow?'':'btn-secondary'}" data-scope-set="${ESC(d)}"
         style="padding:4px 10px;font-size:12px">${isNow?'✓ 练习中':'练习此知识点'}</button></td></tr>`;
@@ -955,8 +960,14 @@ ${ESC(REL[e.relation]&&REL[e.relation][1]||e.relation)}${e.origin==='observed'?'
       孤立节点（没有任何边）不画：VLML 有 9 个工具，被真正用到的才进图。
       <br><b>点任意维度</b>（或下表按钮）把它设成练习范围，出题器就只在这范围里出题。</div>
     <table class="tbl" style="margin-top:12px">
-      <thead><tr><th>维度</th><th>由谁产出</th><th>易混</th><th>练习</th></tr></thead>
-      <tbody>${rows}</tbody></table>`;
+      <thead><tr><th>知识点（维度）</th><th>阶段·工具集梯度</th><th>学科·实体域</th>
+        <th>章节·主题域</th><th>由谁产出</th><th>易混</th><th>练习</th></tr></thead>
+      <tbody>${rows}</tbody></table>
+    <div class="note" style="margin-top:8px;font-size:12px;color:var(--muted)">
+      层级照伴学 <b>阶段 → 学科 → 章节 → 知识点</b>：
+      <b>阶段</b>＝拿下这个知识点最低要动用哪一级工具集（原始事件表 → 派生聚合
+      → 洞察 SQL → 报告工具）；<b>学科</b>＝赛事 / 团队 / 选手 / 地图（从真实列
+      派生，不手写）；<b>章节</b>＝实体域下的主题域（首血 / 经济 / 手枪局 / 连败…）。</div>`;
 }
 
 /* 图谱页顶部的练习范围条：照伴学 i18n

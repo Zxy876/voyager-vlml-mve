@@ -2103,6 +2103,132 @@ def _skills_of(sql: str) -> list[str]:
 LAYER_LABEL = {"core": "主干表", "derived": "派生表", "agg": "聚合表",
                "ref": "参考/字典表"}
 
+# --------------------------------------------------------------------------
+# 伴学的四层组织：**阶段（stage）→ 学科（subject）→ 章节（chapter）→ 知识点**
+# --------------------------------------------------------------------------
+# 伴学 `static/knowledge_seeds/math.json` 实测的层级：
+#   stage   = 学段 primary/junior_high/senior_high/college  ← **梯度**
+#   subject = 学科 math/physics/…（11 个，各一个 seed 文件）
+#   chapter = 学科内章节（math 一个学科就有 37 个：一次函数、三角函数…）
+#   topic   = 知识点，带 depth / difficulty / prerequisites / skills / …
+#
+# MVE 的同构映射（用户指定的语义）：
+#   stage   → **梯度的工具集**：要拿下这个知识点，最低得动用哪一级手段
+#             raw(原始事件表) → agg(派生聚合) → insight(洞察 SQL) → tool(报告工具)
+#             同构点：都是**进阶梯度**，不是节点种类。
+#   subject → **赛事 / 团队 / 选手**：实体域，从取数用的列自动派生
+#   chapter → **实体域下的主题域**：首血 / 经济 / 手枪局 / 连败 / 爆弹 …
+#   topic   → 维度节点（VLML 对数据的建模），脚手架此前已照搬过
+#
+# ⚠️ 一个语义错位必须点明：此前 `chapter` 存的是 LAYER_LABEL（主干表/派生表/
+# 聚合表）—— 那其实是**梯度**，占的是伴学 `stage` 的位。所以这次是把它归位：
+# stage 接手梯度，chapter 回到"主题域"。
+TOOLSET_STAGE_LABEL = {
+    "raw": "原始事件表", "agg": "派生聚合表", "insight": "洞察 SQL",
+    "tool": "报告工具（工具内聚合）",
+}
+SUBJECT_LABEL = {
+    "player": "选手", "team": "团队", "map": "地图", "series": "赛事",
+    "round": "回合", "game": "对局", "tournament": "赛事总览",
+}
+# 主题域：先具体后泛 —— 顺序一旦反了，"回合"会把"首血"全吃掉。
+DOMAIN_HINTS: list[tuple[str, tuple[str, ...]]] = [
+    ("首血对枪", ("first_blood", "fb_", "opening_duel")),
+    ("下包/爆弹", ("plant", "defuse")),
+    ("手枪局", ("pistol",)),          # 要在"经济局"之前：更具体
+    ("经济局", ("eco", "economy")),
+    ("模式识别", ("pattern",)),
+    ("连胜连败", ("streak",)),
+    ("选手表现", ("kast", "kd_ratio", "adr", "impact", "player")),
+    ("胜负与比分", ("win", "won", "score")),
+    ("地图", ("map",)),
+    ("技能/道具", ("ability",)),
+    ("回合", ("round",)),
+    ("赛事/系列赛", ("series", "tournament")),
+]
+# 章节 → 学科的兜底：工具内聚合的维度没有列可认（pistol_win_rate /
+# eco_win_rate），但伴学每个知识点都有 subject，不能留空。
+CHAPTER_SUBJECT = {
+    "选手表现": "player", "地图": "map", "首血对枪": "team",
+    "经济局": "team", "手枪局": "team", "连胜连败": "team",
+    "胜负与比分": "team", "下包/爆弹": "team", "模式识别": "round",
+    "回合": "round", "赛事/系列赛": "series", "技能/道具": "player",
+}
+
+
+def _subject_key_of(col: str) -> str:
+    """列名 → 实体域（赛事/团队/选手/…）。照 `question_gen._subject_key_of`。
+
+    这里复制一份而不是 import：question_gen 会拉起 vlml_env（连库），
+    knowledge_graph 必须保持"只 import 标准库"的轻量性质。
+    """
+    c = str(col or "").lower()
+    if "player" in c:
+        return "player"
+    if c.startswith("map") or c.endswith("_map"):
+        return "map"
+    if "team" in c:
+        return "team"
+    if "series" in c:
+        return "series"
+    if "tournament" in c:
+        return "tournament"
+    if "round" in c:
+        return "round"
+    if "game" in c:
+        return "game"
+    return ""
+
+
+def _subjects_of(d: dict[str, Any]) -> list[str]:
+    """这个知识点属于哪些**学科**（实体域）—— 全部从真实列派生，不手写。"""
+    keys: list[str] = []
+    for c in list(d.get("columns") or []):
+        k = _subject_key_of(c)
+        if k and k not in keys:
+            keys.append(k)
+    # 工具路径没有列：从 value_path 里认（key_metrics.economy.pistol → 无实体域）
+    for c in str(d.get("value_path") or "").split("."):
+        k = _subject_key_of(c)
+        if k and k not in keys:
+            keys.append(k)
+    return keys
+
+
+def _stage_of(d: dict[str, Any]) -> str:
+    """要拿下这个知识点，最低得动用哪一级**工具集**（梯度）。
+
+    tool（只能靠报告工具内聚合）> insight（要套洞察 SQL／多表 JOIN／窗口）
+    > agg（查派生聚合表）> raw（直接查原始事件表）。
+    """
+    if d.get("tool") and not d.get("tables"):
+        return "tool"
+    tables = [str(t) for t in (d.get("tables") or [])]
+    recipe = str(d.get("recipe") or "")
+    # 洞察级：多表 JOIN + 窗口函数/子查询 —— 这正是洞察 SQL 的形态
+    if len(tables) >= 3 or _sql_difficulty(recipe) >= 4:
+        return "insight"
+    if any(t.startswith("agg_") for t in tables):
+        return "agg"
+    return "raw" if tables else "tool"
+
+
+def _chapter_of(dim: str, d: dict[str, Any]) -> str:
+    """实体域下的**主题域**（伴学 chapter 的同构物）。
+
+    从维度名 + 表名 + 口径里认，认不出就退回数据层名 —— 宁可粗，不编。
+    """
+    hay = " ".join([str(dim or "").lower(),
+                    " ".join(str(t) for t in (d.get("tables") or [])),
+                    str(d.get("semantics") or "").lower(),
+                    str(d.get("value_path") or "").lower()])
+    for label, kws in DOMAIN_HINTS:
+        if any(k in hay for k in kws):
+            return label
+    primary = (d.get("tables") or [""])[0]
+    return (LAYER_LABEL.get(str((d.get("layer") or "")), "")
+            or (f"表 {primary}" if primary else "工具内聚合"))
+
 
 def _table_depth(g: KnowledgeGraph, name: str, seen: set[str] | None = None) -> int:
     """这张表在数据流里被推导了几层（伴学 `depth` 的同构物）。"""
@@ -2167,11 +2293,26 @@ def _add_dimension_declarations(g: KnowledgeGraph, specs: dict[str, Any]) -> Non
         d["question_types"] = (["sql_recipe"] if d.get("tables")
                                else ["tool_recipe"])
 
-        # --- chapter / depth：这张维度站在数据流的哪一层 ---
+        # --- 伴学四层：阶段（工具集梯度）/ 学科（实体域）/ 章节（主题域）---
+        # 原来这里只有 chapter + depth，而 chapter 存的是数据层名（主干表/
+        # 派生表）—— 那是**梯度**，占的是伴学 stage 的位。现在归位。
+        d["stage"] = _stage_of(d)
+        d["stage_label"] = TOOLSET_STAGE_LABEL.get(d["stage"], d["stage"])
+        subs = _subjects_of(d)
+        d["subjects"] = subs
+        # 伴学 `topic["subject"]` 是单值（一个知识点归一个学科）；MVE 的维度
+        # 常常跨实体（map_fb_conv 既是地图又是队伍），主学科取**最具体**的
+        # 那个：选手 > 地图 > 团队 > 赛事。
+        d["subject"] = (next((k for k in ("player", "map", "team", "series",
+                                          "round", "game", "tournament")
+                              if k in subs), (subs[0] if subs else "")))
+        d["chapter"] = _chapter_of(dim, d)
+        if not d["subject"]:
+            # 工具内聚合的维度没有列可认（pistol_win_rate / eco_win_rate），
+            # 从章节反推学科 —— 宁可粗，也不留空（伴学每个知识点都有 subject）。
+            d["subject"] = CHAPTER_SUBJECT.get(d["chapter"], "")
+        d["subject_label"] = SUBJECT_LABEL.get(d["subject"], d["subject"])
         primary = tables[0] if tables else ""
-        layer = str((tbl_specs.get(primary) or {}).get("layer") or "")
-        d["chapter"] = (LAYER_LABEL.get(layer, layer) if tables
-                        else "工具内聚合（不出 SQL）")
         d["depth"] = (1 + max((_table_depth(g, t) for t in tables), default=0)
                       if tables else 0)
 
