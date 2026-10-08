@@ -91,6 +91,38 @@ def _int(v: str) -> int | None:
     return int(f) if f is not None else None
 
 
+def _parsed_dir(raw_dir: Path) -> Path:
+    """解析结果缓存目录。
+
+    为什么要缓存：选手统计（`ext_player_game_stats`）来自**解析结果**，
+    而 jsonl 里只有事件。第一次跑 `ingest` 抓完就存一份，之后 `--only-pipeline`
+    重入库时不用再抓一遍站点（实测踩过：只跑 pipeline 时选手表是空的）。
+    """
+    return raw_dir / "_parsed"
+
+
+def _save_parsed(m: dict, raw_dir: Path) -> None:
+    d = _parsed_dir(raw_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    sid = str(m.get("series_id") or "")
+    if sid:
+        (d / f"{sid}.json").write_text(
+            json.dumps(m, ensure_ascii=False), encoding="utf-8")
+
+
+def _load_parsed(raw_dir: Path) -> list[dict]:
+    d = _parsed_dir(raw_dir)
+    if not d.exists():
+        return []
+    out = []
+    for f in sorted(d.glob("*.json")):
+        try:
+            out.append(json.loads(f.read_text(encoding="utf-8")))
+        except Exception:
+            continue
+    return out
+
+
 def write_ext_stats(matches: list[dict], db_path: Path) -> int:
     """vlr 的聚合级选手统计 → `ext_player_game_stats`。返回写入行数。"""
     import duckdb
@@ -192,7 +224,13 @@ def main() -> int:
             rounds = sum(len(g.get("rounds") or []) for g in m["games"])
             print(f"  [{i}/{len(paths)}] ✅ {m['teams'][0]} vs {m['teams'][1]} "
                   f"· {len(m['games'])} 图 / {rounds} 回合 → {out.name}")
+            _save_parsed(m, raw_dir)
             matches.append(m)
+    elif args.only_pipeline:
+        # 没抓就入库：解析结果从缓存读，选手统计才不会丢
+        matches = _load_parsed(raw_dir)
+        if matches:
+            print(f"（从缓存读到 {len(matches)} 场的解析结果，选手统计照样写）")
 
     if args.no_pipeline:
         return 0
