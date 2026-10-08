@@ -1146,7 +1146,10 @@ async def _run_spec(spec: dict[str, Any]) -> dict[str, Any]:
                 bc = others[-1]
         if bc is not None and int(bc) < len(row):
             base = row[int(bc)]
-        return {"value": value, "base": base, "base_column": bc}
+        # **行数必须回给调用方**：裁判只能判一个标量（value_column 取 row[0]），
+        # 返回多行就意味着真值只取到"碰巧排第一的那一行" —— 见下面闸 3c。
+        return {"value": value, "base": base, "base_column": bc,
+                "n_rows": len(rows)}
 
     tool = str(spec.get("tool") or "").strip()
     if tool:
@@ -1567,6 +1570,33 @@ async def validate(candidate: dict[str, Any], *,
                 row["why"] = f"取出的值 {got.get('value')!r} 不是数字（题干按数值评分）"
                 checks.append(row)
                 reasons.append(f"「{point}」取出的值不是数字（{got.get('value')!r}）")
+                continue
+
+        # 闸 3c（通用·决定性的一条）：**裁判只能判一个标量**。
+        # `_run_spec` 取真值就是 `rows[0]`（question_gen.py:1133），SQL 一旦返回
+        # 多行，真值就是"碰巧排第一的那一行" —— 行序一变真值就变。
+        # 实测 `plant_success_rate_lotus`：`GROUP BY round_id` 返回 10 行
+        # [(1,1),(1,0),...]，裁判取 row0 → 真值 100%，而题干问的每回合成功率
+        # 全场聚合是 7/10=70% → **题在数学上无解**，练 15 轮全 0%，
+        # 伪装成"voyager 学不到东西"。坏题比没有题更糟。
+        # 唯一豁免：显式 ORDER BY + LIMIT 1（真值由排序决定，不是行序碰运气）。
+        if STRICT_MODE and spec.get("sql"):
+            n_rows = int(got.get("n_rows") or 1)
+            sql_low = str(spec.get("sql")).lower()
+            deterministic_single = (
+                "limit 1" in sql_low and " order by " in sql_low)
+            if n_rows > 1 and not deterministic_single:
+                row["ok"] = False
+                row["fix"] = (
+                    f"这条 SQL 返回了 {n_rows} 行，但裁判只取第 1 行当真值 —— "
+                    "真值随行序漂移，题就废了。必须让它只返回一行："
+                    "把聚合收拢（外层再套一层 SUM/AVG/COUNT），"
+                    "或去掉 GROUP BY；"
+                    "确要取'排第一的那行'就写 ORDER BY … LIMIT 1。")
+                row["why"] = f"SQL 返回 {n_rows} 行，真值只取第 1 行（行序碰运气）"
+                checks.append(row)
+                reasons.append(f"「{point}」SQL 返回多行（{n_rows} 行），"
+                               "裁判真值不确定 —— 题面与配方口径不一致")
                 continue
 
         row["ok"] = True
