@@ -273,6 +273,25 @@ async def _task_from_text(question: str,
         TASKS[new_id] = question_gen.to_task(rec)
     except Exception as exc:                                 # pragma: no cover
         return "", ""
+    # 题号回填进那条**边**：维度不建节点，做题时的图谱提示就靠边上的载荷
+    # （`knowledge_graph._render_from_links`）。不回填，新题做题时支架是空的
+    # —— 实测 `render_for_prompt` 返回长度 0。
+    try:
+        import knowledge_graph
+        for lk in knowledge_graph.load_imported_links():
+            if (str(lk.get("question") or "")[:300] == question[:300]
+                    and not str(lk.get("topic_id") or "").strip()):
+                knowledge_graph.link_import(
+                    question=str(lk.get("question") or ""),
+                    dimension=str(lk.get("dimension") or ""),
+                    sql=str(lk.get("sql") or ""),
+                    tool=str(lk.get("tool") or ""),
+                    topic_id=new_id,
+                    subject=dict(lk.get("subject") or {}),
+                    value=lk.get("value"),
+                )
+    except Exception:                                        # pragma: no cover
+        pass
     return new_id, "（导入文本归不上已有题，已生成新题）"
 
 

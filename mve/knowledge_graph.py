@@ -546,7 +546,10 @@ class KnowledgeGraph:
         b = budget or GraphBudget()
         sub = self.subgraph_for_topic(topic_id, b)
         if not sub.get("found"):
-            return ""
+            # 维度层里没有这道题的焦点（运行期题的维度**不建节点**，只落边）
+            # → 别返回空串，那等于把支架整个撤掉。支架信息就在边上。
+            # 实测：不兜底时 `plant_success_rate_lotus` 的图谱提示长度为 0。
+            return _render_from_links(topic_id, self)
 
         by_id = {n["id"]: n for n in sub["nodes"]}
         lines: list[str] = []
@@ -1337,6 +1340,7 @@ def build(*, observe: bool = False, with_schema: bool = True) -> KnowledgeGraph:
                         "question": str(getattr(task, "question", ""))[:300],
                         "point": str(getattr(p, "point", "") or ""),
                         "nearest": _nearest_dim(dim, g),
+                        "sql": sql0[:4000],
                         "tables": (_tables_in_sql(sql0, known_tables)
                                    if sql0 else []),
                         "at": datetime.now().isoformat(timespec="seconds"),
@@ -1707,6 +1711,57 @@ def _nearest_dim(dim: str, g: KnowledgeGraph) -> str:
         if s > score:
             best, score = d, s
     return best if score >= 0.34 else ""
+
+
+def _render_from_links(topic_id: str, g: "KnowledgeGraph") -> str:
+    """维度层没有这道题的焦点时，用**边上的载荷**渲染提示。
+
+    运行期题的维度不建节点（照伴学：运行期知识点不进权威层），所以
+    `subgraph_for_topic` 会 `found=False`。但支架信息并没有丢 —— 它在
+    `imported_links.json` / `pending_dimensions.json` 里：那次真实取数的
+    SQL 能解析出表、列、口径、结构骨架。不给这段，模型做题时就是裸奔。
+
+    实测：不兜底时新题的图谱提示长度为 0（等于支架被撤），出了题却练不了。
+    """
+    recs: list[dict[str, Any]] = []
+    try:
+        recs += [r for r in load_imported_links()
+                 if str(r.get("topic_id") or "").strip() == str(topic_id)]
+    except Exception:
+        pass
+    try:
+        recs += [r for r in load_pending_dimensions()
+                 if str(r.get("topic_id") or "").strip() == str(topic_id)]
+    except Exception:
+        pass
+    if not recs:
+        return ""
+
+    b = GraphBudget()
+    lines: list[str] = []
+    seen: set[str] = set()
+    for r in recs:
+        dim = str(r.get("dimension") or "").strip()
+        if not dim or dim in seen:
+            continue
+        seen.add(dim)
+        sql = str(r.get("sql") or "")
+        sh = sql_shape(sql, list(r.get("tables") or []))
+        lines.append(f"· 维度 {dim}（运行期题带来的新维度，**未进维度层**，"
+                     "口径来自它入库时真实跑通的取数）")
+        if r.get("point"):
+            lines.append(f"   要拿什么：{r['point']}")
+        if sh["tables"]:
+            lines.append("   来自表（要用 query_sql 自己查，"
+                         "**表名不是工具名**）：" + "、".join(sh["tables"]))
+        if sh["columns"]:
+            lines.append("   用到的列：" + ", ".join(sh["columns"][:b.max_cols]))
+        if sh["semantics"]:
+            lines.append(f"   怎么算：{sh['semantics']}")
+        if sh["recipe"]:
+            lines.append(f"   结构骨架：{sh['recipe']}")
+            lines.append(f"   自检：{SELF_CHECK_NOTE}")
+    return "\n".join(lines) if len(lines) > 1 else ""
 
 
 def _save_pending_dimensions(pending: dict[str, dict[str, Any]]) -> int:
