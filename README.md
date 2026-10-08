@@ -654,6 +654,25 @@ VLML 的 `db_loader` **自己生成** `game_id`（`{series_id}_game_{n}`），**
 
 `base_events` 里**依然没有一行 kill** —— 这是两个公开源共同的上限，不是 bug。
 
+### ⚠️ 现在的边界：数据在库里，图谱还没消费它
+
+实测确认：VLML 的 `query_sql`（`db_query_tools.execute_custom_sql`）**能直接查**
+这四张新表（经 `vlml_env` 引导后连的是 `db_config` 里那个库）：
+
+```
+SELECT player_name, COUNT(*) FILTER (WHERE first_kill) AS fk
+FROM ext_player_round_stats GROUP BY 1 ORDER BY fk DESC LIMIT 5
+→ lukxo 18 / BuZz 13 / Meteor 13 / N4RRATE 13 / Dambi 10
+```
+
+但**图谱里没有 `ext_*` 表节点，边也是 0**（表 27 全是 VLML 原生表）。原因：
+表节点是**从种子题的 rubric SQL 派生**的（`knowledge_graph.py:1426`），
+VLML 那 46 个洞察 SQL 一样不认我们的表 —— 所以新数据**不会自动变成知识点**。
+
+要让首血/经济这两条轴进图谱，得**加一个用 `ext_player_round_stats` 的种子题**
+（维度 15 → 16）。这属于「新增知识点」而不是「换数据源」，照上一节那条原则
+（换值不重建知识点）应当单独定，别顺手塞进去。
+
 ---
 
 ## 六、面板上可观测的状态清单
