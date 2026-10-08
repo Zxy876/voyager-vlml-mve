@@ -542,3 +542,68 @@ def evidence_from_row(row: dict, *, default_difficulty: float = 3.0) -> MasteryE
         submitted_at=ts,
         tool_calls=row.get("tool_calls"),
     )
+
+
+# ---------------------------------------------------------------------------
+# 维度级掌握度 —— 伴学 readiness 的同构物
+# ---------------------------------------------------------------------------
+# 伴学的 `readiness_in_scope`（knowledge_tracker.py:435-503）是
+# **「图谱 + 掌握度」的联合查询**：
+#     mastery vs required_mastery → ready / blockers
+# 那里掌握度就挂在**图谱节点**（topic）上，粒度天然对齐 —— 所以伴学的
+# 图谱能回答"这个知识点现在能不能出题、该出多难"。
+#
+# MVE 粒度错位：掌握度按 **topic** 算（`calculate_mastery`），
+# 而图谱节点是 **dim:\*** —— 于是图谱做不了伴学那样的 readiness 查询，
+# 出题器只能读节点上**静态的种子难度**，读不到"Voyager 现在会到哪了"。
+# 这是学习曲线 0→100 阶跃的根因之一：梯度少了掌握度这一维。
+#
+# 这里把 topic 级掌握度**投影到维度**：
+#     维度 d 的掌握度 = 出现过 d 的所有**考核**题的分数均值
+# ⚠️ 只认 exam_log。run_log 是带图谱跑的练习，覆盖率恒 100%（贴顶假平线），
+#    拿它算掌握度等于把支架当能力（项目核心设计，见 README 双日志一节）。
+# ---------------------------------------------------------------------------
+_DIM_MASTERY_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def dimension_mastery(*, reload: bool = False) -> dict[str, dict[str, Any]]:
+    """{dimension: {mastery, n, last, topics}} —— 以考核为准，不用练习。"""
+    if _DIM_MASTERY_CACHE and not reload:
+        return _DIM_MASTERY_CACHE
+    import json as _json
+    from pathlib import Path as _P
+    dims_of: dict[str, set[str]] = {}
+    try:
+        from tasks import TASKS
+        for tid, t in TASKS.items():
+            for p in (getattr(t, "rubric", None) or []):
+                d = str(getattr(p, "dimension", "") or "").strip()
+                if d:
+                    dims_of.setdefault(str(tid), set()).add(d)
+    except Exception:
+        dims_of = {}
+    rows: list[dict[str, Any]] = []
+    p = _P(__file__).resolve().parent / "exam_log.jsonl"
+    if p.exists():
+        rows = [_json.loads(l) for l in p.read_text(encoding="utf-8").splitlines()
+                if l.strip()]
+    out: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        tid = str(r.get("topic_id") or "")
+        try:
+            sc = float(r.get("score") or 0) / 100.0
+        except (TypeError, ValueError):
+            continue
+        for d in dims_of.get(tid, ()):
+            rec = out.setdefault(d, {"n": 0, "sum": 0.0, "last": sc,
+                                     "topics": set()})
+            rec["n"] += 1
+            rec["sum"] += sc
+            rec["last"] = sc
+            rec["topics"].add(tid)
+    for d, rec in out.items():
+        rec["mastery"] = round(rec["sum"] / max(1, int(rec["n"])), 4)
+        rec["topics"] = sorted(rec["topics"])
+    _DIM_MASTERY_CACHE.clear()
+    _DIM_MASTERY_CACHE.update(out)
+    return out

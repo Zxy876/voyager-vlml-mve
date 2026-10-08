@@ -539,17 +539,23 @@ class KnowledgeGraph:
     def render_for_prompt(self, topic_id: str,
                           budget: "GraphBudget | None" = None,
                           *, with_recipe: bool = True,
+                          with_formula: bool = True,
                           with_section: bool = True,
                           with_stage: bool = True,
                           with_insight: bool = True) -> str:
-        """把子图渲染成给模型的文本 —— 这就是 MVE 的 control_primitives。"""
+        """把子图渲染成给模型的文本 —— 这就是 MVE 的 control_primitives。
+
+        `with_formula` = 口径层（怎么算 / 取第几列 / 骨架）的总开关。
+        伴学里这块是 **optional**：可以整段不给（见下面那段注释的取证）。
+        只给结构层 = 伴学的"知道有哪张表、有哪些列"，**不告诉它答案怎么写**。
+        """
         b = budget or GraphBudget()
         sub = self.subgraph_for_topic(topic_id, b)
         if not sub.get("found"):
             # 维度层里没有这道题的焦点（运行期题的维度**不建节点**，只落边）
             # → 别返回空串，那等于把支架整个撤掉。支架信息就在边上。
             # 实测：不兜底时 `plant_success_rate_lotus` 的图谱提示长度为 0。
-            return _render_from_links(topic_id, self)
+            return _render_from_links(topic_id, self, with_formula=with_formula)
 
         by_id = {n["id"]: n for n in sub["nodes"]}
         lines: list[str] = []
@@ -569,14 +575,30 @@ class KnowledgeGraph:
                 [d["point"]] if d.get("point") else [])
             if pts:
                 lines.append(f"   要拿什么：{'；'.join(str(p) for p in pts[:3])}")
-            if d.get("semantics"):
+            # ---- 口径层：**答案模板**，必须能整段摘掉 ----
+            #
+            # 伴学的同构位：`knowledge_graph_guidance.py:1088-1104` 的
+            # `model_context` 里确实有 `procedure` 桶，但它给的是"步骤描述"，
+            # 而且整块图谱在出题 prompt 里属于 **optional 段** ——
+            # `llm_prompts.py:285-303` 在 token 超预算时**整段丢弃**，
+            # 判分契约（`prompt_templates.py:170-189` 十六条 requirements）
+            # 更是**一条都不提图谱**。
+            #
+            # MVE 此前漏了这一层：「怎么算 / 取第几列 / 完整 SQL 骨架」是
+            # 常驻上下文，跟掌握度、覆盖率无关 —— 练到覆盖率 100%、掌握度
+            # 0.9 的题，Voyager 照样拿到答案模板，练习分必然贴顶
+            # （run_log 8/8 全 100，exam_log 26/26 全 100，两条曲线都是假平线）。
+            #
+            # 所以口径层不是"支架"，是**判据**：它只能在学生还不会的时候给
+            # （hint=full），会了就必须撤（hint=partial / none）。
+            if with_formula and d.get("semantics"):
                 lines.append(f"   怎么算：{d['semantics']}")
             vcs = d.get("value_columns") or []
-            if vcs:
+            if with_formula and vcs:
                 lines.append("   取结果的第 "
                              + "、".join(str(v) for v in vcs)
                              + " 列（从 0 开始数）")
-            if with_recipe and d.get("recipe"):
+            if with_formula and with_recipe and d.get("recipe"):
                 lines.append(f"   结构骨架：{d['recipe']}")
                 lines.append("   ⚠ 骨架里 WHERE 的**位置**就是口径：内层先编号、"
                              "外层再筛。不要把所有过滤条件合并到最内层 —— "
@@ -1720,7 +1742,8 @@ def _nearest_dim(dim: str, g: KnowledgeGraph) -> str:
     return best if score >= 0.34 else ""
 
 
-def _render_from_links(topic_id: str, g: "KnowledgeGraph") -> str:
+def _render_from_links(topic_id: str, g: "KnowledgeGraph",
+                       with_formula: bool = True) -> str:
     """维度层没有这道题的焦点时，用**边上的载荷**渲染提示。
 
     运行期题的维度不建节点（照伴学：运行期知识点不进权威层），所以
@@ -1763,9 +1786,12 @@ def _render_from_links(topic_id: str, g: "KnowledgeGraph") -> str:
                          "**表名不是工具名**）：" + "、".join(sh["tables"]))
         if sh["columns"]:
             lines.append("   用到的列：" + ", ".join(sh["columns"][:b.max_cols]))
-        if sh["semantics"]:
+        # 与 `render_for_prompt` 同口径：口径层受 `with_formula` 管，
+        # 运行期题（只落边不建节点）走这条兜底路径时也不能例外 ——
+        # 否则撤了支架的题一落到这条路径上，答案模板又回来了。
+        if with_formula and sh["semantics"]:
             lines.append(f"   怎么算：{sh['semantics']}")
-        if sh["recipe"]:
+        if with_formula and sh["recipe"]:
             lines.append(f"   结构骨架：{sh['recipe']}")
             lines.append(f"   自检：{SELF_CHECK_NOTE}")
     return "\n".join(lines) if len(lines) > 1 else ""

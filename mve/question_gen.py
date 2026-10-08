@@ -630,6 +630,25 @@ def _subject_key_of(col: str) -> str:
 _ROWS_CACHE: dict[str, int] = {}
 
 
+_DIM_MASTERY_CACHE: dict[str, dict[str, Any]] = {}
+
+
+def _dim_mastery() -> dict[str, dict[str, Any]]:
+    """维度级掌握度（带缓存）。数据源 = **exam_log**（考核，撤了支架的真水平）。
+
+    ⚠️ 不能用 run_log：练习是带图谱跑的，覆盖率恒 100% 的贴顶假平线，
+    量的是支架不是能力（项目核心设计）。拿它当掌握度等于自欺。
+    """
+    if _DIM_MASTERY_CACHE:
+        return _DIM_MASTERY_CACHE
+    try:
+        import mastery_model as _mm
+        _DIM_MASTERY_CACHE.update(_mm.dimension_mastery() or {})
+    except Exception:                                    # pragma: no cover
+        pass
+    return _DIM_MASTERY_CACHE
+
+
 def _table_rows(table: str) -> int:
     """当前库里这张表有几行（带缓存，一个进程只查一次）。
 
@@ -822,6 +841,16 @@ def _graph_blueprint(difficulty: int = 2,
             for v in vals:
                 subj = {"series": SERIES, "team": C9}
                 subj[k] = v
+                # ---- subject 必须是**这个维度自己的粒度**，不能一律带 team ----
+                # 实测：map_rounds 只用 map_name + series_id，但 subject 里
+                # 躺着 team=Cloud9，模型照着写 `AND team_name='...'` ——
+                # rounds 表根本没有 team_name，0 行，题无解。
+                # 伴学的同构位是 `project_target_topic_evidence()`：只投影
+                # **这个知识点声明过的**字段，不多给。
+                grain = set(keys) | {"series"}
+                subj = {kk: vv for kk, vv in subj.items() if kk in grain}
+                if not subj.get("series"):
+                    subj["series"] = SERIES
                 # ---- 第三道可解性校验：值必须**这场比赛里真有** ----
                 _sid = str(subj.get("series") or SERIES)
                 if k == "series":
@@ -854,7 +883,25 @@ def _graph_blueprint(difficulty: int = 2,
                         own = 3
                     elif "group by" in low:
                         own = 2
-                score += abs(own - int(difficulty or 2)) * 3
+                # 难度匹配要吃**掌握度**，不能只吃静态种子难度。
+                # 伴学 `difficulty_policy.py:94-139`：
+                #     combined = (种子难度归一 + 掌握度) / 2 → _level() → 2/3/4
+                # 即"这个知识点现在该出多难"是**种子难度与掌握度的联合函数**，
+                # 不是节点上写死的常量。MVE 此前只读 `det["difficulty"]`
+                # （种子难度），读不到"Voyager 现在会到哪" → 梯度少一维，
+                # 于是曲线只能 0→100 阶跃（实测 42 条日志）。
+                own_m = float((_dim_mastery().get(d) or {}).get("mastery") or 0.0)
+                try:
+                    from difficulty import seed_unit as _su, _level as _lv
+                    fit = _lv((_su(own) + own_m) / 2.0)
+                except Exception:                        # pragma: no cover
+                    fit = own
+                score += abs(fit - int(difficulty or 2)) * 3
+                # 伴学 readiness：没掌握的先来（先修没过的不给进下一层）。
+                # 掌握度低的维度在**低档**优先出，高档则不优先 —— 否则
+                # 一上来就拿不会的维度出难题，又是阶跃。
+                if own_m < 0.5:
+                    score += (-4 if int(difficulty or 2) <= 2 else +4)
                 cands.append((score, d, {
                     "dimension": d,
                     "subject": subj,

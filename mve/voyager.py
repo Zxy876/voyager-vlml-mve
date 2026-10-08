@@ -39,6 +39,13 @@ from loop_core import from_key_metrics, from_sql_result, make_fact  # noqa: E402
 from llm_client import chat, chat_json  # noqa: E402
 import feedback as feedback_mod  # noqa: E402
 
+# 支架档位常量（difficulty.py 定义）。图谱块必须跟着它收放 ——
+# 伴学把图谱放在出题 prompt 的 **optional** 段、token 超预算整段丢弃
+# （`llm_prompts.py:285-303`），判分契约里更是只字不提图谱
+# （`prompt_templates.py:170-189`）。MVE 此前漏了这一层，图谱块只受 env
+# 全局开关控制，跟掌握度/覆盖率无关 → 会做的题照样拿答案模板。
+from difficulty import HINT_FULL, HINT_NONE, HINT_PARTIAL  # noqa: E402
+
 # ⚠️ 不再写死：换库（GRID → vlr.gg → rib.gg）后 2843069 / Cloud9 在新库里
 # **根本不存在** —— 实测 rib 库上种子题 17 个评分点 **0 个跑得出数**。
 # 锚点跟着库走，从库实查（见 anchor.py）。旧库挑出来的仍是这两个值。
@@ -477,6 +484,22 @@ GRAPH_ENABLED = os.environ.get("MVE_GRAPH", "1") != "0"
 # 看模型靠自己积累的技能库还能不能做对 —— 这才是学习曲线该测的东西。
 GRAPH_STATE: dict[str, bool] = {"on": GRAPH_ENABLED}
 
+# 当前支架档位的模块级镜像（由 LLMVoyager.__init__ 写入）。
+# 存在的理由同 `GRAPH_STATE`：图谱断言是模块级函数，看不到 self.hint_level，
+# 但它们必须跟着档位收放 —— 见 `graph_context` 里伴学的取证。
+HINT_STATE: dict[str, str] = {"level": ""}
+
+
+def _assist_on() -> bool:
+    """图谱**助力**（断言 / 自动修正）现在该不该给。
+
+    判据：图谱开着 + 断言开着 + **支架没撤到 none**。
+    伴学同构：图谱在出题 prompt 里是 optional 段、可整段丢弃；判分契约
+    完全不含图谱。所以"会做的题还在替它拦错"是伴学不会做的事。
+    """
+    return bool(GRAPH_STATE["on"] and ASSERT_ENABLED
+                and str(HINT_STATE.get("level") or "").strip().lower() != HINT_NONE)
+
 # 图谱里两层的单独开关 —— 存在的唯一理由是 A/B。
 # 洞察层（"取工具的哪一段"）和数据分层（表在哪一层、上游是谁）是本轮新加的，
 # 必须能单独关掉才能测出它们到底有没有被模型用上，否则只能靠"感觉有用"。
@@ -548,7 +571,7 @@ def _check_tool_params(tool: str, args: dict[str, Any]) -> str:
     四个评分点全空，覆盖率 0%。它"调对了工具"却什么都拿不到。
     提示（param_hint）写进 prompt 不够，照分层断言的先例做成硬校验。
     """
-    if not (GRAPH_STATE["on"] and ASSERT_ENABLED):
+    if not _assist_on():
         return ""
     g = _load_graph()
     if g is None:
@@ -604,7 +627,7 @@ def _check_group_order(sql: str, task: Any) -> tuple[list[str], str]:
     最稳的写法是**每个分组一条 SQL**（裁判自己的 answer_spec 就是这么写的：
     `WHERE map_name='Corrode'`），所以驳回时把那条形同口径的骨架一起给出去。
     """
-    if not (GRAPH_STATE["on"] and ASSERT_ENABLED):
+    if not _assist_on():
         return [], ""
     s = (sql or "").upper()
     if "GROUP BY" not in s or "ORDER BY" in s:
@@ -639,7 +662,7 @@ def _check_sql_layering(sql: str, task: Any) -> tuple[list[str], str]:
     一次只说一条时，模型改了 WHERE 就忘了 GROUP BY，下一轮又回到 WHERE，
     三次重试打转 → 整轮作废（覆盖率 0% 的波动就是这么来的）。
     """
-    if not (GRAPH_STATE["on"] and ASSERT_ENABLED):
+    if not _assist_on():
         return [], ""
     if not sql or "PARTITION BY" not in sql.upper():
         return [], ""
@@ -692,7 +715,7 @@ def auto_fix_layering(sql: str, task: Any) -> tuple[str, str]:
     只做一种变换：**外层已有该条件时，删掉内层多余的那一份**。
     不改语义（过滤条件一个不少，只是挪层），也就不存在"把 SQL 改坏"的风险。
     """
-    if not (GRAPH_STATE["on"] and ASSERT_ENABLED):
+    if not _assist_on():
         return sql, ""
     if not sql or "PARTITION BY" not in sql.upper():
         return sql, ""
@@ -735,7 +758,7 @@ def auto_fix_layering(sql: str, task: Any) -> tuple[str, str]:
 
 
 def graph_context(task: Any, *, with_recipe: bool | None = None,
-                  mode: str = "plan") -> str:
+                  mode: str = "plan", hint: str = "") -> str:
     """本题相关子图，渲染成给模型的文本；图谱不可用时返回空串（不阻断主流程）。
 
     两条路，按顺序试：
@@ -747,9 +770,36 @@ def graph_context(task: Any, *, with_recipe: bool | None = None,
        它的 82 个知识点种子先于题目存在，题目只负责匹配焦点。
        没有这条兜底时，MVE 的图谱退化成"出过那几道题的备忘"——
        新题的图谱块是空的。
+
+    `hint` = 支架档位（`difficulty.py` 的 full / partial / none）。
+    **图谱块必须受它管** —— 这是 MVE 此前漏掉的一层，也是伴学最关键的
+    一条约束（取证见下）：
+
+      · `llm_prompts.py:270-275`：图谱内容在出题 prompt 里属于 **optional**
+        段；`llm_prompts.py:285-303` 在 token 超预算时把它**整段丢弃**，
+        `required` 段里留下的只有 blockers / 题型 / 难度 ——
+        即**伴学宁可不给图谱，也不给超出需要的图谱**。
+      · `prompt_templates.py:170-189`：判分契约十六条 requirements
+        **没有一条提到图谱**；`tutor_llm_agent_answer_evaluate.py:16-38`
+        只穿 question / answer / expected_answer。
+      · `llm_prompts.py:455-487`：图谱真正当一等公民的地方是**讲解**
+        （拼成具名段落 "Knowledge graph guidance:"），不是做题。
+
+    漏了这一层的后果（实测）：图谱块此前只受 env 全局开关控制，与掌握度、
+    覆盖率无关 —— 于是练到覆盖率 100%、掌握度 0.9 的题，Voyager 照样拿到
+    「怎么算 / 取第几列 / 完整 SQL 骨架」，练习分必然贴顶。
+    分档：
+        full    → 全给（结构层 + 口径层）：还不会，先扶起来
+        partial → 只给结构层（表 / 列 / 上游 / 工具陷阱）：会一半，扶一半
+        none    → 不给：会了就别再看（伴学的 optional 整段丢弃）
     """
     if not GRAPH_STATE["on"]:
         return ""
+    _h = str(hint or "").strip().lower()
+    if _h == HINT_NONE:
+        return ""                      # 伴学：optional 整段丢弃
+    if with_recipe is None:
+        with_recipe = (_h != HINT_PARTIAL)
     g = _load_graph()
     if g is None:
         return ""
@@ -759,7 +809,10 @@ def graph_context(task: Any, *, with_recipe: bool | None = None,
     try:
         s = g.render_for_prompt(
             topic_id,
-            with_recipe=GRAPH_WITH_RECIPE if with_recipe is None else with_recipe,
+            with_recipe=bool(with_recipe) and GRAPH_WITH_RECIPE,
+            # 口径层（怎么算 / 取第几列 / 骨架）= **答案模板**：
+            # 只有 full 档给。partial / 空档只给结构层。
+            with_formula=(_h == HINT_FULL),
             with_section=GRAPH_SECTION,
             with_stage=GRAPH_STAGE,
             with_insight=GRAPH_INSIGHT,
@@ -832,6 +885,11 @@ class LLMVoyager:
         #   none    不聚焦、不给 ★、不给候选（全放开）
         # 空串 = 未指定 → 按 full 处理（保持旧行为，不回退）
         self.hint_level = str(hint_level or "")
+        # 模块级镜像：让**图谱断言**也能按档位收放（那些断言是模块级函数，
+        # 拿不到 self）。断言同样是支架 —— 它替 Voyager 拦下"工具没传参数"
+        # 这类错，等于开卷。伴学判分契约里没有图谱（`prompt_templates.py:
+        # 170-189` 十六条 requirements 一条不提），撤了支架就该一起撤。
+        HINT_STATE["level"] = self.hint_level
         self.failed_dims: list[str] = []   # 照 fork glm_curator._context()：失败维度喂给下一题
         # 点名的**评分点**（比维度更细）：同一维度可能挂多个评分点，
         # 只说维度名模型会以为自己已经交过。
@@ -1215,7 +1273,10 @@ class LLMVoyager:
         mem = self._memory_block(task)
         # 知识图谱子图 —— 原版 render_system_message 拼 control_primitives 的位置。
         # 放在工具目录之后：先知道"有哪些工具"，再知道"这个指标怎么用它们算"。
-        gctx = graph_context(task)
+        # 图谱块跟着**支架档位**走（伴学：图谱在 optional 段，可整段丢弃）。
+        # 此前这里不传 hint，于是无论练到什么程度都按 env 默认值给 ——
+        # 覆盖率 100% 的题照样拿「怎么算 + 取第几列 + 完整骨架」。
+        gctx = graph_context(task, hint=str(getattr(self, "hint_level", "") or ""))
         gctx_block = f"\n{gctx}\n" if gctx else ""
         if self.blind:
             # 盲测：只给自然语言评分点，不泄露 dimension / subject。
