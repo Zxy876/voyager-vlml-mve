@@ -1,0 +1,26 @@
+[plugin]
+id = "voyager_genius"
+name = "Voyager 网络天才（骨架）"
+description = "给原题不给评分点，Voyager 自己观察、取数、逐步逼近；每一步推到面板，做完请求人确认。"
+short_description = "Voyager: 观察-取数-请求人确认"
+keywords = ["voyager", "vlml", "esports", "learning", "数字生命"]
+version = "0.1.0"
+entry = "plugins.voyager_genius:VoyagerGeniusPlugin"
+
+[plugin.author]
+name = "MVE Team"
+
+[plugin.sdk]
+recommended = ">=0.1.0,<0.2.0"
+supported = ">=0.1.0,<0.3.0"
+
+[plugin_runtime]
+enabled = true
+auto_start = true
+
+[plugin.store]
+enabled = false
+
+[voyager]
+# VLML 取数桥（外部常驻服务，插件进程内禁止 fork）
+bridge_url = "http://127.0.0.1:39481"
