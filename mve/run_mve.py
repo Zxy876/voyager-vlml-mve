@@ -139,6 +139,11 @@ async def main() -> None:
     use_llm = "--llm" in argv
     blind = "--blind" in argv
 
+    # 网络天才式（--review）：给原题但不给评分点，Voyager 自己拆解、
+    # 向工具间接求证、逐步逼近，逼近过程全透明（questions/reasoning/conclusion
+    # 都给人看）。判据仍照 Voyager 尺子（done：跑通+拿到数+没翻车）。
+    review = "--review" in argv
+
     # 求助策略：判错后 Voyager 自己决定要不要去旁路看解释（默认 auto）。
     #   auto   —— 由模型判断（有没试过的工具就先自己试）
     #   always —— 一判错就给解释（对照用：能看出掌握度被打了多少折）
@@ -253,7 +258,10 @@ async def main() -> None:
     print(f"  MVE：Voyager 在 VLML 上做题   [{mode}]  裁判=VLML0(原版)")
     print("=" * 72)
     print(f"\n题目：{task.question}")
-    print(f"评分点：{[p.point for p in task.rubric]}")
+    if review:
+        print("评分点：隐藏（网络天才式 —— 给原题，不给答案点，Voyager 自己逼近）")
+    else:
+        print(f"评分点：{[p.point for p in task.rubric]}")
     print(f"validated_target = {task.validated_target}（True → 计入掌握度）")
 
     # ---- 裁判异步开跑：与 Voyager 取数重叠，不阻塞 ----
@@ -274,8 +282,21 @@ async def main() -> None:
             print("  ℹ️ 本轮带着求助到的解释重做 → 掌握度按「借助帮助」计（0.85 折，"
                   "且答对也不拉长半衰期）")
 
-        result = await voyager.run(task)
+        result = await voyager.run_review(task) if review else await voyager.run(task)
         facts = result["facts"]
+
+        if review:
+            # —— 逼近过程全透明（网络天才式）：每个间接问题 + 推理 + 整合，给人看 ——
+            print(f"  [逼近] 拆题主题：{result.get('review_topics')}")
+            for i, q in enumerate(result.get("questions_asked") or [], 1):
+                print(f"  [逼近 #{i}] 为什么问：{q['intent']}")
+                print(f"            用什么问：{q['tool']}({q.get('args')})")
+                print(f"            问出什么：{q.get('result')}")
+            for line in result.get("reasoning") or []:
+                print(f"  [推理] {line}")
+            print(f"  [整合] {result.get('conclusion', '').splitlines()[0] if result.get('conclusion') else '（无）'}")
+            for cl in (result.get('conclusion') or '').splitlines()[1:]:
+                print(f"         {cl}")
 
         # 裁判到这里才必须就绪（前面几轮取数的时间被它白用掉了）
         ref = await ref_task

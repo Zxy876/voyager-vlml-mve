@@ -168,6 +168,312 @@ class ScriptedVoyager:
             "skill_used": skill.name,
         }
 
+    # ------------------------------------------------------------------
+    # 网络天才式：不读评分点，从原题拆主题，向工具间接求证，逐步逼近
+    # ------------------------------------------------------------------
+    # 照用户拍板：给原题但**不给评分点**。Voyager 一开始甚至不理解原题，
+    # 通过自己的理解拆解、向 VLML0/MCP 问间接问题、推理、积累技巧，
+    # 越来越会。产出 questions_asked（逼近过程）+ reasoning（逐步推理）
+    # + conclusion（整合结论）—— 思考 infra 全透明，给人看。
+    REVIEW_TOPIC_RULES: list[tuple[re.Pattern, str]] = [
+        (re.compile(r"首血|转换|fb", re.I), "fb"),
+        (re.compile(r"手枪|pistol", re.I), "pistol"),
+        (re.compile(r"eco|经济", re.I), "eco"),
+        (re.compile(r"回合", re.I), "rounds"),
+        (re.compile(r"胜率", re.I), "win_rate"),
+        (re.compile(r"连败|丢分|最长|连续", re.I), "streak"),
+        (re.compile(r"kast|kd|击杀", re.I), "kast"),
+        (re.compile(r"地图|哪张图|每张图|图名", re.I), "by_map"),
+        (re.compile(r"置信|confidence|数据量", re.I), "pattern"),
+    ]
+    KNOWN_MAPS = ["Corrode", "Haven", "Lotus", "Sunset", "Summit",
+                  "Ascent", "Bind", "Split", "Abyss", "Pearl", "Icebox"]
+
+    def _review_topics(self, question: str) -> list[str]:
+        """从原题拆主题（不读评分点）—— 网络天才的第一步：先猜题目在问什么。"""
+        hits = [tag for rx, tag in self.REVIEW_TOPIC_RULES if rx.search(question)]
+        return hits or ["overview"]
+
+    def _map_from_question(self, question: str) -> str | None:
+        for m in self.KNOWN_MAPS:
+            if m.lower() in question.lower():
+                return m
+        return None
+
+    @staticmethod
+    def _row(rows: dict[str, Any]) -> dict[str, Any]:
+        """execute_custom_sql 的行是 tuple，与 columns 配对成 dict。"""
+        row0 = (rows.get("rows") or [])
+        if not row0:
+            return {}
+        return dict(zip(rows.get("columns") or [], row0[0]))
+
+    async def run_review(self, task: Any) -> dict[str, Any]:
+        """网络天才式一轮：不知道评分点，从原题拆主题 → 间接求证 → 整合。
+
+        与 run() 的区别：run() 对着 rubric 的 dimension 取数（背题路径），
+        run_review() 只拿 question，每一步"为什么问这个、问出什么、
+        据此推出什么"都记进 questions_asked / reasoning —— 逼近过程全透明。
+        """
+        topics = self._review_topics(task.question)
+        facts: list[dict[str, Any]] = []
+        questions: list[dict[str, Any]] = []   # 逼近过程：每个间接问题
+        reasoning: list[str] = []              # 逐步推理
+        self.trajectory = []
+
+        # ① 整体概览：先问"这支队整体打得怎样"（网络天才先建全局印象）
+        rep = await match_summary_report(series_id=SERIES, team_name=C9)
+        self.trajectory.append({"tool": "match_summary_report",
+                                "args": {"series_id": SERIES, "team_name": C9}})
+        km = (rep.get("key_metrics") or {}).get("team", {})
+        km_facts = from_key_metrics(
+            km, subject={"series": SERIES, "team": C9},
+            tool="match_summary_report", scope={"rounds": 59},
+        )
+        questions.append({
+            "intent": "先看整体：这支队伍在这个系列的关键指标",
+            "tool": "match_summary_report",
+            "args": {"series_id": SERIES, "team_name": C9},
+            "result": {f["dimension"]: {"v": f["value"], "base": f.get("base")}
+                       for f in km_facts},
+        })
+        facts += km_facts
+        reasoning.append(f"整体概览拿到 {len(km_facts)} 项指标，先建立全局印象。")
+
+        pat_done = False   # pistol/eco/pattern 共用一个 pattern_detection_report 查询
+
+        # ② 主题求证：每个主题一个间接问题（从原题拆出来的）
+        for t in topics:
+            if t == "overview":
+                continue
+
+            if t == "fb":
+                rows = await execute_custom_sql(
+                    f"SELECT COUNT(*) AS n, ROUND(AVG(fb_team_won)*100,1) AS conv_pct"
+                    f" FROM agg_first_blood_stats WHERE fb_team='{C9}'")
+                rec = self._row(rows)
+                questions.append({
+                    "intent": "首血转换——数一下首血次数、算一下首血转换率",
+                    "tool": "execute_custom_sql",
+                    "args": {"sql": "agg_first_blood_stats WHERE fb_team", "subject": "整体"},
+                    "result": rec,
+                })
+                if rec.get("n") is not None:
+                    facts.append(make_fact(
+                        subject={"series": SERIES, "team": C9},
+                        dimension="opening_duels.fb", value=rec["n"],
+                        unit="count", base=int(rec["n"]),
+                        source={"tool": "execute_custom_sql",
+                                "section": "agg_first_blood_stats"},
+                    ))
+                if rec.get("conv_pct") is not None:
+                    facts.append(make_fact(
+                        subject={"series": SERIES, "team": C9},
+                        dimension="conversion.fb_conv", value=rec["conv_pct"],
+                        unit="percent", base=int(rec.get("n") or 0),
+                        source={"tool": "execute_custom_sql",
+                                "section": "agg_first_blood_stats"},
+                    ))
+                reasoning.append(f"首血确认：次数 {rec.get('n')}，转换率 {rec.get('conv_pct')}%。")
+
+            if t == "by_map" or t == "win_rate":
+                if t == "by_map" and "win_rate" in topics:
+                    # win_rate 已经问了分图胜率，by_map 不重复问同一个问题
+                    continue
+                rows = await execute_custom_sql(
+                    "SELECT map_name AS map,"
+                    " ROUND(AVG(CASE WHEN winning_team_name='" + C9 +
+                    "' THEN 1.0 ELSE 0.0 END)*100,1) AS win_rate, COUNT(*) AS n"
+                    " FROM rounds WHERE series_id='" + SERIES + "' GROUP BY 1")
+                rows_list = rows.get("rows") or []
+                questions.append({
+                    "intent": "按地图拆回合胜率——哪张图强、哪张图弱",
+                    "tool": "execute_custom_sql",
+                    "args": {"sql": "rounds GROUP BY map_name", "subject": "分图"},
+                    "result": rows_list,
+                })
+                for m, w, n in rows_list:
+                    if w is None:
+                        continue
+                    facts.append(make_fact(
+                        subject={"series": SERIES, "map": m, "team": C9},
+                        dimension="map_win_rate", value=w, unit="percent",
+                        base=int(n),
+                        source={"tool": "execute_custom_sql",
+                                "section": "rounds"},
+                    ))
+                reasoning.append(f"分图胜率：{ {m: w for m, w, _ in rows_list} }。")
+
+            if t == "rounds":
+                rows = await execute_custom_sql(
+                    "SELECT COUNT(*) AS n,"
+                    " SUM(CASE WHEN winning_team_name='" + C9 +
+                    "' THEN 1 ELSE 0 END) AS won"
+                    " FROM rounds WHERE series_id='" + SERIES + "'")
+                rec = self._row(rows)
+                questions.append({
+                    "intent": "这个系列总共打了多少回合、赢了多少",
+                    "tool": "execute_custom_sql",
+                    "args": {"sql": "rounds COUNT/SUM", "subject": "系列"},
+                    "result": rec,
+                })
+                if rec.get("n") is not None:
+                    facts.append(make_fact(
+                        subject={"series": SERIES},
+                        dimension="total_rounds", value=rec["n"],
+                        unit="count", base=int(rec["n"]),
+                        source={"tool": "execute_custom_sql", "section": "rounds"},
+                    ))
+                if rec.get("won") is not None:
+                    facts.append(make_fact(
+                        subject={"series": SERIES, "team": C9},
+                        dimension="rounds_won", value=rec["won"],
+                        unit="count", base=int(rec["n"] or 0),
+                        source={"tool": "execute_custom_sql", "section": "rounds"},
+                    ))
+                reasoning.append(f"系列回合：总数 {rec.get('n')}，赢下 {rec.get('won')}。")
+
+            if t == "pistol" or t == "eco" or t == "pattern":
+                if pat_done:
+                    continue
+                pat_done = True
+                try:
+                    pat = await pattern_detection_report(team_name=C9)
+                    pkm = ((pat.get("key_metrics") or {}).get("economy") or {})
+                    pscope = pat.get("scope") or {}
+                    questions.append({
+                        "intent": "手枪局 / eco 局表现，以及结论置信度",
+                        "tool": "pattern_detection_report",
+                        "args": {"team_name": C9},
+                        "result": {"pistol": pkm.get("pistol"),
+                                   "eco": pkm.get("eco"),
+                                   "scope": pscope},
+                    })
+                    for dim, key in (("pistol_win_rate", "pistol"),
+                                     ("eco_win_rate", "eco")):
+                        node = pkm.get(key) or {}
+                        if node.get("num") is not None:
+                            facts.append(make_fact(
+                                subject={"series": SERIES, "team": C9},
+                                dimension=dim, value=node["num"],
+                                unit="percent", base=int(node.get("denom") or 0),
+                                source={"tool": "pattern_detection_report",
+                                        "section": f"key_metrics.economy.{key}"},
+                            ))
+                    if pscope.get("rounds") is not None:
+                        facts.append(make_fact(
+                            subject={"series": SERIES, "team": C9},
+                            dimension="pattern_rounds", value=pscope["rounds"],
+                            unit="count", base=int(pscope["rounds"] or 0),
+                            source={"tool": "pattern_detection_report",
+                                    "section": "scope"},
+                        ))
+                    if pscope.get("confidence"):
+                        facts.append(make_fact(
+                            subject={"series": SERIES, "team": C9},
+                            dimension="pattern_confidence",
+                            value=pscope["confidence"],
+                            source={"tool": "pattern_detection_report",
+                                    "section": "scope"},
+                        ))
+                    reasoning.append(
+                        f"经济模式：pistol={pkm.get('pistol')} eco={pkm.get('eco')} "
+                        f"样本 {pscope.get('rounds')} 置信 {pscope.get('confidence')}。")
+                except Exception as e:                            # pragma: no cover
+                    reasoning.append(f"pattern_detection_report 不可用：{type(e).__name__}")
+
+            if t == "kast":
+                try:
+                    ana = await match_analysis_report(series_id=SERIES, team_name=C9)
+                    cons = ((ana.get("key_metrics") or {}).get("team") or {}).get("consistency") or {}
+                    questions.append({
+                        "intent": "KAST 和 K/D 各是多少",
+                        "tool": "match_analysis_report",
+                        "args": {"series_id": SERIES, "team_name": C9},
+                        "result": cons,
+                    })
+                    kast = cons.get("kast") or {}
+                    if kast.get("num") is not None:
+                        facts.append(make_fact(
+                            subject={"series": SERIES, "team": C9},
+                            dimension="kast_pct", value=kast["num"],
+                            unit="percent", base=int(kast.get("denom") or 0),
+                            source={"tool": "match_analysis_report",
+                                    "section": "key_metrics.team.consistency.kast"},
+                        ))
+                    if cons.get("kd") is not None:
+                        facts.append(make_fact(
+                            subject={"series": SERIES, "team": C9},
+                            dimension="kd_ratio", value=cons["kd"],
+                            unit="raw", base=None,
+                            source={"tool": "match_analysis_report",
+                                    "section": "key_metrics.team.consistency.kd"},
+                        ))
+                    reasoning.append(f"KAST={kast.get('num')} K/D={cons.get('kd')}。")
+                except Exception as e:                            # pragma: no cover
+                    reasoning.append(f"match_analysis_report 不可用：{type(e).__name__}")
+
+            if t == "streak":
+                tmap = self._map_from_question(task.question) or "Sunset"
+                sql = ("SELECT cnt AS max_streak, start_round FROM ("
+                       "  SELECT COUNT(*) AS cnt, MIN(round_number) AS start_round FROM ("
+                       "    SELECT round_number, losing_team_name,"
+                       "      ROW_NUMBER() OVER (ORDER BY round_number) AS rn,"
+                       "      ROW_NUMBER() OVER (PARTITION BY losing_team_name"
+                       "        ORDER BY round_number) AS grp"
+                       f"    FROM rounds WHERE series_id='{SERIES}' AND map_name='{tmap}'"
+                       "  ) t WHERE losing_team_name='" + C9 + "'"
+                       "  GROUP BY rn - grp ORDER BY cnt DESC LIMIT 1)")
+                rows = await execute_custom_sql(sql)
+                rec = self._row(rows)
+                questions.append({
+                    "intent": f"最长连续丢分——在 {tmap} 上数连续丢分段",
+                    "tool": "execute_custom_sql",
+                    "args": {"sql": "rounds gaps-and-islands", "subject": {"map": tmap}},
+                    "result": rec,
+                })
+                if rec.get("max_streak") is not None:
+                    facts.append(make_fact(
+                        subject={"series": SERIES, "map": tmap, "team": C9},
+                        dimension="max_losing_streak", value=rec["max_streak"],
+                        unit="count", base=int(rec["max_streak"] or 0),
+                        source={"tool": "execute_custom_sql", "section": "rounds"},
+                    ))
+                    facts.append(make_fact(
+                        subject={"series": SERIES, "map": tmap, "team": C9},
+                        dimension="streak_start_round", value=rec["start_round"],
+                        unit="count", base=None,
+                        source={"tool": "execute_custom_sql", "section": "rounds"},
+                    ))
+                reasoning.append(
+                    f"最长连败 {rec.get('max_streak')} 段（起于第 {rec.get('start_round')} 回合，"
+                    f"发生在 {tmap}）。")
+
+        # ③ 整合：把间接求证的结果组织成对原题的回答（网络天才的最后一步）
+        conclusion = self._integrate_review(task, facts, topics)
+
+        return {
+            "facts": facts,
+            "narrative": {"text": self._narrate(facts), "comparable": False},
+            "review_topics": topics,
+            "questions_asked": questions,
+            "reasoning": reasoning,
+            "conclusion": conclusion,
+            "skill_used": "review-" + "+".join(topics),
+        }
+
+    def _integrate_review(self, task: Any, facts: list[dict[str, Any]],
+                          topics: list[str]) -> str:
+        """整合结论：把间接求证的事实组织成一段直接回答原题的话。"""
+        if not facts:
+            return f"对《{task.question}》暂无可用数据——目前只会整体概览，还没问到关键数。"
+        lines = []
+        for f in facts:
+            subj = "/".join(f"{k}={v}" for k, v in (f.get("subject") or {}).items())
+            lines.append(f"- {subj} · {f['dimension']} = {f['value']}")
+        return (f"整合 {len(facts)} 条间接求证结果，回答《{task.question}》：\n"
+                + "\n".join(lines))
+
     def _narrate(self, facts: list[dict[str, Any]]) -> str:
         """叙事段：不参与比对，只给人看。"""
         return f"本轮采集 {len(facts)} 条事实，覆盖 {'/'.join(sorted({f['dimension'] for f in facts}))}"
