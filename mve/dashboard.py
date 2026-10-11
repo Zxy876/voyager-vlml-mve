@@ -396,6 +396,8 @@ const TABS = [
    status:s=>s.practice_scope&&s.practice_scope.active?('范围：'+s.practice_scope.label):'维度 → 工具'},
   {id:'voyager', icon:'🤖', label:'MC 真实学习',
    status:s=>(s.voyager&&s.voyager.running)?'学习中':((s.voyager&&s.voyager.completed_count)?('已学 '+(s.voyager.completed_count)+' 技能'):'空闲')},
+  {id:'adaptive', icon:'🧩', label:'自适应练习',
+   status:s=>(s.teaching&&s.teaching.target)?('目标难度'+s.teaching.target):'知识点图谱'},
   {id:'console',  icon:'🖥', label:'运行日志', status:s=>s.pilot&&s.pilot.running?'运行中':'空闲'},
 ];
 let TAB = localStorage.getItem('mve_tab') || 'overview';
@@ -1255,7 +1257,104 @@ document.addEventListener('click',e=>{
   if(sd){ delSubject(sd.dataset.subjectDel); return; }
 });
 
-const PANELS={overview:pOverview,practice:pPractice,import:pImport,trace:pTrace,skill:pSkill,graph:pGraph,voyager:pVoyager,console:pConsole};
+/* ---------------- 自适应练习（伴学出题/图谱移植） ---------------- */
+function pAdaptive(s){
+  const tg=s.teaching||{};
+  const nodes=tg.nodes||[];
+  const mastered=nodes.filter(n=>n.mastery!==null&&n.mastery>=0.8).length;
+  const blocked=nodes.filter(n=>n.blocked).length;
+  // 卡片内容来自客户端状态 window.__oq / window.__oqGradeHTML，
+  // 不写进服务器 state —— 否则每 4 秒轮询重建 stage 会被洗掉。
+  const oq=window.__oq||null;
+  const cardDisp=oq?'block':'none';
+  const topic=oq?(oq.topic_name||oq.topic||'知识点'):'知识点';
+  const meta=oq?(`难度 ${oq.difficulty||'?'} · 题型 ${oq.question_type||'?'} · `
+                +((oq.selection&&oq.selection.reason)||'')):'';
+  const ques=oq?(oq.question||'(无题干)'):'';
+  const hint=oq?(ESC(oq.hint||'（无特别提示）')+'<br><b>解题步骤参考：</b><br>'
+                +(oq.solution_steps||[]).map(ESC).join('<br>')):'';
+  const sel=oq?((oq.selection&&oq.selection.explanation)||''):'';
+  const gradeHTML=window.__oqGradeHTML||'';
+  const gradeDisp=gradeHTML?'block':'none';
+  return `<div class="panel">
+  <div class="panel__head"><h2>🧩 自适应练习 · 教学图谱</h2>
+    <span class="hint">前置门控 + 薄弱优先 + 题型轮换（移植自猫娘伴学）</span></div>
+  <div class="row" style="gap:10px;flex-wrap:wrap">
+    <span class="chip ${mastered?'ok':''}">已掌握 ${mastered}/${nodes.length}</span>
+    <span class="chip ${blocked?'warn':''}">前置未达标 ${blocked}</span>
+    <span class="chip">目标难度 ${tg.difficulty_target||1}</span>
+    <span class="chip grey">知识点总数 ${tg.total||nodes.length}</span>
+  </div>
+  <div class="note info">出题围绕<b>当前库真实实体</b>（系列赛/队伍/地图跟着库走），不再考不存在的图；
+    同一知识点多次练习会<b>轮换题型</b>并明确错开上次题目，解决"重复出一道题"。</div>
+  <div class="row" style="margin-top:8px">
+    <button class="btn btn-primary" id="oqNext">▶ 出下一题</button>
+    <span class="hint" id="oqSel">${ESC(sel)||'选题依据会显示在这里'}</span>
+  </div>
+  <div id="oqCard" class="panel" style="margin-top:12px;display:${cardDisp}">
+    <div class="panel__head"><h3 id="oqTopic">${ESC(topic)}</h3>
+      <span class="hint" id="oqMeta">${ESC(meta)}</span></div>
+    <div id="oqQues" class="q-text">${ESC(ques)}</div>
+    <details style="margin:6px 0"><summary class="hint">📌 给模型的口径提示（误区/拿表步骤）</summary>
+      <div id="oqHint" class="note">${hint}</div></details>
+    <textarea id="oqAns" class="ta" rows="3" placeholder="在此作答（自由文本，可贴 SQL / 工具结果）"></textarea>
+    <div class="row" style="margin-top:6px">
+      <button class="btn btn-primary" id="oqSubmit">提交判分</button>
+      <button class="btn btn-secondary" id="oqReveal">显示参考答案</button>
+    </div>
+    <div id="oqGrade" class="note" style="margin-top:8px;display:${gradeDisp}">${gradeHTML}</div>
+  </div>
+</div>`;
+}
+let _oqLastQuestion='';
+async function oqLoadGraph(){
+  try{ const r=await fetch('/api/teaching-graph?t='+Date.now()); return await r.json(); }
+  catch(e){ return null; }
+}
+async function oqNext(){
+  const btn=document.getElementById('oqNext'); btn.disabled=true; btn.textContent='出题中…';
+  try{
+    const r=await fetch('/api/open-quiz/next',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({last_question:_oqLastQuestion})});
+    const d=await r.json();
+    if(!d.topic_id){ alert('出题失败：'+(d.error||'未知')); return; }
+    _oqLastQuestion=d.question||'';
+    window.__oq=d;
+    window.__oqGradeHTML='';   // 新题清空上一题判分
+    const _a=document.getElementById('oqAns'); if(_a) _a.value='';  // 清空上一题作答（否则会被轮询的 vals 恢复机制回填）
+    await load();              // 重渲染自适应页（卡片从 window.__oq 渲染，不怕轮询洗掉）
+  }catch(e){ alert('请求失败：'+e); }
+  finally{ btn.disabled=false; btn.textContent='出下一题'; }
+}
+async function oqGrade(){
+  const d=window.__oq; if(!d){ return; }
+  const ua=document.getElementById('oqAns').value.trim();
+  if(!ua){ alert('先作答再提交'); return; }
+  const btn=document.getElementById('oqSubmit'); btn.disabled=true;
+  try{
+    const r=await fetch('/api/open-quiz/grade',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({question:d, user_answer:ua, topic_id:d.topic})});
+    const j=await r.json();
+    const g=j.grade||{};
+    window.__oqGradeHTML=
+      `<b>得分：${(+g.score*100).toFixed(0)}%</b> · ${ESC(g.feedback||'')}<br>`+
+      (g.hits&&g.hits.length?('命中：'+g.hits.map(ESC).join('、')+'<br>'):'')+
+      (g.misses&&g.misses.length?('漏/错：'+g.misses.map(ESC).join('、')):'');
+    await load();  // 刷新掌握度统计 + 渲染判分（从 window.__oqGradeHTML，不怕轮询洗掉）
+  }catch(e){ alert('判分失败：'+e); }
+  finally{ btn.disabled=false; }
+}
+function oqReveal(){
+  const d=window.__oq; if(!d) return;
+  window.__oqGradeHTML=
+    `<b>参考答案：</b>${ESC(d.answer||'（无）')}<br>`+
+    `<b>可接受答案：</b>`+(d.accepted_answers||[]).map(ESC).join('、');
+  // 直接写 DOM（即时反馈），同时存 window.__oqGradeHTML 供下次轮询重渲染
+  const g=document.getElementById('oqGrade');
+  if(g){ g.style.display='block'; g.innerHTML=window.__oqGradeHTML; }
+}
+
+const PANELS={overview:pOverview,practice:pPractice,import:pImport,trace:pTrace,skill:pSkill,graph:pGraph,voyager:pVoyager,adaptive:pAdaptive,console:pConsole};
 
 /* ---------------- 人导入（只在 import 分区里挂事件） ---------------- */
 function fillTopics(s){
@@ -1393,7 +1492,7 @@ async function submitImport(){
    用户要求导出的 md「一定要具体到界面交互（按了什么键，然后选了什么难度）」。
    所以每一次按键、每一个下拉选择都落盘成 ui_events.jsonl，导出时排在最前。 */
 const TAB_LABEL = {overview:'概览', practice:'练习', import:'人导入',
-                   trace:'轨迹', skill:'技能·因果', graph:'知识图谱', voyager:'MC 真实学习', console:'运行日志'};
+                   trace:'轨迹', skill:'技能·因果', graph:'知识图谱', voyager:'MC 真实学习', adaptive:'自适应练习', console:'运行日志'};
 function uiEvent(kind, detail, result){
   try{
     fetch('/api/ui-event',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -1636,6 +1735,10 @@ function render(s){
   if(vcs) vcs.onclick=()=>voyagerClear('skill','库');
   const vcm=document.getElementById('voyClearMemory');
   if(vcm) vcm.onclick=()=>voyagerClear('memory','记忆');
+  // 自适应练习页签按钮（按钮只在该页签存在，用 if 守卫，每次 render 都绑）
+  const oqn=document.getElementById('oqNext');    if(oqn) oqn.onclick=oqNext;
+  const oqs=document.getElementById('oqSubmit');  if(oqs) oqs.onclick=oqGrade;
+  const oqr=document.getElementById('oqReveal');  if(oqr) oqr.onclick=oqReveal;
 }
 
 /* ---------------- 数据库切换：先验货，再切换 ----------------
@@ -1760,6 +1863,18 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/practice-scope":
             body = _scope_json().encode("utf-8")
             ctype = "application/json; charset=utf-8"
+        elif path == "/api/teaching-graph":
+            # 教学图谱（伴学 29 知识点种子 + 前置门控 + 掌握度叠加）。
+            # 与 /api/graph（判分侧维度图谱）并存：一个管"下一步学什么"，
+            # 一个管"这个维度该调哪个工具"。
+            try:
+                import topic_graph
+                body = json.dumps(topic_graph.get_graph().to_graph_payload(),
+                                 ensure_ascii=False).encode("utf-8")
+                ctype = "application/json; charset=utf-8"
+            except Exception as e:
+                self._json(500, {"error": f"{type(e).__name__}: {e}"[:200]})
+                return
         else:
             self.send_error(404)
             return
@@ -1943,6 +2058,39 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"ok": False, "code": code,
                                  "error": f"{type(e).__name__}: {e}"[:300],
                                  "scope": cur})
+            return
+
+        if path == "/api/open-quiz/next":
+            # 选下一知识点并出一道开放式题（前置门控 + 薄弱优先 + 题型轮换）。
+            try:
+                import open_quiz
+                scope = payload.get("scope") if isinstance(payload.get("scope"), dict) else None
+                explicit = str(payload.get("topic_id") or "") or None
+                last = str(payload.get("last_question") or "")
+                q = open_quiz.generate_next(scope=scope, explicit=explicit,
+                                            last_question=last)
+                body = json.dumps(q, ensure_ascii=False).encode("utf-8")
+                self._send(200, body, "application/json; charset=utf-8")
+            except Exception as e:
+                self._json(500, {"ok": False,
+                                 "error": f"{type(e).__name__}: {e}"[:300]})
+            return
+
+        if path == "/api/open-quiz/grade":
+            # 判分（accepted_answers + key_points 语义判分；math_exact 先走数值快判）
+            # + 记录掌握度。
+            try:
+                import open_quiz
+                q = payload.get("question") if isinstance(payload.get("question"), dict) else {}
+                ua = str(payload.get("user_answer") or "")
+                topic_id = str(q.get("topic") or payload.get("topic_id") or "")
+                g = open_quiz.grade_answer(q, ua)
+                if topic_id:
+                    open_quiz.record_result(topic_id, score=g["score"])
+                self._json(200, {"ok": True, "grade": g, "topic_id": topic_id})
+            except Exception as e:
+                self._json(500, {"ok": False,
+                                 "error": f"{type(e).__name__}: {e}"[:300]})
             return
 
         if path == "/api/ui-event":

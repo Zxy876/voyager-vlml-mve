@@ -154,7 +154,9 @@ def _exam_view() -> dict[str, Any]:
     rows = exam.load()
     if not rows:
         return {"has_data": False,
-                "hint": "还没有裸考记录：python mve/exam.py --all（全库摸底）"}
+                "hint": "还没有裸考记录：python mve/exam.py --all（全库摸底）",
+                # 教学图谱（伴学出题/图谱移植）：无数据时也展示知识点图谱骨架
+                "teaching": _teaching_payload()}
 
     by_topic: dict[str, list[dict[str, Any]]] = {}
     for r in rows:
@@ -631,7 +633,22 @@ def build_state() -> dict[str, Any]:
         # 真实水平曲线（撤支架考核）—— 学习曲线该看的那一列
         # （上面判读已经算过一次，这里复用，别再读一遍 exam_log）
         "exam_curve": exam_curve,
+        # 教学图谱（伴学出题/图谱移植）：前置门控 + 薄弱优先 + 掌握度叠加。
+        # 与判分侧 /api/graph 并存：一个管"下一步学什么"，一个管"维度↔工具"。
+        # 惰性加载 + 异常兜底：topic_graph 读 JSON 种子，挂了也不拖垮整个面板。
+        "teaching": _teaching_payload(),
     }
+
+
+def _teaching_payload() -> dict:
+    """教学图谱 payload（惰性加载）。失败返回空壳，自适应页签退化为「知识点图谱」。"""
+    try:
+        import topic_graph
+        return topic_graph.get_graph().to_graph_payload()
+    except Exception as e:  # 绝不能因为教学图谱挂了拖垮整个面板
+        return {"schema_version": 3, "difficulty_target": 1, "nodes": [],
+                "edges": [], "layers": {}, "total": 0,
+                "error": f"{type(e).__name__}: {e}"[:200]}
 
 
 def as_json() -> str:

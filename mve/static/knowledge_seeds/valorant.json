@@ -1,0 +1,1897 @@
+{
+ "version": "1.0",
+ "subject": "valorant",
+ "topics": [
+  {
+   "id": "vlml_grain_event",
+   "name": "事件粒度（base_events）",
+   "subject": "valorant",
+   "stage": "college",
+   "chapter": "数据粒度",
+   "course_family": "esports_analytics",
+   "depth": 1,
+   "difficulty": 0.3,
+   "prerequisites": [],
+   "related": [],
+   "skills": [
+    "认得 base_events 的一行 = 一次事件（kill / plant / defuse / ability）",
+    "事件必须挂 round_id 才能并入回合级统计"
+   ],
+   "question_types": [
+    "计算",
+    "判读"
+   ],
+   "examples": [
+    {
+     "prompt": "这场比赛里一共发生了多少种事件，各多少次？",
+     "answer_outline": [
+      "先确认粒度：问题问的是事件，不是回合 → 用 base_events。",
+      "MCP: get_database_info() —— 确认表名与行数，别猜。",
+      "MCP: query_sql(\"SELECT event_type, COUNT(*) FROM base_events WHERE round_id IN (SELECT round_id FROM rounds WHERE series_id = ?) GROUP BY event_type\")",
+      "报数时必须说明这是事件计数，不等于回合数。"
+     ]
+    }
+   ],
+   "typical_misconceptions": [
+    "把 base_events 当回合表直接 COUNT(*) —— 一个回合有十几个事件，数出来的是事件数不是回合数"
+   ],
+   "curriculum_version": [
+    "generic_college",
+    "college_data_structures"
+   ],
+   "exam_region": [
+    "college_course_generic"
+   ],
+   "exam_type": [
+    "college_course_exam"
+   ]
+  },
+  {
+   "id": "vlml_grain_round",
+   "name": "回合粒度（rounds）",
+   "subject": "valorant",
+   "stage": "college",
+   "chapter": "数据粒度",
+   "course_family": "esports_analytics",
+   "depth": 1,
+   "difficulty": 0.34,
+   "prerequisites": [
+    {
+     "id": "vlml_grain_event",
+     "relation": "prerequisite",
+     "reason": "回合由事件聚合而来；不知道事件长什么样就分不清回合的胜负口径",
+     "priority": "core",
+     "context": "diagnosis",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     },
+     "required_mastery": 0.5
+    }
+   ],
+   "related": [],
+   "skills": [
+    "rounds 的一行 = 一个回合，带 round_number / map_name / winning_team_name",
+    "数回合一律 COUNT(*)，不要 SUM(round_number)"
+   ],
+   "question_types": [
+    "计算",
+    "判读"
+   ],
+   "examples": [
+    {
+     "prompt": "这场系列赛一共打了多少个回合？",
+     "answer_outline": [
+      "确认粒度：回合数 → rounds 表，一行一回合。",
+      "MCP: query_sql(\"SELECT COUNT(*) FROM rounds WHERE series_id = ?\")",
+      "用 COUNT(*)；若要用 round_number，只能取 MAX 当最大回合号，不能求和。"
+     ]
+    }
+   ],
+   "typical_misconceptions": [
+    "用 SUM(round_number) 当'打了多少回合' —— 那是回合号求和，量纲错得离谱"
+   ],
+   "curriculum_version": [
+    "generic_college",
+    "college_data_structures"
+   ],
+   "exam_region": [
+    "college_course_generic"
+   ],
+   "exam_type": [
+    "college_course_exam"
+   ]
+  },
+  {
+   "id": "vlml_grain_game",
+   "name": "地图局粒度（games）",
+   "subject": "valorant",
+   "stage": "college",
+   "chapter": "数据粒度",
+   "course_family": "esports_analytics",
+   "depth": 2,
+   "difficulty": 0.38,
+   "prerequisites": [
+    {
+     "id": "vlml_grain_round",
+     "relation": "prerequisite",
+     "reason": "一局 = 一张图上的若干回合；回合表是它的下层",
+     "priority": "core",
+     "context": "diagnosis",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     },
+     "required_mastery": 0.5
+    }
+   ],
+   "related": [],
+   "skills": [
+    "games 的一行 = 一张地图的一局（game_id ↔ series_id + map_name）",
+    "跨图比较必须按 game 分组，不能在所有回合上直接平均"
+   ],
+   "question_types": [
+    "计算",
+    "判读"
+   ],
+   "examples": [
+    {
+     "prompt": "这场系列赛打了哪几张图？",
+     "answer_outline": [
+      "确认粒度：图 → games 表（不是 rounds 的 DISTINCT map_name 也行，但 game_id 才带对局身份）。",
+      "MCP: query_sql(\"SELECT game_id, map_name FROM games WHERE series_id = ?\")"
+     ]
+    }
+   ],
+   "typical_misconceptions": [
+    "把所有图的回合混在一起算'这张图的胜率' —— 必须先用 game_id 或 map_name 切开"
+   ],
+   "curriculum_version": [
+    "generic_college",
+    "college_data_structures"
+   ],
+   "exam_region": [
+    "college_course_generic"
+   ],
+   "exam_type": [
+    "college_course_exam"
+   ]
+  },
+  {
+   "id": "vlml_grain_series",
+   "name": "系列赛粒度（series）",
+   "subject": "valorant",
+   "stage": "college",
+   "chapter": "数据粒度",
+   "course_family": "esports_analytics",
+   "depth": 3,
+   "difficulty": 0.4,
+   "prerequisites": [
+    {
+     "id": "vlml_grain_game",
+     "relation": "prerequisite",
+     "reason": "一个系列赛 = 若干局（BO3/BO5）；局是它的下层",
+     "priority": "core",
+     "context": "diagnosis",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     },
+     "required_mastery": 0.5
+    }
+   ],
+   "related": [],
+   "skills": [
+    "series 的一行 = 一场系列赛，是绝大多数报告工具的入口参数"
+   ],
+   "question_types": [
+    "计算",
+    "判读"
+   ],
+   "examples": [
+    {
+     "prompt": "给我这场比赛的概览。",
+     "answer_outline": [
+      "确认粒度：系列赛级 → 报告工具都以 series_id 为入口。",
+      "MCP: match_summary_report(series_id=?) —— 先看概览再决定下钻哪一层。"
+     ]
+    }
+   ],
+   "typical_misconceptions": [
+    "拿 series 级汇总去回答回合级问题（'第 7 回合谁赢的'在 series 表里没有）"
+   ],
+   "curriculum_version": [
+    "generic_college",
+    "college_data_structures"
+   ],
+   "exam_region": [
+    "college_course_generic"
+   ],
+   "exam_type": [
+    "college_course_exam"
+   ]
+  },
+  {
+   "id": "vlml_grain_tournament",
+   "name": "赛事粒度（agg_tournament_stats）",
+   "subject": "valorant",
+   "stage": "college",
+   "chapter": "数据粒度",
+   "course_family": "esports_analytics",
+   "depth": 4,
+   "difficulty": 0.46,
+   "prerequisites": [
+    {
+     "id": "vlml_grain_series",
+     "relation": "prerequisite",
+     "reason": "赛事级汇总由系列赛上卷而来",
+     "priority": "core",
+     "context": "diagnosis",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     },
+     "required_mastery": 0.55
+    }
+   ],
+   "related": [],
+   "skills": [
+    "agg_tournament_stats 的粒度是 (tournament_id, entity_type, entity_id)"
+   ],
+   "question_types": [
+    "计算",
+    "判读"
+   ],
+   "examples": [
+    {
+     "prompt": "这支队伍在这个赛事里的整体表现如何？",
+     "answer_outline": [
+      "确认粒度：跨系列赛 →  tournament 层。",
+      "MCP: scouting_report(team_name=?, last_n_series=5) —— 跨系列赛画像。"
+     ]
+    }
+   ],
+   "typical_misconceptions": [
+    "赛事级胜率不等于系列赛胜率 —— 上卷会丢掉对手强弱的信息"
+   ],
+   "curriculum_version": [
+    "generic_college",
+    "college_data_structures"
+   ],
+   "exam_region": [
+    "college_course_generic"
+   ],
+   "exam_type": [
+    "college_course_exam"
+   ]
+  },
+  {
+   "id": "vlml_round_result",
+   "name": "回合胜负与赢法",
+   "subject": "valorant",
+   "stage": "college",
+   "chapter": "回合层指标",
+   "course_family": "esports_analytics",
+   "depth": 2,
+   "difficulty": 0.42,
+   "prerequisites": [
+    {
+     "id": "vlml_grain_round",
+     "relation": "prerequisite",
+     "reason": "胜负记在回合行上",
+     "priority": "core",
+     "context": "diagnosis",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     },
+     "required_mastery": 0.5
+    }
+   ],
+   "related": [
+    {
+     "id": "vlml_streak",
+     "relation": "application",
+     "reason": "连败/连胜是回合胜负序列上的连续段",
+     "priority": "core",
+     "context": "practice",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     }
+    }
+   ],
+   "skills": [
+    "winning_team_name 是回合行的字段，取它就知道这回合谁赢",
+    "赢法（win_type）区分歼灭 / 爆弹引爆 / 拆包 / 时间到"
+   ],
+   "question_types": [
+    "计算",
+    "判读"
+   ],
+   "examples": [
+    {
+     "prompt": "这场系列赛两队各赢了多少回合？",
+     "answer_outline": [
+      "确认粒度：回合级 → rounds。",
+      "MCP: query_sql(\"SELECT winning_team_name, COUNT(*) FROM rounds WHERE series_id = ? GROUP BY winning_team_name\")",
+      "分母是**全部**回合；不要把 winning_team_name 写进 WHERE，否则胜率恒为 100%。"
+     ]
+    },
+    {
+     "prompt": "第 7 到第 12 回合发生了什么？",
+     "answer_outline": [
+      "MCP: match_rounds_report(series_id=?, round_start=7, round_end=12) —— 逐回合时间线。"
+     ]
+    }
+   ],
+   "typical_misconceptions": [
+    "把 winning_team_name 写进 WHERE 再算'胜率' —— 分母被自己筛掉了，胜率恒为 100%（实测踩出来的，叫口径自噬）"
+   ],
+   "curriculum_version": [
+    "generic_college",
+    "college_data_structures"
+   ],
+   "exam_region": [
+    "college_course_generic"
+   ],
+   "exam_type": [
+    "college_course_exam"
+   ]
+  },
+  {
+   "id": "vlml_first_blood",
+   "name": "首血（first blood）",
+   "subject": "valorant",
+   "stage": "college",
+   "chapter": "回合层指标",
+   "course_family": "esports_analytics",
+   "depth": 3,
+   "difficulty": 0.48,
+   "prerequisites": [
+    {
+     "id": "vlml_round_result",
+     "relation": "prerequisite",
+     "reason": "首血是回合里的第一个击杀",
+     "priority": "core",
+     "context": "diagnosis",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     },
+     "required_mastery": 0.55
+    }
+   ],
+   "related": [],
+   "skills": [
+    "agg_first_blood_stats 的粒度是 round_id，一行一回合",
+    "字段 fb_team（拿到首血的队）与 fb_team_won（首血方最终是否赢下这回合）"
+   ],
+   "question_types": [
+    "计算",
+    "判读"
+   ],
+   "examples": [
+    {
+     "prompt": "Cloud9 这场拿到多少次首血？",
+     "answer_outline": [
+      "确认粒度：回合级的首血事实 → agg_first_blood_stats（已定序，别自己从事件里找）。",
+      "MCP: query_sql(\"SELECT COUNT(*) FROM agg_first_blood_stats WHERE series_id = ? AND fb_team = ?\")"
+     ]
+    },
+    {
+     "prompt": "这场比赛的首血相关指标都在哪？",
+     "answer_outline": [
+      "MCP: match_analysis_report(series_id=?, team_name=?) —— 首血与转换指标在这份报告里。"
+     ]
+    }
+   ],
+   "typical_misconceptions": [
+    "拿 base_events 里第一个 kill 事件当首血 —— 事件顺序不保证，必须用 agg_first_blood_stats 这个已定序的聚合表"
+   ],
+   "curriculum_version": [
+    "generic_college",
+    "college_data_structures"
+   ],
+   "exam_region": [
+    "college_course_generic"
+   ],
+   "exam_type": [
+    "college_course_exam"
+   ]
+  },
+  {
+   "id": "vlml_fb_conversion",
+   "name": "首血转换率",
+   "subject": "valorant",
+   "stage": "college",
+   "chapter": "回合层指标",
+   "course_family": "esports_analytics",
+   "depth": 4,
+   "difficulty": 0.56,
+   "prerequisites": [
+    {
+     "id": "vlml_first_blood",
+     "relation": "prerequisite",
+     "reason": "转换率 = 拿到首血且赢下回合 / 拿到首血的回合数",
+     "priority": "core",
+     "context": "diagnosis",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     },
+     "required_mastery": 0.6
+    }
+   ],
+   "related": [
+    {
+     "id": "vlml_post_plant",
+     "relation": "analogy",
+     "reason": "同是'拿到优势后有没有兑现'的转换率，口径结构一样",
+     "priority": "useful",
+     "context": "explanation",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     }
+    }
+   ],
+   "skills": [
+    "转换率 = AVG(fb_team_won) * 100，分母是 fb_team = 本队 的回合数",
+    "必须同时给出样本量（COUNT(*)），否则看不出这个率稳不稳"
+   ],
+   "question_types": [
+    "计算",
+    "判读"
+   ],
+   "examples": [
+    {
+     "prompt": "Cloud9 这场拿到首血之后，最终赢下回合的比例是多少？",
+     "answer_outline": [
+      "确认粒度：回合级 → agg_first_blood_stats。",
+      "MCP: query_sql(\"SELECT ROUND(AVG(fb_team_won)*100, 1) AS conv, COUNT(*) AS n FROM agg_first_blood_stats WHERE series_id = ? AND fb_team = ?\")",
+      "SQL 必须只返回**一行**（这里用了聚合、没有 GROUP BY）—— 返回多行时真值只取第 0 行，会随行序漂移。",
+      "报数时 conv 与 n 一起报：n 太小只能说'这场如此'。"
+     ]
+    },
+    {
+     "prompt": "每张图分别的首血转换率是多少？",
+     "answer_outline": [
+      "这类问题本质是**多值**答案；要么外层再聚合回单值，要么明确 ORDER BY … LIMIT 1 取一个。",
+      "MCP: query_sql(\"SELECT ROUND(AVG(fb_team_won)*100, 1) AS conv, COUNT(*) AS n FROM agg_first_blood_stats WHERE series_id = ? AND fb_team = ? AND map_name = ?\")  -- 逐图分别查"
+     ]
+    }
+   ],
+   "typical_misconceptions": [
+    "SQL 里带 GROUP BY map_name 却不聚合 —— 返回多行，真值只取第 0 行，题就永远做不对（实测 `map_fb_conv_window` 就是这么坏的）",
+    "问'每个地图的转换率'却按单一标量取数 —— 要么外层再聚合，要么明确 ORDER BY … LIMIT 1"
+   ],
+   "curriculum_version": [
+    "generic_college",
+    "college_data_structures"
+   ],
+   "exam_region": [
+    "college_course_generic"
+   ],
+   "exam_type": [
+    "college_course_exam"
+   ]
+  },
+  {
+   "id": "vlml_post_plant",
+   "name": "爆弹后局面（post-plant）",
+   "subject": "valorant",
+   "stage": "college",
+   "chapter": "回合层指标",
+   "course_family": "esports_analytics",
+   "depth": 4,
+   "difficulty": 0.58,
+   "prerequisites": [
+    {
+     "id": "vlml_round_result",
+     "relation": "prerequisite",
+     "reason": "下包后的结果也是回合胜负的一种",
+     "priority": "core",
+     "context": "diagnosis",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     },
+     "required_mastery": 0.6
+    }
+   ],
+   "related": [],
+   "skills": [
+    "agg_post_plant_stats 的粒度是 round_id",
+    "区分引爆（detonation）与被拆（defuse）—— 攻方的两种结局"
+   ],
+   "question_types": [
+    "计算",
+    "判读"
+   ],
+   "examples": [
+    {
+     "prompt": "Cloud9 在这张图上下包（plant）之后，最终兑现的比例是多少？",
+     "answer_outline": [
+      "确认粒度：回合级 → base_events（plant / defuse 事件）+ rounds。",
+      "MCP: query_sql(\"SELECT SUM(CASE WHEN event_type='plant' THEN 1 ELSE 0 END) AS plants, COUNT(*) AS n FROM base_events WHERE map_name = ? AND actor_team_name = ? AND event_type IN ('plant','defuse')\")",
+      "这里**不要** GROUP BY round_id —— 那是每回合一个 0/1，问的是全场比例。"
+     ]
+    },
+    {
+     "prompt": "这场的经济与战术节奏怎么看？",
+     "answer_outline": [
+      "MCP: match_economy_report(series_id=?, team_name=?)"
+     ]
+    }
+   ],
+   "typical_misconceptions": [
+    "把'每回合的爆弹成功率'写成按 round_id 分组 —— 那是每回合一个 0/1，要的是全场聚合后的比例（实测 `plant_success_rate_lotus` 就坏在这：真值取第 0 行得 100%，正确聚合是 70%）",
+    "把 defuse 也算成 plant 成功 —— 事件类型要先分清"
+   ],
+   "curriculum_version": [
+    "generic_college",
+    "college_data_structures"
+   ],
+   "exam_region": [
+    "college_course_generic"
+   ],
+   "exam_type": [
+    "college_course_exam"
+   ]
+  },
+  {
+   "id": "vlml_economy",
+   "name": "经济与装备选择",
+   "subject": "valorant",
+   "stage": "college",
+   "chapter": "回合层指标",
+   "course_family": "esports_analytics",
+   "depth": 3,
+   "difficulty": 0.52,
+   "prerequisites": [
+    {
+     "id": "vlml_grain_round",
+     "relation": "prerequisite",
+     "reason": "经济状态记在回合/队伍层",
+     "priority": "core",
+     "context": "diagnosis",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     },
+     "required_mastery": 0.55
+    }
+   ],
+   "related": [
+    {
+     "id": "vlml_streak",
+     "relation": "co_occurs",
+     "reason": "连败往往伴随经济崩盘",
+     "priority": "useful",
+     "context": "practice",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     }
+    }
+   ],
+   "skills": [
+    "agg_team_round_stats 有本回合的装备价值与存留"
+   ],
+   "question_types": [
+    "计算",
+    "判读"
+   ],
+   "examples": [
+    {
+     "prompt": "这场的经济走势和进攻套路是什么？",
+     "answer_outline": [
+      "MCP: match_economy_report(series_id=?, team_name=?)"
+     ]
+    }
+   ],
+   "typical_misconceptions": [
+    "把'手枪局'当成固定回合号 —— 手枪局是每半场的第 1 回合，不是全场第 1 回合"
+   ],
+   "curriculum_version": [
+    "generic_college",
+    "college_data_structures"
+   ],
+   "exam_region": [
+    "college_course_generic"
+   ],
+   "exam_type": [
+    "college_course_exam"
+   ]
+  },
+  {
+   "id": "vlml_clutch",
+   "name": "残局（clutch）",
+   "subject": "valorant",
+   "stage": "college",
+   "chapter": "回合层指标",
+   "course_family": "esports_analytics",
+   "depth": 4,
+   "difficulty": 0.6,
+   "prerequisites": [
+    {
+     "id": "vlml_round_result",
+     "relation": "prerequisite",
+     "reason": "残局是回合胜负的一种特殊情形",
+     "priority": "core",
+     "context": "diagnosis",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     },
+     "required_mastery": 0.6
+    }
+   ],
+   "related": [],
+   "skills": [
+    "残局 = 人数劣势下赢下回合；flag 在 agg_player_round_stats"
+   ],
+   "question_types": [
+    "计算",
+    "判读"
+   ],
+   "examples": [
+    {
+     "prompt": "这场有哪些高光回合（残局）？",
+     "answer_outline": [
+      "MCP: match_players_report(series_id=?, team_name=?) —— 高光回合在这份报告里。"
+     ]
+    }
+   ],
+   "typical_misconceptions": [
+    "把'最后一个活着的队友'当成残局 —— 必须是对手人数更多才算"
+   ],
+   "curriculum_version": [
+    "generic_college",
+    "college_data_structures"
+   ],
+   "exam_region": [
+    "college_course_generic"
+   ],
+   "exam_type": [
+    "college_course_exam"
+   ]
+  },
+  {
+   "id": "vlml_trade",
+   "name": "补枪（trade）",
+   "subject": "valorant",
+   "stage": "college",
+   "chapter": "回合层指标",
+   "course_family": "esports_analytics",
+   "depth": 4,
+   "difficulty": 0.58,
+   "prerequisites": [
+    {
+     "id": "vlml_first_blood",
+     "relation": "prerequisite",
+     "reason": "补枪发生在首血之后的时间窗内",
+     "priority": "core",
+     "context": "diagnosis",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     },
+     "required_mastery": 0.6
+    }
+   ],
+   "related": [],
+   "skills": [
+    "trade 有严格时间窗，不能拿'本回合都死了'当补枪"
+   ],
+   "question_types": [
+    "计算",
+    "判读"
+   ],
+   "examples": [
+    {
+     "prompt": "这队的补枪效率怎么样？",
+     "answer_outline": [
+      "MCP: match_analysis_report(series_id=?, team_name=?)"
+     ]
+    }
+   ],
+   "typical_misconceptions": [
+    "忽略时间窗，把回合内所有阵亡都算成换人"
+   ],
+   "curriculum_version": [
+    "generic_college",
+    "college_data_structures"
+   ],
+   "exam_region": [
+    "college_course_generic"
+   ],
+   "exam_type": [
+    "college_course_exam"
+   ]
+  },
+  {
+   "id": "vlml_map_pool",
+   "name": "地图池胜率",
+   "subject": "valorant",
+   "stage": "college",
+   "chapter": "地图与半场",
+   "course_family": "esports_analytics",
+   "depth": 3,
+   "difficulty": 0.5,
+   "prerequisites": [
+    {
+     "id": "vlml_grain_game",
+     "relation": "prerequisite",
+     "reason": "地图胜率按局聚合",
+     "priority": "core",
+     "context": "diagnosis",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     },
+     "required_mastery": 0.55
+    }
+   ],
+   "related": [],
+   "skills": [
+    "agg_team_map_stats 的粒度是 (team_name, map_name, tournament_name)"
+   ],
+   "question_types": [
+    "计算",
+    "判读"
+   ],
+   "examples": [
+    {
+     "prompt": "这支队伍在各张图上的战绩如何？",
+     "answer_outline": [
+      "确认粒度：跨赛事的图池 → agg_team_map_stats。",
+      "MCP: query_sql(\"SELECT map_name, wins, losses FROM agg_team_map_stats WHERE team_name = ?\")",
+      "若只有 1 局样本，只能说'这一局如此'，不能说'这张图是强图'。"
+     ]
+    }
+   ],
+   "typical_misconceptions": [
+    "拿单场系列赛的一张图就说'这张图是强图' —— 样本量只有 1 局，不能当结论"
+   ],
+   "curriculum_version": [
+    "generic_college",
+    "college_data_structures"
+   ],
+   "exam_region": [
+    "college_course_generic"
+   ],
+   "exam_type": [
+    "college_course_exam"
+   ]
+  },
+  {
+   "id": "vlml_half_split",
+   "name": "攻防半场",
+   "subject": "valorant",
+   "stage": "college",
+   "chapter": "地图与半场",
+   "course_family": "esports_analytics",
+   "depth": 3,
+   "difficulty": 0.52,
+   "prerequisites": [
+    {
+     "id": "vlml_grain_round",
+     "relation": "prerequisite",
+     "reason": "半场由回合号切分",
+     "priority": "core",
+     "context": "diagnosis",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     },
+     "required_mastery": 0.55
+    }
+   ],
+   "related": [
+    {
+     "id": "vlml_side_conversion",
+     "relation": "procedure_step",
+     "reason": "先切开攻防，再算各侧的回合转换率",
+     "priority": "core",
+     "context": "practice",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     }
+    }
+   ],
+   "skills": [
+    "半场按 round_number 切（上半场 / 加时另算），换边后攻防身份对调"
+   ],
+   "question_types": [
+    "计算",
+    "判读"
+   ],
+   "examples": [
+    {
+     "prompt": "这张图的上下半场分别怎么走的？",
+     "answer_outline": [
+      "MCP: match_rounds_report(series_id=?, map_name=?) —— 含半场拆分。"
+     ]
+    }
+   ],
+   "typical_misconceptions": [
+    "按回合号奇偶判断攻防 —— 换边发生在中场，不是交替"
+   ],
+   "curriculum_version": [
+    "generic_college",
+    "college_data_structures"
+   ],
+   "exam_region": [
+    "college_course_generic"
+   ],
+   "exam_type": [
+    "college_course_exam"
+   ]
+  },
+  {
+   "id": "vlml_side_conversion",
+   "name": "攻防侧回合转换率",
+   "subject": "valorant",
+   "stage": "college",
+   "chapter": "地图与半场",
+   "course_family": "esports_analytics",
+   "depth": 4,
+   "difficulty": 0.62,
+   "prerequisites": [
+    {
+     "id": "vlml_half_split",
+     "relation": "prerequisite",
+     "reason": "先分侧才有侧胜率",
+     "priority": "core",
+     "context": "diagnosis",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     },
+     "required_mastery": 0.6
+    }
+   ],
+   "related": [],
+   "skills": [
+    "侧胜率 = 该侧赢下的回合 / 该侧总回合"
+   ],
+   "question_types": [
+    "计算",
+    "判读"
+   ],
+   "examples": [
+    {
+     "prompt": "这张图上，Cloud9 进攻方赢下多少回合？",
+     "answer_outline": [
+      "确认粒度：回合级 + 侧别 → rounds（带 side / winning_team_name）。",
+      "MCP: query_sql(\"SELECT COUNT(*) FROM rounds WHERE series_id = ? AND map_name = ? AND side = ? AND winning_team_name = ?\")",
+      "分母必须是**该侧**的总回合，不是全场总回合。"
+     ]
+    }
+   ],
+   "typical_misconceptions": [
+    "把全场的胜率当攻方胜率 —— 攻守两侧的基线差很多"
+   ],
+   "curriculum_version": [
+    "generic_college",
+    "college_data_structures"
+   ],
+   "exam_region": [
+    "college_course_generic"
+   ],
+   "exam_type": [
+    "college_course_exam"
+   ]
+  },
+  {
+   "id": "vlml_kast",
+   "name": "KAST",
+   "subject": "valorant",
+   "stage": "college",
+   "chapter": "选手层指标",
+   "course_family": "esports_analytics",
+   "depth": 3,
+   "difficulty": 0.48,
+   "prerequisites": [
+    {
+     "id": "vlml_grain_game",
+     "relation": "prerequisite",
+     "reason": "KAST 记在 (game_id, player_id) 层",
+     "priority": "core",
+     "context": "diagnosis",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     },
+     "required_mastery": 0.55
+    }
+   ],
+   "related": [],
+   "skills": [
+    "KAST = 有击杀/助攻/存活/被补枪的回合占比",
+    "agg_player_game_stats 与 agg_player_series_stats 都有，粒度不同"
+   ],
+   "question_types": [
+    "计算",
+    "判读"
+   ],
+   "examples": [
+    {
+     "prompt": "这张图上这位选手的 KAST 是多少？",
+     "answer_outline": [
+      "确认粒度：单图 → agg_player_game_stats（不是 series 表）。",
+      "MCP: query_sql(\"SELECT player_name, kast_percentage FROM agg_player_game_stats WHERE game_id = ?\")",
+      "先确认存的是比例（0.78）还是百分数（78）—— 实测两个口径都见过。"
+     ]
+    }
+   ],
+   "typical_misconceptions": [
+    "把 kast_percentage 的 0.78 当成 78 —— 存的是比例不是百分数，口径要先确认",
+    "照印象写列名（kast_pct）—— 实际列是 kast_percentage，写错直接 Binder Error",
+    "拿系列赛级 KAST 回答'这张图他 KAST 多少' —— 粒度错配"
+   ],
+   "curriculum_version": [
+    "generic_college",
+    "college_data_structures"
+   ],
+   "exam_region": [
+    "college_course_generic"
+   ],
+   "exam_type": [
+    "college_course_exam"
+   ]
+  },
+  {
+   "id": "vlml_adr",
+   "name": "ADR（每回合平均伤害）",
+   "subject": "valorant",
+   "stage": "college",
+   "chapter": "选手层指标",
+   "course_family": "esports_analytics",
+   "depth": 3,
+   "difficulty": 0.46,
+   "prerequisites": [
+    {
+     "id": "vlml_grain_game",
+     "relation": "prerequisite",
+     "reason": "ADR 记在 (game_id, player_id) 层",
+     "priority": "core",
+     "context": "diagnosis",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     },
+     "required_mastery": 0.55
+    }
+   ],
+   "related": [
+    {
+     "id": "vlml_kast",
+     "relation": "co_occurs",
+     "reason": "KAST 与 ADR 常一起看，但量纲不同",
+     "priority": "useful",
+     "context": "explanation",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     }
+    }
+   ],
+   "skills": [
+    "ADR 的分母是回合数，不是击杀数"
+   ],
+   "question_types": [
+    "计算",
+    "判读"
+   ],
+   "examples": [
+    {
+     "prompt": "这名选手最近几场的 ADR 走势？",
+     "answer_outline": [
+      "MCP: player_profile_report(player_name=?, last_n_series=5)"
+     ]
+    }
+   ],
+   "typical_misconceptions": [
+    "把 ADR 当总伤害 —— 它是每回合平均"
+   ],
+   "curriculum_version": [
+    "generic_college",
+    "college_data_structures"
+   ],
+   "exam_region": [
+    "college_course_generic"
+   ],
+   "exam_type": [
+    "college_course_exam"
+   ]
+  },
+  {
+   "id": "vlml_kd",
+   "name": "K/D 与正负值",
+   "subject": "valorant",
+   "stage": "college",
+   "chapter": "选手层指标",
+   "course_family": "esports_analytics",
+   "depth": 3,
+   "difficulty": 0.44,
+   "prerequisites": [
+    {
+     "id": "vlml_grain_game",
+     "relation": "prerequisite",
+     "reason": "K/D 记在 (game_id, player_id) 层",
+     "priority": "core",
+     "context": "diagnosis",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     },
+     "required_mastery": 0.55
+    }
+   ],
+   "related": [],
+   "skills": [
+    "区分 kills/deaths（比值）与 kills-deaths（差值）"
+   ],
+   "question_types": [
+    "计算",
+    "判读"
+   ],
+   "examples": [
+    {
+     "prompt": "这场双方的选手数据对比？",
+     "answer_outline": [
+      "MCP: match_players_report(series_id=?, team_name=?)"
+     ]
+    }
+   ],
+   "typical_misconceptions": [
+    "把 K/D 差值当比值报"
+   ],
+   "curriculum_version": [
+    "generic_college",
+    "college_data_structures"
+   ],
+   "exam_region": [
+    "college_course_generic"
+   ],
+   "exam_type": [
+    "college_course_exam"
+   ]
+  },
+  {
+   "id": "vlml_opening_duel",
+   "name": "首杀对枪（opening duel）",
+   "subject": "valorant",
+   "stage": "college",
+   "chapter": "选手层指标",
+   "course_family": "esports_analytics",
+   "depth": 4,
+   "difficulty": 0.58,
+   "prerequisites": [
+    {
+     "id": "vlml_first_blood",
+     "relation": "prerequisite",
+     "reason": "首杀对枪产出首血",
+     "priority": "core",
+     "context": "diagnosis",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     },
+     "required_mastery": 0.6
+    }
+   ],
+   "related": [],
+   "skills": [
+    "区分'参与首杀对枪'与'拿到首血' —— 有输的一方"
+   ],
+   "question_types": [
+    "计算",
+    "判读"
+   ],
+   "examples": [
+    {
+     "prompt": "这队的首杀对枪参与情况？",
+     "answer_outline": [
+      "MCP: match_analysis_report(series_id=?, team_name=?)"
+     ]
+    }
+   ],
+   "typical_misconceptions": [
+    "把首杀参与率当首血率"
+   ],
+   "curriculum_version": [
+    "generic_college",
+    "college_data_structures"
+   ],
+   "exam_region": [
+    "college_course_generic"
+   ],
+   "exam_type": [
+    "college_course_exam"
+   ]
+  },
+  {
+   "id": "vlml_win_shares",
+   "name": "Win Shares（贡献度）",
+   "subject": "valorant",
+   "stage": "college",
+   "chapter": "选手层指标",
+   "course_family": "esports_analytics",
+   "depth": 4,
+   "difficulty": 0.7,
+   "prerequisites": [
+    {
+     "id": "vlml_kast",
+     "relation": "prerequisite",
+     "reason": "Win Shares 由多项基础指标加权而来",
+     "priority": "core",
+     "context": "diagnosis",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     },
+     "required_mastery": 0.6
+    },
+    {
+     "id": "vlml_adr",
+     "relation": "prerequisite",
+     "reason": "伤害是权重之一",
+     "priority": "core",
+     "context": "diagnosis",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     },
+     "required_mastery": 0.6
+    }
+   ],
+   "related": [],
+   "skills": [
+    "agg_player_win_shares 的粒度是 (player_id, game_id)，权重来自 ref_win_probability_factors"
+   ],
+   "question_types": [
+    "计算",
+    "判读"
+   ],
+   "examples": [
+    {
+     "prompt": "这场每个选手的贡献度（Win Shares）是多少？",
+     "answer_outline": [
+      "确认粒度：(player_id, game_id) → agg_player_win_shares。",
+      "MCP: query_sql(\"SELECT * FROM agg_player_win_shares WHERE game_id = ?\")",
+      "说明这是按 VCT Americas 2025 权重算出的**推导值**，不是官方数据。"
+     ]
+    }
+   ],
+   "typical_misconceptions": [
+    "把 Win Shares 当官方数据 —— 它是用 VCT Americas 2025 的权重算出来的推导值"
+   ],
+   "curriculum_version": [
+    "generic_college",
+    "college_data_structures"
+   ],
+   "exam_region": [
+    "college_course_generic"
+   ],
+   "exam_type": [
+    "college_course_exam"
+   ]
+  },
+  {
+   "id": "vlml_player_consistency",
+   "name": "选手稳定性（跨局波动）",
+   "subject": "valorant",
+   "stage": "college",
+   "chapter": "选手层指标",
+   "course_family": "esports_analytics",
+   "depth": 4,
+   "difficulty": 0.68,
+   "prerequisites": [
+    {
+     "id": "vlml_adr",
+     "relation": "prerequisite",
+     "reason": "稳定性看同一指标在多个 game 上的分布",
+     "priority": "core",
+     "context": "diagnosis",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     },
+     "required_mastery": 0.6
+    }
+   ],
+   "related": [],
+   "skills": [
+    "跨局比较要看方差/极差，不能只比均值"
+   ],
+   "question_types": [
+    "计算",
+    "判读"
+   ],
+   "examples": [
+    {
+     "prompt": "这名选手发挥稳不稳？",
+     "answer_outline": [
+      "MCP: player_profile_report(player_name=?, last_n_series=5, map_name=?)",
+      "取多个 series 的同名指标，看极差与波动，不只报均值。"
+     ]
+    }
+   ],
+   "typical_misconceptions": [
+    "拿最好的一局代表选手水平"
+   ],
+   "curriculum_version": [
+    "generic_college",
+    "college_data_structures"
+   ],
+   "exam_region": [
+    "college_course_generic"
+   ],
+   "exam_type": [
+    "college_course_exam"
+   ]
+  },
+  {
+   "id": "vlml_agent_role",
+   "name": "特工与角色",
+   "subject": "valorant",
+   "stage": "college",
+   "chapter": "选手层指标",
+   "course_family": "esports_analytics",
+   "depth": 2,
+   "difficulty": 0.36,
+   "prerequisites": [],
+   "related": [
+    {
+     "id": "vlml_kast",
+     "relation": "nearby",
+     "reason": "角色不同，选手数据的可比性不同",
+     "priority": "useful",
+     "context": "explanation",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     }
+    }
+   ],
+   "skills": [
+    "agent_roles 是参考表：一名特工一个角色（决斗/先锋/控场/哨位）"
+   ],
+   "question_types": [
+    "计算",
+    "判读"
+   ],
+   "examples": [
+    {
+     "prompt": "这名特工是什么角色？",
+     "answer_outline": [
+      "确认粒度：参考表 → agent_roles。",
+      "MCP: query_sql(\"SELECT * FROM agent_roles\")"
+     ]
+    }
+   ],
+   "typical_misconceptions": [
+    "按角色比较不同特工的个人数据 —— 角色职责不同，横向比不公平"
+   ],
+   "curriculum_version": [
+    "generic_college",
+    "college_data_structures"
+   ],
+   "exam_region": [
+    "college_course_generic"
+   ],
+   "exam_type": [
+    "college_course_exam"
+   ]
+  },
+  {
+   "id": "vlml_team_series",
+   "name": "系列赛团队表现",
+   "subject": "valorant",
+   "stage": "college",
+   "chapter": "团队与系列赛",
+   "course_family": "esports_analytics",
+   "depth": 4,
+   "difficulty": 0.54,
+   "prerequisites": [
+    {
+     "id": "vlml_grain_series",
+     "relation": "prerequisite",
+     "reason": "系列赛级团队表",
+     "priority": "core",
+     "context": "diagnosis",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     },
+     "required_mastery": 0.55
+    }
+   ],
+   "related": [],
+   "skills": [
+    "agg_team_series_stats 的粒度是 (series_id, team_name)"
+   ],
+   "question_types": [
+    "计算",
+    "判读"
+   ],
+   "examples": [
+    {
+     "prompt": "这场两队的整体对比？",
+     "answer_outline": [
+      "MCP: match_summary_report(series_id=?, team_name=?)"
+     ]
+    }
+   ],
+   "typical_misconceptions": [
+    "把团队汇总当选手数据用"
+   ],
+   "curriculum_version": [
+    "generic_college",
+    "college_data_structures"
+   ],
+   "exam_region": [
+    "college_course_generic"
+   ],
+   "exam_type": [
+    "college_course_exam"
+   ]
+  },
+  {
+   "id": "vlml_streak",
+   "name": "连败 / 连胜（streak）",
+   "subject": "valorant",
+   "stage": "college",
+   "chapter": "团队与系列赛",
+   "course_family": "esports_analytics",
+   "depth": 4,
+   "difficulty": 0.74,
+   "prerequisites": [
+    {
+     "id": "vlml_round_result",
+     "relation": "prerequisite",
+     "reason": "连败是回合胜负序列上的连续段",
+     "priority": "core",
+     "context": "diagnosis",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     },
+     "required_mastery": 0.65
+    }
+   ],
+   "related": [
+    {
+     "id": "vlml_momentum",
+     "relation": "next",
+     "reason": "连败之后通常要看势头是否延续",
+     "priority": "useful",
+     "context": "practice",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     }
+    }
+   ],
+   "skills": [
+    "gaps-and-islands：两个 ROW_NUMBER() 相减得段号，再按段号分组计数",
+    "过滤必须放在编号**之后**，否则整段被当成一整块",
+    "最长段的起点要取该段的 MIN，不是全组 MIN"
+   ],
+   "question_types": [
+    "计算",
+    "判读"
+   ],
+   "examples": [
+    {
+     "prompt": "Cloud9 在这张图上的最长连败是几个回合？从哪个回合开始？",
+     "answer_outline": [
+      "确认粒度：回合序列 → rounds，且要**按回合号有序**。",
+      "MCP: query_sql(\"SELECT cnt AS max_streak, start_round FROM (SELECT COUNT(*) AS cnt, MIN(round_number) AS start_round FROM (SELECT round_number, losing_team_name, ROW_NUMBER() OVER (ORDER BY round_number) AS rn, ROW_NUMBER() OVER (PARTITION BY losing_team_name ORDER BY round_number) AS grp FROM rounds WHERE series_id = ? AND map_name = ?) t WHERE losing_team_name = ? GROUP BY (rn - grp)) x ORDER BY cnt DESC, start_round ASC LIMIT 1\")",
+      "三步顺序不能反：先全序列编号 → 再筛目标队 → 再按 (rn-grp) 分组。",
+      "结尾 ORDER BY … LIMIT 1 保证只返回一行（真值唯一）。"
+     ]
+    }
+   ],
+   "typical_misconceptions": [
+    "用 COUNT(*) OVER (ORDER BY round_number) 当'最长连败' —— 那是累计计数，不是连续段数",
+    "先过滤再编号 —— 段号会连成一块，算出来偏大（实测算出 13 而不是 8）",
+    "直接 MIN(round_number) 当起点 —— 拿到的是全组最小值，不是最长那段（实测 R1 而不是 R7）"
+   ],
+   "curriculum_version": [
+    "generic_college",
+    "college_data_structures"
+   ],
+   "exam_region": [
+    "college_course_generic"
+   ],
+   "exam_type": [
+    "college_course_exam"
+   ]
+  },
+  {
+   "id": "vlml_momentum",
+   "name": "势头（momentum）",
+   "subject": "valorant",
+   "stage": "college",
+   "chapter": "团队与系列赛",
+   "course_family": "esports_analytics",
+   "depth": 4,
+   "difficulty": 0.72,
+   "prerequisites": [
+    {
+     "id": "vlml_streak",
+     "relation": "prerequisite",
+     "reason": "势头是连段之上的判读",
+     "priority": "core",
+     "context": "diagnosis",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     },
+     "required_mastery": 0.65
+    }
+   ],
+   "related": [],
+   "skills": [
+    "势头要同时看连段长度与之后是否被中断，只看连段会误导"
+   ],
+   "question_types": [
+    "计算",
+    "判读"
+   ],
+   "examples": [
+    {
+     "prompt": "这队是不是起势了？",
+     "answer_outline": [
+      "MCP: match_rounds_report(series_id=?, map_name=?)",
+      "看连段长度 + 之后是否被中断；3 回合以内的连段不足以判读势头。"
+     ]
+    }
+   ],
+   "typical_misconceptions": [
+    "把'连赢 3 回合'直接说成势头起来了 —— 3 回合的样本不足以判读"
+   ],
+   "curriculum_version": [
+    "generic_college",
+    "college_data_structures"
+   ],
+   "exam_region": [
+    "college_course_generic"
+   ],
+   "exam_type": [
+    "college_course_exam"
+   ]
+  },
+  {
+   "id": "vlml_scouting",
+   "name": "对手侦察",
+   "subject": "valorant",
+   "stage": "college",
+   "chapter": "赛事与侦察",
+   "course_family": "esports_analytics",
+   "depth": 4,
+   "difficulty": 0.66,
+   "prerequisites": [
+    {
+     "id": "vlml_grain_tournament",
+     "relation": "prerequisite",
+     "reason": "侦察跨多个系列赛",
+     "priority": "core",
+     "context": "diagnosis",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     },
+     "required_mastery": 0.6
+    }
+   ],
+   "related": [],
+   "skills": [
+    "侦察报告要跨系列赛聚合，单场样本没有说服力"
+   ],
+   "question_types": [
+    "计算",
+    "判读"
+   ],
+   "examples": [
+    {
+     "prompt": "下一场对手什么风格？",
+     "answer_outline": [
+      "MCP: scouting_report(team_name=?, last_n_series=5, map_name=?)",
+      "last_n_series 至少给到 5，单场只能说明那一场的状态。"
+     ]
+    }
+   ],
+   "typical_misconceptions": [
+    "拿一场比赛侦察对手 —— 那是这场的状态，不是对手的稳定特征"
+   ],
+   "curriculum_version": [
+    "generic_college",
+    "college_data_structures"
+   ],
+   "exam_region": [
+    "college_course_generic"
+   ],
+   "exam_type": [
+    "college_course_exam"
+   ]
+  },
+  {
+   "id": "vlml_pattern",
+   "name": "跨数据集模式识别",
+   "subject": "valorant",
+   "stage": "college",
+   "chapter": "赛事与侦察",
+   "course_family": "esports_analytics",
+   "depth": 4,
+   "difficulty": 0.76,
+   "prerequisites": [
+    {
+     "id": "vlml_scouting",
+     "relation": "prerequisite",
+     "reason": "模式识别是侦察的规模化版本",
+     "priority": "core",
+     "context": "diagnosis",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     },
+     "required_mastery": 0.65
+    }
+   ],
+   "related": [],
+   "skills": [
+    "pattern_detection_report 有 min_rounds 门槛，样本不够它不返回结论"
+   ],
+   "question_types": [
+    "计算",
+    "判读"
+   ],
+   "examples": [
+    {
+     "prompt": "这队有哪些反复出现的套路？",
+     "answer_outline": [
+      "MCP: pattern_detection_report(team_name=?, min_rounds=200)",
+      "先确认样本量：回合数低于 min_rounds 时结论不可信（当前库只有 59 回合）。"
+     ]
+    }
+   ],
+   "typical_misconceptions": [
+    "在 59 个回合的数据上跑模式识别 —— 低于 min_rounds，结论不可信"
+   ],
+   "curriculum_version": [
+    "generic_college",
+    "college_data_structures"
+   ],
+   "exam_region": [
+    "college_course_generic"
+   ],
+   "exam_type": [
+    "college_course_exam"
+   ]
+  },
+  {
+   "id": "vlml_grain_trap",
+   "name": "粒度陷阱",
+   "subject": "valorant",
+   "stage": "college",
+   "chapter": "口径卫生",
+   "course_family": "esports_analytics",
+   "depth": 3,
+   "difficulty": 0.55,
+   "prerequisites": [
+    {
+     "id": "vlml_grain_round",
+     "relation": "prerequisite",
+     "reason": "先分清粒度才谈得上指标",
+     "priority": "core",
+     "context": "diagnosis",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     },
+     "required_mastery": 0.55
+    }
+   ],
+   "related": [
+    {
+     "id": "vlml_kast",
+     "relation": "confusable",
+     "reason": "系列赛 KAST 与单图 KAST 常被混用",
+     "priority": "core",
+     "context": "review",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     }
+    },
+    {
+     "id": "vlml_fb_conversion",
+     "relation": "confusable",
+     "reason": "首血转换率分图与全场常被混用",
+     "priority": "core",
+     "context": "review",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     }
+    }
+   ],
+   "skills": [
+    "答之前先说清：这个问题的粒度是回合 / 局 / 系列赛 / 赛事？对应哪张表？"
+   ],
+   "question_types": [
+    "计算",
+    "判读"
+   ],
+   "examples": [
+    {
+     "prompt": "我不确定这个问题该查哪张表。",
+     "answer_outline": [
+      "MCP: get_database_info() —— 先看每张表的粒度与行数。",
+      "按问题粒度选表：回合 → rounds / agg_*_round_*；单图 → games / agg_*_game_*；系列赛 → series / agg_*_series_*；赛事 → agg_tournament_stats。"
+     ]
+    }
+   ],
+   "typical_misconceptions": [
+    "用聚合表回答明细问题（或反过来）",
+    "跨粒度相加：把回合级计数与局级计数直接相加"
+   ],
+   "curriculum_version": [
+    "generic_college",
+    "college_data_structures"
+   ],
+   "exam_region": [
+    "college_course_generic"
+   ],
+   "exam_type": [
+    "college_course_exam"
+   ]
+  },
+  {
+   "id": "vlml_sample_size",
+   "name": "样本量与结论强度",
+   "subject": "valorant",
+   "stage": "college",
+   "chapter": "口径卫生",
+   "course_family": "esports_analytics",
+   "depth": 4,
+   "difficulty": 0.6,
+   "prerequisites": [
+    {
+     "id": "vlml_grain_trap",
+     "relation": "prerequisite",
+     "reason": "先不错粒度，再谈样本够不够",
+     "priority": "core",
+     "context": "diagnosis",
+     "confidence": 0.85,
+     "use_cases": [
+      "diagnosis",
+      "learning_path"
+     ],
+     "metadata": {
+      "source_subject": "valorant",
+      "target_subject": "valorant"
+     },
+     "required_mastery": 0.55
+    }
+   ],
+   "related": [],
+   "skills": [
+    "报比率必须同时报分母；分母太小时只能说'这场如此'，不能说'他们就是如此'"
+   ],
+   "question_types": [
+    "计算",
+    "判读"
+   ],
+   "examples": [
+    {
+     "prompt": "Cloud9 的首血转换率是多少？这个结论稳吗？",
+     "answer_outline": [
+      "MCP: query_sql(\"SELECT ROUND(AVG(fb_team_won)*100, 1) AS conv, COUNT(*) AS n FROM agg_first_blood_stats WHERE series_id = ? AND fb_team = ?\")",
+      "值（conv）与样本量（n）**一起报**；n 很小就限定结论范围为这一场。"
+     ]
+    }
+   ],
+   "typical_misconceptions": [
+    "只报百分比不报样本量"
+   ],
+   "curriculum_version": [
+    "generic_college",
+    "college_data_structures"
+   ],
+   "exam_region": [
+    "college_course_generic"
+   ],
+   "exam_type": [
+    "college_course_exam"
+   ]
+  }
+ ]
+}
