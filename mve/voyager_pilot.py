@@ -76,7 +76,7 @@ def _alive(pid: int) -> bool:
 
 
 def _secret_key() -> str:
-    """从密钥文件读出 DEEPSEEK_API_KEY（支持 `KEY=val` 或纯 key 两种写法）。"""
+    """从密钥文件读出 DEEPSEEK_API_KEY / ZHIPU_API_KEY（支持 `KEY=val` 或纯 key 两种写法）。"""
     if not SECRET_FILE.exists():
         return ""
     txt = SECRET_FILE.read_text(encoding="utf-8", errors="replace").strip()
@@ -85,9 +85,30 @@ def _secret_key() -> str:
     if "=" in txt.splitlines()[0]:
         for line in txt.splitlines():
             line = line.strip()
+            if line.startswith("ZHIPU_API_KEY="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
             if line.startswith("DEEPSEEK_API_KEY="):
                 return line.split("=", 1)[1].strip().strip('"').strip("'")
     return txt
+
+
+def _secret_env() -> dict[str, str]:
+    """从密钥文件读出所有 `KEY=val` 行（忽略注释/空行），注入子进程环境。
+
+    这样密钥文件里写 ZHIPU_API_KEY / ZHIPU_BASE_URL / ZHIPU_MODEL（或 DEEPSEEK_*）
+    都会被原样转发给 run_voyager_learn，neko_model 按命名决定走哪条 LLM 后端。
+    """
+    out: dict[str, str] = {}
+    if not SECRET_FILE.exists():
+        return out
+    for line in SECRET_FILE.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        k, v = k.strip(), v.strip().strip('"').strip("'")
+        out[k] = v
+    return out
 
 
 def _progress() -> dict[str, Any]:
@@ -155,11 +176,9 @@ def start(*, mc_port: int = 25565, max_iterations: int = DEFAULT_MAX_ITER) -> di
         "--mc-port", str(mc_port), "--ckpt-dir", CKPT_DIR,
         "--max-iterations", str(max_iterations),
     ]
-    # 启动时把密钥文件里的 DEEPSEEK_API_KEY 注入子进程环境
+    # 启动时把密钥文件里的 LLM 凭据（ZHIPU_* / DEEPSEEK_*）注入子进程环境
     env = dict(os.environ)
-    key = _secret_key()
-    if key:
-        env["DEEPSEEK_API_KEY"] = key
+    env.update(_secret_env())
     env["PYTHONUNBUFFERED"] = "1"
 
     proc = subprocess.Popen(
@@ -174,10 +193,12 @@ def start(*, mc_port: int = 25565, max_iterations: int = DEFAULT_MAX_ITER) -> di
         "stop_requested": False,
     }
     _write(st)
+    sec = _secret_env()
+    has_llm = any(k in sec for k in ("ZHIPU_API_KEY", "DEEPSEEK_API_KEY"))
     _log(f"\n===== 启动 Voyager 学习 {_now()} · mc_port {mc_port} · "
-         f"上限 {max_iterations} 轮 · pid {proc.pid} · key {'有' if key else '无'} =====\n")
-    if not key:
-        _log("[驾驶舱] 警告：没找到 DEEPSEEK_API_KEY（/root/.voyager_secret），"
+         f"上限 {max_iterations} 轮 · pid {proc.pid} · LLM凭据 {'有' if has_llm else '无'} =====\n")
+    if not has_llm:
+        _log("[驾驶舱] 警告：/root/.voyager_secret 里没有 ZHIPU_API_KEY/DEEPSEEK_API_KEY，"
              "LLM 调用会失败。\n")
     return {"ok": True, **st}
 
@@ -274,9 +295,7 @@ def _loop(mc_port: int, max_iterations: int, logf) -> int:
     })
 
     env = dict(os.environ)
-    key = _secret_key()
-    if key:
-        env["DEEPSEEK_API_KEY"] = key
+    env.update(_secret_env())
     env["PYTHONUNBUFFERED"] = "1"
 
     cmd = [
