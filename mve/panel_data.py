@@ -586,6 +586,7 @@ def build_state() -> dict[str, Any]:
         "env": probe_env(),
         "db": db,
         "pilot": pilot_view,
+        "voyager": _voyager_view(),
         "practice_scope": scope,
         "question": rows[-1].get("question", ""),
         "topic_id": topic_id,
