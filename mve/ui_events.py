@@ -45,6 +45,11 @@ PRACTICE_SCOPE_CLEAR = "practice_scope_clear"  # 点「清除范围」
 SUBJECT_ADD = "subject_add"        # 学科登记册：人填一个学科（换数据源后填赛事/战队）
 SUBJECT_SYNC = "subject_sync"      # 点「从数据源同步」：把库里实查到的值登记成学科
 SUBJECT_DEL = "subject_del"        # 删掉一个（人填的）学科
+MC_LEARN = "mc_learn"              # 点「🧠 启动 MC 思路学习 → MVE」（MC 侧学习 + 入库）
+VOYAGER_START = "voyager_start"    # 点「▶ 启动 MC 真实学习」（在 MC 里跑 Voyager 自动课程）
+VOYAGER_STOP = "voyager_stop"      # 点「■ 停止」（Voyager 学习）
+VOYAGER_CLEAR_SKILL = "voyager_clear_skill"    # 点「清库」（删技能库）
+VOYAGER_CLEAR_MEMORY = "voyager_clear_memory"  # 点「清记忆」（删课程进度 + 事件）
 
 # kind -> 人话（导出 md 里直接显示）
 ACTION_LABEL = {
@@ -62,6 +67,11 @@ ACTION_LABEL = {
     SUBJECT_ADD: "登记一个学科（人填）",
     SUBJECT_SYNC: "点「从数据源同步学科」",
     SUBJECT_DEL: "删除一个学科",
+    MC_LEARN: "点「🧠 启动 MC 思路学习 → MVE」",
+    VOYAGER_START: "点「▶ 启动 MC 真实学习」",
+    VOYAGER_STOP: "点「■ 停止 MC 真实学习」",
+    VOYAGER_CLEAR_SKILL: "点「清库（删技能库）」",
+    VOYAGER_CLEAR_MEMORY: "点「清记忆（删课程进度 + 事件）」",
 }
 
 

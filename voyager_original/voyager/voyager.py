@@ -162,6 +162,17 @@ class Voyager:
         self.conversations = []
         self.last_events = None
 
+        # 停止信号：被外部（面板「停止」键 → SIGTERM → run_voyager_learn.py）
+        # 置 True 后，learn() 在下一个任务边界优雅退出，而不是硬杀。
+        self._stop_requested = False
+        # 进度钩子：每完成一个任务回调一次（默认空操作）。run_voyager_learn.py
+        # 会覆写成写 voyager_progress.json，让面板能看到「已学 N 个技能」。
+        self._on_progress = None
+
+    def request_stop(self) -> None:
+        """请求停止自动课程循环（在当前任务结束后退出）。"""
+        self._stop_requested = True
+
     def reset(self, task, context="", reset_env=True):
         self.action_agent_rollout_num_iter = 0
         self.task = task
@@ -316,6 +327,11 @@ class Voyager:
             if self.recorder.iteration > self.max_iterations:
                 print("Iteration limit reached")
                 break
+            # 停止信号：面板「停止」键 → SIGTERM → run_voyager_learn.py 调
+            # request_stop()，这里在当前任务结束后退出，不硬杀（技能已按任务落盘）。
+            if self._stop_requested:
+                print("Stop requested — exiting learn loop after current task")
+                break
             task, context = self.curriculum_agent.propose_next_task(
                 events=self.last_events,
                 chest_observation=self.action_agent.render_chest_observation(),
@@ -354,6 +370,13 @@ class Voyager:
                 self.skill_manager.add_new_skill(info)
 
             self.curriculum_agent.update_exploration_progress(info)
+            # 进度钩子：让面板能读出「已学 N 个技能 / 失败 M 个 / 第 K 轮」
+            if callable(self._on_progress):
+                self._on_progress(
+                    list(self.curriculum_agent.completed_tasks),
+                    list(self.curriculum_agent.failed_tasks),
+                    int(self.recorder.iteration),
+                )
             print(
                 f"\033[35mCompleted tasks: {', '.join(self.curriculum_agent.completed_tasks)}\033[0m"
             )

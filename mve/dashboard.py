@@ -361,6 +361,7 @@ li{margin:3px 0}
           <button class="btn btn-primary" id="runStart">▶ 启动 Voyager</button>
           <button class="btn btn-danger" id="runStop" disabled>■ 停止</button>
           <button class="btn btn-secondary" id="btnExport" title="把当前学习过程导出成一份 md">⬇ 导出 md</button>
+          <button class="btn btn-secondary" id="mcLearn" title="先跑 MC 思路学习（提炼域无关规划思维）并入库，再自动启动标准练习循环（正常 MVE 全流程）">🧠 启动 MC 思路学习 → MVE</button>
           <span class="runstate"><i class="dot off" id="runDot"></i><span id="runState">未运行</span></span>
         </div>
         <!-- 练习范围：伴学 onboarding.md:82 —— 人在知识图谱上点知识点定范围，
@@ -393,6 +394,8 @@ const TABS = [
   {id:'skill',    icon:'🧠', label:'技能 · 因果', status:s=>(s.skill_stats&&s.skill_stats.skills||0)+' 条技能'},
   {id:'graph',    icon:'🕸', label:'知识图谱',
    status:s=>s.practice_scope&&s.practice_scope.active?('范围：'+s.practice_scope.label):'维度 → 工具'},
+  {id:'voyager', icon:'🤖', label:'MC 真实学习',
+   status:s=>(s.voyager&&s.voyager.running)?'学习中':((s.voyager&&s.voyager.completed_count)?('已学 '+(s.voyager.completed_count)+' 技能'):'空闲')},
   {id:'console',  icon:'🖥', label:'运行日志', status:s=>s.pilot&&s.pilot.running?'运行中':'空闲'},
 ];
 let TAB = localStorage.getItem('mve_tab') || 'overview';
@@ -812,6 +815,14 @@ function pSkill(s){
     </div>`).join('');
   const c=s.causal||{};
   const kc={control:'ok',attempt:'',referee:'grey',narrative:'grey'};
+  const mc=s.mc_thinking||{};
+  const mcBlock = mc.count ? `
+    <div class="note info" style="margin-top:10px">
+      🧠 <b>MC 思路学习入库：${mc.count} 条</b>
+      <span class="hint">（topic=mc-thinking，MVE 标准练习循环运行期可被检索）</span>
+      <ul style="margin:6px 0 0 18px;padding:0">${(mc.items||[]).map(x=>`<li><b>${ESC(x.name)}</b> · 命中 ${x.hits} · 有效 ${x.ok}${x.versions>1?` · 已覆盖 ${x.versions} 版`:''}</li>`).join('')}</ul>
+      ${mc.skill_md?`<div class="hint">SKILL.md：${ESC(mc.skill_md)}（OpenClaw 考场直接注入）</div>`:''}
+    </div>` : '';
   const tl=(c.rows||[]).length?`<div class="timeline">${(c.rows||[]).slice().reverse().map(r=>`
       <div class="tl"><span class="seq">#${r.seq}</span>
         <span class="kd"><span class="chip ${kc[r.kind]||'grey'}">${ESC(r.kind_label)}</span></span>
@@ -825,12 +836,57 @@ function pSkill(s){
         膨胀率 <span class="chip ${(st.bloat||1)>1?'ok':'warn'}">${st.bloat||1}</span>
         · 每题最多注入 <b>${st.top_k||5}</b> 条进 prompt</div>
       ${cards||'<div class="empty">空。Voyager 还没积累任何经验。</div>'}
+      ${mcBlock}
     </div>
     <div class="panel">
       <div class="panel__head"><h2>行动因果时间线</h2>
         <span class="hint">control（人导入）与 attempt（Voyager 行动）在同一条单调序列上，只保序不评分</span></div>
       ${tl}
     </div>`;
+}
+
+/* ---------------- Voyager 真实学习（MC 现场）----------------
+   这是「在 MC 里真实学习」的面板控件，和 MVE 驾驶舱同款心智：
+   启动 / 停止 / 清库 / 清记忆。停止 = 任务边界优雅退出（不硬杀，技能已落盘）；
+   清库 = 删 ckpt/skill/；清记忆 = 删 ckpt/curriculum/ + ckpt/events/。 */
+function pVoyager(s){
+  const v=s.voyager||{};
+  const running=!!v.running;
+  const st = v.stop_requested ? '停止中（当前任务收尾）'
+           : (running ? '学习中' : ('空闲 · '+(v.why||'')));
+  const inv=`<div class="kpis">
+    <div class="kpi"><div class="label">技能库</div><div class="value">${v.skill_dir_exists?'有':'空'}${v.completed_count?(' · 已学 '+v.completed_count+' 个'):''}</div></div>
+    <div class="kpi"><div class="label">课程进度</div><div class="value">${v.curriculum_dir_exists?'有':'空'}</div></div>
+    <div class="kpi"><div class="label">事件历史</div><div class="value">${v.events_dir_exists?'有':'空'}</div></div>
+    <div class="kpi"><div class="label">失败任务</div><div class="value">${v.failed_count||0}</div></div>
+    <div class="kpi"><div class="label">当前轮次</div><div class="value">${v.iterations||0} / ${v.max_iterations||'—'}</div></div>
+  </div>`;
+  const ctl=`<div class="runctl">
+      <span class="lbl">MC 真实学习</span>
+      <button class="btn btn-primary" id="voyStart" ${running?'disabled':''}>▶ 启动学习</button>
+      <button class="btn btn-danger" id="voyStop" ${running?'':'disabled'}>■ 停止</button>
+      <button class="btn btn-secondary" id="voyClearLog">清空日志</button>
+    </div>
+    <div class="runctl" style="margin-top:8px">
+      <button class="btn btn-danger" id="voyClearSkill" title="删 ckpt/skill/：Voyager 已学的 JS 技能库">🗑 清库（删技能库）</button>
+      <button class="btn btn-danger" id="voyClearMemory" title="删 ckpt/curriculum/ + ckpt/events/：课程进度 + 事件历史">🗑 清记忆（删进度+事件）</button>
+    </div>
+    <div class="note ${running?'info':''}">${
+      running
+        ? ('正在 MC 里跑 Voyager 自动课程（pid '+v.pid+'）· 已学 '+v.completed_count+' 个技能 · 失败 '+v.failed_count+' 个')
+        : ('状态：'+st)
+    }</div>`;
+  const log = ESC((v.tail||'（暂无日志）').replace(/\u001b\[[0-9;]*m/g,''));
+  return `<div class="panel">
+    <div class="panel__head"><h2>MC 真实学习 · Voyager 自动课程</h2>
+      <span class="hint">Voyager 接外部 MC 服务器，自动提任务 → bot 执行 → Critic 验成功 → JS 技能入库</span>
+      <span class="chip ${running?'ok':'grey'}">${running?'学习中':'空闲'}</span></div>
+    <div class="legend">和 MVE 面板一样可操作：<b>停止</b>（任务边界优雅退出，不硬杀）、<b>清库</b>（忘技能）、<b>清记忆</b>（忘进度）。技能按任务落盘，停止不会丢已学的。</div>
+    ${inv}
+    ${ctl}
+    <div class="console">${log}</div>
+    <div class="legend">日志来自 run_voyager_learn.py（venv）。启动前需：① VPS 内存已升级；② MC 服务器已起（25565）；③ /root/.voyager_secret 有 DEEPSEEK_API_KEY。停止后模型在当前任务收尾即停，不会半途强杀。</div>
+  </div>`;
 }
 
 function pConsole(s){
@@ -1199,7 +1255,7 @@ document.addEventListener('click',e=>{
   if(sd){ delSubject(sd.dataset.subjectDel); return; }
 });
 
-const PANELS={overview:pOverview,practice:pPractice,import:pImport,trace:pTrace,skill:pSkill,graph:pGraph,console:pConsole};
+const PANELS={overview:pOverview,practice:pPractice,import:pImport,trace:pTrace,skill:pSkill,graph:pGraph,voyager:pVoyager,console:pConsole};
 
 /* ---------------- 人导入（只在 import 分区里挂事件） ---------------- */
 function fillTopics(s){
@@ -1337,7 +1393,7 @@ async function submitImport(){
    用户要求导出的 md「一定要具体到界面交互（按了什么键，然后选了什么难度）」。
    所以每一次按键、每一个下拉选择都落盘成 ui_events.jsonl，导出时排在最前。 */
 const TAB_LABEL = {overview:'概览', practice:'练习', import:'人导入',
-                   trace:'轨迹', skill:'技能·因果', graph:'知识图谱', console:'运行日志'};
+                   trace:'轨迹', skill:'技能·因果', graph:'知识图谱', voyager:'MC 真实学习', console:'运行日志'};
 function uiEvent(kind, detail, result){
   try{
     fetch('/api/ui-event',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -1376,6 +1432,34 @@ async function pilotStart(){
   const sc=window.__scope||{active:false};
   await runJob('practice',{mode: sc.active?'once':'loop', rounds:3, use_scope:true,
     btnId:'runStart', btnText:'▶ 启动 Voyager', busyText:'启动中…'});
+}
+/* MC 思路学习 → 自动启动 MVE 全流程：
+   先 POST /api/mc-learn（提炼 + 入库，同步、快），成功后再触发标准练习循环
+   （= 现有「▶ 启动 Voyager」做的事，pilot/start）。两步在同一按钮里串起来，
+   对应「MC 学思维 → 入库 → 正常启动 MVE」。 */
+async function mcLearnThenRun(){
+  const b=document.getElementById('mcLearn');
+  if(!b||b.disabled) return;
+  if(window.__pilot&&window.__pilot.running){
+    alert('MVE 已经在跑了（pid '+window.__pilot.pid+'）。\n\n'
+      +'MC 思路学习已就绪，等它跑完再点，或先点「停止」。');
+    return;
+  }
+  b.disabled=true; b.innerHTML='<span class="spin"></span>MC 学习中…';
+  try{
+    const r=await fetch('/api/mc-learn',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:'{}'});
+    const d=await r.json();
+    if(!d.ok){ alert('MC 思路学习失败：'+(d.error||'未知')); return; }
+    uiEvent('mc_learn',
+      {提炼原则:d.principles, 入库:d.store.mc_thinking_count, 密度:d.densities},
+      'MC 思路学习完成，已入库');
+    // 自动启动正常 MVE 全流程（标准练习循环）
+    await runJob('practice',{mode:(window.__scope&&window.__scope.active)?'once':'loop',
+      rounds:3, use_scope:true, btnId:'runStart', btnText:'▶ 启动 Voyager',
+      busyText:'启动中…'});
+  }catch(e){ alert('MC 学习失败：'+e); }
+  finally{ if(b){ b.disabled=false; b.textContent='🧠 启动 MC 思路学习 → MVE'; } }
 }
 async function startPlacement(){
   const n=window.__skills||0;
@@ -1423,10 +1507,53 @@ async function pilotStop(){
   finally{ b.disabled=false; b.textContent='■ 停止'; }
 }
 
+/* ---------------- Voyager 真实学习控制 ---------------- */
+async function voyagerStart(){
+  const b=document.getElementById('voyStart'); if(!b||b.disabled) return;
+  b.disabled=true; b.innerHTML='<span class="spin"></span>启动中…';
+  try{
+    const r=await fetch('/api/voyager/start',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const d=await r.json();
+    uiEvent('voyager_start',
+      {mc_port:d.mc_port||25565, 上限:d.max_iterations||''},
+      d.ok?('启动成功 pid '+(d.pid||'')):('失败：'+(d.error||'未知')));
+    if(!d.ok){ alert('启动失败：'+(d.error||'未知')); }
+    else { TAB='voyager'; localStorage.setItem('mve_tab',TAB); }
+    await load();
+  }catch(e){ uiEvent('voyager_start',{},'异常：'+e); alert('启动失败：'+e); }
+  finally{ if(b){ b.disabled=false; b.textContent='▶ 启动学习'; } }
+}
+async function voyagerStop(){
+  const b=document.getElementById('voyStop'); if(!b||b.disabled) return;
+  b.disabled=true; b.textContent='停止中…';
+  const v=window.__voyager||{};
+  try{
+    const r=await fetch('/api/voyager/stop',{method:'POST'});
+    const d=await r.json();
+    uiEvent('voyager_stop',{停止时轮次:v.iterations||0, 已学技能:v.completed_count||0},'已停止');
+    await load();
+  }catch(e){ alert('停止失败：'+e); }
+  finally{ if(b){ b.disabled=false; b.textContent='■ 停止'; } }
+}
+async function voyagerClear(which, label){
+  const ok=confirm('清'+(which==='skill'?'库':'记忆')+' = 删除 Voyager 的'
+    +(which==='skill'?'已学 JS 技能库（ckpt/skill/）':'课程进度 + 事件历史（ckpt/curriculum/ + ckpt/events/）')
+    +'。\n\n会自动备份到 voyager_backup_*。\n\n确定要清'+label+'？');
+  if(!ok) return;
+  try{
+    const r=await fetch('/api/voyager/clear-'+which,{method:'POST'});
+    const d=await r.json();
+    uiEvent('voyager_clear_'+which,{清了:d.cleared||[], 备份:d.backup||'无'}, d.ok?('已清'+label):'失败');
+    alert(d.ok?('已清'+label+'（备份：'+(d.backup||'无')+'）'):('失败：'+(d.error||'未知')));
+    await load();
+  }catch(e){ alert('清'+label+'失败：'+e); }
+}
+
 /* ---------------- 主渲染 ---------------- */
 function render(s){
   window.__lastRec = s.recommend || {};
   window.__pilot   = s.pilot || {};
+  window.__voyager = s.voyager || {};
   window.__skills  = (s.skill_stats||{}).skills || 0;
   // topic_id -> 难度（埋点里要把"选了什么难度"记下来）
   window.__diff = {};
@@ -1499,6 +1626,16 @@ function render(s){
   const dp=document.getElementById('dbProbe'); if(dp) dp.onclick=dbProbe;
   const ds=document.getElementById('dbSwitch');
   if(ds){ ds.onclick=dbSwitch; ds.disabled=!dbProbedOk; }
+  const vs=document.getElementById('voyStart');
+  if(vs) vs.onclick=voyagerStart;
+  const vsp=document.getElementById('voyStop');
+  if(vsp) vsp.onclick=voyagerStop;
+  const vcl=document.getElementById('voyClearLog');
+  if(vcl) vcl.onclick=async()=>{ await fetch('/api/voyager/clear-log',{method:'POST'}); await load(); };
+  const vcs=document.getElementById('voyClearSkill');
+  if(vcs) vcs.onclick=()=>voyagerClear('skill','库');
+  const vcm=document.getElementById('voyClearMemory');
+  if(vcm) vcm.onclick=()=>voyagerClear('memory','记忆');
 }
 
 /* ---------------- 数据库切换：先验货，再切换 ----------------
@@ -1576,6 +1713,7 @@ document.getElementById('nav').addEventListener('click',e=>{
   load();
 });
 document.getElementById('runStart').onclick=pilotStart;
+document.getElementById('mcLearn').onclick=mcLearnThenRun;
 document.getElementById('runStop').onclick=pilotStop;
 
 load();
@@ -1873,6 +2011,105 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"ok": True})
             except Exception as e:
                 self._json(500, {"ok": False, "error": f"{type(e).__name__}: {e}"[:300]})
+            return
+
+        # MC 思路学习（即「启动在 mc 里的学习」）：提炼 + 入库。跑完之后前端
+        # 会自动触发标准练习循环（正常 MVE 全流程，= pilot/start）。
+        if path == "/api/mc-learn":
+            try:
+                import mc_learn
+                import ui_events
+                res = mc_learn.run()
+                ui_events.append(
+                    ui_events.MC_LEARN,
+                    detail={"提炼原则": res["principles"],
+                            "入库条数": res["store"]["mc_thinking_count"],
+                            "SKILL.md": res["skill_md"]},
+                    result="MC 思路学习完成 → 已入库",
+                )
+                self._json(200, res)
+            except Exception as e:
+                self._json(500, {"ok": False,
+                                 "error": f"{type(e).__name__}: {e}"[:300]})
+            return
+
+        # ---- Voyager 真实学习（MC 现场）----
+        # 启动 / 停止 / 清库 / 清记忆：与 MVE 驾驶舱同款，状态写文件、面板只读。
+        if path == "/api/voyager/start":
+            try:
+                import voyager_pilot
+                import ui_events
+                res = voyager_pilot.start()
+                ui_events.append(
+                    ui_events.VOYAGER_START,
+                    detail={"mc_port": res.get("mc_port", 25565),
+                            "上限": res.get("max_iterations", "")},
+                    result="启动成功" if res.get("ok") else ("失败：" + res.get("error", "")),
+                )
+                self._json(200, res)
+            except Exception as e:
+                self._json(500, {"ok": False,
+                                 "error": f"{type(e).__name__}: {e}"[:300]})
+            return
+
+        if path == "/api/voyager/stop":
+            try:
+                import voyager_pilot
+                import ui_events
+                res = voyager_pilot.stop()
+                ui_events.append(
+                    ui_events.VOYAGER_STOP,
+                    detail={"已学技能": res.get("completed_count", 0)},
+                    result="已停止",
+                )
+                self._json(200, res)
+            except Exception as e:
+                self._json(500, {"ok": False,
+                                 "error": f"{type(e).__name__}: {e}"[:300]})
+            return
+
+        if path == "/api/voyager/clear-log":
+            try:
+                import voyager_pilot
+                voyager_pilot.clear_log()
+                self._json(200, {"ok": True})
+            except Exception as e:
+                self._json(500, {"ok": False,
+                                 "error": f"{type(e).__name__}: {e}"[:300]})
+            return
+
+        if path == "/api/voyager/clear-skill":
+            try:
+                import voyager_learn_reset
+                import ui_events
+                res = voyager_learn_reset.clear_skill()
+                ui_events.append(
+                    ui_events.VOYAGER_CLEAR_SKILL,
+                    detail={"清了": res.get("cleared", []),
+                            "备份": res.get("backup") or "无"},
+                    result="已清库" if res.get("ok") else "失败",
+                )
+                self._json(200, res)
+            except Exception as e:
+                self._json(500, {"ok": False,
+                                 "error": f"{type(e).__name__}: {e}"[:300]})
+            return
+
+        if path == "/api/voyager/clear-memory":
+            try:
+                import voyager_learn_reset
+                import ui_events
+                res = voyager_learn_reset.clear_memory()
+                ui_events.append(
+                    ui_events.VOYAGER_CLEAR_MEMORY,
+                    detail={"清了": res.get("cleared", []),
+                            "备份": res.get("backup") or "无"},
+                    result="已清记忆" if res.get("ok") else "失败",
+                )
+                self._json(200, res)
+            except Exception as e:
+                self._json(500, {"ok": False,
+                                 "error": f"{type(e).__name__}: {e}"[:300]})
             return
 
         self.send_error(404)

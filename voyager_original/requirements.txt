@@ -1,14 +1,19 @@
 tqdm
-langchain
-javascript
+langchain==0.0.267
 setuptools
-openai
+openai==0.27.8
 chardet
 cchardet
 chromadb==0.3.29
 tiktoken
 requests
-setuptools
 gymnasium
 psutil
 minecraft_launcher_lib
+# 本地 embeddings 后端（sentence-transformers）需要 numpy；老 langchain 0.0.267
+# 要求 numpy<2，而 sentence-transformers 新版（>=3）会强拉 numpy 2.x，二者冲突
+# （实测：6.1.0 把 numpy 顶到 2.5.4，运行时崩）。锁版到 2.2.2 + numpy 1.26.4 解决。
+numpy==1.26.4
+# 本地 embeddings 后端。2.7.0 用新版 huggingface_hub 的 hf_hub_download，
+# 兼容已装的新版 huggingface_hub/transformers；且不需要 numpy 2.x。
+sentence-transformers==2.7.0

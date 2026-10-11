@@ -35,6 +35,25 @@ def _task_library() -> list[dict[str, Any]]:
                  "dims": [], "has_answer_spec": 0}]
 
 
+def _mc_thinking_view() -> dict[str, Any]:
+    """MC 思路学习入库情况：4 条域无关规划思维（topic=mc-thinking）是否已进共享库。
+
+    面板「技能库」区据此显示「MC 思维入库 N 条」，让"思维积累入库"可见、可证。
+    """
+    items = [s for s in skill_store.all_skills() if s.get("topic") == "mc-thinking"]
+    skill_md = ROOT / "thought_store" / "SKILL.md"
+    return {
+        "count": len(items),
+        "items": [
+            {"name": s.get("name", ""), "text": (s.get("text", "") or "")[:90],
+             "hits": s.get("hits", 0), "ok": s.get("ok", 0),
+             "versions": s.get("versions", 1)}
+            for s in items
+        ],
+        "skill_md": str(skill_md) if skill_md.exists() else "",
+    }
+
+
 def _referee_view(topic_id: str) -> dict[str, Any]:
     """裁判（VLML0）的标准答案视图。
 
@@ -301,6 +320,28 @@ def _pilot_view() -> dict[str, Any]:
         return {"running": False, "tail": "", "why": f"驾驶舱不可用：{type(e).__name__}: {e}"[:160]}
 
 
+def _voyager_view() -> dict[str, Any]:
+    """Voyager 真实学习驾驶舱状态（面板只读，不持有进程句柄）。
+
+    与 _pilot_view 同构：状态写在 voyager_pilot_state.json，进度由
+    run_voyager_learn.py 每任务写 voyager_progress.json。这里只读文件，
+    并附上技能库 / 课程进度 / 事件目录的**存在性**——让人一眼看清"现在库里有什么"。
+    """
+    try:
+        import voyager_pilot
+        from voyager_paths import SKILL_DIR, CURRICULUM_DIR, EVENTS_DIR
+        st = voyager_pilot.read()
+        return {
+            **st,
+            "tail": voyager_pilot.tail(80),
+            "skill_dir_exists": SKILL_DIR.exists(),
+            "curriculum_dir_exists": CURRICULUM_DIR.exists(),
+            "events_dir_exists": EVENTS_DIR.exists(),
+        }
+    except Exception as e:
+        return {"running": False, "tail": "", "why": f"Voyager 驾驶舱不可用：{type(e).__name__}: {e}"[:160]}
+
+
 def _next_recommend() -> dict[str, Any]:
     """出题器当前推荐（带理由）。人导入之后这条应该跟着变。"""
     try:
@@ -377,6 +418,7 @@ def build_state() -> dict[str, Any]:
             "env": probe_env(),
             "db": db,
             "pilot": pilot_view,
+            "voyager": _voyager_view(),
             "practice_scope": scope,
             "imports": imports,
             "recommend": recommend,
@@ -385,6 +427,7 @@ def build_state() -> dict[str, Any]:
             "skills": memory,
             "skill_stats": skill_stats,
             "skill_detail": skill_detail,
+            "mc_thinking": _mc_thinking_view(),
             # 摸底/考核走的是 exam_log.jsonl，**不写** run_log.jsonl（有意分开：
             # run_log 是带图谱的练习覆盖率，恒 100%，画出来是假平线）。
             # 所以"run_log 为空"≠"没有任何数据" —— 摸底跑完了一样要给看。
@@ -576,6 +619,7 @@ def build_state() -> dict[str, Any]:
         # 防膨胀：写入次数 vs 实际条目（bloat=1 表示每次写入都成了新条目，即没挡住）
         "skill_stats": skill_stats,
         "skill_detail": skill_detail,
+        "mc_thinking": _mc_thinking_view(),
         # 防幻觉：被溯源校验拦下的编造数字
         "hallucination_total": hallucination_total,
         "mastery_delta": (
