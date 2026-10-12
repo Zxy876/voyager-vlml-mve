@@ -486,8 +486,14 @@ async def consume(
         base["derived_points"] = [str(p.get("point") or p.get("dimension"))
                                   for p in points]
         if not ref_facts:
-            base["skipped"] = ("裁判侧（VLML 工具链独立取数）也没取到数 → "
-                               "没有真值可比，覆盖率无从计算")
+            # 两种失败必须分开说：排查方向完全不同
+            #   · 工具都没调通 → 是链路/schema 问题
+            #   · 调通了但整理不出事实 → 是评分点（dimension）对不上数据
+            base["skipped"] = (
+                "裁判侧没取到可比的事实："
+                + ("工具调用全部失败" if not ref_traj
+                   else "工具调通了，但整理不出评分点对应的事实（评分点与数据对不上）")
+                + " → 没有真值可比，覆盖率无从计算（如实留空，不拿 0 分冒充）")
             _log(base)
             return base
         try:
