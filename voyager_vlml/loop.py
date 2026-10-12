@@ -61,6 +61,60 @@ _MAX_ITERATIONS = 0      # 不停模式下的总题数上限（0 = 不限；原�
 # 分家之后：面板**只读**循环状态，两个文件的写入方各只有一个。
 LOOP_STATE = _MVE_DIR / "loop_state.json"
 
+# 运行期新生成的图谱节点落盘处 —— **与消费侧同一份文件**
+# （消费侧登记的是 `consume_<hash8>`，这里登记的是 `runtime_<hash8>`）。
+# 为什么不各存一份：掌握度的分母是「图谱节点 + 这里登记的能力项」，
+# 分两个文件迟早会出现两边口径对不上的账。
+RUNTIME_TOPICS = _MVE_DIR / "runtime_topics.json"
+
+
+def _load_runtime_topics() -> dict[str, Any]:
+    try:
+        import json as _json
+        if RUNTIME_TOPICS.exists():
+            obj = _json.loads(RUNTIME_TOPICS.read_text(encoding="utf-8"))
+            return obj if isinstance(obj, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _save_runtime_topic(node: dict[str, Any]) -> None:
+    """把一个运行期生成的图谱节点**持久化**。
+
+    ⚠️ 为什么必须落盘（2026-10-13 服务器实跑 12 轮后发现）：
+      以前 `_generate_new_task` 只往内存里的 `curr.graph.topics[tid]` 塞，
+      进程一退就没了。结果是：技能库拿到了 14 条新配方、MasteryStore 记了 34 个
+      completed，但**图谱节点一个都没留下** —— 重开之后 `select_next` 看不到
+      这些已完成节点，于是又 exhausted、又去生成新题、又重新验一遍同样的题。
+      用户设计里「任务跑通 → 图谱节点改为已完成（**不重复规划**）」就落空了：
+      节点没存，等于每次都得重新规划。
+    """
+    try:
+        import json as _json
+        reg = _load_runtime_topics()
+        tid = str(node.get("id") or "")
+        if not tid:
+            return
+        reg[tid] = node
+        RUNTIME_TOPICS.write_text(
+            _json.dumps(reg, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:  # pragma: no cover
+        print(f"  （运行期节点落盘失败：{type(e).__name__}: {e}）")
+
+
+def _inject_runtime_topics(curr: Any) -> int:
+    """把落盘的运行期节点装回课程的内存图谱（重开后不必重造同一批题）。"""
+    nodes = [v for k, v in _load_runtime_topics().items()
+             if isinstance(v, dict) and str(k).startswith("runtime_")]
+    n = 0
+    for node in nodes:
+        tid = str(node.get("id") or "")
+        if tid and tid not in curr.graph.topics:
+            curr.graph.topics[tid] = node
+            n += 1
+    return n
+
 
 def _write_loop_state(**kw: Any) -> None:
     """把循环心跳写到 `mve/loop_state.json`（只有循环写，面板只读）。"""
@@ -246,7 +300,7 @@ async def _generate_new_task(curr: Any, env: Any, act: Any = None,
         ok, _why = crit.check_task_success(
             observations=obs, task={"task": question, "hints": skills})
         if ok:
-            curr.graph.topics[tid] = {
+            node = {
                 "id": tid,
                 "name": name,
                 "chapter": "运行期生成",
@@ -255,7 +309,10 @@ async def _generate_new_task(curr: Any, env: Any, act: Any = None,
                 "skills": skills,
                 "examples": [{"prompt": question}],
                 "prerequisites": [],  # 无前置 → 立即可选
+                "source": "practice",
             }
+            curr.graph.topics[tid] = node
+            _save_runtime_topic(node)   # 落盘：不落盘重开就得重造同一批题
             return tid, question, list(obs or []), str(sql or "")
         tried.append(question)
         print(f"  （新题验题没取到数，换一个：{question[:50]}）")
@@ -274,7 +331,11 @@ async def run_one_round(
 ) -> dict[str, Any]:
     """跑一轮：里程碑选题 → LLM 出题 → LLM 写 SQL 取数 → DB 取证判据 → 改写图谱。"""
     env = env or VLMLMCPEnv()
-    curr = curr or VLMLCurriculumAgent(scope=scope)
+    if curr is None:
+        curr = VLMLCurriculumAgent(scope=scope)
+        n = _inject_runtime_topics(curr)
+        if n:
+            print(f"  （从上次的运行期节点里装回 {n} 个，不重造同一批题）")
     act = VLMLActionAgent(env=env)
     crit = VLMLCriticAgent()
 
@@ -448,6 +509,11 @@ async def run_rounds(
     """
     env = VLMLMCPEnv()
     curr = VLMLCurriculumAgent(scope=scope)
+    # 把上次运行期生成的节点装回内存图谱 —— 它们已经落盘且多半已标记完成，
+    # 装回来才能「不重复规划」；不装的话每次重开都要重新生成、重新验一遍。
+    _n_inj = _inject_runtime_topics(curr)
+    if _n_inj:
+        print(f"（装回 {_n_inj} 个上次运行期生成的图谱节点）")
     out: list[dict[str, Any]] = []
     i = 0
     # 连续「没拿到证据」的计数。**只观测，不终止**：设计原文是
