@@ -368,7 +368,7 @@ async def run_one_round(
                     "topic_id": "", "reason": "generated_but_unverifiable",
                     "success": False, "question": "", "sql": "",
                     "skill_key": "", "generated": True, "observations": [],
-                    "critique": "", "progress": curr.progress,
+                    "critique": "", "progress": curr.progress, "reused": 0,
                 }
 
     topic = curr.graph.topics.get(tid) or {}
@@ -390,12 +390,45 @@ async def run_one_round(
         ) or f"按「{topic.get('name') or tid}」这个知识点，从库里取一个数。"
 
     # ---- 写 SQL + 取数（LLM + VLML MCP，带迭代修正）----
+    #
+    # 照原版 Voyager 的顺序（`voyager.py:195` → `:199` → `:370`）：
+    #     ① 每轮**先** retrieve_skills  ② 拼进 system prompt  ③ 跑  ④ 成功才 add
+    # 此前练习线只做了 ④（下面 `skill_store.add`），①②③ 一个都没有 ——
+    # 技能库于是成了**单向仓库**：25 条真 SQL 写进去，一条都没被用过，
+    # hits / ok 恒为 0（mark_used 只在 retrieve 之后被调用）。
+    #
+    # ⚠️ 只在**真的要写 SQL** 的那条路上注入并计数：走 pre_obs 那条路
+    # （新题在验题阶段已经取到数）没有任何 prompt 被注入，计数就会是假的。
+    skill_hits: list[dict[str, Any]] = []
+    injected_keys: list[str] = []
+
     # 验题那一趟已经取到数了 → 直接复用，不重复烧一次 LLM + DB。
     if pre_obs:
         observations, sql = pre_obs, pre_sql
     else:
+        try:
+            import skill_store
+
+            have = skill_store._load_raw().get("skills") or {}
+            if have:
+                skill_hits = skill_store.retrieve(
+                    tid, question, top_k=skill_store.RETRIEVAL_TOP_K
+                )
+                injected_keys = [str(s.get("key") or "") for s in skill_hits]
+                if injected_keys:
+                    # 注入了 prompt 才算一次 hit（照原版：检索到就进 context）
+                    skill_store.mark_used(injected_keys)
+                    print(
+                        f"  注入 {len(injected_keys)} 条已学配方："
+                        + "、".join(k.split("::")[0] for k in injected_keys[:3])
+                    )
+        except Exception as e:  # pragma: no cover
+            print(f"  （检索技能库失败：{type(e).__name__}: {e}）")
+
         observations, sql = await act.solve(
-            question, max_iters=max_iters, hints=list(topic.get("skills") or [])[:3]
+            question, max_iters=max_iters,
+            hints=list(topic.get("skills") or [])[:3],
+            skills=skill_hits,
         )
 
     # ---- 判成败：是否真的从 DB 取到数 ----
@@ -403,6 +436,19 @@ async def run_one_round(
         observations=observations,
         task={"task": question, "hints": list(topic.get("skills") or [])[:3]},
     )
+
+    # ---- 计数：注入过的配方这轮有没有帮上忙 ----
+    # 照原版：有效性低的技能会在 retrieve 的排序里自然沉底
+    # （`skill_store.py:273` 打分式里的 `0.6*(ok/hits)` 项）。
+    # mark_result 只记成功，失败不加 ok —— 所以「hits 涨、ok 不涨」
+    # = 注入了但没帮上，正是要它露出来的信号。
+    if injected_keys:
+        try:
+            import skill_store
+
+            skill_store.mark_result(injected_keys, bool(success))
+        except Exception:  # pragma: no cover
+            pass
 
     # ---- 存技能：可复用 SQL，主键 = 图谱问题类型 topic_id ----
     skill_key = ""
@@ -467,6 +513,8 @@ async def run_one_round(
                 "generated_task": generated,
                 "sql": sql,
                 "skill_key": skill_key,
+                # 这一轮注入了哪些已学配方（复用的直接证据；面板/导出可读）
+                "reused_skills": injected_keys,
             }
         )
     except Exception as e:  # pragma: no cover
@@ -482,6 +530,8 @@ async def run_one_round(
         "critique": critique,
         "skill_key": skill_key,
         "progress": curr.progress,
+        # 这一轮注入了几条已学配方（复用的直接证据）
+        "reused": len(injected_keys),
     }
 
 
@@ -569,6 +619,8 @@ async def run_rounds(
             tool_ok=len(ok_calls),
             tool_fail=len(obs) - len(ok_calls),
             rows=rows,
+            # 这一轮注入了几条已学配方 = 复用链真的在转的证据
+            reused=int(r.get("reused") or 0),
             last_error=next(
                 (str(o.get("error") or "") for o in reversed(obs) if not o.get("ok")),
                 ""),
@@ -585,6 +637,7 @@ async def run_rounds(
             f"[{tag}] {r.get('topic_id') or '（本轮没跑出题）'} · reason={r.get('reason')}"
             f"{' (新生成)' if r.get('generated') else ''}"
             f" · 成功={r.get('success')} · 进度={r.get('progress')}"
+            f" · 复用={r.get('reused') or 0} 条已学配方"
             + (f" · ⚠️ 连续 {streak} 轮没拿到证据"
                f"（{_classify_no_evidence(obs)}）"
                if (streak >= 3 and not empty_round) else "")

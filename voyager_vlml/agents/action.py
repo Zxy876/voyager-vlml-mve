@@ -83,6 +83,7 @@ class VLMLActionAgent:
         schema: str = "",
         critique: str = "",
         last_sql: str = "",
+        skills: list[dict[str, Any]] | None = None,
     ) -> str:
         """让模型按题面写一条 SELECT；迭代修正时带上一轮的 critique 与 SQL 重写。
 
@@ -90,7 +91,7 @@ class VLMLActionAgent:
         """
         from voyager_vlml.llm import chat
 
-        system = self.render_system_message()
+        system = self.render_system_message(skills=list(skills or []))
         if schema:
             system += (
                 "\n\n【当前库真实 schema（只能用这里的表名/列名，不要编造）】\n"
@@ -116,8 +117,12 @@ class VLMLActionAgent:
         *,
         max_iters: int = 3,
         hints: list[str] | None = None,
+        skills: list[dict[str, Any]] | None = None,
     ) -> tuple[list[dict[str, Any]], str]:
         """出题之后真正取数：写 SQL → VLML MCP 执行 → 失败带 critique 重写（迭代修正）。
+
+        `skills` = 检索到的已学会配方（照原版 voyager.py:195 先 retrieve 再跑）。
+        它进 system 区块，所以**迭代的每一轮都带着**，不是只在第一轮给。
 
         返回 (观察列表, 最后一条 SQL)。观察是**可枚举的**：工具成败 + 取到几行。
         """
@@ -134,7 +139,8 @@ class VLMLActionAgent:
         critique = ""
         for _ in range(max_iters):
             sql = self.write_sql(
-                question, schema=schema, critique=critique, last_sql=sql
+                question, schema=schema, critique=critique, last_sql=sql,
+                skills=list(skills or []),
             )
             if not sql:
                 observations.append(
@@ -154,13 +160,54 @@ class VLMLActionAgent:
         return observations, sql
 
     # ---------- 迭代修正的 prompt（语言 = SQL） ----------
-    def render_system_message(self) -> str:
-        """写码阶段的 system：可用取数原语 + 库里的坑（同构原版把 JS 原语拼进来）。"""
-        return (
+
+    # 已学会的技能（可复用 SQL）怎么用的说明。
+    #
+    # 照原版 `render_system_message(skills=...)`：原版把技能 code 直接拼在
+    # control_primitives 后面（`action.py:94` 的 `+ skills`），**一句解释都没有**。
+    # 这里必须多这一段，因为两边技能形态不同：
+    #   原版技能 = **带参数的函数**（`async function mineBlock(bot, name, count)`），
+    #     复用天然就是"换参数调用"，不需要教；
+    #   我们的技能 = **一整条写死了字面量的 SQL**（`team_name = 'NRG'`），
+    #     是实例不是函数。不写这段，模型会把上次的值原样抄过来，
+    #     取到的就是上一题那一队的数 —— 看着像复用，其实是记答案。
+    _SKILL_USAGE = """【已学会的取数配方】下面是你以前跑通过、已经存进技能库的 SQL。
+
+怎么用（这几条就是复用的判据）：
+1. 复用的是配方的**计算方法** —— 用了哪些表、怎么 join、怎么聚合、怎么筛选。
+2. **配方里写死的实体字面量（队伍名 / 图名 / 赛事号 / 选手名）是上一次的值，
+   必须换成当前这道题指的那个值。** 抄上一次算出来的数是记答案，不是复用。
+3. 当前这道题没指定实体（比如问"哪支队伍最高"）→ 保留配方的分组结构，别自己造值。
+4. 配方算的量与当前这道题问的量**不是同一个量** → **不要用**，照题面从零写。
+   换队伍名算复用；换个完全不同的量（K/D 比 → 连败数）不算，那是张冠李戴。
+5. 只输出一条 SELECT。"""
+
+    def render_system_message(
+        self, *, skills: list[dict[str, Any]] | None = None
+    ) -> str:
+        """写码阶段的 system：取数原语 + 已学会的配方。
+
+        同构原版 `action.py:94`：技能拼在原语后面，占同一个 system 区块，
+        迭代修正的每一轮都带着（不是只带第一轮）。
+        """
+        base = (
             "你是在 VLML 电竞数据库里取数的分析 agent。用下面的原语写 **SQL** 完成任务。"
             "\n\n"
             + render_primitives()
         )
+        blocks: list[str] = []
+        for i, s in enumerate(list(skills or [])[:5]):
+            code = str(s.get("code") or "").strip()
+            if not code:
+                continue
+            blocks.append(
+                f"-- 配方 {i + 1}｜topic={s.get('topic') or ''}\n"
+                f"-- 上次用它做的是：{str(s.get('text') or '')[:160]}\n"
+                f"{code[:1200]}"
+            )
+        if not blocks:
+            return base
+        return base + "\n\n" + self._SKILL_USAGE + "\n\n" + "\n\n".join(blocks)
 
     def render_iteration_prompt(
         self, *, task: str, critique: str, last_sql: str = ""
