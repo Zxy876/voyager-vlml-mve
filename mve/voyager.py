@@ -656,18 +656,18 @@ TOOL_REGISTRY: dict[str, Any] = {
     "get_database_info": get_database_info,
 }
 
+# 这几个报告工具共用同一个 map_filter 拼接逻辑，都会踩同一个 bug
+MAP_NAME_BUGGY_TOOLS = {
+    "match_summary_report", "match_analysis_report",
+    "match_economy_report", "scouting_report",
+}
+
 # 把有 map_name bug 的 4 个报告工具换成带防护的版本。
 # 之前 _guarded_report / MAP_NAME_BUGGY_TOOLS 写了却没接进注册表 —— 是死代码，
 # 导致传 map_name 时直接撞 VLML 上游的 tgs BinderException。这里接上。
 for _name in MAP_NAME_BUGGY_TOOLS:
     if _name in TOOL_REGISTRY:
         TOOL_REGISTRY[_name] = _wrap_guarded(TOOL_REGISTRY[_name])
-
-# 这几个报告工具共用同一个 map_filter 拼接逻辑，都会踩同一个 bug
-MAP_NAME_BUGGY_TOOLS = {
-    "match_summary_report", "match_analysis_report",
-    "match_economy_report", "scouting_report",
-}
 
 
 _DB_SELF_DESC: str = ""
