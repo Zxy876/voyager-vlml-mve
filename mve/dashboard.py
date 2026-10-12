@@ -466,8 +466,6 @@ function stepChart(pts, opts){
 
 /* ---------------- hero ---------------- */
 function renderHero(s){
-  const last=s.series&&s.series.length?s.series[s.series.length-1]:null;
-  const cls={'weak':'m-weak','progress':'m-progress','good':'m-good','mastered':'m-mastered','unassessed':'m-new'};
   const pills=[];
   if(s.has_data){
     const tr=(s.exam_curve||{}).transfer;
@@ -476,11 +474,14 @@ function renderHero(s){
     // 判据区 KPI：当前题 self-verification 结果（不是覆盖率、不是掌握度）
     pills.push(['当前题判据', lastOk]);
     pills.push(['迁移成功率', tr ? (tr.ok_count+' / '+tr.count) : '—']);
-    pills.push(['掌握度变化', s.mastery_delta||'—']);
-    pills.push(['状态', `<span class="chip ${cls[last.ui_status]||'m-new'}">${ESC(last.status_label)}</span>`]);
     pills.push(['累计轮次', s.total_rounds]);
     pills.push(['技能库', (s.skill_stats&&s.skill_stats.skills||0)+' 条 / 膨胀率 '+(s.skill_stats&&s.skill_stats.bloat||1)]);
-    if(s.hallucination_total>0) pills.push(['拦下编造', `<span class="chip bad">${s.hallucination_total} 条</span>`]);
+    // ⚠️ 「掌握度变化」「状态」「拦下编造」三块已下架（2026-10-13 按后端索引清理）。
+    //    判据：线上 36 条 run_log 全部来自新后端（judge=db_evidence），这三个读的
+    //    mastery / status_label / flags / hallucination_count **一条都没有** ——
+    //    它们只由已冻结的旧后端 mve/run_mve.py 写入。
+    //    留着它们，面板上就永远挂着一个「掌握度 None」和一排空 flags，
+    //    看着像"它没学会"，其实是无人在生产的字段。
   }
   pills.push(['数据源', `<span class="chip ${s.env.state==='ready'?'ok':'bad'}">${s.env.state==='ready'?'VLML 就绪':'VLML 不可用'}</span>`]);
   document.getElementById('pills').innerHTML =
@@ -644,16 +645,15 @@ function pOverview(s){
     ${examCard(s)}
     ${envCard(s)}`;
   }
-  const cov=s.series.filter(p=>p.coverage!==null).map(p=>({x:p.i,y:p.coverage,label:(p.coverage*100).toFixed(0)+'%'}));
-  const mas=s.series.filter(p=>p.mastery!==null).map(p=>({x:p.i,y:p.mastery,label:p.mastery_pct}));
+  // ⚠️ `cov`（覆盖率）与 `mas`（掌握度）两条线已下架：线上 run_log 全部来自新后端
+  //    （judge=db_evidence），coverage/score 恒写 None、mastery 根本不写 ——
+  //    画出来是两条永远为 0 的虚线，还会让人以为"覆盖率掉了"。
   // 判据层：任务完成（Voyager 尺子：跑通 + 拿到数 + 没翻车，不数覆盖点）
   const suc=s.series.filter(p=>p.done!==null && p.done!==undefined)
                      .map(p=>({x:p.i,v:!!p.done}));
   // VLML 观测：全部评分点达成（考核尺子，不驱动学习）
   const vlm=s.series.filter(p=>p.success!==null && p.success!==undefined)
                     .map(p=>({x:p.i,v:!!p.success}));
-  const last=s.series[s.series.length-1];
-  const cls={'weak':'m-weak','progress':'m-progress','good':'m-good','mastered':'m-mastered','unassessed':'m-new'};
   const rc=s.recommend||{};
   const whyHtml=rc.topic_id?`<div class="note info"><b>出题依据（判据层）：</b>
     ${ESC(rc.reason_label||rc.reason)} —— ${ESC(rc.explanation)}</div>`:'';
@@ -665,32 +665,24 @@ function pOverview(s){
         <div class="value">${s.last_done?'<span class="chip ok">done · 任务完成（跑通+拿到数+没翻车）</span>':'<span class="chip bad">未完成 · 没跑通/没拿到数/翻车</span>'}</div></div>
       <div class="kpi"><div class="label">VLML 观测</div>
         <div class="value">${s.last_success?'<span class="chip ok">success · 全评分点达成</span>':'<span class="chip dim">未全达成</span>'}</div></div>
-      <div class="kpi"><div class="label">掌握度变化</div><div class="value">${ESC(s.mastery_delta)}</div></div>
-      <div class="kpi"><div class="label">状态</div>
-        <div class="value"><span class="chip ${cls[last.ui_status]||'m-new'}">${ESC(last.status_label)}</span></div></div>
       <div class="kpi"><div class="label">累计轮次</div><div class="value">${s.total_rounds}</div></div>
     </div>
-    <div style="margin-top:10px">${chips(last.flags.map(f=>f.label),'warn')}</div>
     <div class="note ${s.reading==='learned'?'info':''}"><b>判读：</b>${ESC(s.reading_text)}</div>
     ${whyHtml}
   </div>
   ${examCard(s)}
-  <div class="grid2">
-    <div class="panel"><div class="panel__head"><h2>判据区 · 任务完成（Voyager 尺子）</h2>
+  <div class="panel"><div class="panel__head"><h2>判据区 · 任务完成（Voyager 尺子）</h2>
       <span class="hint">存技能 / 停止同题 / 推进换题只认这条布尔线；不数覆盖点</span></div>
       ${stepChart(suc,{yes:'#2f7d57',no:'#e5484d'})}
       <div class="legend">绿＝任务完成（跑通编排 + 拿到数 + 没翻车）；红＝未完成。
         VLML 的 success（全评分点达成）只是观测 ↓</div>
       ${stepChart(vlm,{yes:'#3b82f6',no:'#c7ccd4'})}
-      <div class="legend">蓝＝VLML 观测 success（考核尺子，不驱动学习）。覆盖率观测 ↓</div>
-      ${lineChart(cov,{color:'#8a8f98',dash:'4 3'})}
-      <div class="legend">虚线＝覆盖率观测（喂掌握度证据，不当判据）。</div></div>
-    <div class="panel"><div class="panel__head"><h2>掌握度区 · 独立评估</h2>
-      <span class="hint">伴学 mastery 只衡量「独立运用得多好」，不决定练什么</span></div>
-      ${lineChart(mas,{color:'#9ca3af',dash:'5 4'})}
-      <div class="legend">虚线＝独立评估量尺，不可作为学习判据（自适应出题读判据区）。</div>
-      ${s.mastery_warning?`<div class="note">${ESC(s.mastery_warning)}</div>`:''}</div>
-  </div>
+      <div class="legend">蓝＝VLML 观测 success（考核尺子，不驱动学习）。</div>
+      <div class="note">⚠️ <b>练习线有意不判分</b>：覆盖率 / 得分 / 掌握度在练习这条线上恒为空
+        —— 它们是<b>尺子</b>，进了反馈环它学的就是讨好裁判，不是取到数。
+        判分只发生在另外两条线：<b>消费线</b>（人问一句 → 比对 Voyager 与 VLML 的做法）
+        与<b>考核线</b>（撤掉图谱重考）。进步去看「真实水平曲线」和「消费进步曲线」。</div>
+    </div>
   ${envCard(s)}`;
 }
 
@@ -854,58 +846,74 @@ function consumeCurve(s){
       <tbody>${cmpRows}</tbody></table>`;
 }
 
+/* 判据中文名。以前这一列只有 VLML0 / rubric 两种，新后端的 `db_evidence`
+   会被归到 "rubric"（≠referee 就走 else 分支）—— 那是**错的判据名字**，
+   人看到会以为这一轮是 rubric 判的，其实是"有没有真的从 DB 取到数"。 */
+const JUDGE_LABEL={db_evidence:'DB 取证', referee:'VLML0 裁判', rubric:'rubric',
+                   method_compare:'两边做法比对', none:'未判'};
+
 function pTrace(s){
   if(!s.has_data) return '<div class="panel"><div class="empty">还没有轨迹数据。</div></div>';
-  const detail=s.series.map(p=>`
-    <tr><td class="num">${p.i}</td>
-      <td>${p.trajectory.length?p.trajectory.map(t=>`<span class="tool ${s.new_tools.includes(t)?'new':''}">${ESC(t)}</span>`).join(''):'<span class="chip grey">未调用</span>'}</td>
-      <td>${p.covered.length?chips(p.covered,'ok'):'<span class="chip grey">无</span>'}</td>
-      <td>${p.missing.length?chips(p.missing,'bad'):'<span class="chip grey">无</span>'}</td>
-      <td>${p.rejected.length?chips(p.rejected,'warn'):'<span class="chip grey">无</span>'}</td></tr>`).join('');
+
+  // 「编排轨迹」整块**条件渲染**：工具序列（trajectory）只由已冻结的旧后端写入，
+  // 新后端不落 run_log。线上 36 条记录里它恒为空 —— 以前这页是一整张
+  // 「未调用 / 无 / 无 / 无」的表，看着像"它一次工具都没调"，其实是无人在产。
+  const withTraj=s.series.filter(p=>(p.trajectory||[]).length);
+  const trajPanel = withTraj.length ? `<div class="panel">
+      <div class="panel__head"><h2>编排轨迹</h2><span class="hint">「学会编排」的直接证据</span></div>
+      <table><thead><tr><th>#</th><th>本轮调用的工具序列</th><th>已覆盖评分点</th><th>缺失</th><th>base 未过闸</th></tr></thead>
+        <tbody>${s.series.map(p=>`
+          <tr><td class="num">${p.i}</td>
+            <td>${(p.trajectory||[]).length?(p.trajectory||[]).map(t=>`<span class="tool">${ESC(t)}</span>`).join(''):'<span class="chip grey">未调用</span>'}</td>
+            <td>${(p.covered||[]).length?chips(p.covered,'ok'):'<span class="chip grey">无</span>'}</td>
+            <td>${(p.missing||[]).length?chips(p.missing,'bad'):'<span class="chip grey">无</span>'}</td>
+            <td>${(p.rejected||[]).length?chips(p.rejected,'warn'):'<span class="chip grey">无</span>'}</td></tr>`).join('')}</tbody></table>
+    </div>`
+    : `<div class="panel"><div class="panel__head"><h2>编排轨迹</h2></div>
+        <div class="empty">新后端<b>不把工具序列落进 run_log</b> —— 这一页属于已冻结的旧后端
+        （mve/run_mve.py）。要看这一轮调了几次工具、成功几次、取到几行，
+        去「运行日志」页顶的<b>循环心跳</b>：那是新后端每轮如实写下的。</div></div>`;
+
+  // 轮次明细：删掉「事实数 / flags / 幻觉拦截」三列（线上恒空，只由旧后端写），
+  // 「覆盖率 / 得分」合并成一列并说明练习线有意不判分（否则两列全是 "—"）。
   const rows=s.series.map(p=>`
     <tr><td class="num">${p.i}</td><td class="mono">${ESC(p.mode)}</td><td class="num">${p.round}</td>
       <td>${p.done?'<span class="chip ok">✓</span>':'<span class="chip bad">✗</span>'}</td>
       <td>${p.success?'<span class="chip ok">✓</span>':'<span class="chip bad">✗</span>'}</td>
       <td><b>${ESC(p.verdict)}</b></td>
-      <td class="num">${p.coverage===null?'—':(p.coverage*100).toFixed(0)+'%'}</td>
-      <td class="num">${p.score===null?'—':p.score}</td>
-      <td class="num">${p.facts??'—'}</td>
-      <td>${chips(p.flags.map(f=>f.label),'warn')}</td>
+      <td class="num">${p.coverage===null?'<span class="hint">练习线不判分</span>':(p.coverage*100).toFixed(0)+'%'}</td>
       <td class="mono">${ESC(p.evidence)}</td>
-      <td>${p.judge==='referee'?'<span class="chip ok">VLML0</span>':'<span class="chip warn">rubric</span>'}</td>
+      <td>${ESC(JUDGE_LABEL[p.judge]||p.judge||'—')}</td>
       <td>${p.no_tool_calls?'<span class="chip bad">无工具调用</span>':'<span class="chip grey">—</span>'}</td>
-      <td>${p.hallucination_count>0
-            ?`<span class="chip bad" title="${ESC((p.hallucinations||[]).join(' / '))}">拦下 ${p.hallucination_count} 条</span>`
-            :'<span class="chip grey">—</span>'}</td></tr>`).join('');
-  const withStory=s.series.filter(p=>p.narrative);
-  const storyBlocks=withStory.length?withStory.slice(-2).map(p=>`
-    <div class="nocmp">
-      <div class="nocmp-tag">不参与比对 · comparable: false</div>
-      <div class="nocmp-body">${ESC(p.narrative)}</div>
-      ${p.insights.length?`<div class="nocmp-sub"><b>洞察：</b><ul>${p.insights.map(i=>`<li>${ESC(i)}</li>`).join('')}</ul></div>`:''}
-      ${p.caveats.length?`<div class="nocmp-sub"><b>数据局限：</b>${p.caveats.map(c=>ESC(c)).join('；')}</div>`:''}
-      <div class="nocmp-sub">第 ${p.i} 次作答 · 基于 ${p.narrative_based_on} 条<b>已通过裁判核对</b>的事实</div>
-    </div>`).join('')
-    :'<div class="empty">还没有叙事产出。叙事只在「有事实通过裁判核对」之后才生成——顺序不能反。</div>';
+      <td class="mono" style="font-size:12px">${ESC(p.topic_id||'')}</td></tr>`).join('');
 
-  return `<div class="panel">
-      <div class="panel__head"><h2>编排轨迹</h2><span class="hint">「学会编排」的直接证据</span></div>
-      <table><thead><tr><th>#</th><th>本轮调用的工具序列</th><th>已覆盖评分点</th><th>缺失</th><th>base 未过闸</th></tr></thead>
-        <tbody>${detail}</tbody></table>
-      ${s.new_tools.length?`<div class="note info">绿色＝相对上一轮<b>新出现</b>的工具：${s.new_tools.map(t=>ESC(t)).join('、')}。
-        工具序列变长/换新，才是「编排方式真的变了」。</div>`:'<div class="legend">工具序列没有变化。</div>'}
-    </div>
-    <div class="panel">
-      <div class="panel__head"><h2>轮次明细</h2></div>
-      <table><thead><tr><th>#</th><th>模式</th><th>轮</th><th>done</th><th>success</th><th>verdict</th><th>覆盖率</th><th>得分</th>
-        <th>事实数</th><th>flags</th><th>证据状态</th><th>判据</th><th>溯源</th><th>幻觉拦截</th></tr></thead>
-        <tbody>${rows}</tbody></table>
-    </div>
-    <div class="panel">
+  // 叙事洞察同样条件渲染：叙事由消费线产出，练习线不产。
+  const withStory=s.series.filter(p=>p.narrative);
+  const storyPanel = withStory.length ? `<div class="panel">
       <div class="panel__head"><h2>叙事洞察</h2>
         <span class="hint">VLML README:97 —— 指标与证据由工具出，洞察由 LLM 出</span></div>
-      ${storyBlocks}
-    </div>`;
+      ${withStory.slice(-2).map(p=>`
+        <div class="nocmp">
+          <div class="nocmp-tag">不参与比对 · comparable: false</div>
+          <div class="nocmp-body">${ESC(p.narrative)}</div>
+          ${(p.insights||[]).length?`<div class="nocmp-sub"><b>洞察：</b><ul>${p.insights.map(i=>`<li>${ESC(i)}</li>`).join('')}</ul></div>`:''}
+          ${(p.caveats||[]).length?`<div class="nocmp-sub"><b>数据局限：</b>${p.caveats.map(c=>ESC(c)).join('；')}</div>`:''}
+          <div class="nocmp-sub">第 ${p.i} 次作答 · 基于 ${p.narrative_based_on||0} 条<b>已通过裁判核对</b>的事实</div>
+        </div>`).join('')}
+    </div>`
+    : `<div class="panel"><div class="panel__head"><h2>叙事洞察</h2></div>
+        <div class="empty">叙事由<b>消费线</b>产出（人问一句 → 比对做法 → LLM 出叙事洞察），
+        练习线只管取数、不产叙事。去「人导入」页问一句话，这里才会长出内容。</div></div>`;
+
+  return `${trajPanel}
+    <div class="panel">
+      <div class="panel__head"><h2>轮次明细</h2>
+        <span class="hint">done = 有没有真的从 DB 取到数；判分只在消费线 / 考核线</span></div>
+      <table><thead><tr><th>#</th><th>模式</th><th>轮</th><th>done</th><th>success</th><th>verdict</th>
+        <th>判分</th><th>证据状态</th><th>判据</th><th>工具</th><th>知识点</th></tr></thead>
+        <tbody>${rows}</tbody></table>
+    </div>
+    ${storyPanel}`;
 }
 
 function pSkill(s){

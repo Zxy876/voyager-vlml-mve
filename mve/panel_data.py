@@ -151,7 +151,7 @@ def _pct(v: float | None) -> str | None:
 def _exam_view() -> dict[str, Any]:
     """**真实水平曲线** —— 撤支架考核（exam_log.jsonl）。
 
-    为什么面板上必须另画这一条：`coverage_track` 读的是 run_log，
+    为什么面板上必须另画这一条：以前那条 `coverage_track`（已下架）读的是 run_log，
     那是**带着知识图谱**练出来的覆盖率 —— 实测给着图谱首轮就 100%，
     连起来是一条从第一行就贴顶的平线。它量的是支架的高度，不是模型的水平。
     撤掉图谱重考出来的数（`exam.py`）才是学习曲线该画的东西。
@@ -639,13 +639,12 @@ def build_state() -> dict[str, Any]:
         if len(mas) >= 2 else None
     )
 
-    # ---- 编排轨迹是否变复杂（「学会编排」的直接证据）----
-    traj_sizes = [len(s["trajectory"]) for s in series]
-    tool_sets = [set(s["trajectory"]) for s in series]
-    new_tools: list[str] = []
-    for i in range(1, len(tool_sets)):
-        new_tools += sorted(tool_sets[i] - tool_sets[i - 1])
-
+    # ⚠️ 「编排轨迹是否变复杂」这一路（traj_sizes / tool_sets / new_tools）已**下架**：
+    #   它读的 run_log.trajectory 只由已冻结的旧后端 mve/run_mve.py 写入，
+    #   新后端 voyager_vlml/loop.py 不把工具序列落进 run_log —— 线上 36 条记录里
+    #   恒为空，算出来永远是 [0,0,...] 和 []。面板上那张「编排轨迹」表随之下架。
+    #   「这轮调了哪些工具、成败、取到几行」改由 mve/loop_state.json 里的
+    #   循环心跳提供（tool_calls / tool_ok / tool_fail / rows），是真实在产的。
     last = series[-1]
     prev_mastery = series[-2]["mastery"] if len(series) >= 2 else None
 
@@ -673,23 +672,23 @@ def build_state() -> dict[str, Any]:
         "causal": causal,
         "attempted": attempted,
         "failed": failed,
-        "runs": len({(r.get("ts", "")[:10]) for r in rows}),
         "total_rounds": len(series),
         "series": series,
         "reading": reading,
         "reading_text": reading_text,
         "mastery_warning": mas_warning,
-        "coverage_track": [_pct(c) for c in cov],
-        # 判据层轨迹：每轮 self-verification 的布尔（存技能/停止/推进只认它）
-        # 判据层轨迹：每轮任务完成布尔（Voyager 尺子，存技能/停止/推进只认它）
-        "done_track": [bool(s["done"]) for s in series],
+        # ── 已下架的轨迹键（按后端索引，2026-10-10）──────────────────────
+        # 下面这几个顶层键原本是给面板画折线用的，现在**一个消费方都没有**
+        # （dashboard 直接在客户端从 series 现算，不再要服务端喂轨迹）：
+        #     runs / coverage_track / done_track / success_track /
+        #     mastery_track / trajectory_sizes / new_tools
+        # 其中 coverage_track / mastery_track 在新后端上恒为空数组（练习线不判分），
+        # trajectory_sizes / new_tools 恒为 0 / []（new 后端不落 trajectory）。
+        # 留着它们就是给面板挂一排"0"和空数组，看着像"它没学会"，其实无人在产。
+        # 需要时从 series 现算即可，别再往 state 里塞。
         "last_done": bool(series[-1]["done"]),
-        # VLML 观测轨迹：每轮是否全部评分点达成（考核尺子）
-        "success_track": [bool(s["success"]) for s in series],
+        # VLML 观测：最近一次是否全部评分点达成（考核尺子）
         "last_success": bool(series[-1]["success"]),
-        "mastery_track": [_pct(m) for m in mas],
-        "trajectory_sizes": traj_sizes,
-        "new_tools": sorted(set(new_tools)),
         "skills": memory,
         # 防膨胀：写入次数 vs 实际条目（bloat=1 表示每次写入都成了新条目，即没挡住）
         "skill_stats": skill_stats,
@@ -697,10 +696,12 @@ def build_state() -> dict[str, Any]:
         "mc_thinking": _mc_thinking_view(),
         # 防幻觉：被溯源校验拦下的编造数字
         "hallucination_total": hallucination_total,
+        # 注意：新后端（练习线）**不写 mastery**，所以这里通常是 None。
+        # 以前无 mastering 值时返回「掌握度 None」，导出 md 上就挂着一行噪音。
         "mastery_delta": (
             f"掌握度 {_pct(prev_mastery)} -> {_pct(last['mastery'])}"
             if prev_mastery is not None and last["mastery"] is not None
-            else f"掌握度 {_pct(last['mastery'])}"
+            else (f"掌握度 {_pct(last['mastery'])}" if last["mastery"] is not None else None)
         ),
         # 真实水平曲线（撤支架考核）—— 学习曲线该看的那一列
         # （上面判读已经算过一次，这里复用，别再读一遍 exam_log）

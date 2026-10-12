@@ -150,14 +150,21 @@ def build_markdown(state: dict[str, Any] | None = None) -> str:
         f"- 累计轮次: {s.get('total_rounds', 0)}（练习 · run_log）",
         f"- 考核次数: {sum(int(t.get('exam_count') or 0) for t in exam_tracks)}"
         f"（摸底/重考/迁移 · exam_log，**不进 run_log**）",
-        f"- 掌握度变化: {escape_markdown(s.get('mastery_delta', '—'))}",
         f"- 技能库: {stats.get('skills', 0)} 条"
         f"（累计写入 {stats.get('writes', 0)} 次 · 覆盖 {stats.get('rewrites', 0)}"
         f" · 丢弃 {stats.get('skipped', 0)} · 膨胀率 {stats.get('bloat', 1)}）",
-        f"- 累计拦下编造: {s.get('hallucination_total', 0)} 条",
         f"- 人导入: {len(s.get('imports') or [])} 条",
         f"- 行动因果: {len((s.get('causal') or {}).get('rows') or [])} 条",
     ])
+    # 下面两行**条件输出**：mastery / hallucination_count 只由已冻结的旧后端
+    # （mve/run_mve.py）写入。新后端 voyager_vlml/loop.py 的练习线有意不判分，
+    # 这两项恒为 None / 0 —— 以前无条件打印，导出的概览里就永远挂着
+    # 「掌握度变化: 掌握度 None」和「累计拦下编造: 0 条」两行噪音，
+    # 看着像"它没学会 / 它一直在编造"，其实是无人在生产的字段。
+    if s.get("mastery_delta"):
+        lines.append(f"- 掌握度变化: {escape_markdown(s['mastery_delta'])}")
+    if int(s.get("hallucination_total") or 0) > 0:
+        lines.append(f"- 累计拦下编造: {s['hallucination_total']} 条")
     if s.get("reading_text"):
         lines.append(f"- 判读: {escape_markdown(s['reading_text'])}")
 
@@ -222,43 +229,92 @@ def build_markdown(state: dict[str, Any] | None = None) -> str:
             )
 
     # ---------------- 掌握度 ----------------
-    lines.extend(["", "## 掌握度（按题 · run_log，带支架）", ""])
+    # 这一节以前叫「掌握度（按题 · run_log，带支架）」，主列读的是 coverage。
+    # 而 coverage / mastery 只由已冻结的旧后端（mve/run_mve.py）写入 ——
+    # 新后端 voyager_vlml/loop.py 的练习线**有意不判分**（判分进反馈环，
+    # 它学的就是讨好裁判而不是取到数）。结果整张表现在是「题目 / 轮次 / — / — / 0」。
+    # 按后端索引改成用**真在产**的那一列：判据层 done（跑通 + 拿到数 + 没翻车）。
+    # coverage 降级为**有才显示**：有旧后端日志就多两列，没有就不留空列。
+    lines.extend(["", "## 按题统计 · 练习线（判据层 done）", ""])
     by_topic: dict[str, dict[str, Any]] = {}
     for p in series:
         t = p.get("topic_id")
         if not t:
             continue
-        r = by_topic.setdefault(t, {"n": 0, "best": None, "last": None, "wrongs": 0})
+        r = by_topic.setdefault(
+            t, {"n": 0, "done": 0, "success": 0, "best": None, "last": None, "wrongs": 0})
         r["n"] += 1
-        if p.get("coverage") is not None:
-            r["best"] = max(r["best"] or 0, p["coverage"])
-            r["last"] = p["coverage"]
+        r["done"] += 1 if p.get("done") else 0
+        r["success"] += 1 if p.get("success") else 0
+        cov = p.get("coverage")
+        if cov is not None:
+            r["best"] = max(r["best"] or 0, cov)
+            r["last"] = cov
         if p.get("verdict") in ("wrong", "dont_know"):
             r["wrongs"] += 1
+    has_cov = bool(by_topic) and any(r["last"] is not None for r in by_topic.values())
     if by_topic:
-        lines.append("| 题目 | 轮次 | 最近覆盖率 | 最好覆盖率 | 错/不知 |")
-        lines.append("|---|---|---|---|---|")
+        if has_cov:
+            lines.append("| 题目 | 轮次 | 任务完成 done | VLML 全达成 success "
+                         "| 最近覆盖率 | 最好覆盖率 | 错/不知 |")
+            lines.append("|---|---|---|---|---|---|---|")
+        else:
+            lines.append("| 题目 | 轮次 | 任务完成 done | VLML 全达成 success | 错/不知 |")
+            lines.append("|---|---|---|---|---|")
         for t, r in sorted(by_topic.items(), key=lambda kv: -kv[1]["n"]):
-            lines.append(
-                f"| {code(t, 60)} | {r['n']} | {_pct(r['last'])} "
-                f"| {_pct(r['best'])} | {r['wrongs']} |"
-            )
+            row = (f"| {code(t, 60)} | {r['n']} "
+                   f"| {r['done']}/{r['n']} | {r['success']}/{r['n']} ")
+            if has_cov:
+                row += f"| {_pct(r['last'])} | {_pct(r['best'])} "
+            lines.append(row + f"| {r['wrongs']} |")
+        if not has_cov:
+            lines.append("")
+            lines.append("_⚠️ 练习线有意不判分：覆盖率 / 得分 / 掌握度在这条线上不生产_"
+                         "（它们是尺子，进了反馈环它学的就是讨好裁判，不是取到数）。"
+                         "判分看「真实水平」那节（撤支架考核）与消费线。")
     else:
-        lines.append("_还没有掌握度数据。_")
+        lines.append("_还没有练习记录。_")
 
     # ---------------- 轮次明细 ----------------
+    #
+    # 同样是「按后端索引」：覆盖率 / 得分 / 事实数 / 编排 这四列读的是
+    # coverage / score / facts_count / trajectory，四个都只由已冻结的旧后端写入。
+    # 新后端练习线一条都不产 → 这四列恒为「— / None / None / —」。
+    # 改成**整组有才画**：一条都没有就不留空列，别让人对着一排 None 去猜。
+    # 主列换成新后端真在产的：done（任务完成）与 success（VLML 全达成）。
     lines.extend(["", "## 轮次明细", ""])
     if series:
-        lines.append("| # | 时间 | 题目 | 轮 | verdict | 覆盖率 | 得分 | 事实数 | 证据 | 判据 | 编排 |")
-        lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
+        has_score = any(p.get("coverage") is not None or p.get("score") is not None
+                        or p.get("facts") is not None for p in series)
+        has_traj = any(p.get("trajectory") for p in series)
+        head = "| # | 时间 | 题目 | 轮 | done | success | verdict | 证据 | 判据 |"
+        sep = "|---|---|---|---|---|---|---|---|---|"
+        if has_score:
+            head += " 覆盖率 | 得分 | 事实数 |"
+            sep += "---|---|---|"
+        if has_traj:
+            head += " 编排 |"
+            sep += "---|"
+        lines.append(head)
+        lines.append(sep)
         for p in series:
-            lines.append(
+            row = (
                 f"| {p['i']} | {escape_markdown((p.get('ts') or '')[11:19])} "
                 f"| {code(p.get('topic_id'), 40)} | {p.get('round')} "
-                f"| {p.get('verdict')} | {_pct(p.get('coverage'))} | {p.get('score')} "
-                f"| {p.get('facts')} | {p.get('evidence')} | {p.get('judge')} "
-                f"| {code(' → '.join(p.get('trajectory') or []) or '—', 120)} |"
+                f"| {'✓' if p.get('done') else '✗'} "
+                f"| {'✓' if p.get('success') else '✗'} "
+                f"| {p.get('verdict')} | {p.get('evidence')} | {p.get('judge')} "
             )
+            if has_score:
+                row += (f"| {_pct(p.get('coverage'))} | {p.get('score')} "
+                        f"| {p.get('facts')} ")
+            if has_traj:
+                row += f"| {code(' → '.join(p.get('trajectory') or []) or '—', 120)} "
+            lines.append(row + "|")
+        if not has_score:
+            lines.append("")
+            lines.append("_⚠️ 覆盖率 / 得分 / 事实数三列已按后端索引下架："
+                         "练习线不判分，它们在新后端上无人在产。_")
     else:
         lines.append("_还没有轮次记录。_")
 
