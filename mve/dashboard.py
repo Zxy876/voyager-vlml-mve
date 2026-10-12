@@ -761,21 +761,30 @@ function pImport(s){
 function consumeCurve(s){
   const cc=s.consume_curve||[];
   if(!cc.length) return `<h3>消费进步曲线</h3>
-    <div class="empty">还没有消费记录。在上面问一句话，Voyager 会用已积累的能力回答，
-    覆盖率与掌握度从这里开始累计。</div>`;
-  const covPts=cc.map((c,i)=>({x:i+1, y:c.coverage, label:`覆盖率 ${Math.round(c.coverage*100)}% · ${c.question}`}));
-  const masPts=cc.filter(c=>c.mastery!==null&&c.mastery!==undefined)
-                 .map((c,i)=>({x:i+1, y:c.mastery, label:`掌握度 ${Math.round(c.mastery*100)}%`}));
+    <div class="empty">还没有消费记录。在上面问一句话，Voyager 会用已积累的能力回答 ——
+    答完了这题就进它的能力库，掌握与进步从这里开始累计。</div>`;
+  // 主曲线 = **累计已掌握数**（能力集合在变大）。掌握不是分数，是"会做的题有几道"。
+  const tot=cc[cc.length-1].ability_total||0;
+  const masPts=cc.map((c,i)=>({
+    x:i+1,
+    y: tot ? Math.min(1,(c.mastered_total||0)/tot) : 0,
+    label:`掌握 ${c.mastered_total||0}/${tot||'?'} · ${c.question}`}));
+  // 副线 = 覆盖率（这次答得全不全，质量分，不是掌握度）
+  const covPts=cc.filter(c=>c.coverage!==null&&c.coverage!==undefined)
+                 .map((c,i)=>({x:i+1, y:c.coverage, label:`覆盖率 ${Math.round(c.coverage*100)}% · ${c.question}`}));
   const last=cc[cc.length-1];
   const reused=cc.filter(c=>c.reused).length;
-  return `<h3>消费进步曲线（${cc.length} 次）</h3>
-    <div class="legend">每次消费的覆盖率（VLML0 裁判独立跑一遍量出来）· 掌握度是同一题的滑动平均。</div>
-    ${lineChart(covPts,{color:'#2563eb'})}
-    ${masPts.length>1?`<div class="legend" style="margin-top:6px">掌握度曲线</div>${lineChart(masPts,{color:'#059669',dash:'4 3'})}`:''}
+  return `<h3>消费进步曲线（${cc.length} 次消费）</h3>
+    <div class="legend"><b>掌握 = 能力集合的增长</b>：答完了 → 这题进能力库 → 掌握。
+    曲线是累计会做的题数；覆盖率是另一条（这次答得全不全，只作质量参考）。</div>
+    ${lineChart(masPts,{color:'#059669'})}
+    <div class="legend" style="margin-top:4px">累计掌握 ${last.mastered_total||0} / ${tot||'?'} 题</div>
+    ${covPts.length?`<div class="legend" style="margin-top:8px">覆盖率（VLML0 裁判独立跑一遍量出来，只给人看）</div>${lineChart(covPts,{color:'#2563eb',dash:'4 3'})}`:''}
     <div class="legend" style="margin-top:6px">
-      最近一次：覆盖率 <b>${Math.round(last.coverage*100)}%</b>（${ESC(last.verdict||'')}）
-      · 掌握度 <b>${last.mastery===null||last.mastery===undefined?'—':Math.round(last.mastery*100)+'%'}</b>
-      · ${reused}/${cc.length} 次是复用已学配方
+      最近一次：${last.mastered?'<span class="chip ok">已掌握（进能力库）</span>':'<span class="chip bad">没答出来，未进能力库</span>'}
+      ${last.coverage===null||last.coverage===undefined?'':`<span class="chip grey">覆盖率 ${Math.round(last.coverage*100)}% · ${ESC(last.verdict||'')}</span>`}
+      <span class="chip grey">${reused}/${cc.length} 次复用已学配方</span>
+      ${last.skill_action?`<span class="chip grey">${ESC(last.skill_action)}</span>`:''}
     </div>`;
 }
 
@@ -1471,7 +1480,6 @@ function renderImportResult(res){
              <span class="chip ${res.coverage>=0.95?'ok':(res.coverage>0?'warn':'bad')}">覆盖率 ${pct(res.coverage)}</span>
              <span class="chip grey">得分 ${ESC(res.score)}</span>
              <span class="chip grey">判读 ${ESC(res.verdict||'')}</span>
-             <span class="chip grey">掌握度 ${pct(res.mastery)}</span>
            </div>
            ${(res.covered_points||[]).length?`<div style="margin-top:4px;font-size:12px"><b>答出：</b>${res.covered_points.map(c=>ESC(c)).join('；')}</div>`:''}
            ${(res.missing_points||[]).length?`<div style="margin-top:4px;font-size:12px"><b>缺：</b>${res.missing_points.map(c=>ESC(c)).join('；')}</div>`:''}
@@ -1488,6 +1496,17 @@ function renderImportResult(res){
       ${graphLinkChips(res.graph_link)}
     </div>
     ${isConsume&&res.reuse_note?`<div style="margin-top:5px;font-size:12px"><b>配方怎么用的：</b>${ESC(res.reuse_note)}</div>`:''}
+    ${isConsume?`<div style="margin-top:9px"><b>掌握（能力集合）：</b>
+      ${res.mastered
+        ? `<span class="chip ok">已掌握 —— 这题进能力库了</span>
+           <span class="chip grey">累计 ${ESC(res.mastered_total)} / ${ESC(res.ability_total)} 题</span>
+           ${res.skill_action?`<span class="chip grey">${ESC(res.skill_action)}</span>`:''}
+           <div style="font-size:12px;color:var(--muted);margin-top:4px">
+             掌握的判据是「答没答出来」（调通工具 + 取到数 + 产出回答），
+             <b>不是覆盖率</b> —— 覆盖率只作质量参考，不参与"这题算不算学会"。</div>`
+        : `<span class="chip bad">没答出来，未进能力库</span>
+           <div style="font-size:12px;color:var(--muted);margin-top:4px">${ESC(res.skipped||'')}</div>`}
+    </div>`:''}
     ${scoreBlock}
     ${res.skipped?`<div><b>未产出解释：</b>${ESC(res.skipped)}</div>`:''}
     ${(res.errors||[]).length?`<div style="margin-top:5px"><b>工具报错：</b>${(res.errors||[]).map(e=>ESC(e)).join('；')}</div>`:''}

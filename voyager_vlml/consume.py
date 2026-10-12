@@ -395,6 +395,11 @@ async def consume(
         except Exception as e:  # pragma: no cover
             print(f"  （组织回答失败：{type(e).__name__}: {e}）")
 
+    # ---- 答完了 → 这题进能力库 → 掌握（判据是"答没答出来"，不是覆盖率）----
+    absorbed = _absorb(question, sql, topic_id) if (facts and answer) else {}
+    m_tot = int(absorbed.get("mastered_total") or 0)
+    a_tot = int(absorbed.get("ability_total") or 0)
+
     base: dict[str, Any] = {
         "question": question,
         "topic_id": topic_id,
@@ -424,7 +429,13 @@ async def consume(
         "covered_points": [],
         "missing_points": [],
         "unjudgeable": [],
-        "mastery": None,
+        # —— 掌握 = 能力集合的增长（"答完了这题就到他的能力里了"）——
+        "mastered": bool(absorbed.get("mastered")),
+        "skill_action": str(absorbed.get("skill_action") or ""),
+        "mastered_total": m_tot,
+        "ability_total": a_tot,
+        # 掌握度 = 已掌握 / 该掌握的总量（不是覆盖率的折算）
+        "mastery": (round(m_tot / a_tot, 4) if a_tot else None),
         "judge": "",
         "skipped": "",
     }
@@ -479,9 +490,8 @@ async def consume(
         # 放弃换题，那是把两条线的账本混了。
         try:
             import topic_graph
-            row = topic_graph.MasteryStore().update(
+            topic_graph.MasteryStore().update(
                 topic_id, score=float(ev.coverage), count_attempt=False)
-            base["mastery"] = row.get("mastery")
         except Exception as e:  # pragma: no cover
             print(f"  （写掌握度失败：{type(e).__name__}: {e}）")
         # 技能有效性反馈（技能库自身维护，不是给 Voyager 的反馈）
@@ -499,6 +509,61 @@ async def consume(
 
     _log(base)
     return base
+
+
+def _absorb(question: str, sql: str, topic_id: str) -> dict[str, Any]:
+    """答完了 → **这题就到他的能力里了 → 这就是掌握**（用户 2026-10-13 定）。
+
+    掌握不是覆盖率折算出来的一个分数，而是**能力集合的增长**：
+      「我问你一句，Voyager 答完了，之后这题就到他的能力里了」。
+
+    所以这里做两件事：
+      1. 把这题标记为**已掌握**（`MasteryStore.mark_completed`）；
+      2. 这次的取数 SQL 存成**可复用配方**进技能库（这题本来没有配方时）。
+         存的是**计算方法**，不是这次算出来的数值 —— 下次遇到同一类问法就能复用。
+
+    ⚠️ 判据是**有没有真的答出来**（调通工具 + 取到数 + 产出回答），
+    **不是覆盖率**。覆盖率算不算、算出来多少，都不影响"这题进不进能力库" ——
+    否则就是把 VLML 的判分塞回了学习判定，正是设计禁止的。
+    """
+    out: dict[str, Any] = {"mastered": False, "skill_action": "",
+                           "mastered_total": 0, "ability_total": 0}
+    if not topic_id or not sql:
+        return out
+    try:
+        import topic_graph
+        st = topic_graph.MasteryStore()
+        st.mark_completed(topic_id)
+        out["mastered"] = True
+        out["mastered_total"] = sum(
+            1 for r in st.all().values() if r.get("completed"))
+        try:
+            out["ability_total"] = len(topic_graph.TopicGraph().topics)
+        except Exception:
+            out["ability_total"] = 0
+    except Exception as e:  # pragma: no cover
+        print(f"  （标记掌握失败：{type(e).__name__}: {e}）")
+        return out
+
+    try:
+        import skill_store
+        have = [k for k in (skill_store._load_raw().get("skills") or {})
+                if str(k).startswith(f"{topic_id}::")]
+        if have:
+            skill_store.mark_result(have, True)
+            out["skill_action"] = "已有配方，标记为用过且有效"
+        else:
+            _, key = skill_store.add(
+                topic_id, topic_id,
+                f"消费时答出来的取数方法：{question[:60]}",
+                code=sql,
+                blueprint={"source": "consume", "question": question},
+                source="consume",
+            )
+            out["skill_action"] = f"新配方入库：{key}" if key else "（内容太短未入库）"
+    except Exception as e:  # pragma: no cover
+        print(f"  （存配方失败：{type(e).__name__}: {e}）")
+    return out
 
 
 def _log(result: dict[str, Any]) -> None:

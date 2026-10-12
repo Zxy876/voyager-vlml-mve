@@ -299,24 +299,34 @@ def _consume_curve(limit: int = 40) -> list[dict[str, Any]]:
       消费（人问一句 → Voyager 用已积累的能力答）才是**交付**：人真的要一个答案，
       这时候用 VLML0 裁判独立跑一遍量出覆盖率，才是真实的进步曲线。
 
-    只收 `mode == "voyager_consume"` 的记录；老的人导入（纯 VLML 解释）没有
-    coverage，一律跳过 —— 不能拿 None 补 0，那会把"没测"画成"测得 0 分"。
+    曲线画的是**累计已掌握数**（`mastered_total`）—— 掌握不是覆盖率折算的分数，
+    而是「答完了 → 这题进能力库 → 掌握」（用户 2026-10-13 定义）。
+    所以进步 = 能力集合在变大，y 轴是"会做的题有几道"。
+
+    覆盖率另记一条（那是这次答得全不全的质量分，不是掌握度）。
+    老的人导入（纯 VLML 解释）没有这些字段，一律跳过 ——
+    不能拿 None 补 0，那会把"没测"画成"测得 0 分"。
     """
     out: list[dict[str, Any]] = []
     for i, rec in enumerate(
         [r for r in _human_imports(limit=limit)
-         if r.get("mode") == "voyager_consume" and r.get("coverage") is not None],
+         if r.get("mode") == "voyager_consume"],
         start=1,
     ):
+        cov = rec.get("coverage")
         out.append({
             "i": i,
             "ts": rec.get("ts", ""),
             "question": str(rec.get("question") or "")[:80],
             "topic_id": str(rec.get("topic_id") or ""),
-            "coverage": float(rec.get("coverage")),
+            "coverage": float(cov) if cov is not None else None,
             "score": rec.get("score"),
             "verdict": str(rec.get("verdict") or ""),
-            "mastery": rec.get("mastery"),
+            # 掌握（能力集合）
+            "mastered": bool(rec.get("mastered")),
+            "mastered_total": rec.get("mastered_total"),
+            "ability_total": rec.get("ability_total"),
+            "skill_action": str(rec.get("skill_action") or ""),
             "reused": bool(rec.get("reused")),
         })
     return out

@@ -122,6 +122,12 @@ def _log_import(result: dict[str, Any]) -> None:
         "coverage": result.get("coverage"),
         "score": result.get("score"),
         "verdict": result.get("verdict", ""),
+        # 掌握 = 能力集合的增长：答完了 → 这题进能力库 → 掌握。
+        # mastered_total 是**累计**已掌握数，进步曲线画的就是它。
+        "mastered": bool(result.get("mastered")),
+        "mastered_total": result.get("mastered_total"),
+        "ability_total": result.get("ability_total"),
+        "skill_action": result.get("skill_action", ""),
         "mastery": result.get("mastery"),
     }
     with COACH_LOG.open("a", encoding="utf-8") as f:
