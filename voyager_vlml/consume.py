@@ -464,8 +464,59 @@ async def consume(
         return base
 
     if task is None:
-        base["skipped"] = ("这句话归不到有评分点的题上，也没有生成出新题 → "
-                           "覆盖率无从计算（如实留空，不编造数字）")
+        # 没有现成 rubric（人的自由提问大多归不上旧题库）→ 从**这句话本身**派生
+        # 评分点，让 VLML 工具链独立取一遍当尺子。这样"消费算覆盖率"才落得下去，
+        # 而不是一归不上题就整体落空。判据标注成软尺子，面板上要能看出软硬。
+        points = _derive_dims(question)
+        if not points:
+            base["skipped"] = ("这句话既归不到有评分点的题上，也抽不出该答哪几个量 → "
+                               "覆盖率无从计算（如实留空，不编造数字）")
+            _log(base)
+            return base
+        ref_facts, ref_traj = await _referee_facts(question, points)
+        base["referee_trajectory"] = ref_traj
+        base["derived_points"] = [str(p.get("point") or p.get("dimension"))
+                                  for p in points]
+        if not ref_facts:
+            base["skipped"] = ("裁判侧（VLML 工具链独立取数）也没取到数 → "
+                               "没有真值可比，覆盖率无从计算")
+            _log(base)
+            return base
+        try:
+            from loop_core import RubricPoint, evaluate_vs_referee
+            rubric = [
+                RubricPoint(
+                    point=str(p.get("point") or p.get("dimension")),
+                    subject=dict(p.get("subject") or {}),
+                    dimension=str(p.get("dimension")),
+                    weight=1.0, min_base=0, tolerance=0.05,
+                )
+                for p in points
+            ]
+            ev = evaluate_vs_referee(facts, rubric, ref_facts,
+                                     tool_calls=len(ok_calls))
+            base.update({
+                "coverage": float(ev.coverage),
+                "score": int(ev.score),
+                "verdict": str(ev.verdict),
+                "covered_points": list(ev.covered_points),
+                "missing_points": list(ev.missing_points),
+                "unjudgeable": list(ev.unjudgeable),
+                # ⚠️ 软尺子：评分点是从这句话派生的（不是题库里既有的 rubric），
+                # 真值由 VLML 工具链从 DB 独立取 —— 值仍是 DB 真值，
+                # 但"该答哪几个量"是模型提的。面板必须标出来，别和 referee 混。
+                "judge": "derived_dims",
+            })
+        except Exception as e:  # pragma: no cover
+            base["skipped"] = f"比对失败，覆盖率未计算：{type(e).__name__}: {str(e)[:120]}"
+        if reused and base.get("coverage") is not None:
+            try:
+                import skill_store
+                skill_store.mark_result(
+                    [str(s.get("key") or "") for s in skills[:2]],
+                    bool(base["coverage"] >= 0.6))
+            except Exception:  # pragma: no cover
+                pass
         _log(base)
         return base
 
@@ -510,6 +561,85 @@ async def consume(
 
     _log(base)
     return base
+
+
+def _derive_dims(question: str) -> list[dict[str, Any]]:
+    """从这句话本身抽出"这一问该答出哪几个量"（只给名字，不给值）。
+
+    为什么需要它：覆盖率要拿 Voyager 的事实集跟裁判的事实集比，比对键是
+    (subject, dimension)。归得上旧题库时，dimension 由 rubric 给；
+    归不上时（人的自由提问大多归不上）就没有 rubric → 覆盖率算不出来，
+    "从消费开始算覆盖率"这条就落空了。
+
+    所以这里让 LLM 从**这句话**派生评分点。⚠️ 派生的只是**名字**
+    （该答哪几个量），**不是值**——值仍由两边各自从 DB 取：
+      · Voyager 侧：用它已积累的能力取（本文件 ③）
+      · 裁判侧：走 VLML 自己的工具链独立取一遍（_referee_facts）
+    两个值都是 DB 真值，比对的是两个独立取数结果，不是"模型编的参考答案"。
+    """
+    out = chat_json(
+        [
+            {"role": "system",
+             "content": ("从一句话里抽出「要回答它，得给出哪几个量」。只给**名字与对象**，"
+                         "不给数值。2 到 4 个。只返回 JSON："
+                         "{\"points\":[{\"point\":\"中文说明\",\"dimension\":\"英文维度名\","
+                         "\"subject\":{\"team\":\"...\",\"map\":\"...\"}}]}")},
+            {"role": "user", "content": question},
+        ],
+        temperature=0.0,
+    )
+    pts = [p for p in (out.get("points") or []) if isinstance(p, dict)
+           and str(p.get("dimension") or "").strip()]
+    return pts[:4]
+
+
+async def _referee_facts(question: str,
+                         points: list[dict[str, Any]]) -> tuple[list[dict], list[str]]:
+    """让 **VLML 自己的工具链独立取一遍数**（裁判侧），不去碰 Voyager 的取数结果。
+
+    走的是 `coach` 那套原版 VLML 编排（工具注册表 + 数据集上下文），
+    与 Voyager 侧的 env 是两条独立通路 —— 正因如此，两者的值可比。
+    """
+    try:
+        from coach import _execute, _plan_prompt
+        from loop_core import make_fact
+    except Exception as e:  # pragma: no cover
+        print(f"  （裁判工具链不可用：{type(e).__name__}: {e}）")
+        return [], []
+    dims = [str(p.get("dimension")) for p in points]
+    subs = [dict(p.get("subject") or {}) for p in points]
+    plan = chat_json(
+        [
+            {"role": "system", "content": "你是原版 VLML 分析引擎。只取数，不做主观推断。"},
+            {"role": "user", "content": _plan_prompt(question)},
+        ],
+        temperature=0.1,
+    )
+    obs, traj, _ = await _execute(plan.get("calls") or [])
+    if not traj:
+        return [], []
+    out = chat_json(
+        [
+            {"role": "system", "content": _extract_system()},
+            {"role": "user",
+             "content": _extract_user(question, [
+                 {"tool": o.get("tool"), "args": o.get("args"),
+                  "data": o.get("result"), "error": o.get("error")} for o in obs],
+                 dims, subs)},
+        ],
+        temperature=0.1,
+    )
+    facts: list[dict] = []
+    for f in (out.get("facts") or []):
+        if not isinstance(f, dict) or "dimension" not in f:
+            continue
+        facts.append(make_fact(
+            subject=f.get("subject") or {},
+            dimension=str(f.get("dimension")),
+            value=f.get("value"), unit=str(f.get("unit") or "raw"),
+            base=f.get("base"), source={"tool": (traj or ["?"])[0], "args": {}},
+        ))
+    return facts, traj
 
 
 def _absorb(question: str, sql: str, topic_id: str) -> dict[str, Any]:
@@ -611,16 +741,29 @@ def _main() -> int:
         print(f"   {subj} · {f.get('dimension')} = {f.get('value')} (base={f.get('base')})")
     print("--- 回答 ---")
     print(r.get("answer") or "（没取到数，不产出回答）")
-    print("--- 覆盖率 / 掌握度（只给人看，不进 Voyager 反馈）---")
+    # 掌握与覆盖率**是两个东西**，分开打印：
+    #   掌握 = 答完了 → 这题进能力库（能力集合增长）
+    #   覆盖率 = 这次答得全不全（质量分，只给人看）
+    print("--- 掌握（能力集合）---")
+    if r.get("mastered"):
+        print(f"已掌握 · 累计 {r.get('mastered_total')} / {r.get('ability_total')} 题"
+              f"（掌握度 {float(r.get('mastery') or 0):.0%}）")
+        print("  ", r.get("skill_action") or "")
+    else:
+        print("没答出来，未进能力库。" + (r.get("skipped") or ""))
+    print("--- 覆盖率（质量分，只给人看，不进 Voyager 反馈）---")
     if r.get("coverage") is None:
         print("未计算：", r.get("skipped") or "（无评分点）")
     else:
-        print(f"覆盖率 {r['coverage']:.0%} · 得分 {r['score']} · 判读 {r['verdict']}")
+        print(f"覆盖率 {r['coverage']:.0%} · 得分 {r['score']} · 判读 {r['verdict']}"
+              f" · 尺子={r.get('judge')}")
         print("  答出:", r.get("covered_points"))
         print("  缺  :", r.get("missing_points"))
         if r.get("unjudgeable"):
             print("  裁判也没答出来:", r.get("unjudgeable"))
-        print("  掌握度:", r.get("mastery"))
+        if r.get("judge") == "derived_dims":
+            print("  ⚠️ 软尺子：评分点是从这句话派生的，真值由 VLML 工具链从 DB 独立取；"
+                  "值仍是 DB 真值，但『该答哪几个量』是模型提的。")
     return 0
 
 
