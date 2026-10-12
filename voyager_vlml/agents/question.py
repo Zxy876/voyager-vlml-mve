@@ -56,7 +56,7 @@ class VLMLQuestionAgent:
         gran = _gran(name)
         gran_line = (
             f"\n【口径锁定】本题粒度是 `{gran}`，题面必须围绕该粒度（取数主表 `{gran}`）提问，"
-            f"不要借用其它粒度（例如粒度不是 rounds 就不要问"多少个回合"）。"
+            f"不要借用其它粒度（例如粒度不是 rounds 就不要问「多少个回合」）。"
             if gran
             else ""
         )
