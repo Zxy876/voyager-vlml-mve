@@ -295,6 +295,18 @@ def _build_messages(topic: dict[str, Any], *, attempt: int, last_question: str =
     _gm = re.search(r"[（(]([^（）()]+)[）)]", name)
     if _gm:
         gran = _gm.group(1).strip()
+    # 粒度标记本身往往就是表名（rounds / games / series / base_events /
+    # agg_tournament_stats…），直接当取数锚点点名，比只说"锁定粒度"更硬：
+    # 模型对抽象的"粒度"不敏感，但对"不许 FROM 某张表"这类具体约束敏感
+    # （实测：只说锁定粒度时 grain_series 仍被出成 FROM rounds 的回合题）。
+    gran_hint = ""
+    if gran:
+        gran_hint = (
+            f"\n  本题粒度标记是 `{gran}`：reference_sql 必须围绕 `{gran}` 取数"
+            f"（若该粒度对应的是报告工具，则以 series_id 等入口参数调用它）；"
+            f"**严禁**用与 `{gran}` 粒度不符的表做计数——例如粒度不是 rounds 就"
+            f"不要写 FROM rounds，不是 games 就不要写 FROM games。"
+        )
     gran_lock = (
         f"\n【口径锁定】本题知识点是「{name}」"
         + (f"，粒度标记为 {gran}" if gran else "")
@@ -302,6 +314,7 @@ def _build_messages(topic: dict[str, Any], *, attempt: int, last_question: str =
         "（务必参照上方『问法示例』的口径，例如数图/数局/数系列赛/数回合/首血/"
         "经济，不要混用）。严禁把其它粒度的问法（如本粒度是『图/局』却去问『多少个"
         "回合』、本粒度是『回合』却去问『几张图』）套到本题；也不要照搬上一题的措辞。"
+        + gran_hint
     )
 
     repeat_guard = ""
