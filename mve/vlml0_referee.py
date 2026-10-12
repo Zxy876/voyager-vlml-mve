@@ -37,6 +37,8 @@ from llm_client import chat_json  # noqa: E402
 from voyager import LOCAL_SQL_NOTES, TOOL_CATALOG, TOOL_REGISTRY, VLML_USAGE_TIPS  # noqa: E402
 
 STORE = Path(__file__).resolve().parent / "referee_store.json"
+# 给人看的 VLML 视角（叙事 + LLM 估算）单独落盘，与客观裁判隔离 —— 绝不喂 Voyager
+JUDGE_STORE = Path(__file__).resolve().parent / "referee_judge_store.json"
 
 
 @dataclass
@@ -103,26 +105,75 @@ def spec_fingerprint(task: Any) -> str:
 
 
 def cached(topic_id: str, fingerprint: str = "") -> RefereeAnswer | None:
+    """读客观裁判（STORE）。防御式剥离 `vlml0_referee.llm` 来源的事实——
+    即便旧版本把 LLM 估算混进了 STORE，Voyager 比对时也绝看不到它们。"""
     raw = _load_store().get(topic_id)
     if not raw:
         return None
     # 配方变了 → 这份缓存是**旧题的答案**，不能再用
     if fingerprint and str(raw.get("spec_fingerprint") or "") != fingerprint:
         return None
+    det_facts = [
+        f for f in (raw.get("facts") or [])
+        if (f.get("source") or {}).get("tool") != "vlml0_referee.llm"
+    ]
     return RefereeAnswer(
         topic_id=raw.get("topic_id", topic_id),
-        facts=raw.get("facts") or [],
+        facts=det_facts,
         narrative=raw.get("narrative", ""),
         trajectory=raw.get("trajectory") or [],
-        ok=bool(raw.get("ok", True)),
-        error=raw.get("error", ""),
+        ok=bool(det_facts),
+        error=raw.get("error", "") if det_facts else "裁判没有产出任何 DB 事实",
     )
 
 
 def reset() -> None:
     if STORE.exists():
         STORE.unlink()
-    print(f"已清空裁判缓存：{STORE}")
+    if JUDGE_STORE.exists():
+        JUDGE_STORE.unlink()
+    print(f"已清空裁判缓存：{STORE} + {JUDGE_STORE}")
+
+
+def _load_judge_store() -> dict[str, Any]:
+    if not JUDGE_STORE.exists():
+        return {}
+    try:
+        return json.loads(JUDGE_STORE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_judge_store(data: dict[str, Any]) -> None:
+    JUDGE_STORE.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _save_judge(topic_id: str, fp: str,
+                llm_facts: list[dict[str, Any]],
+                narrative: str, traj: list[str]) -> None:
+    """把给人看的 VLML 视角单独落盘，与客观裁判（STORE）隔离。"""
+    store = _load_judge_store()
+    store[topic_id] = {
+        "topic_id": topic_id,
+        "spec_fingerprint": fp,
+        "llm_facts": llm_facts,
+        "narrative": narrative,
+        "trajectory": traj,
+    }
+    _save_judge_store(store)
+
+
+def cached_judge(topic_id: str, fingerprint: str = "") -> dict[str, Any] | None:
+    """读给人看的 VLML 视角（叙事 + LLM 估算）。不参与 Voyager 比对。"""
+    raw = _load_judge_store().get(topic_id)
+    if not raw:
+        return None
+    if fingerprint and str(raw.get("spec_fingerprint") or "") != fingerprint:
+        return None
+    return raw
 
 
 # ---------------------------------------------------------------------------
@@ -310,9 +361,18 @@ async def _deterministic_facts(task: Any) -> tuple[list[dict[str, Any]], list[st
 
 
 async def answer(task: Any, *, force: bool = False) -> RefereeAnswer:
-    """异步跑原版 VLML 拿标准答案。同一 topic_id 只跑一次（除非 force）。
+    """异步跑裁判拿标准答案 —— **只把 DB 取数结果喂给 Voyager**。
 
-    次序照伴学 AssessmentEngine：确定性层先跑，缺口才交给 LLM。
+    边界（用户 2026-10-12 纠偏）：Voyager 的成败反馈必须 100% 来自 DB 取数，
+    绝不能让 VLML/LLM 裁判掺进反馈链。LLM 会数错、会编造（实测把连败 8 说成 5），
+    拿它的输出当裁判真值，等于把"模型给的参考答案"塞回比对环 —— 正是伴学硬契约
+    （tutor_llm_agent_answer_evaluate.py:82-84）禁止的。
+
+    因此本函数：
+      · 返回 / 落 `STORE` 的 `facts` = 确定性层（SQL 直算 + 工具路径取数），**纯 DB**；
+      · LLM 层产出的叙事与估算事实只落 `JUDGE_STORE`，**仅供面板给人看**，
+        绝不进 `ref.facts`、绝不进 `evaluate_vs_referee`。
+    次序照伴学 AssessmentEngine：确定性层先跑，LLM 层只补"给人看"的视角。
     """
     fp = spec_fingerprint(task)
     if not force:
@@ -320,22 +380,22 @@ async def answer(task: Any, *, force: bool = False) -> RefereeAnswer:
         if hit is not None:
             return hit
 
-    # ---- ① 确定性层 ----（SQL 直算 + 工具路径取值，两条互补）
+    # ---- ① 确定性层 ----（SQL 直算 + 工具路径取值，两条互补）· 唯一喂给 Voyager 的事实
     det_facts, det_done = await _deterministic_facts(task)
     tool_facts, tool_done = await _tool_facts(task)
     det_facts = det_facts + tool_facts
     det_keys = {fact_key(f) for f in det_facts}
 
-    # ---- ② LLM 层 ----
-    # 需要 LLM 补事实的评分点（确定性层没覆盖到的）
+    # ---- ② LLM 层 ----（仅给人看的叙事 + 估算，不进事实比对）
+    # 确定性层没覆盖到的评分点没有 DB 真值：既不能算 Voyager 对也不能算错，
+    # LLM 只产出"给人看"的估算叙事，绝不作为比对基准。
     remaining = [
         p for p in task.rubric
         if fact_key({"subject": p.subject, "dimension": p.dimension}) not in det_keys
     ]
-    # 关键：即使确定性层已经覆盖了全部评分点，**这一趟编排照样要跑**。
-    # 因为它产出的 trajectory 是给 Voyager 看的「编排示范」——
-    # 伴学答完题后会回传 reference_answer（tutor_llm_agent_answer_evaluate.py:84），
-    # 人类学习者就是靠看标准解法进步的。我们同理，但只给工具序列、不给数值。
+    # 这一趟编排照样跑：产出的 trajectory 是给人类/图谱看的「参考取数路径」
+    # （对照伴学 reference_answer，tutor_llm_agent_answer_evaluate.py:84）。
+    # 只给工具序列、不给数值当裁判真值。
     sub = _SubTask(task, remaining or list(task.rubric))
     plan = chat_json([
         {"role": "system", "content": "你是原版 VLML 分析引擎。你只取数，不做主观推断。"},
@@ -366,26 +426,30 @@ async def answer(task: Any, *, force: bool = False) -> RefereeAnswer:
             ))
         narrative = str(out.get("narrative", ""))
 
-    # 确定性层产出的优先（它不会错），LLM 层只补缺
-    facts = det_facts + [
-        f for f in llm_facts
-        if fact_key(f) not in det_keys
-    ]
+    if not narrative:
+        narrative = (
+            f"DB 基准裁判：确定性层覆盖 {len(det_facts)} 条评分点"
+            + (f"；另有 {len(remaining)} 条无 DB 真值，VLML 仅做估算、不参与判分。"
+               if remaining else "；全部评分点均有 DB 真值。")
+        )
 
+    # 落盘 ①：客观裁判（STORE）—— 只含 DB 真值，VLML 估算一律不进这里
     ans = RefereeAnswer(
         topic_id=task.topic_id,
-        facts=facts,
-        narrative=narrative or f"确定性层覆盖 {len(det_facts)} 条，LLM 层补充 {len(facts) - len(det_facts)} 条。",
+        facts=det_facts,                       # ← 纯 DB，Voyager 比对专用
+        narrative=narrative,                    # 判分叙事（含"仅估算"说明）
         trajectory=(["<deterministic-sql>"] if det_facts else []) + traj,
-        ok=bool(facts),
-        error="" if facts else "裁判没有产出任何事实",
+        ok=bool(det_facts),
+        error="" if det_facts else "裁判没有产出任何 DB 事实",
     )
-
     store = _load_store()
     rec = ans.as_dict()
     rec["spec_fingerprint"] = fp        # 配方换了就得重跑（见 spec_fingerprint）
     store[task.topic_id] = rec
     _save_store(store)
+
+    # 落盘 ②：给人看的 VLML 视角（JUDGE_STORE）—— 绝不喂 Voyager
+    _save_judge(task.topic_id, fp, llm_facts, narrative, traj)
     return ans
 
 
@@ -403,8 +467,16 @@ if __name__ == "__main__":
     import sys
 
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from tasks import TASKS
     from run_mve import TASK, TASK_HARD
 
-    task = TASK_HARD if "--hard" in sys.argv else TASK
-    res = asyncio.run(answer(task, force="--force" in sys.argv))
-    print(json.dumps(res.as_dict(), ensure_ascii=False, indent=2)[:3000])
+    if "--judge-all" in sys.argv:
+        # 回填：对所有种子题跑裁判，同时填充客观裁判(STORE) 与 VLML 视角(JUDGE_STORE)
+        for tid, task in TASKS.items():
+            res = asyncio.run(answer(task, force=True))
+            print(f"  {tid}: DB 事实 {len(res.facts)} 条，ok={res.ok}")
+        print("judge-all 完成")
+    else:
+        task = TASK_HARD if "--hard" in sys.argv else TASK
+        res = asyncio.run(answer(task, force="--force" in sys.argv))
+        print(json.dumps(res.as_dict(), ensure_ascii=False, indent=2)[:3000])

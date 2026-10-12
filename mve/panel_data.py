@@ -55,7 +55,10 @@ def _mc_thinking_view() -> dict[str, Any]:
 
 
 def _referee_view(topic_id: str) -> dict[str, Any]:
-    """裁判（VLML0）的标准答案视图。
+    """裁判（VLML0）的标准答案视图 —— 双层隔离（2026-10-12 纠偏）。
+
+      · `facts` / `narrative` = 客观裁判（DB 基准），Voyager 比对与面板判分都用它；
+      · `judge` = 给人看的 VLML 视角（叙事 + LLM 估算），**仅供参考、不参与判分**。
 
     只显示已经有了的（缓存命中）；没有就标 pending，不现场跑——
     面板是读视图，不该在渲染时触发一次 LLM 编排。
@@ -65,24 +68,33 @@ def _referee_view(topic_id: str) -> dict[str, Any]:
     try:
         import vlml0_referee
         ans = vlml0_referee.cached(topic_id)
+        judge = vlml0_referee.cached_judge(topic_id)
     except Exception as e:
         return {"state": "unavailable", "reason": f"{type(e).__name__}: {e}"[:160], "facts": []}
     if ans is None:
         return {"state": "pending", "facts": []}
+
+    def _fmt(f: dict) -> dict:
+        return {
+            "subject": "/".join(f"{k}={v}" for k, v in (f.get("subject") or {}).items()),
+            "dimension": f.get("dimension"),
+            "value": f.get("value"),
+            "base": f.get("base"),
+            "source": (f.get("source") or {}).get("tool", ""),
+        }
+
+    judge_view: dict[str, Any] = {}
+    if judge:
+        judge_view = {
+            "narrative": judge.get("narrative", ""),
+            "llm_facts": [_fmt(f) for f in (judge.get("llm_facts") or [])],
+        }
     return {
         "state": "ready" if ans.ok else "empty",
-        "facts": [
-            {
-                "subject": "/".join(f"{k}={v}" for k, v in (f.get("subject") or {}).items()),
-                "dimension": f.get("dimension"),
-                "value": f.get("value"),
-                "base": f.get("base"),
-                "source": (f.get("source") or {}).get("tool", ""),
-            }
-            for f in ans.facts
-        ],
+        "facts": [_fmt(f) for f in ans.facts],
         "trajectory": ans.trajectory,
         "narrative": ans.narrative,
+        "judge": judge_view,
     }
 
 # 五档 UI 状态（照 ui_api.py:62-73 的阈值）
