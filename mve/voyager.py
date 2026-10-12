@@ -588,6 +588,12 @@ query_sql 的实测限制（踩过）：
 - match_summary_report / match_analysis_report / match_economy_report / scouting_report
   **传 map_name 会崩溃**（报错 "Referenced table tgs not found"）。
   要按图分析就用 query_sql 自己加 WHERE map_name=... —— 这条永远有效。
+
+**点名了某张图就必须按图过滤（答非所问比报错更危险）**：
+- 问题里出现 Haven / Corrode / Lotus 任一张图名时，你的 query_sql **必须带**
+  `WHERE map_name='那张图'`，否则取回来的是全系列数据，结论会张冠李戴。
+- 不要只靠 team_name 过滤——team 是全系列维度，过滤不掉图。
+- 反过来：问题没点名图时，就不要乱加 map_name，否则会丢掉其它图的数据。
 """
 
 PLAN_SCHEMA = """只输出一个 JSON 对象：
