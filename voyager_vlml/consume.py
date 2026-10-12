@@ -376,6 +376,25 @@ async def consume(
         ],
         temperature=0.1,
     ) if ok_calls else {"facts": []}
+    # ⚠️ 实测踩过：工具明明取到了数（1 行），LLM 整理却返回空数组 —— 取到数交白卷，
+    # 人看到"没回答"，掌握也不涨。数据是真的在那儿，所以**重试一次**：
+    # 把"你上次返回了空数组"和原始数据再喂一遍，并明确"有数据就必须给出事实"。
+    if ok_calls and not (out.get("facts") or []):
+        rows_preview = json.dumps(
+            [o.get("data") for o in ok_calls], ensure_ascii=False, default=str)[:3000]
+        out = chat_json(
+            [
+                {"role": "system", "content": _extract_system()},
+                {"role": "user",
+                 "content": (_extract_user(question, observations, dims or None,
+                                           subs or None)
+                             + "\n\n⚠️ 你刚才返回了空数组，但工具明明取到了数据：\n"
+                             + rows_preview
+                             + "\n\n数据里有数就必须整理出事实（dimension 按上面的名字写，"
+                               "值抄数据里的，不许编）；数据确实答不了这一问才允许留空。")},
+            ],
+            temperature=0.1,
+        )
 
     facts: list[dict[str, Any]] = []
     try:
@@ -680,25 +699,37 @@ def _strip_sql(text: str) -> str:
 
 def _facts_from_obs(obs: list[dict[str, Any]], dims: list[str],
                     subs: list[dict[str, Any]], question: str) -> list[dict]:
-    """观察 → 事实（裁判侧）。"""
+    """观察 → 事实（裁判侧）。整理为空时重试一次（工具取到了数就不能交白卷）。"""
     from loop_core import make_fact
-    out = chat_json(
-        [
-            {"role": "system", "content": _extract_system()},
-            {"role": "user", "content": _extract_user(question, obs, dims, subs)},
-        ],
-        temperature=0.1,
-    )
-    facts: list[dict] = []
-    for f in (out.get("facts") or []):
-        if not isinstance(f, dict) or "dimension" not in f:
-            continue
-        facts.append(make_fact(
-            subject=f.get("subject") or {},
-            dimension=str(f.get("dimension")),
-            value=f.get("value"), unit=str(f.get("unit") or "raw"),
-            base=f.get("base"), source={"tool": "query_sql", "args": {}},
-        ))
+
+    def _once(extra: str = "") -> list[dict]:
+        out = chat_json(
+            [
+                {"role": "system", "content": _extract_system()},
+                {"role": "user",
+                 "content": _extract_user(question, obs, dims, subs) + extra},
+            ],
+            temperature=0.1,
+        )
+        facts: list[dict] = []
+        for f in (out.get("facts") or []):
+            if not isinstance(f, dict) or "dimension" not in f:
+                continue
+            facts.append(make_fact(
+                subject=f.get("subject") or {},
+                dimension=str(f.get("dimension")),
+                value=f.get("value"), unit=str(f.get("unit") or "raw"),
+                base=f.get("base"), source={"tool": "query_sql", "args": {}},
+            ))
+        return facts
+
+    facts = _once()
+    if not facts:
+        rows_preview = json.dumps(
+            [o.get("data") for o in obs], ensure_ascii=False, default=str)[:3000]
+        facts = _once("\n\n⚠️ 你刚才返回了空数组，但工具明明取到了数据：\n"
+                      + rows_preview
+                      + "\n\n有数就必须整理出事实；数据确实答不了才允许留空。")
     return facts
 
 

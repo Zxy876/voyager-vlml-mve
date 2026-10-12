@@ -117,6 +117,11 @@ def _log_import(result: dict[str, Any]) -> None:
         "used_skills": result.get("used_skills") or [],
         "ok_tool_calls": int(result.get("ok_tool_calls") or 0),
         "rows": int(result.get("rows") or 0),
+        # 审计要能回看"它是怎么答出来的"：取数 SQL 和派生评分点必须落盘。
+        # 实测踩过：facts 整理为空时想查"评分点长什么样"无从查起。
+        "sql": result.get("sql", ""),
+        "derived_points": result.get("derived_points") or [],
+        "referee_trajectory": result.get("referee_trajectory") or [],
         # 覆盖率/掌握度**只在消费侧算**（练习不判分）—— 这是给人看的质量数，
         # 绝不回灌 Voyager 反馈。
         "coverage": result.get("coverage"),
