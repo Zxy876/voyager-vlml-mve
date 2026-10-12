@@ -753,14 +753,25 @@ async def _referee_facts(question: str,
     dims = [str(p.get("dimension")) for p in points]
     subs = [dict(p.get("subject") or {}) for p in points]
 
-    # 主路：裁判也用**同一个 VLML MCP 环境**写 SQL 取数（与 Voyager 侧同一套表/列，
-    # 但独立提示、独立调用 —— 值都来自 DB，可比）。
-    # 为什么不用旧的 coach 编排：实测它三条调用全撞列名幻觉（base_events 里写
-    # player_name，真实列是 actor_player_name），裁判侧一条数都取不到 → 覆盖率落空。
+    # 裁判取数走**同一套迭代修正机制**（solve：写 SQL → 执行 → 失败带 SQL critique
+    # 重写 3 轮）。之前手写的"带错重试"循环实测 3 轮都改不对列名歧义 ——
+    # critique 机制是练习侧验证过能纠错的，别重造一个弱化版。
     if env is not None:
-        obs = await _referee_by_sql(question, dims, subs, env, schema)
-        if obs:
+        from voyager_vlml.agents.action import VLMLActionAgent
+        act = VLMLActionAgent(env=env)
+        want = "；".join(
+            f"dimension=`{d}`" + (f"，subject={json.dumps(s, ensure_ascii=False)}" if s else "")
+            for d, s in zip(dims, subs)
+        )
+        q2 = (f"（裁判·独立取标准答案）{question}\n"
+              f"要给出的量（dimension 逐字用这些名字，值从库里算）：{want}")
+        observations, sql2 = await act.solve(q2, max_iters=3)
+        ok_obs = [o for o in observations if o.get("ok")]
+        if ok_obs:
+            obs = [{"tool": "query_sql", "args": {"sql_query": sql2},
+                    "data": ok_obs[-1].get("data"), "error": None}]
             return _facts_from_obs(obs, dims, subs, question), ["query_sql"]
+        return [], []
     # 兜底：旧 VLML 编排
     # ⚠️ 实测踩过：不注入实查 schema，裁判会犯和 Voyager 一样的**列名幻觉** ——
     # 写 `base_events.player_name`，而真实列是 actor_player_name / target_player_name
