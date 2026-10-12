@@ -104,8 +104,16 @@ class MasteryStore:
     def all(self) -> dict[str, dict[str, Any]]:
         return dict(self._rows)
 
-    def update(self, topic_id: str, *, score: float, commit: bool = True) -> dict[str, Any]:
+    def update(self, topic_id: str, *, score: float, commit: bool = True,
+               count_attempt: bool = True) -> dict[str, Any]:
         """score ∈ [0,1]：本次作答得分。更新滑动平均掌握度。
+
+        `count_attempt=False`（**消费通路**用）：只更新分数，不递增 attempts、
+        不置 stale。
+        为什么必须分开：练习侧 stale 是按「练了几次」判的（MAX_ATTEMPTS_PER_TOPIC=3，
+        练够就放弃换题）。人导入是**消费**，不是练习 —— 同一个人连问三次同一道题，
+        就会把该节点标记成 stale，练习时再也不选它。那是把两条线的账本混了：
+        消费的次数不该吃掉练习的尝试预算。
 
         额外维护两个 Voyager 课程要用的字段：
           streak_wrong —— 连续答错次数（连错触发加支架，见 difficulty.py）；
@@ -117,7 +125,8 @@ class MasteryStore:
             "correct": 0, "last_at": 0, "streak_wrong": 0, "stale": False,
             "completed": False, "skills": [], "failures": [], "skips": [],
         }
-        row["attempts"] = int(row.get("attempts", 0)) + 1
+        if count_attempt:
+            row["attempts"] = int(row.get("attempts", 0)) + 1
         row["correct"] = int(row.get("correct", 0)) + (1 if score >= 0.6 else 0)
         # 连错计数：答对清零，答错 +1（difficulty.py 的连错两题加支架读它）
         row["streak_wrong"] = 0 if score >= 0.6 else int(row.get("streak_wrong", 0)) + 1
@@ -132,7 +141,8 @@ class MasteryStore:
         # ⚠️ 设计硬约束：放弃判定**只看次数**，不读掌握度/覆盖率——
         # 评分结果不被任何推进条件读到（决定跳过、下一题、整轮结束都不读它）。
         # "刚好最后一次蒙对"不会刷掉标记：次数到了就是到了。
-        row["stale"] = bool(row["attempts"] >= MAX_ATTEMPTS_PER_TOPIC)
+        if count_attempt:
+            row["stale"] = bool(row["attempts"] >= MAX_ATTEMPTS_PER_TOPIC)
         self._rows[topic_id] = row
         if commit:
             self._persist()

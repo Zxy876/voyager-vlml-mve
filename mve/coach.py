@@ -109,6 +109,20 @@ def _log_import(result: dict[str, Any]) -> None:
         "comparable": result.get("comparable", False),
         "skipped": result.get("skipped", ""),
         "errors": (result.get("errors") or [])[:2],
+        # —— 消费通路（`voyager_vlml/consume.py`）新增的字段 ——
+        # 老记录（纯 VLML 解释）没有这几项 → 面板显示时要容错（读不到就显示"—"），
+        # 不能因为缺字段把整条历史刷没。
+        "answer": result.get("answer", ""),
+        "reused": bool(result.get("reused")),
+        "used_skills": result.get("used_skills") or [],
+        "ok_tool_calls": int(result.get("ok_tool_calls") or 0),
+        "rows": int(result.get("rows") or 0),
+        # 覆盖率/掌握度**只在消费侧算**（练习不判分）—— 这是给人看的质量数，
+        # 绝不回灌 Voyager 反馈。
+        "coverage": result.get("coverage"),
+        "score": result.get("score"),
+        "verdict": result.get("verdict", ""),
+        "mastery": result.get("mastery"),
     }
     with COACH_LOG.open("a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
