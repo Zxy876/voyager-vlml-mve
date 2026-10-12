@@ -182,7 +182,16 @@ class MasteryStore:
 
     def add_failure(self, topic_id: str, verdict: str, reason: str, *,
                     commit: bool = True) -> None:
-        """记录一次任务失败（带原因），进上下文让观察者分辨「没学会」vs「链路没跑通」。"""
+        """记录一次任务失败（带原因），进上下文让观察者分辨「没学会」vs「链路没跑通」。
+
+        同时**递增 attempts 并在够 3 次时置 stale** —— 这是「重试 ≥3 跳过」这条
+        设计约束唯一的落点。
+        ⚠️ 实测踩过：stale 原先只在 `update(score=...)` 里置位，而新后端
+        （voyager_vlml）根本不走打分通道，只走 add_failure → attempts 永远是 0
+        → stale 永远 False → select_next 每轮都把同一道拿不下的题再选一遍
+        （实测连跑 3 轮全是 vlml_kd，进度卡死不动）。失败也必须计数，
+        否则「放弃换题」在没打分的后端里是条死代码。
+        """
         row = self._rows.get(topic_id) or {
             "topic_id": topic_id, "mastery": None, "attempts": 0,
             "correct": 0, "last_at": 0, "streak_wrong": 0, "stale": False,
@@ -192,9 +201,14 @@ class MasteryStore:
         fails.append({"verdict": str(verdict), "reason": str(reason),
                       "at": int(time.time())})
         row["failures"] = fails[-20:]
+        row["attempts"] = int(row.get("attempts", 0)) + 1
+        row["last_at"] = int(time.time())
+        # 放弃判定只看次数，不读掌握度/覆盖率（设计硬约束）
+        row["stale"] = bool(row["attempts"] >= MAX_ATTEMPTS_PER_TOPIC)
         self._rows[topic_id] = row
         if commit:
             self._persist()
+        return row
 
     def add_skip(self, topic_id: str, reason: str, *, commit: bool = True) -> None:
         """记录一次跳过（带原因），进上下文。"""

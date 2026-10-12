@@ -296,9 +296,15 @@ class VLMLCurriculumAgent:
                     str(info.get("verdict") or "failed"),
                     str(info.get("reason") or "任务未跑通"),
                 )
-                self.mastery.add_skip(
-                    tid, str(info.get("reason") or "重试耗尽仍未跑通 → 放弃换题")
-                )
+                # 跳过只在**真的放弃**时记（重试 ≥3 → stale），不是每失败一次都记。
+                # 否则上下文里的「跳过（带原因）」会把一次普通失败说成已放弃，
+                # 观察者分不清「还在重试」和「已经换题」。
+                if self.mastery.is_stale(tid):
+                    self.mastery.add_skip(
+                        tid,
+                        f"重试 {int((self.mastery.get(tid) or {}).get('attempts', 0))} "
+                        f"次仍未跑通 → 放弃换题：{info.get('reason') or ''}",
+                    )
         except Exception as e:  # pragma: no cover
             print(f"（课程 Agent 改写图谱失败：{type(e).__name__}: {e}）")
 
