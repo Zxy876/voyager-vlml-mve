@@ -171,6 +171,47 @@ async def run_one_round(
             "skill_key": skill_key,
         }
     )
+
+    # 落一行 run_log，字段对齐面板读取（面板后置，但先保持数据连续性）。
+    # ⚠️ 不编造 coverage / score：那是 VLML 判分的事，新后端不判分，如实写 None，
+    #    judge 标成 db_evidence 以示区别。
+    try:
+        import run_log
+
+        ok_calls = [o for o in observations if o.get("ok")]
+        run_log.append(
+            {
+                "mode": "curriculum",
+                "topic_id": tid,
+                "task": tid,
+                "question": question,
+                "round": 1,
+                "hint": "",
+                "coverage": None,
+                "score": None,
+                "verdict": "ok" if success else "no_evidence",
+                "success": success,
+                "done": bool(success),
+                "evidence_status": "collected" if success else "none",
+                "judge": "db_evidence",
+                "no_tool_calls": not ok_calls,
+                "feedback": {},
+                "tool_calls": len(observations),
+                "errors": [
+                    str(o.get("error") or "")
+                    for o in observations
+                    if not o.get("ok")
+                ],
+                "covered": [],
+                "missing": [] if success else [question],
+                "narrative": "",
+                "generated_task": generated,
+                "sql": sql,
+                "skill_key": skill_key,
+            }
+        )
+    except Exception as e:  # pragma: no cover
+        print(f"  （写 run_log 失败：{type(e).__name__}: {e}）")
     return {
         "topic_id": tid,
         "reason": reason,

@@ -12,10 +12,31 @@ import json
 import os
 import re
 import time
+from pathlib import Path
 from typing import Any
 
 
+def _load_env_once() -> None:
+    """密钥兜底：从 mve/.env 读（照 mve/llm_client.load_env 的做法）。
+
+    pilot 起的子进程不一定带上 ZHIPU_API_KEY，新后端要能自己拿到密钥。
+    """
+    env = Path(__file__).resolve().parents[1] / "mve" / ".env"
+    try:
+        if not env.exists():
+            return
+        for line in env.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip())
+    except Exception:
+        pass
+
+
 def _endpoint() -> tuple[str, str, str]:
+    _load_env_once()
     base = os.getenv("MVE_QUIZ_BASE_URL", "").strip()
     if base:
         return (
