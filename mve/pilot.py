@@ -194,6 +194,10 @@ def start(*, mode: str = "once", topic: str = "", rounds: int = 3,
     cmd = [PY, str(ROOT / "pilot.py"), "_run", "--mode", mode,
            "--rounds", str(rounds), "--job", job,
            "--units", str(units), "--transfer", str(transfer)]
+    if job == "practice":
+        # 驾驶舱（practice）走 Voyager 同构循环：出题/推进都在 run_mve 内部，
+        # pilot 只拉起一个长进程并读 stop 信号，不再一题一进程。
+        cmd += ["--curriculum"]
     if topic:
         cmd += ["--topic", str(topic)]
 
@@ -300,7 +304,7 @@ def _install_signal_handlers() -> None:
 
 
 def _run(mode: str, topic: str, rounds: int, job: str = "practice",
-         units: int = 1, transfer: int = 0) -> int:
+         units: int = 1, transfer: int = 0, curriculum: bool = False) -> int:
     _install_signal_handlers()
 
     # 日志文件句柄必须**全程持有**：用 `with` 包住 Popen 会在它返回后立刻关掉 fd，
@@ -308,7 +312,7 @@ def _run(mode: str, topic: str, rounds: int, job: str = "practice",
     #   Fatal Python error: init_sys_streams: ... OSError: [Errno 9] Bad file descriptor
     logf = LOG.open("a", encoding="utf-8")
     try:
-        code = _loop(mode, topic, rounds, logf, job, units, transfer)
+        code = _loop(mode, topic, rounds, logf, job, units, transfer, curriculum)
     finally:
         try:
             logf.close()
@@ -318,7 +322,7 @@ def _run(mode: str, topic: str, rounds: int, job: str = "practice",
 
 
 def _loop(mode: str, topic: str, rounds: int, logf, job: str = "practice",
-          units: int = 1, transfer: int = 0) -> int:
+          units: int = 1, transfer: int = 0, curriculum: bool = False) -> int:
     pid = os.getpid()
 
     def mark(text: str) -> None:
@@ -346,8 +350,10 @@ def _loop(mode: str, topic: str, rounds: int, logf, job: str = "practice",
     iterations = 0
     # 摸底与学习单元**只跑一次**：它们自己内部就是一轮全库循环，
     # 驾驶舱再套一层 loop 会变成"摸底完了又摸一遍"。
-    max_iterations = 1 if job != "practice" else (200 if mode == "loop" else 1)
-    timeout = JOB_TIMEOUT.get(job, 900)
+    # practice + curriculum：run_mve 内部自行循环，pilot 只拉起一个长进程，
+    # 所以外层只 spawn 一次（max_iterations=1），超时也放大到 6 小时。
+    max_iterations = 1 if (job != "practice" or curriculum) else (200 if mode == "loop" else 1)
+    timeout = (6 * 3600) if curriculum else JOB_TIMEOUT.get(job, 900)
 
     while iterations < max_iterations and not asked_to_stop():
         iterations += 1
@@ -368,7 +374,10 @@ def _loop(mode: str, topic: str, rounds: int, logf, job: str = "practice",
                     + (f"（每 {transfer} 单元加考一道没练过的题）" if transfer else "")
                     + f" · {_now()}")
         else:
-            cmd = [PY, str(ROOT / "run_mve.py"), "--llm", "--rounds", str(rounds)]
+            cmd = [PY, str(ROOT / "run_mve.py"), "--llm"]
+            if curriculum:
+                cmd += ["--curriculum"]
+            cmd += ["--rounds", str(rounds)]
             if topic:
                 cmd += ["--topic", topic]
             what = f"第 {iterations} 题 · {_now()} · {' '.join(cmd[-4:])}"
@@ -473,6 +482,7 @@ if __name__ == "__main__":
         t = ""
         if "--topic" in argv:
             t = argv[argv.index("--topic") + 1]
+        curriculum = "--curriculum" in argv
 
         def _flag(name: str, default: str) -> str:
             return argv[argv.index(name) + 1] if name in argv else default
@@ -480,7 +490,7 @@ if __name__ == "__main__":
         job = _flag("--job", "practice")
         units = int(_flag("--units", "1"))
         transfer = int(_flag("--transfer", "0"))
-        sys.exit(_run(m, t, r, job, units, transfer))
+        sys.exit(_run(m, t, r, job, units, transfer, curriculum))
 
     if argv and argv[0] == "status":
         st = read()

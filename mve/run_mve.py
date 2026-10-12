@@ -11,6 +11,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import signal
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -115,6 +118,246 @@ def _deterministic_ratio(ref_facts: list[dict[str, Any]]) -> float:
     return det / len(ref_facts)
 
 
+# ===========================================================================
+# Voyager 同构学习循环（驾驶舱「▶ 启动 Voyager」走这里，2026-10-12 落地）
+# ---------------------------------------------------------------------------
+# 同构对照（原版 Voyager learn/rollout/step）：
+#   curriculum_agent.propose_next_task  →  topic_graph.select_next（新奇/放弃/场景条件化）
+#   rollout（每题最多 N 次重试）        →  每知识点最多 rounds 次作答
+#   step（critic 验证 done）            →  open_quiz.grade_answer（伴学式语义判分）
+#   done = success or 重试用尽          →  同；成功→存 SQL 技能，失败→stale 跳过
+#   add_new_skill（逐字存 program_code）→  skill_store.add(code=调用序列)
+# 出题器（planner）/ 推题 / 支架(hint) / 原 mve 记忆注入 一律撤下；
+# 图谱同构为「出生地元信息」= scene_context（biome/nearby_blocks/inventory/chests）。
+# 评分只由 grade_answer 出（verdict/score），推进由 done 条件决定，不替 voyager 决定。
+# ===========================================================================
+
+_PILOT_STATE = Path(__file__).resolve().parent / "pilot_state.json"
+
+
+def _pilot_stop_requested() -> bool:
+    try:
+        return bool(json.loads(_PILOT_STATE.read_text(encoding="utf-8"))
+                    .get("stop_requested"))
+    except Exception:
+        return False
+
+
+def _answer_from(result: dict[str, Any]) -> str:
+    """把 Voyager 的取数结果拼成一段可被判分的「作答文本」。
+
+    生成题没有 rubric，判分靠语义（grade_answer 比 accepted_answers/key_points），
+    所以把 agent 的结论（narrative）+ 取出的事实 + 规划思路一起喂给阅卷人，
+    比只给一句话结论更稳。
+    """
+    narr = result.get("narrative") or ""
+    if isinstance(narr, dict):
+        narrative = str(narr.get("text") or "")
+    else:
+        narrative = str(narr)
+    facts = result.get("facts") or []
+    facts_text = "；".join(
+        f"{f.get('dimension')}={f.get('value')}"
+        for f in facts[:10] if isinstance(f, dict))
+    thought = result.get("thought") or ""
+    return "\n".join(x for x in (narrative,
+                                 (f"数据：{facts_text}" if facts_text else ""),
+                                 (f"思路：{thought}" if thought else ""))
+                     if x).strip()
+
+
+def _store_skill_for(voyager: Any, topic_id: str, task: Any, result: dict[str, Any],
+                    score: float, question: str) -> str | None:
+    """判对时把 Voyager 本次跑通的编排固化成**可复用 SQL/工具代码**进技能库。
+
+    原版 add_new_skill 逐字存 program_code；MVE 的等价物是：
+      · program_code 路径（代码化取证）→ 直接存源码
+      · plan 路径（SQL 类，占多数）→ 把跑通的调用序列渲染成可重放程序
+    两条路都落 `code` 字段，不是话术/一两句话。返回技能名或 None。
+    """
+    try:
+        prog = str(result.get("program_code") or "")
+        if prog:
+            _saved = skill_store.add(
+                topic_id, _stable_skill_name(task),
+                f"自己跑通的编排（评分 {score:.0%}）：{question[:60]}",
+                code=prog,
+                blueprint={"source": "practice", "coverage": score,
+                           "program_name": result.get("program_name") or ""},
+                source="practice")
+            return _saved[0]
+        calls = _successful_calls(voyager)
+        if calls:
+            code, fn = _plan_program(str(topic_id), calls)
+            _saved = skill_store.add(
+                topic_id, _stable_skill_name(task),
+                f"自己跑通的编排（评分 {score:.0%}）："
+                f"{' → '.join(str(c['tool']) for c in calls)}",
+                code=code,
+                blueprint={"source": "practice", "coverage": score,
+                           "program_name": fn, "calls": calls},
+                source="practice")
+            return _saved[0]
+    except Exception as e:                 # pragma: no cover
+        print(f"  （存程序失败：{type(e).__name__}: {e}）")
+    return None
+
+
+class _GenTask:
+    """最小伪 Task：LLMVoyager.run 只用到 question / rubric / topic_id /
+    subject / validated_target。生成题没有 rubric（无权威答案），
+    所以 rubric 留空——agent 只按问题 + 工具目录 + 出生地场景作答。"""
+
+    def __init__(self, question: str, topic_id: str) -> None:
+        self.question = question
+        self.topic_id = topic_id
+        self.rubric: list[Any] = []
+        self.subject: dict[str, Any] = {}
+        self.validated_target = True
+        self.difficulty = 3
+
+
+async def run_curriculum(rounds: int, topic_id: str = "", *,
+                         blind: bool = False, use_llm: bool = True,
+                         help_policy: str = "auto") -> None:
+    import open_quiz
+    import scene_context
+    from topic_graph import TopicGraph
+
+    graph = TopicGraph()
+    voyager: Any = (LLMVoyager(blind=blind, hint_level="")
+                   if use_llm else ScriptedVoyager())
+
+    stopped = {"flag": False}
+
+    def _on_sigterm(_signum, _frame):
+        stopped["flag"] = True
+    try:
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except Exception:
+        pass
+
+    def _should_stop() -> bool:
+        return stopped["flag"] or _pilot_stop_requested()
+
+    print("=" * 72)
+    print("  MVE：Voyager 同构学习循环（topic_graph 课程 + 伴学式语义判分）")
+    print("=" * 72)
+    seen = 0
+    while not _should_stop():
+        sel = graph.select_next(explicit=topic_id or None)
+        tid = sel["topic_id"]
+        mrow = graph.mastery.get(tid) or {}
+        attempt = int(mrow.get("attempts", 0))
+        # —— 出题：topic_graph 选知识点 → open_quiz 即时出一道具体题 ——
+        try:
+            q = open_quiz.generate_for(tid, attempt=attempt,
+                                      memories=True, scene=True)
+        except Exception as e:
+            print(f"  ⚠ 出题失败 {tid}：{type(e).__name__}: {e} —— 记入一次失败，等放弃机制跳过")
+            graph.mastery.update(tid, score=0.0)
+            seen += 1
+            continue
+        question = q.get("question") or ""
+        # —— 出生地元信息（图谱同构物）注入 agent 的题面 ——
+        scene_text = ""
+        try:
+            scene_text = scene_context.scene_injection(tid)
+        except Exception:
+            scene_text = ""
+        full_q = question + ("\n\n" + scene_text if scene_text else "")
+        task = _GenTask(full_q, tid)
+        print(f"\n----- 选题 {tid}（{sel.get('reason')}）· 第 {seen + 1} 次 -----")
+        print(f"  问题：{question}")
+
+        # —— rollout：每知识点最多 rounds 次作答（Voyager 节奏，不动它）——
+        done = False
+        last_score = 0.0
+        for r in range(1, rounds + 1):
+            if _should_stop():
+                break
+            result = await voyager.run(task)
+            answer = _answer_from(result)
+            grade = open_quiz.grade_answer(q, answer)
+            last_score = float(grade.get("score", 0.0))
+            # —— 伴学式评分：只评分，不推进 ——
+            print(f"  第{r}轮 score={last_score:.0%} · {grade.get('feedback','')[:80]}")
+            graph.mastery.update(tid, score=last_score)
+            # 阅卷人给的反馈也回灌给 agent，下轮能看到自己漏了什么
+            try:
+                voyager.learn(
+                    covered=[str(h) for h in (grade.get("hits") or [])],
+                    missing=[str(m) for m in (grade.get("misses") or [])],
+                    task=task, verdict="correct" if last_score >= 0.6 else "wrong")
+            except Exception:
+                pass
+            if last_score >= 0.6:
+                done = True
+                name = _store_skill_for(voyager, tid, task, result, last_score, question)
+                print(f"  ✅ 完成（score≥0.6）→ 存技能"
+                      + (f"：{name}" if name else "（无可固化程序）"))
+                break
+        if not done:
+            print(f"  ⚠ 重试用尽仍 <0.6（score={last_score:.0%}）→ 标记 stale，"
+                  f"下轮由放弃机制跳过换题")
+        seen += 1
+        _log_curriculum(tid, question, last_score, done, use_llm, voyager)
+    print(f"\n===== 驾驶舱 Voyager 循环结束 · 共处理 {seen} 次选题 =====")
+
+
+def _log_curriculum(topic_id: str, question: str, score: float, done: bool,
+                   use_llm: bool, voyager: Any) -> None:
+    """落一行 run_log，字段对齐 panel_data 读取（topic_id/round/coverage/
+    score/verdict/success），让进步曲线/导出 md 不崩。"""
+    try:
+        run_log.append({
+            "mode": "curriculum",
+            "topic_id": topic_id,
+            "task": topic_id,
+            "question": question,
+            "round": 1,
+            "hint": "",
+            "coverage": round(score, 4),
+            "score": round(score, 4),
+            "verdict": "correct" if score >= 0.6 else "wrong",
+            "success": bool(score >= 0.6),
+            "done": bool(done),
+            "evidence_status": "scored",
+            "judge": "open_quiz.grade_answer",
+            "no_tool_calls": False,
+            "feedback": {},
+            "used_hint": False,
+            "help_wasted": False,
+            "help_decision": None,
+            "ref_plan": [],
+            "difficulty": 3,
+            "tool_calls": len(getattr(voyager, "trajectory", []) or []),
+            "evaluator_confidence": round(0.6 + 0.35 * 1.0, 4),
+            "errors": [],
+            "unjudgeable": [],
+            "referee_facts": 0,
+            "covered": [],
+            "missing": [],
+            "rejected_low_base": [],
+            "narrative": "",
+            "insights": [],
+            "caveats": [],
+            "narrative_comparable": False,
+            "narrative_based_on": 0,
+            "facts_count": len(getattr(voyager, "trajectory", []) or []),
+            "trajectory": [t.get("tool") for t in getattr(voyager, "trajectory", []) or []],
+            "skill_count": len(voyager.memory) if use_llm else len(voyager.skills),
+            "skill_stats": skill_store.stats() if use_llm else None,
+            "hallucinations": [],
+            "hallucination_count": 0,
+            "mastery": None, "level": None, "status": None, "flags": [],
+            "mastery_recency": None, "mastery_confidence": None,
+            "mastery_evidence_count": 0, "mastery_model": "topic_graph",
+        })
+    except Exception:
+        pass
+
+
 async def main() -> None:
     argv = sys.argv[1:]
 
@@ -169,6 +412,18 @@ async def main() -> None:
             rounds = max(1, min(10, int(argv[argv.index("--rounds") + 1])))
         except (ValueError, IndexError):
             rounds = 3
+
+    # ---- Voyager 同构学习循环（驾驶舱「▶ 启动 Voyager」新路径，优先于旧单题路径）----
+    # 出题 = topic_graph 自动课程；判分 = 伴学式语义判分；推进由 done 决定。
+    # 旧的单题路径（planner + vlml0_referee）保留给 CLI 对照（不带本开关）。
+    if "--curriculum" in argv:
+        _ctopic = ""
+        if "--topic" in argv:
+            _ctopic = argv[argv.index("--topic") + 1]
+        await run_curriculum(
+            rounds, _ctopic,
+            blind=blind, use_llm=use_llm, help_policy=help_policy)
+        return
 
     # 选题：照伴学 practice_scope 的两种模式
     #   --topic <id>  → explicit_topic：钉住一道题连考
