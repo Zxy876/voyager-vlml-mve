@@ -208,9 +208,45 @@ def _install_stop_handler() -> None:
             pass
 
 
+def _retrieve_skills(
+    tid: str, question: str, quiet: bool = False
+) -> list[dict[str, Any]]:
+    """照原版 `voyager.py:195`：这一趟**要写 SQL 之前**，先检索已学会的技能。
+
+    原版是 `skills = self.skill_manager.retrieve_skills(query=self.context)`，
+    每次 rollout 都做，不管这个任务是新课程给的还是自己新想的。这里照做：
+    检索到的配方会拼进 system prompt（同构 `action.py:94` 的 `+ skills`），
+    所以**注入了才算一次 hit** —— 直接在这里 mark_used。
+
+    库里一条都没有 / 一条都不相关（跨题相似度门槛）/ 检索出错 → 返回空，
+    不打扰主流程：技能库为空是冷启动的常态，不该被当成异常。
+    """
+    try:
+        import skill_store
+
+        have = skill_store._load_raw().get("skills") or {}
+        if not have:
+            return []
+        got = skill_store.retrieve(tid, question, top_k=skill_store.RETRIEVAL_TOP_K)
+        keys = [str(s.get("key") or "") for s in got]
+        if keys:
+            skill_store.mark_used(keys)
+            if not quiet:
+                print(
+                    f"  注入 {len(keys)} 条已学配方："
+                    + "、".join(k.split("::")[0] for k in keys[:3])
+                    + (" …" if len(keys) > 3 else "")
+                )
+        return got
+    except Exception as e:  # pragma: no cover
+        print(f"  （检索技能库失败：{type(e).__name__}: {e}）")
+        return []
+
+
 async def _generate_new_task(curr: Any, env: Any, act: Any = None,
                              max_tries: int = 3, max_iters: int = 3
-                             ) -> tuple[str, str, list[dict[str, Any]], str]:
+                             ) -> tuple[str, str, list[dict[str, Any]], str,
+                                        list[str]]:
     """生成一个新任务，**并且先验证它真的能从库里取到数**。
 
     返回 (topic_id, 题面, 验题时取到的观察, 验题用的 SQL)。取不到就换一个再生成，
@@ -287,7 +323,8 @@ async def _generate_new_task(curr: Any, env: Any, act: Any = None,
         tid = "runtime_" + hashlib.md5(question.encode("utf-8")).hexdigest()[:8]
         if tid in curr.graph.topics:
             # 同一道题以前生成过 → 复用它的节点，不重复验、也不重复建
-            return tid, question, [], ""
+            # （没写 SQL 就没有任何注入，keys 给空，别虚报一次复用）
+            return tid, question, [], "", []
 
         # —— 验题就当正式那趟跑（同一个 agent、同样的迭代次数）——
         # ⚠️ 别用更严的标准筛题：一开始写成 `max_iters=1`（只迭代一次就判生死），
@@ -295,8 +332,16 @@ async def _generate_new_task(curr: Any, env: Any, act: Any = None,
         #    验题必须与正式跑同标准，否则等于自杀式筛选。
         #    而且跑通就直接复用这趟结果，不重复烧一次 LLM + DB。
         # 取不到数 → 题面不合格，换一个再来；**不记失败**（它还没进课程）
+        #
+        # ⚠️ 这里**也要**检索技能库：原版是每次 rollout 都 retrieve
+        #    （`voyager.py:195`），不管任务是课程给的还是自己新想的。
+        #    而种子课程跑完之后，走的**全是**这条生成路径 —— 实测进度 32 之后
+        #    连跑 4 轮、4 轮都是 generated_new_task。不在这里检索，
+        #    复用链就等于永远不转（技能库 28 条一条都用不上）。
+        gen_hits = _retrieve_skills(tid, question)
+        gen_keys = [str(s.get("key") or "") for s in gen_hits]
         obs, sql = await act.solve(
-            question, max_iters=max_iters, hints=skills[:3])
+            question, max_iters=max_iters, hints=skills[:3], skills=gen_hits)
         ok, _why = crit.check_task_success(
             observations=obs, task={"task": question, "hints": skills})
         if ok:
@@ -313,12 +358,14 @@ async def _generate_new_task(curr: Any, env: Any, act: Any = None,
             }
             curr.graph.topics[tid] = node
             _save_runtime_topic(node)   # 落盘：不落盘重开就得重造同一批题
-            return tid, question, list(obs or []), str(sql or "")
+            return tid, question, list(obs or []), str(sql or ""), gen_keys
         tried.append(question)
         print(f"  （新题验题没取到数，换一个：{question[:50]}）")
 
-    # 连续几次都生成不出能从库里取到数的题 —— 如实返回空，不硬凑一道去跑
-    return "", "", [], []
+    # 连续几次都生成不出能从库里取到数的题 —— 如实返回空，不硬凑一道去跑。
+    # ⚠️ 这一趟的注入已经记进 hits 了（mark_used 在 _retrieve_skills 里就地做），
+    #    但**没有**对应的 mark_result —— 注入了却没帮上，正是要它沉底的信号。
+    return "", "", [], [], []
 
 
 async def run_one_round(
@@ -344,6 +391,8 @@ async def run_one_round(
     gen_question = ""
     pre_obs: list[dict[str, Any]] = []
     pre_sql = ""
+    # 验题那一趟注入了哪些已学配方（由 _generate_new_task 带回来，别重复记 hit）
+    gen_keys: list[str] = []
     if topic_id:
         tid, reason = topic_id, "explicit"
     else:
@@ -351,7 +400,7 @@ async def run_one_round(
         tid, reason = nxt["topic_id"], nxt["reason"]
         if not tid:
             # 范围内已无可拿下的任务 → 生成一个**并先验题**（设计：整轮不结束）
-            tid, gen_question, pre_obs, pre_sql = await _generate_new_task(
+            tid, gen_question, pre_obs, pre_sql, gen_keys = await _generate_new_task(
                 curr, env, act=act, max_iters=max_iters)
             reason, generated = "generated_new_task", True
             if not tid:
@@ -397,34 +446,20 @@ async def run_one_round(
     # 技能库于是成了**单向仓库**：25 条真 SQL 写进去，一条都没被用过，
     # hits / ok 恒为 0（mark_used 只在 retrieve 之后被调用）。
     #
-    # ⚠️ 只在**真的要写 SQL** 的那条路上注入并计数：走 pre_obs 那条路
-    # （新题在验题阶段已经取到数）没有任何 prompt 被注入，计数就会是假的。
-    skill_hits: list[dict[str, Any]] = []
+    # ⚠️ 两条**真的会写 SQL** 的路都要检索（原版是每次 rollout 都 retrieve）：
+    #    · 生成新题那条路：验题时已经在 `_generate_new_task` 里检索并注入过了，
+    #      keys 顺着 `gen_keys` 带回来；
+    #    · 现场写这条路：在这里检索。
+    #    **不要两边都检索** —— 否则同一题同一次注入会被记两次 hit。
     injected_keys: list[str] = []
 
     # 验题那一趟已经取到数了 → 直接复用，不重复烧一次 LLM + DB。
     if pre_obs:
         observations, sql = pre_obs, pre_sql
+        injected_keys = gen_keys
     else:
-        try:
-            import skill_store
-
-            have = skill_store._load_raw().get("skills") or {}
-            if have:
-                skill_hits = skill_store.retrieve(
-                    tid, question, top_k=skill_store.RETRIEVAL_TOP_K
-                )
-                injected_keys = [str(s.get("key") or "") for s in skill_hits]
-                if injected_keys:
-                    # 注入了 prompt 才算一次 hit（照原版：检索到就进 context）
-                    skill_store.mark_used(injected_keys)
-                    print(
-                        f"  注入 {len(injected_keys)} 条已学配方："
-                        + "、".join(k.split("::")[0] for k in injected_keys[:3])
-                    )
-        except Exception as e:  # pragma: no cover
-            print(f"  （检索技能库失败：{type(e).__name__}: {e}）")
-
+        skill_hits = _retrieve_skills(tid, question)
+        injected_keys = [str(s.get("key") or "") for s in skill_hits]
         observations, sql = await act.solve(
             question, max_iters=max_iters,
             hints=list(topic.get("skills") or [])[:3],
