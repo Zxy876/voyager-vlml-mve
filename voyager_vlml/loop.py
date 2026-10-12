@@ -81,17 +81,44 @@ def _write_loop_state(**kw: Any) -> None:
         pass
 
 
+# 错误分诊的关键词表。**顺序有意义**：基础设施类先判，因为它看起来也像
+# "does not exist"（`database does not exist` vs `column "x" does not exist`）。
+_INFRA_ERRORS = (
+    "cannot open database", "database does not exist", "io error",
+    "catalog error", "permission denied", "no module named",
+    "未装载的工具", "connection", "failed to open", "file not found",
+)
+_SQL_ERRORS = (
+    "parser error", "syntax error", "binder error", "conversion error",
+    "not implemented", "transactioncontext", "invalid input",
+    "referenced column", "does not exist", "ambiguous reference",
+)
+
+
+def _is_infra_error(err: str) -> bool:
+    e = (err or "").lower()
+    return any(m in e for m in _INFRA_ERRORS)
+
+
+def _is_sql_error(err: str) -> bool:
+    e = (err or "").lower()
+    return any(m in e for m in _SQL_ERRORS)
+
+
 def _classify_no_evidence(observations: list[dict[str, Any]]) -> str:
     """这轮为什么没拿到证据 —— 让观察者能分清「它没学会」和「链路根本没跑通」。
 
     ⚠️ 用户明确要求的可区分性（原话：「面板要用可区分信息让观察者分辨
-      '它没学会' 和 '链路根本没跑通'」）。这两件事的处置完全不同：
-        · `linkage`  —— 一次工具都没调成功：**链路问题**（DB 不可达 / MCP 工具
-                        没装载 / 库换了但没引导）。改代码或改配置能修，跟
-                        "学没学会"没关系。
-        · `empty`    —— 工具调通了但取到 0 行：题面在库里没数据，或 SQL 口径写错
-                        （过滤条件过严）。这是**它**的水平问题。
-        · `unproven` —— 取到数了但判据没过（critic 判定为没取到有效证据）。
+      '它没学会' 和 '链路根本没跑通'」）。四种结果的处置完全不同：
+        · `linkage`   —— 一次工具都没调成功，且错误是**基础设施类**（打不开库、
+                         工具没装载、模块缺失）。改配置/依赖能修，跟"学没学会"无关。
+        · `sql_error` —— 工具**跑起来了**，是它写的 SQL 有问题（Parser/Binder
+                         错误）。这是**它**的水平问题，不是链路。
+                         ⚠️ 这一档是 2026-10-13 补的：之前把「SQL 语法/列名写错」
+                         一律归成 `linkage`，于是面板让人去查"库在不在、工具装没装"
+                         —— 查半天查的是根本没错的地方。
+        · `empty`     —— SQL 跑通了但取到 0 行：题面在库里没数据，或过滤条件过严。
+        · `unproven`  —— 取到数了但判据没过（critic 判定为没取到有效证据）。
     不停循环**不会因为任何一种而停下** —— 这里只负责如实标出来。
     """
     obs = observations or []
@@ -99,7 +126,12 @@ def _classify_no_evidence(observations: list[dict[str, Any]]) -> str:
         return "linkage"          # 连一次调用都没发出去 = 环境根本没转起来
     ok_n = sum(1 for o in obs if o.get("ok"))
     if ok_n <= 0:
-        return "linkage"
+        errs = [str(o.get("error") or "") for o in obs]
+        if any(_is_infra_error(e) for e in errs):
+            return "linkage"
+        if any(_is_sql_error(e) for e in errs):
+            return "sql_error"
+        return "linkage"          # 工具失败但认不出原因 → 按最坏情况当链路问题
     rows = sum(int(o.get("rows") or 0) for o in obs if o.get("ok"))
     if rows <= 0:
         return "empty"
@@ -266,10 +298,16 @@ async def run_one_round(
                 # 以前的写法是"生成完就去跑"，跑不通记一次失败，失败会喂 stale，
                 # stale 会把课程越堵越死（实测 3 轮全 generated_new_task、2 轮失败）。
                 print("  （连续生成的新题都从库里取不到数，本轮不跑，也不记失败）")
+                # ⚠️ 字段必须与正常返回**完全对齐**。2026-10-13 服务器实跑踩到：
+                #   跑满课程后连续生成新题都验不过 → 走进这条早退 → 返回里漏了
+                #   `progress`/`critique` → run_rounds 打印时 `r['progress']`
+                #   KeyError → **整个不停循环当场崩掉**。不停循环里"空转一圈"
+                #   是设计内的常态（设计：整轮不结束），它绝不能成为致命路径。
                 return {
                     "topic_id": "", "reason": "generated_but_unverifiable",
                     "success": False, "question": "", "sql": "",
                     "skill_key": "", "generated": True, "observations": [],
+                    "critique": "", "progress": curr.progress,
                 }
 
     topic = curr.graph.topics.get(tid) or {}
@@ -473,13 +511,17 @@ async def run_rounds(
             rounds_since_progress=since_progress,
         )
 
+        # 一律用 .get()：不停循环里"这轮什么都没跑成"是设计内的常态，
+        # 任何一条早退路径缺字段都不该把整个循环打死（实测踩过 KeyError 崩循环）。
         tag = f"第 {i}/{n} 轮" if n > 0 else f"第 {i} 轮（不停）"
+        empty_round = not str(r.get("topic_id") or "")
         print(
-            f"[{tag}] {r['topic_id']} · reason={r['reason']}"
+            f"[{tag}] {r.get('topic_id') or '（本轮没跑出题）'} · reason={r.get('reason')}"
             f"{' (新生成)' if r.get('generated') else ''}"
-            f" · 成功={r['success']} · 进度={r['progress']}"
+            f" · 成功={r.get('success')} · 进度={r.get('progress')}"
             + (f" · ⚠️ 连续 {streak} 轮没拿到证据"
-               f"（{_classify_no_evidence(obs)}）" if streak >= 3 else "")
+               f"（{_classify_no_evidence(obs)}）"
+               if (streak >= 3 and not empty_round) else "")
         )
     _write_loop_state(running=False, round=i, progress=last_progress)
     return out

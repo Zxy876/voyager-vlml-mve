@@ -235,9 +235,13 @@ python mve/pilot.py                                          # 或面板驾驶�
 
 | kind | 含义 | 该去改什么 |
 |---|---|---|
-| `linkage` | 一次工具都没调成功 | **链路没跑通**：库在不在、VLML 工具装没装、`db_config.json` 指的哪个库。改配置/依赖，跟"它没学会"无关 |
-| `empty` | 工具调通了但取到 0 行 | **它**的问题：SQL 口径过严、题面在库里没这个数据。去看日志里它写的 WHERE |
+| `linkage` | 一次工具都没调成功，且错误是**基础设施类**（打不开库 / 工具没装载 / 模块缺失） | **链路没跑通**：库在不在、VLML 工具装没装、`db_config.json` 指的哪个库。改配置/依赖，跟"它没学会"无关 |
+| `sql_error` | 工具**跑起来了**，报的是 Parser / Binder 错误 | **它**的问题：SQL 写错、列名写错、值类型猜错。看日志里具体哪条 SQL 报错 |
+| `empty` | SQL 跑通了但取到 0 行 | **它**的问题：过滤条件过严、题面在库里没这个数据。看它写的 WHERE |
 | `unproven` | 取到数但 critic 判定不构成有效证据 | 多半取到了错误对象或空壳表 |
+
+⚠️ `sql_error` 这一档是后补的：最初把「SQL 写错」一律归到 `linkage`，于是面板
+让人去查"库在不在、工具装没装"—— 查的是根本没错的地方。分诊错的代价跟不分诊一样大。
 
 连续 ≥3 轮时面板出告警条；**循环不因此停下**（设计：只有停止能改变节奏）。
 
@@ -841,8 +845,28 @@ vlml/data/raw_events       → raw_events_rib   （软链，管线只认这个�
 写 `mve/db_config.json` 的 `db_path`（`vlml_env.py:52` 打了补丁换掉 VLML 写死的默认库），
 再 `python mve/entity_catalog.py` 刷新目录。
 
+⚠️ **路径按仓库根解析，不按 cwd**。`vlml_env` 启动时会 `os.chdir(vlml/)`，
+所以相对路径 `vlml/data/x.duckdb` 会被 DuckDB 拼成 `<repo>/vlml/vlml/data/x.duckdb`
+（**vlml 出现两遍**，报 `database does not exist`）。四个读取口
+（`vlml_env` / `anchor` / `entity_catalog` / `db_switch`）现在统一按仓库根解析，
+`db_switch.write()` 存绝对路径。2026-10-13 在服务器上就是这么栽的，详见第 19 章。
+
+换库后一并做的事（漏一件就会出玄学症状）：
+
+```bash
+python mve/entity_catalog.py            # 刷新实体可填值（图谱只读缓存）
+python mve/knowledge_graph.py --build   # 重建图谱（json 被 gitignore，不跟着 push）
+python -c "import sys;sys.path.insert(0,'mve');import anchor;print(anchor.refresh())"  # 重算锚点
+```
+
 ⚠️ **换库后必须重建图谱**：`knowledge_graph.json` 被 gitignore，不跟着 push。
 服务器上图谱可能是很早的版本（实测服务器 insight 层曾为 0）。
+
+**当前服务器在跑哪个库**（2026-10-13 核对）：`vlml_rib.duckdb`
+（285 回合 / 2850 行 ext_player_round_stats，含首血与经济两条轴）。
+此前 `db_path` 是空的 → 落到默认 `vlml_events.duckdb`，那是**单场系列赛切片**
+（1 场赛事 / 59 回合 / 10 名选手 / 无 ext 层），连杀、势头、多赛事类问题在库里
+根本没有数据。三个库都还在盘上，随时可以切回去。
 
 ### ⚠️ 现在的边界：数据在库里，图谱还没消费它
 
@@ -1080,6 +1104,7 @@ systemctl restart mve-panel                                     # ← 必须！
 | **「跑三轮就结束了，图谱都没跑完」** | ① `rounds` 被当硬上限，面板写死 `rounds:3`、而且 `opts.rounds\|\|3` 把传进来的 0 换成 3 ② 常量写成 `if a.rounds > 1`，传 0 走单轮路径 ③ 原版 Voyager 根本没有"跑 N 轮"这个概念（`voyager.py:326` 是 `while True`） | `rounds<=0` = 不停 + `--max-iterations`；面板加「不停」开关并默认勾上；`\|\|3` 改成显式判 undefined |
 | 连跑 3 轮全是 `generated_new_task`，2 轮失败 | ① stale 沿前置链传染，4 个卡死堵死 9 个后继（29 节点 0 可选）② 新题**生成完不验题**就跑（`JOIN weapon_types` 表根本不存在）③ `runtime_{n}` 只在内存计数，重启回到 `runtime_1`，不同题共 id 互相叠账 | stale 前置视为"已放弃不再挡路"；新题**生成即验题**（同标准）且验不过不记失败；id 改 `runtime_<md5(题面)[:8]>` |
 | 模型把布尔列当字符串比（`round_won='win'` / `='team'`） | schema 只给**列名**不给类型和值，模型只能猜；VLML 自带的 `column_definitions.yaml` 只覆盖 3 张表 | schema 三要素：**每张表行数 + 列类型 + 一行真实样例**；空表明写"查它只会得 0 行" |
+| **换库后连三轮一次工具都没调成功**（分诊 `linkage`） | `vlml_env` 里 `os.chdir(vlml/)`（VLML 查询依赖那个 cwd），配置写相对路径 `vlml/data/x.duckdb` 时 DuckDB 按 cwd 拼 → `<repo>/vlml/vlml/data/x.duckdb`，**vlml 出现两遍** | 四个读取口（`vlml_env` / `anchor` / `entity_catalog` / `db_switch`）统一按**仓库根**解析；`db_switch.write()` 存绝对路径；启动时校验文件存在并告警 |
 | 问「每回合每角色平均击杀」取回 0 行 | 当前库 `agg_*` 是 0 行，真实数据在 `ext_player_round_stats`（2850 行）。只给表名列名时模型挑了名字更"正规"的空表 | 同上：带行数 + 有数据的表排前面（防截断把 ext_* 截没了） |
 
 **一句要记下的教训**：这些都不是"模型学不会"，是**链路断了**。
