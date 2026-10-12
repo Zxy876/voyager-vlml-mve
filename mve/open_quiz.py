@@ -147,6 +147,103 @@ def _entity_block() -> str:
 
 
 # ---------------------------------------------------------------------------
+# 当前库真实 schema（生成参考 SQL 的唯一事实来源；跟着库走，换库自动更新）
+# ---------------------------------------------------------------------------
+def _active_db() -> Path:
+    cfg = HERE / "db_config.json"   # db_config.json 与 open_quiz.py 同目录（mve/）
+    try:
+        obj = json.loads(Path(cfg).read_text(encoding="utf-8"))
+        p = str(obj.get("db_path") or "")
+        if p:
+            return Path(p)
+    except Exception:
+        pass
+    return HERE.parent / "vlml" / "data" / "vlml_events.duckdb"
+
+
+_SCHEMA_CACHE: str | None = None
+
+
+def _schema_block() -> str:
+    """当前库所有真实表与列（连接库实查；照抄伴学 entity_catalog 的"实查不写死"原则）。"""
+    global _SCHEMA_CACHE
+    if _SCHEMA_CACHE is not None:
+        return _SCHEMA_CACHE
+    try:
+        import duckdb
+        con = duckdb.connect(str(_active_db()), read_only=True)
+        tables = [r[0] for r in con.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema='main' ORDER BY 1").fetchall()]
+        lines = []
+        for t in tables:
+            try:
+                cols = [r[0] for r in con.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name=? ORDER BY 1", [t]).fetchall()]
+            except Exception:
+                cols = []
+            lines.append(f"- {t}: {', '.join(cols)}")
+        con.close()
+        block = "\n".join(lines)
+    except Exception as e:
+        block = f"（无法读取库 schema：{e}）"
+    _SCHEMA_CACHE = block
+    return block
+
+
+_SCHEMA_CAVEATS = (
+    "【当前库真实 schema 与常见坑——reference_sql 必须严格遵守】\n"
+    "- 没有名为 `teams` 的表。队伍名散落在：games(team1_name, team2_name, "
+    "winning_team_name)、rounds(winning_team_name, losing_team_name)、"
+    "series(team1_name, team2_name)、各 agg_* 表用 team_name / opponent_team_name / "
+    "winning_team_name / losing_team_name。\n"
+    "- 地图列一律叫 `map_name`（不是 map）。\n"
+    "- `agent_roles` 是静态维表，只有 agent_name / agent_role / is_controller / "
+    "is_duelist / is_initiator / is_sentinel，没有 team / map / player 列——"
+    "只能查\"某特工属于什么位置\"，不能按队/图/选手过滤。\n"
+    "- 要查\"某队在某图用了哪些某位置（Initiator/Sentinel/Duelist/Controller）特工\"，"
+    "用 **agg_player_round_stats**（含 team_name, map_name, agent_name, agent_role）。"
+    "注意 agg_player_game_stats 只有 agent_name、**没有 agent_role 列**，别用错表。\n"
+    "- 选手名：agg_player_* 与 ext_player_* 用 player_name；base_events 用 "
+    "actor_player_name / target_player_name（没有 player_name 列）。\n"
+    "- base_events 的队伍列是 **actor_team_name / target_team_name**（不是 team_name）。\n"
+    "- 多表 JOIN 时，所有**重复列名必须加表前缀**（如 base_events.weapon_name），"
+    "否则报 Ambiguous reference。\n"
+    "- `agg_team_round_stats` **没有 series_id 列**（只有 game_id / round_id）；"
+    "要按系列赛过滤，请先 `JOIN games ON game_id` 拿 series_id，或改用 "
+    "agg_team_game_stats（含 series_id）。\n"
+    "- `agg_post_plant_stats` 的队伍列是 planting_team / defending_team / "
+    "winning_team_name（没有 team_name）。\n"
+    "- 类型别混：series_id 是整数（如 1058），tournament_id 是字符串"
+    "（如 'valorant-champions-2026'）。\"系列赛\"过滤用 series_id，不要拿 1058 去查 "
+    "tournament_id。\n"
+    "- reference_sql 仅一条 SELECT，表名与列名必须来自下方【真实 schema】；"
+    "跑不通的题会被直接淘汰，请务必先核对列名再写。"
+)
+
+
+def _validate_sql(sql: str) -> tuple[bool, str]:
+    """直接对当前库跑一次 SELECT，返回 (可执行且返回非空行?, 错误信息)。
+    这是生成题参考 SQL 的硬闸门：跑不通 → 该题没有客观真值（VLML 判不了成功）。"""
+    s = str(sql or "").strip()
+    if not s.lower().lstrip().startswith("select"):
+        return False, "reference_sql 不是以 SELECT 开头"
+    try:
+        import duckdb
+        con = duckdb.connect(str(_active_db()), read_only=True)
+        try:
+            rows = con.execute(s).fetchall()
+        finally:
+            con.close()
+        if not rows:
+            return False, "reference_sql 执行返回 0 行（本题在当前库无解）"
+        return True, ""
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+# ---------------------------------------------------------------------------
 # 提示组装
 # ---------------------------------------------------------------------------
 def recall_context(task_text: str, limit: int = 5) -> list[str]:
@@ -164,7 +261,7 @@ def recall_context(task_text: str, limit: int = 5) -> list[str]:
 
 def _build_messages(topic: dict[str, Any], *, attempt: int, last_question: str = "",
                     memories: list[str] | None = None,
-                    scene_text: str = "") -> list[dict[str, str]]:
+                    scene_text: str = "", sql_error: str = "") -> list[dict[str, str]]:
     name = _as_str(topic.get("name"), topic.get("id", ""))
     chapter = _as_str(topic.get("chapter"))
     skills = _as_list(topic.get("skills"))
@@ -208,11 +305,30 @@ def _build_messages(topic: dict[str, Any], *, attempt: int, last_question: str =
         "  solution_steps: 解题步骤列表（先确认粒度→选表→写 SQL/调工具→报数）\n"
         "  question_type: 机器题型（short_answer / math_exact / math_reasoning）\n"
         "  difficulty: 1-5 整数\n"
-        "不要编造不存在的表或列；口径必须可验证。"
+        "  reference_sql: 一条 SELECT 语句，返回本题**目标数值**（必须在当前库可执行，"
+        "SELECT 开头；只允许查真实存在的表与列）。这是给「VLML0 裁判」独立跑出标准答案用的——"
+        "数值由数据库算，绝不是你编的，你只负责写出能取到该数的查询\n"
+        "  dimension: 指标维度短标识（英文，如 event_count / win_rate / kill_count）\n"
+        "  subject: 实体字典，如 {\"series\":\"2843069\",\"team\":\"NRG\",\"map\":\"Lotus\"}"
+        "（从当前库真实实体取，不要编造；键只能用 series/team/map）\n"
+        "  value_column: 目标数值在结果第几列（从 0 开始，默认 0）\n"
+        "  numeric_tolerance: 数值容差（默认 0.5）\n"
+        "不要编造不存在的表或列；口径必须可验证；reference_sql 必须能跑通。"
+    )
+    system += (
+        "\n\n【真实 schema——reference_sql 的表名/列名只能从这里选】\n"
+        f"{_schema_block()}\n\n"
+        f"{_SCHEMA_CAVEATS}"
     )
     scene_line = ""
     if scene_text:
         scene_line = f"\n{scene_text}\n"
+    sql_err_line = ""
+    if sql_error:
+        sql_err_line = (
+            f"\n\n⚠️ 上一轮生成的 reference_sql 在当前库执行报错，**请修正后重新出一道题**"
+            f"（可换问法），确保新 SQL 能在当前库跑通：\n{sql_error}\n"
+        )
     user = (
         f"【知识点】{name}（章节：{chapter}）\n"
         f"{style_hint}\n"
@@ -223,6 +339,7 @@ def _build_messages(topic: dict[str, Any], *, attempt: int, last_question: str =
         f"{scene_line}"
         f"{_entity_block()}"
         f"{repeat_guard}"
+        f"{sql_err_line}"
         + (_memory_block(memories) if memories else "")
         + "\n请返回 JSON。"
     )
@@ -248,6 +365,14 @@ def _normalize(raw: dict[str, Any], topic: dict[str, Any], *, attempt: int) -> d
     steps = [_as_str(x) for x in _as_list(raw.get("solution_steps")) if _as_str(x)]
     mis = _as_list(topic.get("typical_misconceptions"))
     hint = "；".join(_as_str(x) for x in mis[:3]) if mis else ""
+    reference_sql = _as_str(raw.get("reference_sql"))
+    dimension = _as_str(raw.get("dimension"))
+    subject = raw.get("subject") if isinstance(raw.get("subject"), dict) else {}
+    value_column = _clamp_int(raw.get("value_column"), 0, 20, 0)
+    try:
+        numeric_tolerance = float(_as_str(raw.get("numeric_tolerance")) or 0.5)
+    except (TypeError, ValueError):
+        numeric_tolerance = 0.5
     return {
         "question": question,
         "answer": answer,
@@ -261,6 +386,11 @@ def _normalize(raw: dict[str, Any], topic: dict[str, Any], *, attempt: int) -> d
         "topic": topic.get("id"),
         "topic_name": _as_str(topic.get("name"), topic.get("id", "")),
         "screen_type": "open_quiz",
+        "reference_sql": reference_sql,
+        "dimension": dimension,
+        "subject": subject,
+        "value_column": value_column,
+        "numeric_tolerance": numeric_tolerance,
     }
 
 
@@ -275,13 +405,15 @@ def _memory_block(memories: list[str] | None) -> str:
 
 
 def generate_for(topic_id: str, *, attempt: int = 0, last_question: str = "",
-                 memories: bool = True, scene: bool = True) -> dict[str, Any]:
+                 memories: bool = True, scene: bool = True,
+                 sql_error: str = "") -> dict[str, Any]:
     """为某个知识点生成一道开放式题。失败抛异常，由调用方降级。
 
     memories=True 时，先按知识点文本从 mem0 召回既往经验注入出题 prompt
     （Task 3：技能消费带记忆系统——人消费路径也接记忆）。
     scene=True 时，注入「初始场景（数据世界）」块（Task 2：渐进披露——
     模型只能看到当前进度档允许看到的表/工具）。
+    sql_error：上一轮参考 SQL 执行报错时回灌，让模型带错重试（见 generate_validated）。
     """
     graph = TopicGraph()
     topic = graph.topics.get(topic_id)
@@ -296,13 +428,51 @@ def generate_for(topic_id: str, *, attempt: int = 0, last_question: str = "",
         except Exception:
             scene_text = ""
     messages = _build_messages(topic, attempt=attempt, last_question=last_question,
-                               memories=mem, scene_text=scene_text)
+                               memories=mem, scene_text=scene_text, sql_error=sql_error)
     raw = _quiz_json(messages)
     if not raw:
         raise ValueError("出题 LLM 返回空/非 JSON")
     q = _normalize(raw, topic, attempt=attempt)
     q["memories_recalled"] = len(mem)
     return q
+
+
+def generate_validated(topic_id: str, *, max_tries: int = 3, attempt: int = 0,
+                       last_question: str = "", memories: bool = True,
+                       scene: bool = True) -> tuple[dict[str, Any], str | None]:
+    """出题 + 参考 SQL 自检：生成题后立刻拿真实库校验 reference_sql，
+    跑不通就把**具体 SQL 错误**回灌给模型重试（最多 max_tries 次）。
+
+    返回 (q, error)：error 为 None 表示 reference_sql 已可执行；
+    否则为最后一条错误（调用方应淘汰换题）。这样客观裁判永远拿得到真值，
+    不会出现"题出得对但 SQL 跑不通 → 裁判 unjudgeable → 永远 0% 学会"的死循环。
+    """
+    sql_error = ""
+    last_q: dict[str, Any] = {}
+    for i in range(max_tries):
+        try:
+            q = generate_for(topic_id, attempt=attempt, last_question=last_question,
+                             memories=memories, scene=scene, sql_error=sql_error)
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            if i == max_tries - 1:
+                return {}, err
+            sql_error = f"上一轮出题本身失败：{err}"
+            continue
+        last_q = q
+        sql = str(q.get("reference_sql") or "").strip()
+        if not sql:
+            # 明确没给 SQL：留给调用方按"无参考 SQL"处理，这里不重试
+            return q, "无 reference_sql"
+        ok, err = _validate_sql(sql)
+        if ok:
+            return q, None
+        sql_error = (
+            f"上一次生成的 reference_sql 执行报错，请修正后重出：\n{sql}\n"
+            f"报错：{err}"
+        )
+        print(f"  （出题自检 {topic_id} 第{i+1}次参考 SQL 不通：{err} → 重试）")
+    return last_q, sql_error or "参考 SQL 多次尝试仍不可执行"
 
 
 def _memory_query(topic: dict[str, Any]) -> str:

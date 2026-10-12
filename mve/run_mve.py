@@ -205,16 +205,50 @@ def _store_skill_for(voyager: Any, topic_id: str, task: Any, result: dict[str, A
 
 class _GenTask:
     """最小伪 Task：LLMVoyager.run 只用到 question / rubric / topic_id /
-    subject / validated_target。生成题没有 rubric（无权威答案），
-    所以 rubric 留空——agent 只按问题 + 工具目录 + 出生地场景作答。"""
+    subject / validated_target。生成题附带的参考 SQL 会被组装成 rubric
+    —— rubric 非空 → Voyager 走**执行路径**（真正跑 SQL 取数），且 VLML0
+    裁判能据 answer_spec.sql 独立算出客观标准答案。"""
 
-    def __init__(self, question: str, topic_id: str) -> None:
+    def __init__(self, question: str, topic_id: str,
+                 rubric: list[Any] | None = None) -> None:
         self.question = question
         self.topic_id = topic_id
-        self.rubric: list[Any] = []
+        self.rubric: list[Any] = list(rubric or [])
         self.subject: dict[str, Any] = {}
         self.validated_target = True
         self.difficulty = 3
+
+
+def _build_rubric(q: dict[str, Any], topic_id: str) -> list[Any]:
+    """把生成题附带的参考 SQL / 维度 / 实体，组装成 Voyager 可执行的 rubric。
+
+    关键：answer_spec.sql 就是「服务端标准答案配方」—— 裁判（VLML0）会执行它
+    算出真值，绝不靠模型给的数（满足伴学 server-held expected answer 契约）。
+    """
+    sql = str(q.get("reference_sql") or "").strip()
+    if not sql:
+        return []
+    dim = str(q.get("dimension") or "value").strip() or "value"
+    subj = q.get("subject") if isinstance(q.get("subject"), dict) else {}
+    try:
+        vc = int(q.get("value_column") or 0)
+    except (TypeError, ValueError):
+        vc = 0
+    try:
+        tol = float(q.get("numeric_tolerance") or 0.5)
+    except (TypeError, ValueError):
+        tol = 0.5
+    try:
+        return [RubricPoint(
+            point=str(q.get("question") or topic_id)[:60],
+            subject=dict(subj),
+            dimension=dim,
+            weight=100,
+            min_base=1,
+            answer_spec=AnswerSpec(sql=sql, value_column=vc, numeric_tolerance=tol),
+        )]
+    except Exception:
+        return []
 
 
 async def run_curriculum(rounds: int, topic_id: str = "", *,
@@ -241,8 +275,11 @@ async def run_curriculum(rounds: int, topic_id: str = "", *,
         return stopped["flag"] or _pilot_stop_requested()
 
     print("=" * 72)
-    print("  MVE：Voyager 同构学习循环（topic_graph 课程 + 伴学式语义判分）")
+    print("  MVE：Voyager 同构学习循环（topic_graph 课程 + VLML0 客观裁判）")
     print("=" * 72)
+    print("  反馈机制：Voyager 真正执行 SQL 取数 → 与 VLML0 裁判独立算出的标准答案")
+    print("  客观比对 → 任务完成/未完成。不再用语义评分（那只会让它讨好阅卷人）。")
+    print()
     seen = 0
     while not _should_stop():
         sel = graph.select_next(explicit=topic_id or None)
@@ -250,14 +287,23 @@ async def run_curriculum(rounds: int, topic_id: str = "", *,
         mrow = graph.mastery.get(tid) or {}
         attempt = int(mrow.get("attempts", 0))
         # —— 出题：topic_graph 选知识点 → open_quiz 即时出一道具体题 ——
-        try:
-            q = open_quiz.generate_for(tid, attempt=attempt,
-                                      memories=True, scene=True)
-        except Exception as e:
-            print(f"  ⚠ 出题失败 {tid}：{type(e).__name__}: {e} —— 记入一次失败，等放弃机制跳过")
+        # generate_validated 会先拿真实库校验参考 SQL，跑不通就把具体 SQL 错误
+        # 回灌模型重试（最多 3 次），保证客观裁判永远拿得到真值。
+        q, sql_err = open_quiz.generate_validated(tid, attempt=attempt,
+                                                  memories=True, scene=True)
+        if sql_err is not None:
+            print(f"  ⚠ {tid} 参考 SQL 经重试仍不可执行（{sql_err}）→ 淘汰换题")
             graph.mastery.update(tid, score=0.0)
             seen += 1
             continue
+        # 生成题必须带「服务端可执行的参考 SQL」才能有客观真值（VLML 跑一次判成功）
+        rubric = _build_rubric(q, tid)
+        if not rubric:
+            print(f"  ⚠ {tid} 生成题无参考 SQL（无法客观判分）→ 淘汰换题")
+            graph.mastery.update(tid, score=0.0)
+            seen += 1
+            continue
+
         question = q.get("question") or ""
         # —— 出生地元信息（图谱同构物）注入 agent 的题面 ——
         scene_text = ""
@@ -266,49 +312,72 @@ async def run_curriculum(rounds: int, topic_id: str = "", *,
         except Exception:
             scene_text = ""
         full_q = question + ("\n\n" + scene_text if scene_text else "")
-        task = _GenTask(full_q, tid)
+        task = _GenTask(full_q, tid, rubric=rubric)
         print(f"\n----- 选题 {tid}（{sel.get('reason')}）· 第 {seen + 1} 次 -----")
         print(f"  问题：{question}")
 
+        # —— 客观真值：VLML0 裁判执行参考 SQL 算出标准答案（服务端独立产出）——
+        ref_task = asyncio.create_task(vlml0_referee.answer(task))
+
         # —— rollout：每知识点最多 rounds 次作答（Voyager 节奏，不动它）——
         done = False
-        last_score = 0.0
+        last_ev = None
         for r in range(1, rounds + 1):
             if _should_stop():
                 break
             result = await voyager.run(task)
-            answer = _answer_from(result)
-            grade = open_quiz.grade_answer(q, answer)
-            last_score = float(grade.get("score", 0.0))
-            # —— 伴学式评分：只评分，不推进 ——
-            print(f"  第{r}轮 score={last_score:.0%} · {grade.get('feedback','')[:80]}")
-            graph.mastery.update(tid, score=last_score)
-            # 阅卷人给的反馈也回灌给 agent，下轮能看到自己漏了什么
+            facts = result.get("facts") or []
+            tool_calls = sum(1 for t in voyager.trajectory
+                            if not str(t.get("error") or ""))
+            ref = await ref_task
+            ev = evaluate_vs_referee(facts, task.rubric, ref.facts, tool_calls=tool_calls)
+            last_ev = ev
+            # —— 客观反馈：任务完成度（不是语义分）。回灌 Voyager 的是它**实际
+            #    做了什么**：覆盖了哪些评分点 / 漏了哪些 / 工具是否调通 —— 这正是
+            #    「Voyager 在环境里做了什么」+ 与图谱的交互，不是讨好阅卷人。
+            verdict_label = {"correct": "完成", "partial": "部分达成",
+                             "wrong": "未达成", "dont_know": "无证据"}.get(
+                                 ev.verdict, ev.verdict)
+            print(f"  第{r}轮 [{verdict_label}] coverage={ev.coverage:.0%}"
+                  f" · 覆盖={ev.covered_points} · 漏={ev.missing_points[:3]}")
+            graph.mastery.update(tid, score=float(ev.coverage))
             try:
                 voyager.learn(
-                    covered=[str(h) for h in (grade.get("hits") or [])],
-                    missing=[str(m) for m in (grade.get("misses") or [])],
-                    task=task, verdict="correct" if last_score >= 0.6 else "wrong")
+                    covered=[str(c) for c in ev.covered_points],
+                    missing=[str(m) for m in ev.missing_points],
+                    task=task, verdict=ev.verdict)
             except Exception:
                 pass
-            if last_score >= 0.6:
+            if ev.success:
                 done = True
-                name = _store_skill_for(voyager, tid, task, result, last_score, question)
-                print(f"  ✅ 完成（score≥0.6）→ 存技能"
+                name = _store_skill_for(voyager, tid, task, result,
+                                        float(ev.coverage), question)
+                print(f"  ✅ 客观完成（VLML0 核验通过）→ 存技能"
                       + (f"：{name}" if name else "（无可固化程序）"))
                 break
         if not done:
-            print(f"  ⚠ 重试用尽仍 <0.6（score={last_score:.0%}）→ 标记 stale，"
-                  f"下轮由放弃机制跳过换题")
+            cov = getattr(last_ev, "coverage", 0.0) if last_ev else 0.0
+            print(f"  ⚠ 重试用尽仍客观未达成（coverage={cov:.0%}）→ "
+                  f"标记 stale，下轮由放弃机制跳过换题")
         seen += 1
-        _log_curriculum(tid, question, last_score, done, use_llm, voyager)
+        _log_curriculum(tid, question, last_ev, done, use_llm, voyager)
     print(f"\n===== 驾驶舱 Voyager 循环结束 · 共处理 {seen} 次选题 =====")
 
 
-def _log_curriculum(topic_id: str, question: str, score: float, done: bool,
+def _log_curriculum(topic_id: str, question: str, ev: Any, done: bool,
                    use_llm: bool, voyager: Any) -> None:
     """落一行 run_log，字段对齐 panel_data 读取（topic_id/round/coverage/
-    score/verdict/success），让进步曲线/导出 md 不崩。"""
+    score/verdict/success），让进步曲线/导出 md 不崩。
+    ev = evaluate_vs_referee 的 Evaluation（客观）；None 表示本题被淘汰换题。"""
+    verdict = getattr(ev, "verdict", "dont_know") if ev else "dont_know"
+    cov = float(getattr(ev, "coverage", 0.0) or 0.0) if ev else 0.0
+    success = bool(getattr(ev, "success", False)) if ev else False
+    evidence = getattr(ev, "evidence_status", "none") if ev else "none"
+    no_tool = bool(getattr(ev, "no_tool_calls", False)) if ev else False
+    unjudgeable = getattr(ev, "unjudgeable", []) if ev else []
+    covered = getattr(ev, "covered_points", []) if ev else []
+    missing = getattr(ev, "missing_points", []) if ev else []
+    rejected = getattr(ev, "rejected_low_base", []) if ev else []
     try:
         run_log.append({
             "mode": "curriculum",
@@ -317,14 +386,14 @@ def _log_curriculum(topic_id: str, question: str, score: float, done: bool,
             "question": question,
             "round": 1,
             "hint": "",
-            "coverage": round(score, 4),
-            "score": round(score, 4),
-            "verdict": "correct" if score >= 0.6 else "wrong",
-            "success": bool(score >= 0.6),
+            "coverage": round(cov, 4),
+            "score": round(cov, 4),
+            "verdict": verdict,
+            "success": success,
             "done": bool(done),
-            "evidence_status": "scored",
-            "judge": "open_quiz.grade_answer",
-            "no_tool_calls": False,
+            "evidence_status": evidence,
+            "judge": "vlml0_referee",
+            "no_tool_calls": no_tool,
             "feedback": {},
             "used_hint": False,
             "help_wasted": False,
@@ -334,11 +403,11 @@ def _log_curriculum(topic_id: str, question: str, score: float, done: bool,
             "tool_calls": len(getattr(voyager, "trajectory", []) or []),
             "evaluator_confidence": round(0.6 + 0.35 * 1.0, 4),
             "errors": [],
-            "unjudgeable": [],
-            "referee_facts": 0,
-            "covered": [],
-            "missing": [],
-            "rejected_low_base": [],
+            "unjudgeable": unjudgeable,
+            "referee_facts": len(covered),
+            "covered": covered,
+            "missing": missing,
+            "rejected_low_base": rejected,
             "narrative": "",
             "insights": [],
             "caveats": [],
