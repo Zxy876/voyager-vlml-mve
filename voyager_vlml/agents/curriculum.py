@@ -67,7 +67,11 @@ class VLMLCurriculumAgent:
         self.scope = scope or {}
         topic_graph = _mve("topic_graph")
         self.graph = topic_graph.TopicGraph()
-        self.mastery = topic_graph.MasteryStore()
+        # ⚠️ 必须共用 TopicGraph 的同一个 MasteryStore 实例。
+        # 实测踩过：这里另外 new 一个 MasteryStore，于是 mark_completed 写 A、
+        # 而 select_next 查的是 TopicGraph 自己的 B → 永远看不到"已完成"，
+        # 同一道题被反复选中（进度读 A 却显示已解锁，两处状态分裂）。
+        self.mastery = self.graph.mastery
 
     # ---------- 同构的观察字段（对应原版 curriculum_observations） ----------
     @property
