@@ -90,6 +90,28 @@ class VLMLMCPEnv:
         return "GRID/DB"
 
     # ---------- 执行 ----------
+    @staticmethod
+    def _nested_error(res: Any) -> str:
+        """从工具返回里挖出**嵌套的 error**。
+
+        ⚠️ 实测踩过：VLML 工具失败时**不抛异常**，而是返回
+        `{"error": "Query execution failed: Binder Error: ..."}`（顶层直接带
+        error 键）。这里原来只用 try/except，于是错误响应被判成
+        `ok=True, rows=1` —— SQL 明明炸了，闭环却当成"取到了 1 行"：
+          · 练习侧：假成功 → 错误的 SQL 被当技能存进库；
+          · 消费侧：取到的是错误对象，事实整理器看到的是 error 不是数据
+            （它返回空数组是对的 —— "不许错配"的约束生效了），
+            于是"工具调通了、取到 1 行"，人却得不到任何回答。
+        """
+        if not isinstance(res, dict):
+            return ""
+        err = res.get("error")
+        if not err:
+            inner = res.get("result") or res.get("data")
+            if isinstance(inner, dict):
+                err = inner.get("error")
+        return str(err or "")
+
     async def call(self, name: str, **args: Any) -> dict[str, Any]:
         """调一个 VLML MCP 工具，回一份可枚举的观察。
 
@@ -106,6 +128,10 @@ class VLMLMCPEnv:
         except Exception as e:
             return {"ok": False, "tool": name, "rows": 0,
                     "error": f"{type(e).__name__}: {e}", "data": None}
+        err = self._nested_error(res)
+        if err:
+            return {"ok": False, "tool": name, "rows": 0,
+                    "error": err[:300], "data": res}
         return {"ok": True, "tool": name, "rows": _rows_of(res),
                 "error": "", "data": res}
 
