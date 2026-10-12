@@ -317,6 +317,19 @@ async def consume(
             hit = f"{hit}（归到的题与这句话不是同一个问题：{why}）"
             task = None
 
+    # ---- 评分点（dimension 名）必须在**取数之前**定下来，且两边共用同一份 ----
+    # ⚠️ 实测踩过：Voyager 侧因为没有 rubric 就自由命名成 avg_kd_ratio，
+    #   裁判侧用的是另派生的 player —— 两边 dimension 对不上，覆盖率恒 0。
+    #   那不是"答错了"，是"两个事实集没对齐"，必须挡掉。
+    derived: list[dict[str, Any]] = []
+    if task is not None:
+        dims = [str(p.dimension) for p in (task.rubric or [])]
+        subs = [dict(p.subject or {}) for p in (task.rubric or [])]
+    else:
+        derived = _derive_dims(question)
+        dims = [str(p.get("dimension")) for p in derived]
+        subs = [dict(p.get("subject") or {}) for p in derived]
+
     # ---- ② 找已积累的能力（配方）----
     skills = _retrieve_skills(question, topic_hint)
     reused_list = [{"topic": s.get("topic"), "name": s.get("name"),
@@ -354,12 +367,6 @@ async def consume(
     trajectory = [str(o.get("tool") or "") for o in ok_calls]
 
     # ---- ④ 整理事实 ----
-    dims: list[str] = []
-    subs: list[dict[str, Any]] = []
-    if task is not None:
-        for p in (task.rubric or []):
-            dims.append(str(p.dimension))
-            subs.append(dict(p.subject or {}))
     out = chat_json(
         [
             {"role": "system", "content": _extract_system()},
@@ -467,7 +474,7 @@ async def consume(
         # 没有现成 rubric（人的自由提问大多归不上旧题库）→ 从**这句话本身**派生
         # 评分点，让 VLML 工具链独立取一遍当尺子。这样"消费算覆盖率"才落得下去，
         # 而不是一归不上题就整体落空。判据标注成软尺子，面板上要能看出软硬。
-        points = _derive_dims(question)
+        points = derived
         if not points:
             base["skipped"] = ("这句话既归不到有评分点的题上，也抽不出该答哪几个量 → "
                                "覆盖率无从计算（如实留空，不编造数字）")
@@ -584,7 +591,15 @@ def _derive_dims(question: str) -> list[dict[str, Any]]:
              "content": ("从一句话里抽出「要回答它，得给出哪几个量」。只给**名字与对象**，"
                          "不给数值。2 到 4 个。只返回 JSON："
                          "{\"points\":[{\"point\":\"中文说明\",\"dimension\":\"英文维度名\","
-                         "\"subject\":{\"team\":\"...\",\"map\":\"...\"}}]}")},
+                         "\"subject\":{\"team\":\"...\",\"map\":\"...\"}}]}\n\n"
+                         "⚠️ 两个字段不要串味（实测串过一次）：\n"
+                         "  · dimension = **量叫什么**（如 kd_ratio、total_damage、"
+                         "usage_rate），是英文指标名；\n"
+                         "  · subject = **说的是谁**（team / map / player 的真实取值，"
+                         "如 {\"map\":\"Corrode\"}），不要把「K/D 比最高」这种描述塞进来，"
+                         "也不要把图名塞进 team 字段。\n"
+                         "  · 一句话问的是某个维度的最高/最低值时，dimension 就写那个维度名，"
+                         "subject 只留定位用的实体（没有就留空对象 {}）。")},
             {"role": "user", "content": question},
         ],
         temperature=0.0,
