@@ -2015,6 +2015,15 @@ class Handler(BaseHTTPRequestHandler):
                     #
                     # 与旧的 `coach.explain(voyager=True)` 的区别：那条只是把技能库
                     # 的**文字**塞进 VLML 编排的 prompt（= 注入话术，不是用配方取数）。
+                    # ⚠️ 面板进程的 sys.path[0] 是 mve/（systemd 从这里拉起 dashboard），
+                    # 不含仓库根 —— 直接 import voyager_vlml 会
+                    # ModuleNotFoundError（实测：面板上点「交给 Voyager 回答」
+                    # 直接报「导入失败」）。所以先把仓库根插进 sys.path。
+                    import sys as _sys
+                    from pathlib import Path as _Path
+                    _repo_root = str(_Path(__file__).resolve().parents[1])
+                    if _repo_root not in _sys.path:
+                        _sys.path.insert(0, _repo_root)
                     import voyager_vlml.consume as _consume
                     res = asyncio.run(_consume.consume(
                         q, topic_hint=str(payload.get("topic_id") or "")))
