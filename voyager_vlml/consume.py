@@ -473,7 +473,7 @@ async def consume(
                                "覆盖率无从计算（如实留空，不编造数字）")
             _log(base)
             return base
-        ref_facts, ref_traj = await _referee_facts(question, points)
+        ref_facts, ref_traj = await _referee_facts(question, points, schema=schema)
         base["referee_trajectory"] = ref_traj
         base["derived_points"] = [str(p.get("point") or p.get("dimension"))
                                   for p in points]
@@ -594,7 +594,8 @@ def _derive_dims(question: str) -> list[dict[str, Any]]:
 
 
 async def _referee_facts(question: str,
-                         points: list[dict[str, Any]]) -> tuple[list[dict], list[str]]:
+                         points: list[dict[str, Any]],
+                         schema: str = "") -> tuple[list[dict], list[str]]:
     """让 **VLML 自己的工具链独立取一遍数**（裁判侧），不去碰 Voyager 的取数结果。
 
     走的是 `coach` 那套原版 VLML 编排（工具注册表 + 数据集上下文），
@@ -608,14 +609,35 @@ async def _referee_facts(question: str,
         return [], []
     dims = [str(p.get("dimension")) for p in points]
     subs = [dict(p.get("subject") or {}) for p in points]
+    # ⚠️ 实测踩过：不注入实查 schema，裁判会犯和 Voyager 一样的**列名幻觉** ——
+    # 写 `base_events.player_name`，而真实列是 actor_player_name / target_player_name
+    # → 三条调用全 Binder Error → 裁判侧一条数都取不到 → 覆盖率直接落空。
+    # 所以这里必须把库里真实存在的表/列给它（照 entity_catalog 的"实查不写死"）。
+    plan_user = _plan_prompt(question)
+    if schema:
+        plan_user += ("\n\n当前库真实存在的表与列（**只能引用这里出现的名字**，"
+                      "尤其是列名，写错会直接报错）：\n" + schema[:6000])
     plan = chat_json(
         [
             {"role": "system", "content": "你是原版 VLML 分析引擎。只取数，不做主观推断。"},
-            {"role": "user", "content": _plan_prompt(question)},
+            {"role": "user", "content": plan_user},
         ],
         temperature=0.1,
     )
-    obs, traj, _ = await _execute(plan.get("calls") or [])
+    obs, traj, errors = await _execute(plan.get("calls") or [])
+    if not traj and errors:
+        # 一次带错重试：把工具报错原样回灌，让它换正确的列名重写
+        plan2 = chat_json(
+            [
+                {"role": "system", "content": "你是原版 VLML 分析引擎。只取数，不做主观推断。"},
+                {"role": "user",
+                 "content": (plan_user + "\n\n上一轮全部调用都报错了：\n"
+                             + "\n".join(str(e)[:300] for e in errors[:3])
+                             + "\n\n照上面的报错改对列名/表名，重新规划。")},
+            ],
+            temperature=0.1,
+        )
+        obs, traj, _ = await _execute(plan2.get("calls") or [])
     if not traj:
         return [], []
     out = chat_json(
