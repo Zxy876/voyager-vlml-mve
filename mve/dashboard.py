@@ -724,11 +724,13 @@ function pPractice(s){
 function pImport(s){
   return `<div class="panel">
     <div class="panel__head"><h2>人导入意图</h2>
-      <span class="hint">人为发意图 → 影响自适应出题</span></div>
+      <span class="hint">人提问 → Voyager 回答 · VLML 解析照旧披露</span></div>
     <div class="imp">
       <div style="font-size:12.5px;color:var(--muted);margin-bottom:8px">
-        写一句你想问 VLML 的话。它由<b>原版 VLML</b> 取数并解释（不经过 Voyager），
-        然后作为 <b>control fact</b> 写进行动因果时间线 —— 出题器读这条线决定下一题。
+        写一句你想问的话。<b>Voyager 会用它已积累的能力回答</b>——mem0 召回的既往经验、
+        技能库里的取数思路、当前数据世界可见的工具/表——底下 VLML 的解析（调了哪些工具、
+        取到哪些事实）照旧披露。结果作为 <b>control fact</b> 写进行动因果时间线 ——
+        出题器读这条线决定下一题。
       </div>
       <div style="font-size:12px;color:var(--muted);margin-bottom:8px">
         <b>收录判据</b>（不是"图谱里有没有同名维度"）：VLML 这次取数读到的表，
@@ -739,7 +741,7 @@ function pImport(s){
       <textarea id="q" placeholder="例：Cloud9 的手枪局到底打得怎么样？这个结论置信度够吗？"></textarea>
       <div class="imp-row">
         <select id="topic"><option value="">自动匹配（按关键词归类）</option></select>
-        <button class="btn btn-primary" id="go">交给 VLML 解释</button>
+        <button class="btn btn-primary" id="go">交给 Voyager 回答</button>
         <button class="btn btn-secondary" id="clr">清空</button>
       </div>
       <div class="hit" id="hit">归类结果会在这里显示。</div>
@@ -1414,12 +1416,20 @@ function renderImportResult(res){
   const facts=(res.facts||[]).map(f=>
     `<div class="fact"><b>${ESC(f.subject||'')}</b> · ${ESC(f.dimension||'')} =
        <span class="fv">${ESC(f.value)}</span>${f.base!==null&&f.base!==undefined?` <span style="color:var(--muted)">(base ${ESC(f.base)})</span>`:''}</div>`).join('');
+  // Voyager 能力消耗披露（mode=voyager 时返回）：记忆召回了几条、复用了哪些技能、场景是否注入
+  const vc=res.voyager_context||null;
+  const vcChips=vc?`
+      <span class="chip ok">Voyager 回答</span>
+      <span class="chip grey">记忆召回 ${vc.memory_count||0} 条</span>
+      ${(vc.skills||[]).length?`<span class="chip grey">复用技能：${vc.skills.map(k=>ESC(k.name)).join('、')}</span>`:''}
+      ${vc.scene?'<span class="chip grey">场景已注入（工具/表 base·ext 分层）</span>':''}`:'';
   box.innerHTML=`<div class="note info" style="margin-top:10px">
     <div style="margin-bottom:6px">
       ${res.topic_id?`<span class="chip ok">归入 ${ESC(res.topic_id)}</span>`:'<span class="chip bad">没归入任何题 → 不驱动出题</span>'}
       ${res.topic_hit?`<span class="chip grey">命中「${ESC(res.topic_hit)}」</span>`:''}
       <span class="chip grey">validated_target: ${ESC(res.validated_target)}</span>
-      ${(res.trajectory||[]).length?`<span class="chip grey">编排：${(res.trajectory||[]).map(t=>ESC(t)).join(' → ')}</span>`:'<span class="chip bad">未取到数据</span>'}
+      ${(res.trajectory||[]).length?`<span class="chip grey">VLML 解析：${(res.trajectory||[]).map(t=>ESC(t)).join(' → ')}</span>`:'<span class="chip bad">未取到数据</span>'}
+      ${vcChips}
       ${graphLinkChips(res.graph_link)}
     </div>
     ${res.skipped?`<div><b>未产出解释：</b>${ESC(res.skipped)}</div>`:''}
@@ -1428,6 +1438,8 @@ function renderImportResult(res){
       <div style="font-size:12px;color:var(--muted);margin-top:5px">
         注意：这条通路的 facts <b>没有经过裁判核对</b>，维度名也是开放式自取的
         —— 它比 Voyager 那条过了裁判的事实软，不能拿来当判据。</div></div>`:''}
+    ${(vc&&vc.memory_texts&&vc.memory_texts.length)?`<div style="margin-top:9px;font-size:12px;color:var(--muted)">
+      <b>本次消费的记忆（mem0 召回）：</b><ul style="margin:4px 0 0 16px">${vc.memory_texts.map(m=>`<li>${ESC(String(m).slice(0,120))}</li>`).join('')}</ul></div>`:''}
     ${res.narrative?`<div class="nocmp" style="margin-top:9px">
         <div class="nocmp-tag">不参与比对 · comparable: false</div>
         <div class="nocmp-body">${ESC(res.narrative)}</div>
@@ -1462,29 +1474,31 @@ async function submitImport(){
   const v=q.value.trim();
   if(!v){ document.getElementById('hit').innerHTML='<b>先写一句话再提交。</b>'; return; }
   const btn=document.getElementById('go');
-  busy=true; btn.disabled=true; btn.innerHTML='<span class="spin"></span>VLML 正在编排…';
+  busy=true; btn.disabled=true; btn.innerHTML='<span class="spin"></span>Voyager 正在回答…';
   window.__changedFrom=(window.__lastRec||{}).topic_id||'';
   const sel=document.getElementById('topic');
   const picked=sel ? sel.value : '';
   try{
     const r=await fetch('/api/coach',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({question:v, topic_id:picked})});
+      body:JSON.stringify({question:v, topic_id:picked, mode:'voyager'})});
     const res=await r.json();
     renderImportResult(res);
     uiEvent('human_import',
       {问题: v.slice(0,300),
+       模式: 'voyager（记忆+技能+场景注入）',
        手动指定的题: picked || '未指定（走关键词自动归类）'},
       res.ok
         ? ('归入 '+(res.topic_id||'未归入任何题')
            +(res.topic_hit?'（命中「'+res.topic_hit+'」）':'')
            +' · '+(res.facts||[]).length+' 条事实 · 编排 '+(res.trajectory||[]).join(' → ')
+           +' · 记忆召回 '+(((res.voyager_context||{}).memory_count)||0)+' 条'
            +' · validated_target=false 不计掌握度')
         : ('失败：'+(res.error||'未知')));
     q.value=''; q.blur();   // 失焦：让下一轮轮询照常刷新导入历史（焦点在输入框上时渲染是被 hold 住的）
     document.getElementById('hit').textContent='归类结果会在这里显示。';
     await load();
   }catch(e){ renderImportResult({ok:false,error:String(e)}); }
-  finally{ busy=false; btn.disabled=false; btn.textContent='交给 VLML 解释'; }
+  finally{ busy=false; btn.disabled=false; btn.textContent='交给 Voyager 回答'; }
 }
 
 /* ---------------- 驾驶舱控制 ---------------- */
@@ -1912,7 +1926,13 @@ class Handler(BaseHTTPRequestHandler):
                 import asyncio
 
                 import coach  # 会拉起 VLML 环境（chdir + 打补丁），按需加载
-                res = asyncio.run(coach.explain(q, topic_id=str(payload.get("topic_id") or "")))
+                # mode=voyager（默认）：由 Voyager 回答——编排前注入它已积累的
+                # 能力（mem0 记忆 + 技能库 + 场景），并披露 VLML 解析。
+                # mode=vlml：旧的纯 VLML 解释通路，保留可切回。
+                mode = str(payload.get("mode") or "voyager").strip().lower()
+                res = asyncio.run(coach.explain(
+                    q, topic_id=str(payload.get("topic_id") or ""),
+                    voyager=(mode == "voyager")))
             except Exception as e:
                 self._json(500, {"ok": False, "error": f"{type(e).__name__}: {e}"[:300]})
                 return

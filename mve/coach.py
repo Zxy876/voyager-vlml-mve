@@ -93,6 +93,8 @@ def _log_import(result: dict[str, Any]) -> None:
     rec = {
         "ts": datetime.now().isoformat(timespec="seconds"),
         "question": result.get("question", ""),
+        "mode": result.get("mode", "vlml"),
+        "voyager": (result.get("voyager_context") or {}).get("memory_count", 0),
         "topic_id": result.get("topic_id", ""),
         "topic_matched": result.get("topic_matched", False),
         "topic_hit": result.get("topic_hit", ""),
@@ -295,9 +297,74 @@ async def _task_from_text(question: str,
     return new_id, "（导入文本归不上已有题，已生成新题）"
 
 
+def _voyager_context(question: str, topic_id: str) -> dict[str, Any]:
+    """收集 Voyager 已积累的能力（记忆 / 技能 / 场景），供人导入消费。
+
+    用户定的消费形态（2026-10-12）：人在人导入提问 → **由 Voyager 回答**
+    （带技能库 + 记忆 + 场景），同时披露 VLML 的解析（工具轨迹 + 事实）。
+    这里就是"Voyager 能力"的来源：
+      · mem0 召回：语义召回原则 + **确定性取回纠正记忆**（纠正碎片不能靠
+        相似度 top-N，会被挤掉——failure_correction_loop 同款教训）；
+      · skill_store.retrieve：同题优先 + 词面相关的技能 top-4（跨题经验
+        有相关度下限，避免被不相关经验带偏）；
+      · scene_context.scene_injection：数据世界（工具/表 base·ext 分层 +
+        真实实体锚点），编排只能用场景里可见的工具/表。
+
+    任何一路失败都优雅降级（空块），不阻断解释。
+    """
+    mem_texts: list[str] = []
+    try:
+        import mem0_backend
+        sem = mem0_backend.recall(question, limit=4)
+        corr = mem0_backend.recall(question, category="correction", limit=4)
+        seen: set[str] = set()
+        for t in [*sem, *corr]:
+            if t and t not in seen:
+                seen.add(t)
+                mem_texts.append(t)
+    except Exception:                                        # pragma: no cover
+        pass
+    skills: list[dict[str, Any]] = []
+    try:
+        import skill_store
+        skills = skill_store.retrieve(topic_id or "", question, top_k=4)
+    except Exception:                                        # pragma: no cover
+        pass
+    scene_text = ""
+    try:
+        import scene_context
+        scene_text = scene_context.scene_injection(topic_id)
+    except Exception:                                        # pragma: no cover
+        pass
+    parts: list[str] = []
+    if mem_texts:
+        parts.append("【既往经验记忆（mem0 召回，编排时优先避开里面记过的坑）】\n"
+                     + "\n".join(f"- {t}" for t in mem_texts[:6]))
+    if skills:
+        parts.append("【已学会的技能（优先复用其取数思路）】\n"
+                     + "\n".join(f"- {s.get('name', '')}：{str(s.get('text', ''))[:160]}"
+                                 for s in skills[:4]))
+    if scene_text:
+        parts.append(scene_text)
+    return {
+        "text": "\n\n".join(parts),
+        "memory_count": len(mem_texts),
+        "memory_texts": mem_texts[:6],
+        "skills": [{"name": s.get("name", ""), "topic": s.get("topic", "")}
+                   for s in skills[:4]],
+        "scene": bool(scene_text),
+    }
+
+
 async def explain(question: str, *, topic_id: str = "",
-                  auto_task: bool = True) -> dict[str, Any]:
-    """人导入一个问题，由 VLML 解释回答。
+                  auto_task: bool = True, voyager: bool = False) -> dict[str, Any]:
+    """人导入一个问题，由 VLML 解释回答（voyager=True 时由 Voyager 回答）。
+
+    voyager=False（旧默认）：纯 VLML 编排取数解释——人只消费 VLML 本身。
+    voyager=True（2026-10-12 用户定的消费形态）：**Voyager 回答人的问题**——
+      编排前先收集它已积累的能力（mem0 记忆 + 技能库 + 场景），注入编排与
+      整理两步的 prompt；返回里带 `voyager_context` 让面板披露"消耗了哪些
+      能力"。VLML 的解析（工具轨迹 + 事实）照旧披露。
 
     返回结构与 Voyager 的答卷同构（facts + narrative），但：
       - validated_target = False → 不计掌握度
@@ -328,6 +395,12 @@ async def explain(question: str, *, topic_id: str = "",
         topic_id = inferred
         # 归不上时不在这里生成题 —— 等取完数拿到维度再说（见 docstring）
 
+    # Voyager 消费链：编排前收集能力（记忆/技能/场景）。归题先行，
+    # 技能检索才能吃到同题加成。
+    vctx: dict[str, Any] | None = None
+    if voyager:
+        vctx = _voyager_context(question, topic_id)
+
     base: dict[str, Any] = {
         "question": question,
         "topic_id": topic_id,
@@ -336,11 +409,24 @@ async def explain(question: str, *, topic_id: str = "",
         "topic_inferred": bool(inferred),
         "source": "human_import",           # 出题器产出才是 targeted_question
         "validated_target": VALIDATED_TARGET_IMPORTED,
+        "mode": "voyager" if voyager else "vlml",
     }
+    if voyager and vctx is not None:
+        base["voyager_context"] = {
+            "memory_count": vctx["memory_count"],
+            "memory_texts": vctx["memory_texts"],
+            "skills": vctx["skills"],
+            "scene": vctx["scene"],
+        }
 
+    plan_user = _plan_prompt(question)
+    if vctx and vctx.get("text"):
+        plan_user += ("\n\n以下是 Voyager 已积累的能力（记忆/技能/数据世界），"
+                      "编排时优先复用技能思路、避开记忆里记过的坑、"
+                      "只用场景里可见的工具与表：\n" + str(vctx["text"]))
     plan = chat_json([
         {"role": "system", "content": "你是原版 VLML 分析引擎，只取数不做主观推断。"},
-        {"role": "user", "content": _plan_prompt(question)},
+        {"role": "user", "content": plan_user},
     ])
     obs, traj, errors = await _execute(plan.get("calls") or [])
 
@@ -380,9 +466,14 @@ async def explain(question: str, *, topic_id: str = "",
         _log_import(result)
         return result
 
+    extract_user = _extract_prompt(question, obs)
+    if vctx and vctx.get("text"):
+        extract_user += ("\n\n（整理事实时参考 Voyager 记忆里的口径与坑，"
+                         "但数字一律以工具返回为准，记忆只影响怎么问、不影响数。）\n"
+                         + str(vctx["text"]))
     out = chat_json([
         {"role": "system", "content": "你是严谨的数据整理器，只输出 JSON，绝不编造数字。"},
-        {"role": "user", "content": _extract_prompt(question, obs)},
+        {"role": "user", "content": extract_user},
     ])
 
     facts = []
