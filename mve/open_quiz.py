@@ -469,6 +469,39 @@ def generate_for(topic_id: str, *, attempt: int = 0, last_question: str = "",
     return q
 
 
+def _real_tables() -> set[str]:
+    """从 _schema_block 解析当前库真实表名（复用缓存，不重复连库）。"""
+    tabs: set[str] = set()
+    for line in _schema_block().splitlines():
+        line = line.strip()
+        if line.startswith("- ") and ":" in line:
+            tabs.add(line[2:line.index(":")].strip())
+    return tabs
+
+
+def _gran_table(topic: dict[str, Any]) -> str:
+    """本题粒度对应的**取数表**；粒度标记本身就是真实表名时才返回它，否则空串。
+
+    数据驱动、不硬编码：粒度标记来自知识点名括号（rounds / games / series /
+    base_events / agg_tournament_stats…），是否真是一张表由当前库 schema 判定。
+    """
+    name = _as_str(topic.get("name"), topic.get("id", ""))
+    m = re.search(r"[（(]([^（）()]+)[）)]", name)
+    if not m:
+        return ""
+    gran = m.group(1).strip()
+    return gran if gran in _real_tables() else ""
+
+
+def _sql_tables(sql: str) -> set[str]:
+    """提取 reference_sql 的 FROM / JOIN 主表名，用于粒度闸门比对。"""
+    out: set[str] = set()
+    for m in re.finditer(r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)",
+                         str(sql or ""), re.I):
+        out.add(m.group(1).strip('"'))
+    return out
+
+
 def generate_validated(topic_id: str, *, max_tries: int = 3, attempt: int = 0,
                        last_question: str = "", memories: bool = True,
                        scene: bool = True) -> tuple[dict[str, Any], str | None]:
@@ -481,6 +514,12 @@ def generate_validated(topic_id: str, *, max_tries: int = 3, attempt: int = 0,
     """
     sql_error = ""
     last_q: dict[str, Any] = {}
+    # 粒度闸门：本题粒度标记若是一张真实表，就要求 reference_sql 必须落在它上面
+    try:
+        topic = TopicGraph().topics.get(topic_id) or {}
+    except Exception:
+        topic = {}
+    gran_tbl = _gran_table(topic)
     for i in range(max_tries):
         try:
             q = generate_for(topic_id, attempt=attempt, last_question=last_question,
@@ -498,6 +537,23 @@ def generate_validated(topic_id: str, *, max_tries: int = 3, attempt: int = 0,
             return q, "无 reference_sql"
         ok, err = _validate_sql(sql)
         if ok:
+            # —— 粒度闸门：SQL 能跑通还不够，取数层必须落在本题粒度上 ——
+            # 实测：grain_series 的 SQL 可执行却查的是 rounds（回合粒度），
+            # 于是题面与知识点错位 → 裁判按 series 口径判 → 必然 coverage=0%。
+            # 提示词层约束不住（模型对"锁定粒度"不敏感），必须在运行时拦下重试。
+            if gran_tbl:
+                used = _sql_tables(sql)
+                if gran_tbl not in used:
+                    sql_error = (
+                        f"上一次的 reference_sql 能跑通，但**取数粒度与本题知识点不符**"
+                        f"（本题粒度表应为 `{gran_tbl}`，你实际查的是 "
+                        f"{sorted(used) or '未知'}）。请重写：question 与 reference_sql "
+                        f"都必须落在 `{gran_tbl}` 这一层计数，不要借用其它粒度的表。\n"
+                        f"错误 SQL：{sql}"
+                    )
+                    print(f"  （出题自检 {topic_id} 第{i+1}次粒度不符："
+                          f"应为 {gran_tbl}，实为 {sorted(used)} → 重试）")
+                    continue
             return q, None
         sql_error = (
             f"上一次生成的 reference_sql 执行报错，请修正后重出：\n{sql}\n"
