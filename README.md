@@ -40,16 +40,21 @@
 **与覆盖率彻底拆开**：覆盖率只是"这次答得全不全"的质量分，
 不参与"这题算不算学会"。
 
-### 当前快照（2026-10-13 02:30，本地实测；服务器面板干净待跑）
+### 当前快照（2026-10-13 05:40，服务器实跑后）
 
 | 项 | 值 |
 |---|---|
-| 练习 `run_log.jsonl` | 27 条（新后端里程碑课程） |
-| 撤支架考核 `exam_log.jsonl` | 26 条 |
-| 消费 `coach_log.jsonl` | 8 条（其中 5 条 `voyager_consume`） |
-| 技能库 | 11 条（8 道旧题 + `map_win_rate_summit` + `vlml_first_blood` + 1 条消费期配方） |
-| 消费掌握度 | 2 / 30（分母 = 图谱 29 节点 + 消费期能力项 1） |
-| 面板 | 9 个分区，已部署在线 |
+| 练习 `run_log.jsonl` | 36 条，其中成功 25（新后端里程碑课程） |
+| 技能库 | 25 条，**全部是 SQL 配方**（服务器侧没有旧后端的编排代码） |
+| 图谱节点 | 种子 29，已完成 23 |
+| 运行期新增能力项 | `runtime_*` 6（练习线自己生成的）+ `consume_*` 3（消费线答出来的） |
+| 撤支架考核 / 消费日志 | 服务器侧 0 条（这两条线还没在服务器上跑过，本地有 26 / 8 条） |
+| 数据源 | `vlml_rib.duckdb`（285 回合 + 首血/经济 ext 层） |
+| 面板 | <https://43.161.203.50:8443/mve/> · 9 个分区 |
+
+⚠️ **练习线的 `success` 不等于"学会了"**：它只表示"这一轮真的从库里取到数了"。
+真实水平要看撤支架考核（`exam_log`）与消费线（`coach_log`）—— 那两条线在服务器
+上还没跑过。
 
 ---
 
@@ -183,6 +188,11 @@ curriculum.update_exploration_progress()  ← 跑通 → 解锁里程碑 + 挂 S
 | 整轮结束 | **不结束**。一直跳过、进度不涨也不结束 | `run_rounds` 的 `while True` |
 | 范围内没可拿下的题 | **不断生成新任务**，且**先验题**（验不过就换，不记失败） | `_generate_new_task` |
 | 谁能改变节奏 | 只有「停止」（SIGTERM） | `_install_stop_handler` |
+
+运行期生成的节点会**落盘**到 `mve/runtime_topics.json`（与消费侧的 `consume_<hash8>`
+同一份文件，这里登记 `runtime_<hash8>`），启动时装回内存图谱。不落盘的后果
+（2026-10-13 实测）：跑 12 轮拿到 14 条新配方、记了 34 个 completed，但图谱节点
+一个都没留下 —— 重开又 exhausted、又把同一批题重新验一遍，「不重复规划」直接落空。
 
 停止是**优雅停**：收到信号后把手头这道题跑完、技能落盘再退（原版
 "exiting learn loop after current task"），不硬杀。
@@ -1079,10 +1089,10 @@ systemctl restart mve-panel                                     # ← 必须！
 6. **出题器会被错题卡住。** 已有冷却闸与"没进展就毕业"机制，但仍会重现。
 7. **SQL 路径出题成功率约三分之一**，会被七道闸挡下并回灌，但三轮改不动的情况存在
    —— 那是模型能力问题，不是链路问题。
-8. **技能库还没换血。** 库里 11 条里 10 条是旧后端存下的**编排代码**
-   （`async def xxx_solve(mcp)`），不是设计要的"可复用 SQL 配方"。新练习线
-   （`voyager_vlml/loop.py`）存的已经是 SQL，但历史条目没迁移 —— 上下文里
-   「已学会技能」现在会同时列出两种形态。
+8. **技能库里还混着旧后端的条目。** 早期存下的是**编排代码**
+   （`async def xxx_solve(mcp)`），不是设计要的"可复用 SQL 配方"；新练习线
+   （`voyager_vlml/loop.py`）与消费线存的已经是 SQL。历史条目没迁移，
+   所以上下文里「已学会技能」现在会同时列出两种形态。
 9. **不停循环有 60～90 秒的收尾窗口。** 点停止后面板立刻显示"正在收尾"，
    但循环还在把手头那道题跑完（优雅停）。这段时间 `run_log` / 技能库**还在写**，
    不是面板自己动了。启动闸会挡住这段时间内的重复启动。
@@ -1105,6 +1115,9 @@ systemctl restart mve-panel                                     # ← 必须！
 | 连跑 3 轮全是 `generated_new_task`，2 轮失败 | ① stale 沿前置链传染，4 个卡死堵死 9 个后继（29 节点 0 可选）② 新题**生成完不验题**就跑（`JOIN weapon_types` 表根本不存在）③ `runtime_{n}` 只在内存计数，重启回到 `runtime_1`，不同题共 id 互相叠账 | stale 前置视为"已放弃不再挡路"；新题**生成即验题**（同标准）且验不过不记失败；id 改 `runtime_<md5(题面)[:8]>` |
 | 模型把布尔列当字符串比（`round_won='win'` / `='team'`） | schema 只给**列名**不给类型和值，模型只能猜；VLML 自带的 `column_definitions.yaml` 只覆盖 3 张表 | schema 三要素：**每张表行数 + 列类型 + 一行真实样例**；空表明写"查它只会得 0 行" |
 | **换库后连三轮一次工具都没调成功**（分诊 `linkage`） | `vlml_env` 里 `os.chdir(vlml/)`（VLML 查询依赖那个 cwd），配置写相对路径 `vlml/data/x.duckdb` 时 DuckDB 按 cwd 拼 → `<repo>/vlml/vlml/data/x.duckdb`，**vlml 出现两遍** | 四个读取口（`vlml_env` / `anchor` / `entity_catalog` / `db_switch`）统一按**仓库根**解析；`db_switch.write()` 存绝对路径；启动时校验文件存在并告警 |
+| 分诊让人去查"库在不在"，其实是它 SQL 写错了 | 分诊只分了"工具成功/失败"，**没看错误文本**：`Binder Error: column "x" does not exist` 和 `IO Error: database does not exist` 都归 `linkage` | 补 `sql_error` 档（Parser/Binder/值类型），按错误文本分诊；注意 `database does not exist` 与 `column "x" does not exist` 只差几个字，**基础设施关键词必须先判** |
+| 跑满课程后不停循环**当场崩掉**（KeyError） | 连续生成的新题都验不过 → `run_one_round` 早退分支返回里漏了 `progress`/`critique` → `run_rounds` 打印 `r['progress']` KeyError | 早退返回补齐全部字段 + 一律 `.get()`。**教训：不停循环里"空转一圈"是设计内常态，任何早退路径都不该是致命路径** |
+| 跑完 12 轮拿到 14 条技能，图谱节点却一个没多 | 运行期生成的节点只塞进内存的 `graph.topics`，进程一退就没 → 重开又 exhausted、又把同一批题重新验一遍 | 落盘到 `mve/runtime_topics.json`（与消费侧同一份文件），启动时 `_inject_runtime_topics()` 装回 |
 | 问「每回合每角色平均击杀」取回 0 行 | 当前库 `agg_*` 是 0 行，真实数据在 `ext_player_round_stats`（2850 行）。只给表名列名时模型挑了名字更"正规"的空表 | 同上：带行数 + 有数据的表排前面（防截断把 ext_* 截没了） |
 
 **一句要记下的教训**：这些都不是"模型学不会"，是**链路断了**。
