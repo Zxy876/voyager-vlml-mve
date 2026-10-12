@@ -113,6 +113,28 @@ class VLMLMCPEnv:
         """执行一条 SQL（模型写的取数代码在这里跑）。"""
         return await self.call("query_sql", sql_query=sql)
 
+    async def schema_block(self, max_cols: int = 14, max_tables: int = 24) -> str:
+        """实查当前库的表与列，渲染成给模型看的 schema 文本块。
+
+        照伴学 entity_catalog 的「实查不写死」原则：出题与写 SQL 都只能引用
+        这里真实存在的表名/列名，避免模型编造。
+        """
+        obs = await self.run_sql(
+            "SELECT table_name, column_name FROM information_schema.columns "
+            "WHERE table_schema='main' ORDER BY table_name, ordinal_position"
+        )
+        if not obs.get("ok"):
+            return ""
+        data = obs.get("data") or {}
+        rows = data.get("rows") if isinstance(data, dict) else data
+        cols: dict[str, list[str]] = {}
+        for r in rows or []:
+            if len(r) >= 2:
+                cols.setdefault(str(r[0]), []).append(str(r[1]))
+        return "\n".join(
+            f"- {t}: {', '.join(c[:max_cols])}" for t, c in list(cols.items())[:max_tables]
+        )
+
 
 def _rows_of(res: Any) -> int:
     """从工具返回里数「取到几行」，尽量兼容几种返回形态。"""

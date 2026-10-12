@@ -39,6 +39,84 @@ class VLMLActionAgent:
             out.append(await self.env.call(str(c.get("name")), **(c.get("args") or {})))
         return out
 
+    # ---------- LLM 写 SQL（用户指令：让闭环真正自己出题取数） ----------
+    def write_sql(
+        self,
+        question: str,
+        *,
+        schema: str = "",
+        critique: str = "",
+        last_sql: str = "",
+    ) -> str:
+        """让模型按题面写一条 SELECT；迭代修正时带上一轮的 critique 与 SQL 重写。
+
+        只收 SELECT（不接受其它语句），拿不到就返回空串由调用方判失败。
+        """
+        from voyager_vlml.llm import chat_json
+
+        system = self.render_system_message()
+        if schema:
+            system += (
+                "\n\n【当前库真实 schema（只能用这里的表名/列名，不要编造）】\n"
+                f"{schema}\n"
+            )
+        user = self.render_iteration_prompt(
+            task=question,
+            critique=critique or "（首轮，直接写一条 SELECT 回答这个问题）",
+            last_sql=last_sql,
+        )
+        out = chat_json(
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            temperature=0.3,
+        )
+        sql = str(out.get("sql") or "").strip()
+        if not sql.lower().startswith("select"):
+            return ""
+        return sql
+
+    async def solve(
+        self,
+        question: str,
+        *,
+        max_iters: int = 3,
+        hints: list[str] | None = None,
+    ) -> tuple[list[dict[str, Any]], str]:
+        """出题之后真正取数：写 SQL → VLML MCP 执行 → 失败带 critique 重写（迭代修正）。
+
+        返回 (观察列表, 最后一条 SQL)。观察是**可枚举的**：工具成败 + 取到几行。
+        """
+        from voyager_vlml.agents.critic import VLMLCriticAgent
+
+        critic = VLMLCriticAgent()
+        try:
+            schema = await self.env.schema_block()
+        except Exception:
+            schema = ""
+
+        observations: list[dict[str, Any]] = []
+        sql = ""
+        critique = ""
+        for _ in range(max_iters):
+            sql = self.write_sql(
+                question, schema=schema, critique=critique, last_sql=sql
+            )
+            if not sql:
+                observations.append(
+                    {"ok": False, "tool": "write_sql", "rows": 0,
+                     "error": "模型没给出 SELECT 语句"}
+                )
+                critique = "上一轮没给出 SELECT。请只输出一条以 SELECT 开头的查询。"
+                continue
+            obs = await self.run_sql(sql)
+            observations.append(obs)
+            ok, critique = critic.check_task_success(
+                observations=[obs],
+                task={"task": question, "hints": list(hints or [])},
+            )
+            if ok:
+                break
+        return observations, sql
+
     # ---------- 迭代修正的 prompt（语言 = SQL） ----------
     def render_system_message(self) -> str:
         """写码阶段的 system：可用取数原语 + 库里的坑（同构原版把 JS 原语拼进来）。"""

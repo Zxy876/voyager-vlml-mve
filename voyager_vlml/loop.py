@@ -1,21 +1,25 @@
 """VLML 同构学习循环的最小驱动（⑤ 冒烟用，面板后置）。
 
-闭环：
+闭环（真正自己出题取数）：
   curriculum.propose_next_task()   ← 里程碑树选题（种子 → 树干，已完成排除）
       ↓
-  action.run_sql(...)              ← 在 VLML MCP(DB/RIB/VLGG) 里跑 SQL 取数
+  question.generate(topic)         ← LLM 按里程碑节点**出题**（只出题面，不给答案）
+      ↓
+  action.solve(question)           ← LLM **写 SQL** → VLML MCP(DB/RIB/VLGG) 执行
+                                     失败则带 critique 迭代重写（最多 3 轮）
       ↓
   critic.check_task_success()      ← **成败 = 有没有真的从 DB 取到数**（不比标准答案）
       ↓
-  curriculum.update_exploration_progress()  ← 跑通→解锁里程碑+挂技能；否则记失败/跳过
+  curriculum.update_exploration_progress()  ← 跑通→解锁里程碑 + 挂 SQL 技能指针
+                                             否则记失败/跳过（带原因）
 
-⚠️ 整条链里没有 VLML 判决、没有覆盖率、没有参考答案 —— 那是给人看的，只在面板。
+⚠️ 整条链里没有 VLML 判决、没有覆盖率、没有参考答案 —— 那些是给人看的，只在面板。
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
-import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -27,52 +31,73 @@ if str(_REPO_ROOT) not in sys.path:
 from voyager_vlml.agents.action import VLMLActionAgent  # noqa: E402
 from voyager_vlml.agents.critic import VLMLCriticAgent  # noqa: E402
 from voyager_vlml.agents.curriculum import VLMLCurriculumAgent  # noqa: E402
-
-
-def _gran_table(name: str) -> str:
-    """从知识点名的括号取粒度标记（rounds / games / series / base_events…）。
-    与 open_quiz._gran_table 同一套数据驱动做法：标记本身就是表名。"""
-    m = re.search(r"[（(]([^（）()]+)[）)]", name or "")
-    return m.group(1).strip() if m else ""
+from voyager_vlml.agents.question import VLMLQuestionAgent  # noqa: E402
+from voyager_vlml.env.vlml_mcp import VLMLMCPEnv  # noqa: E402
 
 
 async def run_one_round(
-    scope: dict[str, Any] | None = None, topic_id: str | None = None
+    scope: dict[str, Any] | None = None,
+    topic_id: str | None = None,
+    use_llm: bool = True,
+    max_iters: int = 3,
 ) -> dict[str, Any]:
-    """跑一轮：选题 → 取数 → 判据 → 改写图谱。
-
-    topic_id 给定时钉住该知识点（冒烟/调试用）；不给则走课程的里程碑选题。
-    """
+    """跑一轮：里程碑选题 → LLM 出题 → LLM 写 SQL 取数 → DB 取证判据 → 改写图谱。"""
+    env = VLMLMCPEnv()
     curr = VLMLCurriculumAgent(scope=scope)
-    act = VLMLActionAgent()
+    act = VLMLActionAgent(env=env)
     crit = VLMLCriticAgent()
 
+    # ---- 选题（里程碑树）----
     if topic_id:
-        nxt = {
-            "task": f"拿下里程碑 {topic_id}",
-            "context": curr._topic_context(topic_id),
-            "topic_id": topic_id,
-            "exhausted": False,
-            "reason": "explicit",
-        }
+        tid, reason = topic_id, "explicit"
     else:
         nxt = curr.propose_next_task()
-    tid = nxt["topic_id"]
-    if not tid:
-        return {"topic_id": "", "exhausted": True, "reason": nxt["reason"]}
-
+        tid, reason = nxt["topic_id"], nxt["reason"]
+        if not tid:
+            return {"topic_id": "", "exhausted": True, "reason": nxt["reason"]}
     topic = curr.graph.topics.get(tid) or {}
-    table = _gran_table(str(topic.get("name") or ""))
-    sql = f"SELECT COUNT(*) AS n FROM {table}" if table else ""
 
-    observations: list[dict[str, Any]] = []
-    if sql:
-        observations.append(await act.run_sql(sql))
+    # ---- 出题（LLM；只出题面，不给参考答案）----
+    question = ""
+    if use_llm:
+        try:
+            question = VLMLQuestionAgent(env=env).generate(topic) or ""
+        except Exception as e:
+            print(f"  （出题失败：{type(e).__name__}: {e}）")
+    if not question:
+        # 兜底：用知识点自带的问法示例，保证链路仍可跑
+        ex = topic.get("examples") or []
+        question = (
+            str(ex[0].get("prompt") or "") if ex and isinstance(ex[0], dict) else ""
+        ) or f"按「{topic.get('name') or tid}」这个知识点，从库里取一个数。"
 
+    # ---- 写 SQL + 取数（LLM + VLML MCP，带迭代修正）----
+    observations, sql = await act.solve(
+        question, max_iters=max_iters, hints=list(topic.get("skills") or [])[:3]
+    )
+
+    # ---- 判成败：是否真的从 DB 取到数 ----
     success, critique = crit.check_task_success(
         observations=observations,
-        task={"task": nxt["task"], "hints": list(topic.get("skills") or [])[:3]},
+        task={"task": question, "hints": list(topic.get("skills") or [])[:3]},
     )
+
+    # ---- 存技能：可复用 SQL，主键 = 图谱问题类型 topic_id ----
+    skill_key = ""
+    if success and sql:
+        try:
+            import skill_store
+
+            _, skill_key = skill_store.add(
+                tid,
+                tid,  # 主键 = 索引到的图谱问题类型（设计）
+                f"自己写 SQL 取数跑通：{question[:60]}",
+                code=sql,
+                blueprint={"source": "practice", "question": question},
+                source="practice",
+            )
+        except Exception as e:  # pragma: no cover
+            print(f"  （存技能失败：{type(e).__name__}: {e}）")
 
     curr.update_exploration_progress(
         {
@@ -80,34 +105,46 @@ async def run_one_round(
             "success": success,
             "verdict": "ok" if success else "no_evidence",
             "reason": "已从库取到数" if success else "未从库取到数（链路/口径问题）",
-            "skill_key": f"{tid}::count_{table}" if (success and table) else "",
+            "skill_key": skill_key,
         }
     )
     return {
         "topic_id": tid,
-        "exhausted": False,
-        "reason": nxt["reason"],
+        "reason": reason,
+        "question": question,
         "sql": sql,
         "observations": observations,
         "success": success,
+        "critique": critique,
+        "skill_key": skill_key,
         "progress": curr.progress,
     }
 
 
 def _main() -> int:
-    import argparse
-
-    ap = argparse.ArgumentParser(description="VLML 同构学习循环 · 一轮冒烟")
+    ap = argparse.ArgumentParser(description="VLML 同构学习循环 · 一轮（自己出题取数）")
     ap.add_argument("--topic", default="", help="钉住某个知识点（不给则走课程选题）")
+    ap.add_argument("--no-llm", action="store_true", help="不出题不写 SQL（仅演示骨架）")
+    ap.add_argument("--iters", type=int, default=3, help="写 SQL 的迭代修正轮数")
     a = ap.parse_args()
-    r = asyncio.run(run_one_round(topic_id=a.topic or None))
-    print("=== 一轮闭环 ===")
+
+    r = asyncio.run(
+        run_one_round(
+            topic_id=a.topic or None, use_llm=not a.no_llm, max_iters=a.iters
+        )
+    )
+    print("=== 一轮闭环（自己出题取数）===")
     print("选题     :", r.get("topic_id"), "| reason:", r.get("reason"))
+    print("题面     :", r.get("question"))
     print("SQL      :", r.get("sql"))
     for o in r.get("observations") or []:
         print("  观察   :", {k: o[k] for k in ("ok", "tool", "rows", "error")})
     print("成功     :", r.get("success"), "（判据 = 是否真的从 DB 取到数）")
+    print("技能     :", r.get("skill_key") or "（未存）")
     print("进度     :", r.get("progress"), "个里程碑已解锁")
+    if r.get("critique"):
+        print("--- 反馈（SQL 语言，无答案/覆盖率）---")
+        print(r["critique"])
     return 0
 
 
