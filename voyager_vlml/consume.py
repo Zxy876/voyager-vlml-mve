@@ -274,6 +274,33 @@ dimension 要能看出方向：写 max_losing_streak 这种，不要写 round_st
 # ⑤ 用取到的数回答这句话
 # ---------------------------------------------------------------------------
 
+def _answer_raw(question: str, obs: list[dict[str, Any]]) -> str:
+    """取到数、但整理不出结构化事实时，用**原始数据**直接回答。
+
+    ⚠️ 实测踩过：问「每个回合中各个角色的平均击杀数」，SQL 完全正确、取到 85 行，
+    但答案是一张表（round × agent），压不进 `{subject, dimension, value}` 单值事实
+    → 整理器返回空 → 回答为空 → 人看到「Voyager 回答不出来」。
+    **取到了数却不给回答，是最糟的失败**：数据明明在那儿。
+    所以这里兜底：把原始行喂给模型组织成答案，宁可少一层结构，也不能交白卷。
+    """
+    payload = json.dumps(
+        [o.get("data") for o in obs if o.get("ok")],
+        ensure_ascii=False, default=str)[:9000]
+    return chat(
+        [
+            {"role": "system",
+             "content": ("你是 Valorant 电竞数据分析师。下面是工具从数据库里取到的原始结果，"
+                         "用它回答人的问题。只用给出来的数，不许补充数据里没有的东西。"
+                         "结果是多行的就说清楚维度和前几行，别只丢一句「有多个」。"
+                         "两到四句话。")},
+            {"role": "user",
+             "content": f"人的问题：{question}\n\n工具取到的原始数据：\n{payload}"},
+        ],
+        temperature=0.3,
+        max_tokens=600,
+    )
+
+
 def _answer(question: str, facts: list[dict[str, Any]],
             obs: list[dict[str, Any]]) -> str:
     if not facts:
@@ -415,12 +442,21 @@ async def consume(
         print(f"  （事实整理失败：{type(e).__name__}: {e}）")
 
     # ---- ⑤ 用取到的数回答 ----
-    answer = ""
+    answer, base_note = "", ""
     if facts:
         try:
             answer = _answer(question, facts, observations) or ""
         except Exception as e:  # pragma: no cover
             print(f"  （组织回答失败：{type(e).__name__}: {e}）")
+    if not answer and ok_calls and rows:
+        # 取到数但整理不出结构化事实（答案是一张表时常见）→ 用原始数据照样回答。
+        # 取到了数却不给回答是最糟的失败：数据明明在那儿，人却以为它答不出来。
+        try:
+            answer = _answer_raw(question, observations) or ""
+            if answer:
+                base_note = "（用原始数据直接回答：这一问的答案是一张表，压不进单值事实）"
+        except Exception as e:  # pragma: no cover
+            print(f"  （用原始数据回答失败：{type(e).__name__}: {e}）")
 
     # 归不上已有题 → 拿这句话（+刚取到的事实）生成一道新题。
     # ⚠️ 必须在"进能力库"**之前**：答完了就得有归属，否则这道题明明答出来了，
@@ -438,7 +474,9 @@ async def consume(
             print(f"  （生成新题失败：{type(e).__name__}: {e}）")
 
     # ---- 答完了 → 这题进能力库 → 掌握（判据是"答没答出来"，不是覆盖率）----
-    absorbed = _absorb(question, sql, topic_id) if (facts and answer) else {}
+    # 判据是"答没答出来"（取到数 + 给出了回答），**不是**有没有整理成结构化事实 ——
+    # 答案是一张表时压不进 facts，但那也是答出来了，照样进能力库。
+    absorbed = _absorb(question, sql, topic_id) if (answer and ok_calls) else {}
     m_tot = int(absorbed.get("mastered_total") or 0)
     a_tot = int(absorbed.get("ability_total") or 0)
 
@@ -464,6 +502,7 @@ async def consume(
         "facts": facts,
         "facts_count": len(facts),
         "answer": answer,
+        "answer_note": base_note,
         # —— 覆盖率/掌握度（消费侧才算，见 ⑥）——
         "coverage": None,
         "score": None,
