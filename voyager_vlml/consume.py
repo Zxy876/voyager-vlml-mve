@@ -266,7 +266,8 @@ dimension 要能看出方向：写 max_losing_streak 这种，不要写 round_st
 方向反了比报错更危险。
 
 只输出 JSON：{{"facts":[...]}}
-取不到就留空数组，不要编。"""
+数据里的 NaN / null 一律当「取不到」，不许写进事实（NaN 比值 = 除零的产物，
+拿它当真值判比对必错）。取不到就留空数组，不要编。"""
 
 
 # ---------------------------------------------------------------------------
@@ -764,7 +765,10 @@ async def _referee_facts(question: str,
             for d, s in zip(dims, subs)
         )
         q2 = (f"（裁判·独立取标准答案）{question}\n"
-              f"要给出的量（dimension 逐字用这些名字，值从库里算）：{want}")
+              f"要给出的量（dimension 逐字用这些名字，值从库里算）：{want}\n"
+              "⚠️ 比值/除法必须写 NULLIF(x, 0)（如 AVG(kills)/NULLIF(AVG(deaths),0)）—— "
+              "DuckDB 里 x/0 得 NaN 不报错，取回来是个没法比的数；"
+              "且优先在聚合层做除法（先 AVG 再相除），不要对逐行比值再 MAX。")
         observations, sql2 = await act.solve(q2, max_iters=3)
         ok_obs = [o for o in observations if o.get("ok")]
         if ok_obs:
