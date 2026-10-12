@@ -143,6 +143,32 @@ def _pilot_stop_requested() -> bool:
         return False
 
 
+def _stop_and_wait(*, why: str) -> None:
+    """设计⑫：连续多轮无证据 → 停下等人干预。写 pilot_state（面板读它），并打印清晰理由。
+
+    关键区分：「链路未跑通」（一次工具都没调成功 / 取到的数据集为空）与
+    「没学会」（调了工具但值不对、覆盖率低）—— 前者是取证通路断了，不是模型能力
+    问题，继续空转只会刷同一条失败。停下等人工把数据源/实体值/工具连通性修好再重开。
+    """
+    state: dict[str, Any] = {}
+    try:
+        state = json.loads(_PILOT_STATE.read_text(encoding="utf-8"))
+    except Exception:
+        state = {}
+    state.update({
+        "running": False,
+        "stop_requested": True,
+        "why": why,
+        "stopped_at": datetime.now().isoformat(timespec="seconds"),
+    })
+    try:
+        _PILOT_STATE.write_text(json.dumps(state, ensure_ascii=False, indent=2),
+                                encoding="utf-8")
+    except Exception:
+        pass
+    print(f"\n⛔ 循环已停止，等待人工干预：{why}\n")
+
+
 def _answer_from(result: dict[str, Any]) -> str:
     """把 Voyager 的取数结果拼成一段可被判分的「作答文本」。
 
@@ -322,6 +348,7 @@ async def run_curriculum(rounds: int, topic_id: str = "", *,
         # —— rollout：每知识点最多 rounds 次作答（Voyager 节奏，不动它）——
         done = False
         last_ev = None
+        no_ev_rounds = 0            # 设计⑫：本题连续「无证据」轮数
         for r in range(1, rounds + 1):
             if _should_stop():
                 break
@@ -332,6 +359,13 @@ async def run_curriculum(rounds: int, topic_id: str = "", *,
             ref = await ref_task
             ev = evaluate_vs_referee(facts, task.rubric, ref.facts, tool_calls=tool_calls)
             last_ev = ev
+            # 无证据判定（设计⑫）：一次工具都没调成功，或判定 dont_know 且零覆盖。
+            # 这是「链路未跑通」，与「没学会」（有调用但值不对）性质不同。
+            _no_ev = bool(getattr(ev, "no_tool_calls", False)) or (
+                str(getattr(ev, "verdict", "")) == "dont_know"
+                and not getattr(ev, "covered_points", []))
+            if _no_ev:
+                no_ev_rounds += 1
             # —— 客观反馈：任务完成度（不是语义分）。回灌 Voyager 的是它**实际
             #    做了什么**：覆盖了哪些评分点 / 漏了哪些 / 工具是否调通 —— 这正是
             #    「Voyager 在环境里做了什么」+ 与图谱的交互，不是讨好阅卷人。
@@ -356,6 +390,15 @@ async def run_curriculum(rounds: int, topic_id: str = "", *,
                       + (f"：{name}" if name else "（无可固化程序）"))
                 break
         if not done:
+            if no_ev_rounds >= rounds:
+                # 设计⑫：本题全部 rounds 均无证据 → 取证通路断了，停下等人干预。
+                # 与「没学会」（有工具调用但值不符）明确区分，避免空转刷同一条失败。
+                _stop_and_wait(
+                    why=f"链路未跑通：连续 {rounds} 轮无工具调用/空数据集"
+                        f"（非「没学会」）。请检查数据源连接、实体值是否在库内、"
+                        f"10 个工具是否可达，再清 pilot_state.stop_requested 后重开。")
+                stopped["flag"] = True
+                break
             cov = getattr(last_ev, "coverage", 0.0) if last_ev else 0.0
             print(f"  ⚠ 重试用尽仍客观未达成（coverage={cov:.0%}）→ "
                   f"标记 stale，下轮由放弃机制跳过换题")

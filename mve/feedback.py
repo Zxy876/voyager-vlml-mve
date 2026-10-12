@@ -476,9 +476,13 @@ def build_feedback(
         # 干脆被当成"全覆盖"，把失败播报成成功。必须单独一支，说清**没被认可**。
         fb.error_type = "not_accepted"
         fb.error_types = ["not_accepted"]
+        # ⚠️ 设计硬约束（同构会话约定⑧）：得分 / 覆盖率这类「VLML 跑一遍得到的
+        # 判定数值」**不允许进反馈**——它会让模型把重心从「把事实取到」歪到
+        # 「刷覆盖率」。这里只给已覆盖**评分点个数**（枚举量，不可被单值游戏化），
+        # 绝不报百分比。score/coverage 仍留在 Feedback 结构与 to_dict()，供面板/日志。
         fb.feedback = (
-            f"交上去的事实一个都没被裁判认可（判定 {verdict}，覆盖率 "
-            f"{round(float(coverage) * 100)}%，已覆盖 {len(covered)} 个评分点）。"
+            f"交上去的事实一个都没被裁判认可（判定 {verdict}，已覆盖 "
+            f"{len(covered)} 个评分点）。"
             "**交了 ≠ 拿到了证据** —— 这不是「编排有效」。")
         why: list[str] = []
         if rejected_low_base:
@@ -535,11 +539,13 @@ def build_feedback(
     n_by_type: dict[str, int] = {}
     for i in items:
         n_by_type[i.error_type] = n_by_type.get(i.error_type, 0) + 1
+    # ⚠️ 同构会话约定⑧：覆盖率是「VLML 判定数值」，禁止进反馈（见 not_accepted 分支）。
+    # 这里只给「已覆盖评分点个数」这种枚举量；具体漏了哪些维度在 missing_points 里。
     fb.feedback = (
-        f"判定 {verdict}（覆盖率 {coverage:.0%}）："
+        f"判定 {verdict}："
         + "；".join(f"{ERROR_TYPES.get(t, t)} ×{n}" for t, n in
                    sorted(n_by_type.items(), key=lambda kv: -kv[1]))
-        + f"。已覆盖 {len(covered)} 个评分点。"
+        + f"。已覆盖 {len(covered)} 个评分点（不报百分比）。"
     )
 
     fb.step_feedback = _step_feedback(my_plan, ref_plan, items)
