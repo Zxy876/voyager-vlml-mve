@@ -36,13 +36,27 @@ def _gran_table(name: str) -> str:
     return m.group(1).strip() if m else ""
 
 
-async def run_one_round(scope: dict[str, Any] | None = None) -> dict[str, Any]:
-    """跑一轮：选题 → 取数 → 判据 → 改写图谱。"""
+async def run_one_round(
+    scope: dict[str, Any] | None = None, topic_id: str | None = None
+) -> dict[str, Any]:
+    """跑一轮：选题 → 取数 → 判据 → 改写图谱。
+
+    topic_id 给定时钉住该知识点（冒烟/调试用）；不给则走课程的里程碑选题。
+    """
     curr = VLMLCurriculumAgent(scope=scope)
     act = VLMLActionAgent()
     crit = VLMLCriticAgent()
 
-    nxt = curr.propose_next_task()
+    if topic_id:
+        nxt = {
+            "task": f"拿下里程碑 {topic_id}",
+            "context": curr._topic_context(topic_id),
+            "topic_id": topic_id,
+            "exhausted": False,
+            "reason": "explicit",
+        }
+    else:
+        nxt = curr.propose_next_task()
     tid = nxt["topic_id"]
     if not tid:
         return {"topic_id": "", "exhausted": True, "reason": nxt["reason"]}
@@ -81,7 +95,12 @@ async def run_one_round(scope: dict[str, Any] | None = None) -> dict[str, Any]:
 
 
 def _main() -> int:
-    r = asyncio.run(run_one_round())
+    import argparse
+
+    ap = argparse.ArgumentParser(description="VLML 同构学习循环 · 一轮冒烟")
+    ap.add_argument("--topic", default="", help="钉住某个知识点（不给则走课程选题）")
+    a = ap.parse_args()
+    r = asyncio.run(run_one_round(topic_id=a.topic or None))
     print("=== 一轮闭环 ===")
     print("选题     :", r.get("topic_id"), "| reason:", r.get("reason"))
     print("SQL      :", r.get("sql"))
