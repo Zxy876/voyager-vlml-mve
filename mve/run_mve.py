@@ -210,7 +210,7 @@ def _store_skill_for(voyager: Any, topic_id: str, task: Any, result: dict[str, A
                 blueprint={"source": "practice", "coverage": score,
                            "program_name": result.get("program_name") or ""},
                 source="practice")
-            return _saved[0]
+            return _saved[1]
         calls = _successful_calls(voyager)
         if calls:
             code, fn = _plan_program(str(topic_id), calls)
@@ -222,7 +222,7 @@ def _store_skill_for(voyager: Any, topic_id: str, task: Any, result: dict[str, A
                 blueprint={"source": "practice", "coverage": score,
                            "program_name": fn, "calls": calls},
                 source="practice")
-            return _saved[0]
+            return _saved[1]
     except Exception as e:                 # pragma: no cover
         print(f"  （存程序失败：{type(e).__name__}: {e}）")
     return None
@@ -463,6 +463,13 @@ async def run_curriculum(rounds: int, topic_id: str = "", *,
                 graph.mastery.mark_completed(tid)
                 name = _store_skill_for(voyager, tid, task, result,
                                         float(ev.coverage), question)
+                # 设计：技能库与图谱同一份存储——技能落库后把指针挂到图谱节点，
+                # 每节点积累技能（voyager 按图谱节点解锁里程碑、节点上堆技能）。
+                if name:
+                    try:
+                        graph.mastery.add_skill(tid, name)
+                    except Exception:
+                        pass
                 print(f"  ✅ 客观完成（VLML0 核验通过）→ 标记节点完成 + 存技能"
                       + (f"：{name}" if name else "（无可固化程序）"))
                 break
@@ -470,6 +477,12 @@ async def run_curriculum(rounds: int, topic_id: str = "", *,
             if no_ev_rounds >= rounds:
                 # 设计⑫：本题全部 rounds 均无证据 → 取证通路断了，停下等人干预。
                 # 与「没学会」（有工具调用但值不符）明确区分，避免空转刷同一条失败。
+                try:
+                    graph.mastery.add_failure(
+                        tid, "no_evidence",
+                        f"链路未跑通：连续 {rounds} 轮无工具调用/空数据集")
+                except Exception:
+                    pass
                 _stop_and_wait(
                     why=f"链路未跑通：连续 {rounds} 轮无工具调用/空数据集"
                         f"（非「没学会」）。请检查数据源连接、实体值是否在库内、"
@@ -477,6 +490,17 @@ async def run_curriculum(rounds: int, topic_id: str = "", *,
                 stopped["flag"] = True
                 break
             cov = getattr(last_ev, "coverage", 0.0) if last_ev else 0.0
+            # 设计⑨：放弃（重试耗尽仍客观未达成）→ 记一次跳过（带原因）+ 失败，
+            # 进上下文让观察者分辨「没学会」vs「链路没跑通」。下轮由放弃机制跳过换题。
+            try:
+                verdict = getattr(last_ev, "verdict", "wrong") or "wrong"
+                graph.mastery.add_failure(
+                    tid, verdict,
+                    f"客观未达成（coverage={cov:.0%}），标记放弃")
+                graph.mastery.add_skip(
+                    tid, f"重试耗尽仍客观未达成（coverage={cov:.0%}）→ 放弃换题")
+            except Exception:
+                pass
             print(f"  ⚠ 重试用尽仍客观未达成（coverage={cov:.0%}）→ "
                   f"标记 stale，下轮由放弃机制跳过换题")
         seen += 1

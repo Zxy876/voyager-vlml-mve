@@ -192,6 +192,59 @@ def unlocked_milestones() -> list[str]:
         return []
 
 
+def milestone_tree() -> dict[str, Any]:
+    """MC 节点里程碑树（进入上下文）。
+
+    同构原版 Voyager 的「里程碑 = 已完成的任务」+ MC 的「必须先砍树」科技树：
+      · seed    —— 树干起点（无前置），对应 MC 的 Mine 1 wood log；MVE 里是
+                  基础粒度知识点，且出生注入会随机给一个最小单位 (表,列) 作为
+                  真正的「第一块木头」。
+      · trunk   —— 最长前置路径（设计原文「经过节点最多的路径上的节点就是里程碑」）。
+      · milestone —— trunk 上的节点集合。
+      · keystone —— betweenness 最高的节点（「经过路径最多的节点」= 树干最粗处）。
+    返回结构含每个里程碑的 completed 状态，供面板/上下文展示进度。
+    """
+    out: dict[str, Any] = {
+        "seed": None, "trunk": [], "milestones": [], "keystone": None,
+        "completed_n": 0, "total_n": 0, "progress": "0/0",
+    }
+    try:
+        from topic_graph import MasteryStore, TopicGraph
+        ms = MasteryStore()
+        g = TopicGraph()
+        info = g.milestone_info()
+        trunk = info["trunk"]
+        milestones = set(info["milestones"])
+        done = [t for t in trunk if ms.is_completed(t)]
+        out["seed"] = info["seed"]
+        out["trunk"] = trunk
+        out["milestones"] = sorted(milestones)
+        out["keystone"] = info["keystone"]
+        out["completed_n"] = len(done)
+        out["total_n"] = len(trunk)
+        out["progress"] = f"{len(done)}/{len(trunk)}"
+        out["completed_list"] = done
+    except Exception:
+        pass
+    return out
+
+
+def skip_history(limit: int = 8) -> list[dict[str, Any]]:
+    """跳过任务（带原因）等价物：把 stale-skip / 放弃 写进上下文（设计⑨：跳过任务
+    带原因进运行时上下文）。读循环日志无关的节点状态（MasteryStore 的 skips）。
+    """
+    out: list[dict[str, Any]] = []
+    try:
+        from topic_graph import MasteryStore
+        ms = MasteryStore()
+        for tid, r in ms.all().items():
+            for s in (r.get("skips") or [])[-limit:]:
+                out.append({"topic": tid, "reason": s.get("reason", "")})
+    except Exception:
+        return []
+    return out[-limit:]
+
+
 def learned_skills(limit: int = 5) -> list[dict[str, Any]]:
     """学会技能等价物：技能库里已固化的取数配方（SQL 源码）。进上下文，供复用。
 
@@ -257,8 +310,11 @@ def random_unit() -> dict[str, Any]:
         except Exception:
             cols = {}
         col = random.choice(list(cols.keys())) if cols else ""
-        desc = cols.get(col, "") if cols else ""
-        return {"table": tbl, "column": col, "desc": str(desc)}
+        raw = cols.get(col, "") if cols else ""
+        # knowledge_graph 的 column_desc 值可能是 dict（含 desc/type/flag），归一化。
+        if isinstance(raw, dict):
+            raw = raw.get("desc") or raw.get("type") or ""
+        return {"table": tbl, "column": col, "desc": str(raw)}
     except Exception:
         return {}
 
@@ -319,6 +375,19 @@ def scene_injection(topic_id: str = "", *, progress_tier: int | None = None) -> 
     # 这些和上面 biome/nearby_blocks/inventory/chests 正交：上面是「世界长啥样」，
     # 下面是「我学到哪了 / 栽在哪了」。VLML 判决与覆盖率数值**不在这里**（约定⑧，
     # 它们只进面板 run_log，不进上下文）。
+    # MC 节点里程碑树（设计：把 VLML 的表理成树状图，树干最粗 = 里程碑）：
+    mt = milestone_tree()
+    if mt.get("trunk"):
+        lines.append(
+            f"· MC 里程碑树（树干=最长前置路径，节点最多路径上的节点即里程碑）："
+            f"进度 {mt['progress']}")
+        lines.append(f"    种子（须先拿下，对应 MC 的 Mine 1 wood log）：{mt['seed']}")
+        lines.append(
+            f"    树干链：{' → '.join(mt['trunk'])}")
+        if mt.get("keystone"):
+            lines.append(f"    树干最粗处（keystone，经过路径最多）：{mt['keystone']}")
+        if mt.get("completed_list"):
+            lines.append(f"    已解锁里程碑：{', '.join(mt['completed_list'])}")
     ms_topics = unlocked_milestones()
     if ms_topics:
         lines.append(f"· 已解锁里程碑（图谱节点·已完成）：{', '.join(ms_topics)}")
@@ -331,9 +400,14 @@ def scene_injection(topic_id: str = "", *, progress_tier: int | None = None) -> 
             lines.append(f"    - [{s['topic']}] {s['name']}：{snippet}")
     fails = failure_history()
     if fails:
-        lines.append("· 历史失败/跳过（带原因，避免重蹈）：")
+        lines.append("· 历史失败（带原因，避免重蹈）：")
         for f in fails:
             lines.append(f"    - {f['topic']}（{f['verdict']}）：{f['reason']}")
+    skips = skip_history()
+    if skips:
+        lines.append("· 历史跳过（带原因，避免重复绕路）：")
+        for s in skips:
+            lines.append(f"    - {s['topic']}：{s['reason']}")
     unit = random_unit()
     if unit.get("table"):
         lines.append(

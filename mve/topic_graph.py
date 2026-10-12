@@ -84,6 +84,14 @@ class MasteryStore:
                 continue
             if isinstance(row.get("topic_id"), str):
                 row.setdefault("completed", False)
+                # —— MVE 节点状态（同构原版 curriculum 的 completed/failed + skill）——
+                # 每个图谱节点聚合：已积累技能指针 / 任务失败 / 跳过（带原因）。
+                # 设计：「技能库和图谱是同一份存储——voyager 按图谱节点解锁里程碑，
+                # 每个节点可以积累技能」。节点状态即里程碑账本，技能 SQL 体仍在
+                # skill_store（按 topic::name 寻址），节点只存指针，避免重复落库。
+                row.setdefault("skills", [])
+                row.setdefault("failures", [])
+                row.setdefault("skips", [])
                 self._rows[row["topic_id"]] = row
 
     def get(self, topic_id: str) -> dict[str, Any] | None:
@@ -107,7 +115,7 @@ class MasteryStore:
         row = self._rows.get(topic_id) or {
             "topic_id": topic_id, "mastery": None, "attempts": 0,
             "correct": 0, "last_at": 0, "streak_wrong": 0, "stale": False,
-            "completed": False,
+            "completed": False, "skills": [], "failures": [], "skips": [],
         }
         row["attempts"] = int(row.get("attempts", 0)) + 1
         row["correct"] = int(row.get("correct", 0)) + (1 if score >= 0.6 else 0)
@@ -142,13 +150,65 @@ class MasteryStore:
         row = self._rows.get(topic_id) or {
             "topic_id": topic_id, "mastery": None, "attempts": 0,
             "correct": 0, "last_at": 0, "streak_wrong": 0, "stale": False,
-            "completed": False,
+            "completed": False, "skills": [], "failures": [], "skips": [],
         }
         row["completed"] = True
         self._rows[topic_id] = row
         if commit:
             self._persist()
         return row
+
+    # ---- 节点状态：每个图谱节点累积的技能 / 失败 / 跳过（设计：技能库与图谱同一份
+    #      存储，每节点积累技能；任务失败/跳过带原因进上下文）----
+    def node_skills(self, topic_id: str) -> list[str]:
+        return list((self._rows.get(topic_id) or {}).get("skills") or [])
+
+    def add_skill(self, topic_id: str, skill_key: str, *, commit: bool = True) -> None:
+        """技能落库成功后，把技能指针挂到对应图谱节点（每节点积累技能）。"""
+        if not skill_key:
+            return
+        row = self._rows.get(topic_id) or {
+            "topic_id": topic_id, "mastery": None, "attempts": 0,
+            "correct": 0, "last_at": 0, "streak_wrong": 0, "stale": False,
+            "completed": False, "skills": [], "failures": [], "skips": [],
+        }
+        skills = list(row.get("skills") or [])
+        if skill_key not in skills:
+            skills.append(skill_key)
+        row["skills"] = skills
+        self._rows[topic_id] = row
+        if commit:
+            self._persist()
+
+    def add_failure(self, topic_id: str, verdict: str, reason: str, *,
+                    commit: bool = True) -> None:
+        """记录一次任务失败（带原因），进上下文让观察者分辨「没学会」vs「链路没跑通」。"""
+        row = self._rows.get(topic_id) or {
+            "topic_id": topic_id, "mastery": None, "attempts": 0,
+            "correct": 0, "last_at": 0, "streak_wrong": 0, "stale": False,
+            "completed": False, "skills": [], "failures": [], "skips": [],
+        }
+        fails = list(row.get("failures") or [])
+        fails.append({"verdict": str(verdict), "reason": str(reason),
+                      "at": int(time.time())})
+        row["failures"] = fails[-20:]
+        self._rows[topic_id] = row
+        if commit:
+            self._persist()
+
+    def add_skip(self, topic_id: str, reason: str, *, commit: bool = True) -> None:
+        """记录一次跳过（带原因），进上下文。"""
+        row = self._rows.get(topic_id) or {
+            "topic_id": topic_id, "mastery": None, "attempts": 0,
+            "correct": 0, "last_at": 0, "streak_wrong": 0, "stale": False,
+            "completed": False, "skills": [], "failures": [], "skips": [],
+        }
+        skips = list(row.get("skips") or [])
+        skips.append({"reason": str(reason), "at": int(time.time())})
+        row["skips"] = skips[-20:]
+        self._rows[topic_id] = row
+        if commit:
+            self._persist()
 
     def is_completed(self, topic_id: str) -> bool:
         return bool((self._rows.get(topic_id) or {}).get("completed"))
@@ -213,6 +273,108 @@ class TopicGraph:
 
     def topics_in_scope(self, scope: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         return [t for t in self.topics.values() if self.scope_matches(t, scope)]
+
+    # ---- MC 节点里程碑模型（设计：把 VLML 的表理成树状图，树干最粗 = 里程碑）----
+    # 同构原版 Voyager 的「里程碑 = 已完成的任务」+ MC 的「必须先砍树」科技树：
+    #   · 前置 DAG（prerequisite 边）就是 VLML 的树；trunk = 最长前置路径
+    #     （设计原文「经过节点最多的路径上的节点就是里程碑」）。
+    #   · keystone = betweenness 最高的节点（「经过路径最多的节点」= 树干最粗处）。
+    #   · seed = 树干起点（无前置），对应 MC 的 Mine 1 wood log——必须先把
+    #     基础单位（随机 (表,列)）做通，才解锁整条树干。
+    def _prereq_adj(self) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+        parents: dict[str, list[str]] = defaultdict(list)
+        children: dict[str, list[str]] = defaultdict(list)
+        for e in self.edges:
+            if e["relation"] != "prerequisite":
+                continue
+            parents[e["to"]].append(e["from"])
+            children[e["from"]].append(e["to"])
+        return parents, children
+
+    def _milestone_cache(self) -> dict[str, Any]:
+        if hasattr(self, "_mc_cache"):
+            return self._mc_cache
+        parents, children = self._prereq_adj()
+
+        # 最长前置路径（DP：从每个根向下找最长链）
+        memo: dict[str, tuple[int, list[str]]] = {}
+
+        def longest(node: str) -> tuple[int, list[str]]:
+            if node in memo:
+                return memo[node]
+            best: tuple[int, list[str]] = (1, [node])
+            for c in children.get(node, []):
+                l, path = longest(c)
+                if l + 1 > best[0]:
+                    best = (l + 1, [node] + path)
+            memo[node] = best
+            return best
+
+        roots = [n for n in self.topics if not parents.get(n)]
+        trunk: list[str] = []
+        best_len = 0
+        for r in roots:
+            l, path = longest(r)
+            if l > best_len:
+                best_len, trunk = l, path
+
+        milestones = set(trunk)
+        seed = trunk[0] if trunk else None
+
+        # betweenness（keystone）：对每个节点统计 (祖先, 后代) 路径经过它的对数。
+        # 祖先 / 后代用 DAG 上溯/下溯。
+        def ancestors(n: str) -> set[str]:
+            out: set[str] = set()
+            stack = list(parents.get(n, []))
+            while stack:
+                p = stack.pop()
+                if p not in out:
+                    out.add(p)
+                    stack.extend(parents.get(p, []))
+            return out
+
+        def descendants(n: str) -> set[str]:
+            out: set[str] = set()
+            stack = list(children.get(n, []))
+            while stack:
+                c = stack.pop()
+                if c not in out:
+                    out.add(c)
+                    stack.extend(children.get(c, []))
+            return out
+
+        keystone, key_score = None, -1
+        for n in self.topics:
+            a, d = len(ancestors(n)), len(descendants(n))
+            score = a * d
+            if score > key_score:
+                key_score, keystone = score, n
+
+        self._mc_cache = {
+            "trunk": trunk, "milestones": milestones, "seed": seed,
+            "keystone": keystone, "keystone_score": key_score,
+        }
+        return self._mc_cache
+
+    def milestone_info(self) -> dict[str, Any]:
+        """给面板/上下文消费：树干、里程碑集合、种子、keystone。"""
+        c = self._milestone_cache()
+        return {
+            "trunk": list(c["trunk"]),
+            "milestones": sorted(c["milestones"]),
+            "seed": c["seed"],
+            "keystone": c["keystone"],
+            "seed_unit": None,  # 种子单位（随机 (表,列)）由 scene_context 注入
+        }
+
+    def trunk_milestones(self) -> set[str]:
+        return set(self._milestone_cache()["milestones"])
+
+    def is_milestone(self, topic_id: str) -> bool:
+        return topic_id in self._milestone_cache()["milestones"]
+
+    def is_trunk(self, topic_id: str) -> bool:
+        return topic_id in set(self._milestone_cache()["trunk"])
 
     # ---- 前置门控 ----
     def prerequisites_of(self, topic_id: str) -> list[dict[str, Any]]:
@@ -326,15 +488,19 @@ class TopicGraph:
                 "ext_deprioritized": False, "exhausted": True,
             }
 
-        # —— 有序课程：章节顺序 × 深度（不读掌握度/覆盖率）——
-        # 缺 ext 表时，依赖 ext 的知识点降权到末尾（跨域基线：技能锁定工具/
-        # 语义层，裸 ext 查询在缺表库上不可答），但仍排在已完成节点之后。
+        # —— 有序课程：树干（里程碑）优先 × 章节顺序 × 深度（不读掌握度/覆盖率）——
+        # 设计「树干最粗 = 里程碑」：trunk 节点（最长前置路径）先于分支节点选，
+        # 使「先问比赛→再问队伍→再问队员」结构化为树干优先，而非仅靠章节顺序。
+        # 缺 ext 表时，依赖 ext 的知识点降权到末尾，但仍排在已完成节点之后。
+        milestones = self.trunk_milestones()
         ext_blocked = {t["id"] for t in selectable
                        if (not ext_available) and t["id"] in EXT_TOPICS}
 
         def key(t: dict[str, Any]) -> tuple:
+            trunk_pen = 0 if t["id"] in milestones else 1
             ext_pen = 1 if t["id"] in ext_blocked else 0
-            return (ext_pen, self._chapter_rank(t), int(t.get("depth", 1)), t["id"])
+            return (trunk_pen, ext_pen, self._chapter_rank(t),
+                    int(t.get("depth", 1)), t["id"])
 
         chosen = min(selectable, key=key)
         cid = chosen["id"]
@@ -392,17 +558,26 @@ class TopicGraph:
         nodes = []
         for t in self.topics.values():
             m = self.mastery.mastery_of(t["id"])
+            tid = t["id"]
+            is_ms = self.is_milestone(tid)
+            is_trunk = self.is_trunk(tid)
             nodes.append({
-                "id": t["id"], "name": t.get("name", t["id"]),
+                "id": tid, "name": t.get("name", tid),
                 "stage": t.get("stage", ""), "subject": t.get("subject", ""),
                 "chapter": t.get("chapter", ""), "depth": int(t.get("depth", 1)),
                 "difficulty": float(t.get("difficulty", 0.5)),
                 "mastery": (None if m is None else round(m, 3)),
-                "completed": bool(self.mastery.is_completed(t["id"])),
+                "completed": bool(self.mastery.is_completed(tid)),
                 "blocked": bool(self.blocked_by(t)),
-                "stale": bool(self.mastery.is_stale(t["id"])),
-                "ext_layer": bool(t["id"] in EXT_TOPICS),
-                "skill_count": int(skill_counts.get(t["id"], 0)),
+                "stale": bool(self.mastery.is_stale(tid)),
+                "ext_layer": bool(tid in EXT_TOPICS),
+                "milestone": bool(is_ms),
+                "trunk": bool(is_trunk),
+                "seed": bool(tid == self._milestone_cache()["seed"]),
+                "skill_count": int(skill_counts.get(tid, 0)),
+                "node_skills": len(self.mastery.node_skills(tid)),
+                "failures": len(self.mastery._rows.get(tid, {}).get("failures") or []),
+                "skips": len(self.mastery._rows.get(tid, {}).get("skips") or []),
                 "misconceptions": len(t.get("typical_misconceptions") or []),
                 "examples": len(t.get("examples") or []),
             })
@@ -414,11 +589,12 @@ class TopicGraph:
             layers[("subject", n["subject"])].add(n["id"])
             layers[("chapter", n["chapter"])].add(n["id"])
         return {
-            "schema_version": 3,
+            "schema_version": 4,
             "difficulty_target": target,
             "target": target,
             "nodes": nodes, "edges": edges,
             "layers": {f"{k[0]}:{k[1]}": sorted(v) for k, v in layers.items()},
+            "milestone": self.milestone_info(),
             "total": len(nodes),
         }
 
