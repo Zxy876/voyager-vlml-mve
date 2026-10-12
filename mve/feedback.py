@@ -195,6 +195,16 @@ def parse_missing(entry: str, *, dim_by_point: dict[str, str] | None = None) -> 
                        error_type="missing_dimension")
 
 
+def point_name(entry: str) -> str:
+    """评分点原文：剥掉判定后缀（`(值不符: got≠ref)` / `(未取到值…)` / `(base=…)`）。
+
+    后缀是判定时刻拼上的，里面带**裁判参考值** —— 它只能进面板/日志（人看的
+    对账信息），绝不能进模型可见上下文，否则下一轮直接抄答案（约定⑧延伸，
+    用户 2026-10-12 纠偏）。parse_missing 的 point 组就是剥好后缀的原文。
+    """
+    return parse_missing(entry).point
+
+
 # --------------------------------------------------------------------------
 # 知识图谱（lazy）：维度 → 由哪个工具产出
 # --------------------------------------------------------------------------
@@ -322,13 +332,18 @@ def _next_action(item: MissingItem, *, ref_plan: list[str] | None = None,
         return f"{dim} 没有任何事实，连 null 都没交 —— 先确认哪个工具能出它，再补调。{tail}"
 
     if item.error_type == "wrong_value":
-        return (f"{dim} 取到了但数不对（{item.got or '?'} ≠ {item.ref or '?'}）—— "
-                f"这是口径/过滤条件的问题（时间范围、地图、队伍、回合类型），"
-                f"**不是补工具能解决的**，回看调用参数。")
+        # ⚠️ 同构会话约定⑧的延伸（用户 2026-10-12 纠偏）：裁判的**参考值**绝不进反馈。
+        # 实测泄漏：wrong_value 的反馈写成「skuba≠initiator」——标准答案就这么
+        # 送给了模型，下一轮直接抄答案交卷，取证通路等于作废。只说"口径不一致"，
+        # 让模型回环境里重新取证，而不是等裁判喂答案。got 是模型自己的观测，可以留。
+        return (f"{dim} 取到了但与裁判口径不一致（我交的是 {item.got or '?'}）—— "
+                f"这是过滤条件/范围的问题（时间范围、地图、队伍、回合类型），"
+                f"**不是补工具能解决的**，回看调用参数重新取证。")
 
     if item.error_type == "value_form":
+        # 同上：只给**形态**指引（数值 vs 枚举），不给裁判的参考值。
         return (f"{dim} 形态对不上（我给的是 {item.got or '?'}<{item.got_type}>，"
-                f"裁判是 {item.ref or '?'}<{item.ref_type}>）—— "
+                f"裁判要的是 <{item.ref_type}> 形态）—— "
                 f"对齐答案形态（数值 vs 枚举/字符串），不是数值算错。")
 
     if item.error_type == "low_base":
@@ -498,7 +513,7 @@ def build_feedback(
             "事实没通过裁判校验 —— 不是漏维度，是**没被认可**。换一种取法，"
             "别把上一轮完全相同的查询再跑一遍：同一条 SQL 只会拿到同一个结果。")
         fb.misconceptions.append(
-            "我把「把事实交上去」当成了「拿到了证据」 —— 覆盖率 0% 说明还没有。"
+            "我把「把事实交上去」当成了「拿到了证据」 —— 交上去的事实一个都没被裁判认可。"
             "重复同样的编排不会让它变对。")
         fb.step_feedback = _step_feedback(my_plan, ref_plan, [])
         fb.related_topics = sorted({dim_by_point.get(c, c) for c in covered})
@@ -527,9 +542,10 @@ def build_feedback(
             f"（已调用过但仍取不到，说明不是忘调，是这两个工具不出这个维度）")
     wrong = [i for i in items if i.error_type == "wrong_value"]
     if wrong:
+        # ⚠️ 约定⑧延伸：不写 (got≠ref) —— ref 是裁判参考值，写出来=送答案。
         fb.misconceptions.append(
             "我以为取到的数就是裁判口径下的数 —— 实际过滤条件/范围不一致："
-            + "、".join(f"{i.dimension or i.point}({i.got}≠{i.ref})" for i in wrong))
+            + "、".join(f"{i.dimension or i.point}（取值与裁判口径不符）" for i in wrong))
     form = [i for i in items if i.error_type == "value_form"]
     if form:
         fb.misconceptions.append(

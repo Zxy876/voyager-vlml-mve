@@ -2374,8 +2374,11 @@ VLML 的 10 个报告工具已经封装好指标口径。能用报告工具拿�
                 dim_by_point.get(m.split("(")[0].strip(), m)
                 for m in last_missing
             })
-            # 评分点级一起恢复：跨运行时维度级恢复不了"这个维度下哪条没交"
-            self.failed_points = sorted(set(last_missing))
+            # 评分点级一起恢复：跨运行时维度级恢复不了"这个维度下哪条没交"。
+            # ⚠️ run_log 里的 missing 带 `(值不符: got≠ref)` 判定后缀（含裁判
+            # 参考值），恢复时必须剥掉 —— failed_points 会拼进下一轮 prompt。
+            self.failed_points = sorted({feedback_mod.point_name(m)
+                                         for m in last_missing})
 
         # ---- 先跑库里的程序，跑通就直接采用（原版"技能被 exec"的本体）----
         #
@@ -2532,8 +2535,12 @@ VLML 的 10 个报告工具已经封装好指标口径。能用报告工具拿�
         # 照 fork：失败要留下"缺口类型"，供下一题的 curriculum 读取
         self.failed_dims = sorted(set(getattr(self, "failed_dims", [])) | set(miss_dims))
         # 评分点级：维度级只能说"哪个维度缺"，说不出"这个维度下哪一条没交"。
+        # ⚠️ 必须存**剥掉判定后缀**的评分点原文（point_name）—— 后缀里的
+        # `(值不符: got≠ref)` 带裁判参考值，而 failed_points 会被拼进下一轮
+        # prompt（_render_observation），不剥就是直接把标准答案递给模型。
         self.failed_points = sorted(
-            set(getattr(self, "failed_points", [])) | {str(m) for m in missing})
+            set(getattr(self, "failed_points", []))
+            | {feedback_mod.point_name(str(m)) for m in missing})
         self._sync_memory()
 
         # 错误假设单独留一条给因果时间线：维度级的 failed_dims 只能说"哪个维度缺"，
