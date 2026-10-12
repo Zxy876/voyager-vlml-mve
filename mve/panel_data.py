@@ -459,18 +459,32 @@ def build_state() -> dict[str, Any]:
     memory = skill_store.load()
     # 防膨胀/防幻觉能不能自证，就看这两个数
     skill_stats = skill_store.stats()
-    skill_detail = [
+    # 排序：**最有效（ok 多）的排最前**，其次被注入次数多的，完全没用过的排最后。
+    #
+    # 不排序的话这列表是插入序 —— 复用链接上之前 25 条全 0/0 看不出差别；
+    # 接上之后（实测 hits 9 / ok 5），真正被复用且帮上忙的那 2 条会淹在
+    # 31 条的最底下，人根本看不见「哪些经验是真在用的」。
+    # hits / ok 的语义（skill_store.py:313 / :327）：
+    #   hits = 被检索注入过几次 prompt；ok = 注入后这一轮判成功几次。
+    #   「hits 涨、ok 不涨」= 注入了但没帮上，是要它沉底的信号。
+    _detail = [
         {
             "key": s.get("key", ""),
             "topic": s.get("topic", ""),
             "name": s.get("name", ""),
             "text": s.get("text", ""),
-            "hits": s.get("hits", 0),
-            "ok": s.get("ok", 0),
+            "hits": int(s.get("hits") or 0),
+            "ok": int(s.get("ok") or 0),
             "versions": s.get("versions", 1),
+            "rate": (
+                round(int(s.get("ok") or 0) / int(s.get("hits") or 1), 3)
+                if int(s.get("hits") or 0) else None
+            ),
         }
         for s in skill_store.all_skills()
     ]
+    _detail.sort(key=lambda x: (-x["ok"], -x["hits"]))
+    skill_detail = _detail
 
     # 人导入通路：这两块在「还没跑过」时也要显示 —— 它正是让人开始的地方
     imports = _human_imports()

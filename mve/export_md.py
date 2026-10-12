@@ -323,10 +323,16 @@ def build_markdown(state: dict[str, Any] | None = None) -> str:
     detail = s.get("skill_detail") or []
     if detail:
         for x in detail:
+            # 有效率 = ok / hits。「命中 N · 有效 0」= 注入了 N 次，一次都没帮上。
+            _h, _o = int(x.get("hits") or 0), int(x.get("ok") or 0)
+            _rate = (
+                f" · 有效率 {round(100 * _o / _h)}%" if _h
+                else " · 还没被用过"
+            )
             lines.append(
                 f"- {escape_markdown(x.get('text'))} "
                 f"（题: {code(x.get('topic'), 40)} · "
-                f"命中 {x.get('hits')} · 有效 {x.get('ok')}"
+                f"命中 {_h} · 有效 {_o}{_rate}"
                 + (f" · 已覆盖 {x.get('versions')} 版" if (x.get("versions") or 1) > 1 else "")
                 + "）"
             )

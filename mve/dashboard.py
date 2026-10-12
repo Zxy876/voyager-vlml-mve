@@ -924,6 +924,9 @@ function pSkill(s){
       <div class="tm"><span class="chip grey">${ESC(x.topic||'—')}</span>
         <span class="chip grey">命中 ${x.hits}</span>
         <span class="chip ${x.ok>0?'ok':'grey'}">有效 ${x.ok}</span>
+        ${x.hits>0
+          ? `<span class="chip ${x.ok>0?'ok':'bad'}">有效率 ${Math.round(100*x.ok/x.hits)}%</span>`
+          : '<span class="chip dim">还没被用过</span>'}
         ${x.versions>1?`<span class="chip warn">已覆盖 ${x.versions} 版</span>`:''}</div>
     </div>`).join('');
   const c=s.causal||{};
@@ -943,7 +946,12 @@ function pSkill(s){
         <span class="ts">${ESC(String(r.ts||'').replace('T',' ').slice(5,19))}</span></div>`).join('')}</div>`
     :'<div class="empty">时间线为空。</div>';
   return `<div class="panel">
-      <div class="panel__head"><h2>技能库</h2><span class="hint">Voyager 自己写的教训（照 Voyager 原仓库：同名覆盖、只取 top_k）</span></div>
+      <div class="panel__head"><h2>技能库</h2>
+        <span class="hint">照原版 voyager.py:195/199：每轮<b>先检索</b>再写 SQL；按有效性排序</span></div>
+      <div class="legend"><b>命中</b> = 被检索注入过几次 prompt · <b>有效</b> = 注入后这轮判成功几次 ·
+        <b>命中涨、有效不涨</b> = 注入了但没帮上，它会在检索排序里自然沉底。
+        有效率高 = 这条经验真在被复用。
+      </div>
       <div class="legend">条目 <b>${st.skills||0}</b> · 累计写入 <b>${st.writes||0}</b> 次
         （覆盖 ${st.rewrites||0} · 丢弃 ${st.skipped||0}）·
         膨胀率 <span class="chip ${(st.bloat||1)>1?'ok':'warn'}">${st.bloat||1}</span>

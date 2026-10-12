@@ -161,16 +161,75 @@ curriculum.propose_next_task()     ← 里程碑树选题（种子 → 树干，
         ↓
 question.generate(topic)           ← LLM 按里程碑节点出题（只出题面，不给答案）
         ↓
-action.solve(question)             ← LLM 写 SQL → VLML MCP 执行
+skill_store.retrieve(tid, q)       ← **检索已学会的 SQL 配方**（同题优先 + 跨题门槛）
+        ↓                            → 拼进 system prompt（照原版 voyager.py:195/199）
+action.solve(question, skills=...) ← LLM 写 SQL → VLML MCP 执行
                                       失败带 critique 迭代重写（最多 3 轮）
         ↓
 critic.check_task_success()        ← 成败 = 有没有真的从 DB 取到数（不比标准答案）
+        ↓
+skill_store.add(...) + mark_result ← 跑通才存新配方；注入过的配方记一次成败
         ↓
 curriculum.update_exploration_progress()  ← 跑通 → 解锁里程碑 + 挂 SQL 技能指针
                                              否则记失败/跳过（带原因）
 ```
 
 **整条链里没有 VLML 判决、没有覆盖率、没有参考答案。** 那些只在面板上。
+
+### 技能复用链：retrieve → 注入 → 跑 → 存 + 计数（照原版四步）
+
+原版的顺序（`voyager_original/voyager/voyager.py`）：
+
+| 步 | 原版 | 行号 |
+|---|---|---|
+| ① 检索 | `skills = self.skill_manager.retrieve_skills(query=self.context)` | `:195` |
+| ② 注入 | `system_message = action_agent.render_system_message(skills=skills)` | `:199` |
+| ③ 跑 | rollout（写码 → 执行 → 观察） | `:214+` |
+| ④ 存 | `self.skill_manager.add_new_skill(info)`（**成功才存**） | `:370` |
+
+**此前练习线只做了 ④**：`loop.py` 里只有 `skill_store.add()`，①②③ 一次都没做。
+后果不是"数字不好看"，是**技能库成了单向仓库** —— 服务器上一度 25 条真 SQL
+写进去，一条都没被用过；`hits` / `ok` 恒为 0，因为 `mark_used()`（`skill_store.py:313`）
+**只在 retrieve 之后被调用**。
+
+2026-10-13 按原版补齐：
+
+- `_retrieve_skills(tid, question)`：每趟**要写 SQL 之前**检索（同题优先 + 跨题
+  相似度门槛 + 有效性加权），检索到就 `mark_used`（注入了才算一次命中）。
+- `render_system_message(skills=[...])`：照原版 `action.py:94` 的 `+ skills`，
+  配方拼在取数原语后面，**进 system 区块**所以迭代修正的每一轮都带着。
+- 判成败后 `mark_result(keys, success)`；`mark_result` 只记成功，所以
+  「hits 涨、ok 不涨」= 注入了没帮上 —— 它会在 `retrieve()` 的
+  `0.6*(ok/hits)` 项里自然沉底。
+- ⚠️ **两条写 SQL 的路都要检索**：`_generate_new_task` 的验题那一趟（种子课程
+  跑完之后走的**全是**这条生成路径）和现场写那一趟。返回值多带一个 `gen_keys`，
+  保证同一题同一次注入**只记一次 hit**。
+
+**一处必要偏差**（两边技能形态不同，必须说清）：
+
+> 原版技能是**带参数的函数**（`async function mineBlock(bot, name, count)`），
+> 复用天然就是"换参数调用"，所以原版注入时一句解释都不写。
+> 我们的技能是一整条**写死了字面量的 SQL**（`WHERE team_name = 'NRG'`）——
+> 它是实例，不是函数。不写使用规则，模型会把上次的值原样抄过来，
+> 取到的就是上一题那一队的数：看着像复用，其实是记答案。
+
+所以注入块带了五条规则，核心两条：**配方里的实体字面量是上一次的值，必须换成
+当前这道题指的那个值**（用户原话：复用时当前这道题的实体值回填进配方）；
+**配方算的量与当前问的不是同一个量 → 不要用**（换队伍名算复用，换量算张冠李戴）。
+
+**实测（服务器，2026-10-13 06:1x）**：
+
+| | 接上之前 | 接上之后 |
+|---|---|---|
+| 技能条数 | 25 | 31 |
+| `hits` 总和 | **0** | **9** |
+| `ok` 总和 | **0** | **5** |
+| 轮次日志 | 无复用信息 | 每行带 `reused_skills`；控制台 `复用=N 条已学配方` |
+
+被复用过的技能：`runtime_b4b2bb78` 命中 4 / 有效 3（75%）、
+`runtime_d049337b` 命中 3 / 有效 2（67%）；`vlml_side_conversion`
+命中 1 / 有效 0（那轮 0 行失败）——**有效率这个数开始有区分度了**，
+`retrieve()` 的排序也就真的在读它。
 
 ### 循环节奏：不带停（同构原版 `while True`）
 
