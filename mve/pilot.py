@@ -119,7 +119,7 @@ def _alive(pid: int) -> bool:
 def read() -> dict[str, Any]:
     """当前状态。进程不在了就自动判定为已停 —— 不信任文件里的 running 位。"""
     if not STATE.exists():
-        return {"running": False, "mode": "", "topic": "", "rounds": 3,
+        return {"running": False, "mode": "", "topic": "", "rounds": 0,
                 "iterations": 0, "pid": None, "started_at": "",
                 "stopped_at": "", "last_exit": None, "why": "从未启动过"}
     try:
@@ -134,7 +134,52 @@ def read() -> dict[str, Any]:
         st["why"] = "进程已退出（崩溃或被强杀）"
     if not st.get("running") and not st.get("why"):
         st["why"] = "已停止"
+    # ⚠️ 循环状态是**另一个文件、另一个写入方**（voyager_vlml/loop.py 每轮写一次
+    # mve/loop_state.json）。面板只读不写 —— 反过来写会把循环刚落的"这轮没取到数"
+    # 抹掉，也会让人点的 stop_requested 被循环的重写覆盖。
+    st["loop"] = loop_read()
+    # 「已停止」但其实还在收尾：优雅停的语义就是「跑完当前这道题再退」，
+    # 所以 pilot 退出 ≠ 循环结束。不标出来，人会在数据还在涨的时候刷新面板，
+    # 以为曲线自己动了。
+    if (not st.get("running")) and st["loop"].get("running") \
+            and _fresh(st["loop"].get("updated_at"), 180):
+        st["winding_down"] = True
+        st["why"] = "正在收尾（跑完当前这道题才退，不是立刻杀死）"
     return st
+
+
+LOOP_STATE = ROOT / "loop_state.json"
+
+
+def loop_read() -> dict[str, Any]:
+    """读循环心跳（只有 voyager_vlml/loop.py 写，面板只读）。
+
+    存在的意义：学习循环是**不带停**的（同构原版 while True），所以"它现在
+    到底在干嘛"不能靠退出码 —— 循环不退出。心跳里有连续几轮没拿到证据、
+    以及"为什么没拿到"（链路没跑通 / 取到 0 行 / 判据没过），面板据此把
+    「它没学会」和「链路根本没跑通」分开显示。
+    """
+    if not LOOP_STATE.exists():
+        return {}
+    try:
+        return json.loads(LOOP_STATE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _fresh(stamp: Any, seconds: int = 180) -> bool:
+    """时间戳是不是还在 seconds 秒内（判断心跳是否还活着）。
+
+    为什么不用"进程在不在"判：收尾期的 loop.py 是孤儿进程（pilot 已退出），
+    父进程那一套 _alive(pid) 用不上，只能靠心跳的更新时刻。
+    """
+    if not stamp:
+        return False
+    try:
+        t = datetime.fromisoformat(str(stamp))
+    except Exception:
+        return False
+    return (datetime.now() - t).total_seconds() <= seconds
 
 
 def tail(lines: int = 60) -> str:
@@ -150,7 +195,7 @@ def _log(text: str) -> None:
         f.flush()
 
 
-def start(*, mode: str = "once", topic: str = "", rounds: int = 3,
+def start(*, mode: str = "once", topic: str = "", rounds: int = 0,
           use_scope: bool = True, job: str = "practice",
           units: int = 1, transfer: int = 0) -> dict[str, Any]:
     """启动驾驶舱（自己再起子进程）。
@@ -167,14 +212,32 @@ def start(*, mode: str = "once", topic: str = "", rounds: int = 3,
     use_scope —— 没显式钉题时，按**练习范围**选题（practice_scope.py）。
     范围是在知识图谱页上点「练习此知识点」设的；设了范围，人就不用在驾驶舱里
     挑难度 / 选题，界面只剩开始 / 停止（伴学 onboarding.md:82 的做法）。
+
+    rounds —— **0 = 不停**（默认）。同构原版 Voyager：主循环是 `while True`
+      （voyager_original/voyager/voyager.py:326），只有 iteration 上限和停止信号
+      能让它退，没有"跑 N 轮就结束"。以前这里默认 3、面板还写死 `rounds:3`
+      → 一次启动只跑 3 道题就退出，29 个节点的图谱根本跑不完，人看到的就是
+      「三轮就结束了」。学习循环本来就不带停。
     """
     cur = read()
     if cur.get("running"):
         return {"ok": False, "error": f"已经在跑了（pid {cur.get('pid')}，"
                                      f"任务 {cur.get('job') or 'practice'}）"}
 
+    # ⚠️ 第二道闸：**上一轮还在收尾**。停止是优雅停 —— 面板点停止后 pilot 立刻
+    #   退出，但 loop.py 会把手头这道题跑完再退（60～90 秒，同构原版
+    #   "exiting learn loop after current task"）。这段时间面板已经显示"已停止"，
+    #   再点一次启动就会起第二个 loop.py，两个循环同时往 run_log / skill_store
+    #   里写 —— 曲线会莫名其妙地翻倍，图谱节点状态互相覆盖。所以拿循环自己的
+    #   心跳文件判：它说还在跑、而且是最近更新过的，就不许启动。
+    lp = loop_read()
+    if lp.get("running") and _fresh(lp.get("updated_at"), 180):
+        return {"ok": False, "error": "上一轮学习循环还在收尾（跑完当前这道题才退），"
+                                     "请等它落盘后再启动，避免两个循环同时写数据"}
+
     mode = "loop" if mode == "loop" else "once"
-    rounds = max(1, min(10, int(rounds or 3)))
+    # 0 = 不停；>0 才是硬上限（留着给"我只想跑几题看看"这种一次性用途）
+    rounds = max(0, min(1000, int(rounds or 0)))
     job = str(job or "practice")
     if job not in ("practice", "placement", "final", "learn"):
         job = "practice"
@@ -218,7 +281,7 @@ def start(*, mode: str = "once", topic: str = "", rounds: int = 3,
     }
     _write(st)
     _log(f"\n===== 启动 {_now()} · 任务 {JOB_LABEL[job]} · 模式 {mode} · "
-         f"轮数上限 {rounds}"
+         f"{'不停（同构原版 while True，只有点停止才退）' if not rounds else f'轮数上限 {rounds}'}"
          + (f" · 单元 {units}" if job == "learn" else "")
          + (f" · 迁移对照每 {transfer} 单元" if job == "learn" and transfer else "")
          + f" · 选题 {st['topic']}"
@@ -332,6 +395,13 @@ def _loop(mode: str, topic: str, rounds: int, logf, job: str = "practice",
         logf.write(text)
         logf.flush()
 
+    # ⚠️ 钉了具体知识点就不允许"不停"：loop.py 会**一直跑同一道题**
+    #   （topic_id 是显式传入的，不进课程推进），进度永远停在 0/1，
+    #   人看到的是"它在跑但什么都没长"。面板上「练习此知识点」就是这条路径。
+    #   不停只对"走课程"有意义 —— 课程会自己换题。
+    if topic and rounds <= 0:
+        rounds = 1
+
     _write({
         "running": True, "mode": mode, "job": job, "units": units,
         "transfer": transfer, "job_label": JOB_LABEL.get(job, job),
@@ -357,7 +427,18 @@ def _loop(mode: str, topic: str, rounds: int, logf, job: str = "practice",
     # 单题超时要跟着轮数放大：新后端每轮是「出题 LLM + 写 SQL 迭代（最多 3 次）
     # + MCP 取数」，实测一轮 60～90 秒，rounds=10 时旧的 900 秒会把它掐断在半路
     # （人看到的是"已停止（退出码 -15）"，看不到题跑没跑完）。
-    timeout = (6 * 3600) if curriculum else max(JOB_TIMEOUT.get(job, 900), 240 * rounds)
+    #
+    # ⚠️ 但**不停模式（rounds<=0）不能给等待超时**：不停循环的终止条件是「人点
+    #   停止」（SIGTERM → loop.py 跑完当前这道题再优雅退），不是时间。给个 6 小时
+    #   上限等于偷偷把"不停"改回"跑 6 小时"，而且超时走的是 proc.kill()——
+    #   硬杀在半道题上，这一题的技能落不了盘。真要限制总题数，用 loop.py 的
+    #   --max-iterations（同样是跑完当前题才退）。
+    if curriculum and rounds <= 0:
+        timeout = None
+    elif curriculum:
+        timeout = 6 * 3600
+    else:
+        timeout = max(JOB_TIMEOUT.get(job, 900), 240 * max(rounds, 1))
 
     while iterations < max_iterations and not asked_to_stop():
         iterations += 1
@@ -370,8 +451,10 @@ def _loop(mode: str, topic: str, rounds: int, logf, job: str = "practice",
             cmd = [PY, str(ROOT / "exam.py"), "--final"]
             what = f"结业考（带技能库全库撤图谱再考）· {_now()}"
         elif job == "learn":
+            # learn 的 --rounds 是"每个学习单元里练几轮"，语义与"不停"无关，
+            # 传 0 会让它一轮都不跑 → 兜回 1
             cmd = [PY, str(ROOT / "learn.py"), "--units", str(units),
-                   "--rounds", str(rounds)]
+                   "--rounds", str(max(1, rounds))]
             if transfer:
                 cmd += ["--transfer", str(transfer)]
             what = (f"学习单元 {units} 个"
@@ -390,7 +473,9 @@ def _loop(mode: str, topic: str, rounds: int, logf, job: str = "practice",
                    "--rounds", str(rounds)]
             if topic:
                 cmd += ["--topic", topic]
-            what = f"第 {iterations} 题 · {_now()} · {' '.join(cmd[-4:])}"
+            what = (f"学习循环 · **不停**（同构原版 while True，点停止才退）"
+                    f" · {_now()}" if rounds <= 0
+                    else f"第 {iterations} 题 · {_now()} · {' '.join(cmd[-4:])}")
 
         mark(f"\n----- {what} -----\n")
         try:
@@ -486,7 +571,7 @@ if __name__ == "__main__":
         m = "loop"
         if "--mode" in argv:
             m = argv[argv.index("--mode") + 1]
-        r = 3
+        r = 0          # 0 = 不停（同构原版 while True），与 start() 的默认值一致
         if "--rounds" in argv:
             r = int(argv[argv.index("--rounds") + 1])
         t = ""

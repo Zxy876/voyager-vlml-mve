@@ -53,9 +53,13 @@ SEMANTIC_TOOLS: list[str] = [
     "query_sql", "get_database_info",
 ]
 
-# 进度档位：0 = 新手（只看 base 表），1 = 已掌握基础层（放开 ext 表）
+# 进度档位：0 = 新手（只看 base 表），1 = 已解锁基础层（放开 ext 表）
 TIER_BASE = 0
 TIER_EXT = 1
+# 升到 ext 档需要已解锁几个里程碑。用**里程碑数**而不是掌握度，是因为
+# 掌握度是 VLML 的评分结果 —— 评分只进面板，不能当披露/推进的门槛
+# （用户原话：「评分结果不被任何推进条件读到」）。
+TIER_EXT_UNLOCKS = 3
 
 # VLML 已知表（静态回退用）：duckdb 不在时也能给出有意义的"场景"，
 # 不必每次出题都实查库（也避免慢查询）。实查到时以实查为准。
@@ -156,8 +160,61 @@ def entity_fillables() -> dict[str, list[str]]:
     return inv
 
 
+def _skill_count() -> int:
+    """技能库里现有几条配方（**不含任何评分**）。"""
+    try:
+        import skill_store
+        return len(skill_store.load())
+    except Exception:
+        return 0
+
+
+def panel_only() -> dict[str, Any]:
+    """**只给人看、绝不进模型上下文**的那一半。
+
+    用户划的线很明确：
+      进运行时上下文的 —— 解锁里程碑 / 学会技能 / 任务失败 / 任务跳过（带原因）
+                          + 环境反馈（工具成没成、取到几行、图谱变了什么）
+      只进面板的       —— ① 当前实体在库里实际存在哪些取值
+                          ② VLML 跑一遍得到的判定结果（得分 / 覆盖率）
+    为什么 ① 不能进上下文：那是一份答案候选清单，会把它的重心从"把取数做通"
+    拉到"枚举取值凑答案"。
+    为什么 ② 不能进上下文：那是尺子，不是反馈。尺子进了反馈环，它就会去讨好
+    尺子（照覆盖率调 SQL），而不是完成任务 —— 用户原话：「会影响 voyager
+    完成任务的重心」。
+
+    面板从这里取数，别自己去 MasteryStore / entity_catalog 里翻。
+    """
+    out: dict[str, Any] = {
+        "entity_values": {}, "mastery": {}, "skill_count": _skill_count(),
+    }
+    try:
+        import entity_catalog
+        for kind in ("series", "team", "map", "player"):
+            vals = entity_catalog.options(kind)
+            if vals:
+                out["entity_values"][kind] = vals
+    except Exception:
+        pass
+    try:
+        from topic_graph import MasteryStore
+        ms = MasteryStore()
+        out["mastery"] = {
+            tid: {"mastery": r.get("mastery"), "completed": ms.is_completed(tid),
+                  "stale": ms.is_stale(tid), "attempts": r.get("attempts", 0)}
+            for tid, r in ms.all().items()
+        }
+    except Exception:
+        pass
+    return out
+
+
 def mastered_skills() -> dict[str, Any]:
-    """chests 等价物：技能库图谱——已掌握的知识点（=已学会的"配方"）。"""
+    """chests 等价物：技能库图谱——已掌握的知识点（=已学会的"配方"）。
+
+    ⚠️ **面板专用**：这里读的是掌握度（≥0.8），属「评分结果」，
+    按约定只进面板（`panel_only()`），不进 `scene_injection()`。
+    """
     out: dict[str, Any] = {"mastered_topics": [], "skill_count": 0}
     try:
         from topic_graph import MasteryStore
@@ -220,6 +277,7 @@ def milestone_tree() -> dict[str, Any]:
         out["trunk"] = trunk
         out["milestones"] = sorted(milestones)
         out["keystone"] = info["keystone"]
+        out["keystone_score"] = info.get("keystone_score")
         out["completed_n"] = len(done)
         out["total_n"] = len(trunk)
         out["progress"] = f"{len(done)}/{len(trunk)}"
@@ -271,20 +329,32 @@ def failure_history(limit: int = 8) -> list[dict[str, Any]]:
     设计⑨明确：任务失败、跳过任务（原因…）要进运行时上下文。这里读的是循环日志
     run_log（循环写的那份），不是面板状态文件——面板只读它、不回写上下文。
     注意：只给「漏了哪些维度（枚举）」和 verdict，**不给覆盖率数值**（约定⑧）。
+
+    ⚠️ 必须**去重**（2026-10-13 实测）：同一个知识点连着栽 7 次，这里就会吐
+      7 行一模一样的 `vlml_first_blood（wrong）：wrong`。那不是"历史"，是噪声
+      —— 白占上下文预算，而且「带原因」变得名不副实（`wrong` 不是原因）。
+      去重按 (知识点, verdict, 原因) 三元组，保留**最近**那一条并记上次数，
+      「栽过几次」这个信息比重复七遍有用。
     """
     out: list[dict[str, Any]] = []
+    seen: dict[tuple[str, str, str], dict[str, Any]] = {}
     try:
         import run_log
-        for r in run_log.load_all()[-limit:]:
+        for r in run_log.load_all():
             v = str(r.get("verdict") or "")
             if v in ("wrong", "dont_know") or r.get("done") is False:
                 tid = r.get("topic_id") or r.get("task") or ""
                 miss = [str(m) for m in (r.get("missing") or [])]
                 reason = "、".join(m.split("(")[0] for m in miss[:3]) or v
-                out.append({"topic": tid, "verdict": v, "reason": reason})
+                key = (tid, v, reason)
+                if key in seen:
+                    seen[key]["times"] = int(seen[key].get("times") or 1) + 1
+                    continue
+                seen[key] = {"topic": tid, "verdict": v, "reason": reason, "times": 1}
+        out = list(seen.values())
     except Exception:
         return []
-    return out
+    return out[-limit:]
 
 
 def random_unit() -> dict[str, Any]:
@@ -322,24 +392,28 @@ def random_unit() -> dict[str, Any]:
 def scene_injection(topic_id: str = "", *, progress_tier: int | None = None) -> str:
     """生成给模型 prompt 的「场景注入」文本块（渐进披露，按 progress_tier 收放）。
 
-    progress_tier 不传则按掌握度自动判：有任何知识点掌握≥0.8 → 进 ext 档，
-    否则 base 档。这样"基础层没掌握就别碰 ext"是结构性的，不靠说教。
+    progress_tier 不传则按**已解锁里程碑数**自动判（≥ TIER_EXT_UNLOCKS → ext 档），
+    这样"基础层没拿下就别碰 ext"是结构性的，不靠说教。
+
+    ⚠️ 以前这里读的是「有任何知识点掌握度 ≥0.8」—— 那是把 VLML 的**评分结果**
+       当成披露条件，与设计相悖（用户原话：「评分结果不被任何推进条件读到」）。
+       改成里程碑计数：里程碑是布尔的（这一题跑通了 / 没跑通），不含任何评分。
     """
     if progress_tier is None:
         try:
-            from topic_graph import MasteryStore
-            ms = MasteryStore()
-            any_mastered = any(
-                (r.get("mastery") is not None and float(r["mastery"]) >= 0.8)
-                for r in ms.all().values())
-            progress_tier = TIER_EXT if any_mastered else TIER_BASE
+            progress_tier = TIER_EXT if len(unlocked_milestones()) >= TIER_EXT_UNLOCKS \
+                else TIER_BASE
         except Exception:
             progress_tier = TIER_BASE
 
     ds = data_source_identity()
     tabs = available_tables(progress_tier)
     inv = entity_fillables()
-    skills = mastered_skills()
+    # ⚠️ 刻意**不读掌握度**：chests 该装的是"已经学会的取数配方"（skill_store 里的
+    #    SQL），不是"评分 ≥0.8 的知识点"。用掌握度当门槛，等于把 VLML 的评分结果
+    #   偷偷读进上下文 —— 而设计规定评分只进面板、不被任何推进/披露条件读到
+    #   （用户原话：「评分结果不被任何推进条件读到」）。
+    skills = {"skill_count": _skill_count()}
     src_note = "（静态已知 schema）" if tabs.get("source") != "live" else "（实查）"
 
     lines: list[str] = []
@@ -359,17 +433,15 @@ def scene_injection(topic_id: str = "", *, progress_tier: int | None = None) -> 
     if inv["anchor"]:
         lines.append("· 当前实体（inventory · 锚点，出题/作答围绕这些，不要编造）："
                      + "；".join(inv["anchor"]))
-    opts = inv.get("options") or {}
-    if opts:
-        parts = []
-        for k, v in opts.items():
-            parts.append(f"{k}∈{{{', '.join(v)}}}") if v else None
-        if parts:
-            lines.append("· 实体可填值（inventory · 目录预览）：" + "；".join(parts))
-    if skills["mastered_topics"]:
+    # ⚠️ **不给** `inv["options"]`（「series/team/map 在库里各有哪些取值」）。
+    #    用户原话：「当前实体在库里实际存在哪些取值…不允许进反馈，因为会影响
+    #    voyager 完成任务的重心」。理由很实在：那是一份**答案候选清单**，
+    #    等于把选择题的选项一并递过去 —— 它会去"枚举取值凑答案"，而不是
+    #    "把这一题的取数做通"。要看有哪些取值，去面板（panel_only()）。
+    if skills.get("skill_count"):
         lines.append(
-            f"· 已掌握配方（chests · 已学会）：{', '.join(skills['mastered_topics'])}"
-            f"（技能库共 {skills['skill_count']} 条，可复用其取数思路）")
+            f"· 已学会技能（chests）：技能库共 {skills['skill_count']} 条配方，"
+            f"下面列出可直接复用的 SQL 思路")
 
     # —— 同构会话新增（设计⑨⑩）：进运行时上下文的「学习状态」字段 ——
     # 这些和上面 biome/nearby_blocks/inventory/chests 正交：上面是「世界长啥样」，
@@ -385,7 +457,9 @@ def scene_injection(topic_id: str = "", *, progress_tier: int | None = None) -> 
         lines.append(
             f"    树干链：{' → '.join(mt['trunk'])}")
         if mt.get("keystone"):
-            lines.append(f"    树干最粗处（keystone，经过路径最多）：{mt['keystone']}")
+            lines.append(
+                f"    树干最粗处（keystone，经过路径最多）：{mt['keystone']}"
+                f"（betweenness {mt.get('keystone_score')}）")
         if mt.get("completed_list"):
             lines.append(f"    已解锁里程碑：{', '.join(mt['completed_list'])}")
     ms_topics = unlocked_milestones()
@@ -402,7 +476,10 @@ def scene_injection(topic_id: str = "", *, progress_tier: int | None = None) -> 
     if fails:
         lines.append("· 历史失败（带原因，避免重蹈）：")
         for f in fails:
-            lines.append(f"    - {f['topic']}（{f['verdict']}）：{f['reason']}")
+            times = int(f.get("times") or 1)
+            lines.append(
+                f"    - {f['topic']}（{f['verdict']}）：{f['reason']}"
+                + (f" ×{times}" if times > 1 else ""))
     skips = skip_history()
     if skips:
         lines.append("· 历史跳过（带原因，避免重复绕路）：")

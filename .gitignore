@@ -46,6 +46,7 @@ mve/imported_links.json
 mve/pending_dimensions.json
 mve/knowledge_graph.json
 mve/learn.log
+mve/loop_state.json
 mve/pilot.log
 mve/pilot_state.json
 mve/practice_scope.json

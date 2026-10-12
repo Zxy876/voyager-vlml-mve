@@ -13,7 +13,8 @@
   biome             → 数据源（rib / vlgg / DB）
   nearby_blocks     → 可见表（按进度档解锁，同构 base/ext 分层）
   other_blocks      → 其它见过的表
-  nearby_entities   → 实体可填值（库里真实取值范围）
+  nearby_entities   → 实体可填值 —— **刻意不进上下文**（那是一份答案候选清单，
+                      会把重心从"把取数做通"拉到"枚举取值凑答案"），只在面板看
   inventory         → 当前实体锚点（series / team / map）
   chests            → 已学会技能（可复用 SQL 配方）
   completed_tasks   → 已解锁里程碑（图谱节点已完成）
@@ -81,8 +82,13 @@ class VLMLCurriculumAgent:
             "data_source",      # biome
             "visible_tables",   # nearby_blocks
             "other_tables",     # other_blocks
-            "entity_values",    # nearby_entities
-            "anchor_entities",  # inventory
+            # ⚠️ 这里**没有** entity_values。它原本对着 MC 的 nearby_entities
+            #   （"眼前有什么"），但落到 VLML 上它变成的是
+            #   「series/team/map 在库里各有哪些取值」—— 那是一份**答案候选清单**。
+            #   用户明确把它划到只进面板：「当前实体在库里实际存在哪些取值…
+            #   不允许进反馈，因为会影响 voyager 完成任务的重心」。
+            #   要看它走 scene_context.panel_only()（面板），不走这里（上下文）。
+            "anchor_entities",  # inventory（只留**当前**锚点，不给候选值清单）
             "skills",           # chests
             "milestone_tree",   # 新增：MC 里程碑树同构
             "random_unit",      # 新增：出生随机最小单位 (表,列)
@@ -98,7 +104,6 @@ class VLMLCurriculumAgent:
             "data_source": 0,
             "visible_tables": 0,
             "other_tables": 2,
-            "entity_values": 1,
             "anchor_entities": 0,
             "skills": 1,
             "milestone_tree": 0,
@@ -141,7 +146,9 @@ class VLMLCurriculumAgent:
             tree.append(f"种子（须先拿下，对应 MC 的 Mine 1 wood log）：{mt.get('seed')}")
             tree.append("树干链：" + " → ".join(mt.get("trunk") or []))
             if mt.get("keystone"):
-                tree.append(f"树干最粗处（keystone）：{mt['keystone']}")
+                tree.append(
+                    f"树干最粗处（keystone，经过路径最多）：{mt['keystone']}"
+                    f"（betweenness {mt.get('keystone_score')}）")
             if mt.get("completed_list"):
                 tree.append("已解锁里程碑：" + ", ".join(mt["completed_list"]))
             obs["milestone_tree"] = "里程碑树：" + "\n  ".join(tree) + "\n\n"

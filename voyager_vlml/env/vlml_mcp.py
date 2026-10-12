@@ -146,7 +146,7 @@ class VLMLMCPEnv:
         这里真实存在的表名/列名，避免模型编造。
         """
         obs = await self.run_sql(
-            "SELECT table_name, column_name FROM information_schema.columns "
+            "SELECT table_name, column_name, data_type FROM information_schema.columns "
             "WHERE table_schema='main' ORDER BY table_name, ordinal_position"
         )
         if not obs.get("ok"):
@@ -154,9 +154,13 @@ class VLMLMCPEnv:
         data = obs.get("data") or {}
         rows = data.get("rows") if isinstance(data, dict) else data
         cols: dict[str, list[str]] = {}
+        types: dict[str, dict[str, str]] = {}
         for r in rows or []:
             if len(r) >= 2:
-                cols.setdefault(str(r[0]), []).append(str(r[1]))
+                t = str(r[0])
+                cols.setdefault(t, []).append(str(r[1]))
+                if len(r) >= 3:
+                    types.setdefault(t, {})[str(r[1])] = _short_type(str(r[2]))
 
         # ⚠️ 必须把**每张表有多少行**一起给模型（2026-10-13 实测踩的坑）：
         #   当前库（rib）`agg_player_round_stats` 是 **0 行**，真实数据全在
@@ -180,20 +184,85 @@ class VLMLMCPEnv:
             except Exception:
                 counts = {}
 
+        # ⚠️ 必须给**一行真实数据**（2026-10-13 第 4 个坑）：
+        #   只给列名，模型就会猜列里装的是什么值 —— 实测写出
+        #   `WHERE round_won = 'win'`、`= 'team'`（把布尔列当成字符串比）；
+        #   `side` 究竟是 attack/defense 还是 T/CT，光看列名也只能猜。
+        #   VLML 自带的列级口径（`column_definitions.yaml`）**只覆盖 3 张表**，
+        #   指望不上。给一行样例 = 让值自己说话，比写一百句口径说明管用。
+        #   只取行数最多的 8 张（schema 有长度上限，宁可少而准，别把样例挤没了）。
+        samples: dict[str, str] = {}
+        for t in sorted([x for x in names if counts.get(x)],
+                        key=lambda x: -counts.get(x, 0))[:8]:
+            try:
+                o = await self.run_sql(f'SELECT * FROM "{t}" LIMIT 1')
+                if not o.get("ok"):
+                    continue
+                dd = o.get("data") or {}
+                rr = dd.get("rows") if isinstance(dd, dict) else dd
+                if not rr:
+                    continue
+                first = rr[0]
+                if not isinstance(first, (list, tuple)):
+                    continue
+                pairs = []
+                for name, v in zip(cols.get(t) or [], first):
+                    sv = "" if v is None else str(v)
+                    pairs.append(f"{name}={sv[:16] or 'NULL'}")
+                if pairs:
+                    samples[t] = "，".join(pairs[:8])
+            except Exception:
+                continue
+
         def _line(t: str, c: list[str]) -> str:
+            ty = types.get(t) or {}
+            head = "，".join(
+                f"{n}" + (f"::{ty[n]}" if n in ty else "") for n in c[:max_cols])
             n = counts.get(t)
             if n is None:
-                return f"- {t}: {', '.join(c[:max_cols])}"
-            if n == 0:
-                return (f"- {t}（**0 行 · 空表，查它只会得 0 行，别查**）: "
-                        f"{', '.join(c[:max_cols])}")
-            return f"- {t}（{n} 行）: {', '.join(c[:max_cols])}"
+                base = f"- {t}: {head}"
+            elif n == 0:
+                base = f"- {t}（**0 行 · 空表，查它只会得 0 行，别查**）: {head}"
+            else:
+                base = f"- {t}（{n} 行）: {head}"
+            smp = samples.get(t)
+            return base + (f"\n    样例：{smp}" if smp else "")
 
         # 有数据的表排前面、空表沉到最后：schema 文本有长度上限（max_tables），
         # 真被截断时宁可丢空表，也不能把唯一有数据的 ext_* 表截没了
         # （它们字母序靠后，不排序就会被先截掉）。
         ordered = sorted(cols.items(), key=lambda kv: -(counts.get(kv[0]) or 0))
         return "\n".join(_line(t, c) for t, c in ordered[:max_tables])
+
+
+def _short_type(t: str) -> str:
+    """把 DuckDB 的类型名压短，省 schema 的字符预算。
+
+    为什么必须带类型（2026-10-13 实测）：只给列名，模型就猜列里装什么值
+    —— 写出 `WHERE round_won = 'win'`、`= 'team'`，把布尔列当字符串比。
+    带上 `::bool` 之后这类猜测当场消失。压短是为了在同样的字数里多塞
+    几张表：schema 文本块有长度上限，类型名写全了就会挤掉后面的表。
+    """
+    s = (t or "").strip().upper()
+    if not s:
+        return ""
+    if s.startswith("VARCHAR") or s.startswith("CHAR") or s == "TEXT":
+        return "str"
+    if s in {"BOOLEAN", "BOOL"}:
+        return "bool"
+    if any(s.startswith(p) for p in ("DECIMAL", "NUMERIC", "DOUBLE", "FLOAT", "REAL")):
+        return "float"
+    if s.endswith("INT"):  # BIGINT / SMALLINT / UTINYINT / HUGEINT … 整数族兜底
+        return "int"
+    if s.startswith("TIMESTAMP"):
+        return "ts"
+    if s == "DATE":
+        return "date"
+    if s == "TIME":
+        return "time"
+    if s.startswith("BLOB") or s.startswith("BYTEA"):
+        return "blob"
+    return s.lower()[:12]
 
 
 def _rows_of(res: Any) -> int:

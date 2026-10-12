@@ -42,6 +42,85 @@ from voyager_vlml.agents.curriculum import VLMLCurriculumAgent  # noqa: E402
 from voyager_vlml.agents.question import VLMLQuestionAgent  # noqa: E402
 from voyager_vlml.env.vlml_mcp import VLMLMCPEnv  # noqa: E402
 
+# ---- 停止信号（同构原版 voyager.py:_stop_requested / run_voyager_learn.py:request_stop）----
+# 原版：面板「停止」→ SIGTERM → request_stop() → 主循环**在当前任务结束后**退出，
+# 不硬杀（技能已按任务落盘）。
+# ⚠️ 学习循环本来就是**不带停**的（原版 `while True` + 只有 iteration 上限），
+#    停止是外部动作，不是循环内部的终止条件。
+_STOP = {"requested": False}
+_MAX_ITERATIONS = 0      # 不停模式下的总题数上限（0 = 不限；原版 --max-iterations 默认 160）
+
+# ---- 循环自己的状态文件（与面板状态文件**分开**）----
+# 用户原话：「循环与面板的运行状态写在两个不同的状态文件里」。
+# 为什么必须分开（实测踩的耦合）：面板状态（mve/pilot_state.json）是**人的操作
+# 记录**（谁点了启动、点了停止、pid 多少）；循环状态是**循环自己的心跳**（跑到
+# 第几轮、这轮工具成没成、连续几轮没拿到证据）。混在一个文件里会有两种互相
+# 污染的写法：
+#   · 循环每轮重写状态文件 → 人点「停止」写的 stop_requested 位可能被覆盖回去；
+#   · 面板为了显示 pid 重写文件 → 把循环刚写的"这轮没取到数"抹掉。
+# 分家之后：面板**只读**循环状态，两个文件的写入方各只有一个。
+LOOP_STATE = _MVE_DIR / "loop_state.json"
+
+
+def _write_loop_state(**kw: Any) -> None:
+    """把循环心跳写到 `mve/loop_state.json`（只有循环写，面板只读）。"""
+    import json as _json
+    import time as _time
+
+    cur: dict[str, Any] = {}
+    try:
+        cur = _json.loads(LOOP_STATE.read_text(encoding="utf-8"))
+    except Exception:
+        cur = {}
+    cur.update(kw)
+    cur["updated_at"] = _time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        LOOP_STATE.write_text(
+            _json.dumps(cur, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:  # pragma: no cover
+        pass
+
+
+def _classify_no_evidence(observations: list[dict[str, Any]]) -> str:
+    """这轮为什么没拿到证据 —— 让观察者能分清「它没学会」和「链路根本没跑通」。
+
+    ⚠️ 用户明确要求的可区分性（原话：「面板要用可区分信息让观察者分辨
+      '它没学会' 和 '链路根本没跑通'」）。这两件事的处置完全不同：
+        · `linkage`  —— 一次工具都没调成功：**链路问题**（DB 不可达 / MCP 工具
+                        没装载 / 库换了但没引导）。改代码或改配置能修，跟
+                        "学没学会"没关系。
+        · `empty`    —— 工具调通了但取到 0 行：题面在库里没数据，或 SQL 口径写错
+                        （过滤条件过严）。这是**它**的水平问题。
+        · `unproven` —— 取到数了但判据没过（critic 判定为没取到有效证据）。
+    不停循环**不会因为任何一种而停下** —— 这里只负责如实标出来。
+    """
+    obs = observations or []
+    if not obs:
+        return "linkage"          # 连一次调用都没发出去 = 环境根本没转起来
+    ok_n = sum(1 for o in obs if o.get("ok"))
+    if ok_n <= 0:
+        return "linkage"
+    rows = sum(int(o.get("rows") or 0) for o in obs if o.get("ok"))
+    if rows <= 0:
+        return "empty"
+    return "unproven"
+
+
+def _install_stop_handler() -> None:
+    import signal
+
+    def _handler(signum, _frame):
+        _STOP["requested"] = True
+        print(f"\n（收到信号 {signum}：跑完当前这道题就停）", flush=True)
+
+    for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGINT", None)):
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _handler)
+        except Exception:  # pragma: no cover
+            pass
+
 
 async def _generate_new_task(curr: Any, env: Any, act: Any = None,
                              max_tries: int = 3, max_iters: int = 3
@@ -314,11 +393,41 @@ async def run_rounds(
     use_llm: bool = True,
     max_iters: int = 3,
 ) -> list[dict[str, Any]]:
-    """连跑 n 轮（共享 env 与课程状态；设计：一直跑到你点停止，整轮不结束）。"""
+    """连跑 n 轮（共享 env 与课程状态）。
+
+    ⚠️ **`n <= 0` = 不停**（同构原版 Voyager 的 `while True`）：
+      一直跑到人点「停止」，或跑满 `--max-iterations`。
+      原版就是这个语义 —— `voyager_original/voyager/voyager.py:326` 的主循环
+      **没有"跑 N 轮就结束"这一说**，只有 iteration 上限（`--max-iterations`，
+      默认 160）和停止信号（SIGTERM → 当前任务跑完后退出）。
+
+      以前这里 n 是硬上限，面板还写死 `rounds:3` → 一次启动只跑 3 道题就退出，
+      29 个节点的图谱根本跑不完，人看到的就是「三轮就结束了」。
+      那不是 Voyager 该有的行为：**学习循环是不带停的**。
+
+    停止是**优雅停**：收到信号后把手头这道题跑完再退出（照原版
+    "exiting learn loop after current task"），不硬杀 —— 技能已按任务落盘。
+    """
     env = VLMLMCPEnv()
     curr = VLMLCurriculumAgent(scope=scope)
     out: list[dict[str, Any]] = []
-    for i in range(n):
+    i = 0
+    # 连续「没拿到证据」的计数。**只观测，不终止**：设计原文是
+    # 「一直跳过且技能进度没涨时，整轮不会结束；只有停止能改变循环节奏」。
+    # 所以它唯一的作用是把状态写进 loop_state.json，让面板把
+    # 「它没学会」和「链路没跑通」区分给人看（见 _classify_no_evidence）。
+    streak = 0
+    last_progress = curr.progress
+    since_progress = 0
+    while True:
+        if n > 0 and i >= n:
+            break
+        if _STOP["requested"]:
+            print("\n（收到停止信号：跑完当前这道题就停，不硬杀）")
+            break
+        if n <= 0 and _MAX_ITERATIONS > 0 and i >= _MAX_ITERATIONS:
+            print(f"\n（跑满 --max-iterations {_MAX_ITERATIONS}，停）")
+            break
         r = await run_one_round(
             scope=scope,
             use_llm=use_llm,
@@ -328,11 +437,51 @@ async def run_rounds(
         )
         r["round"] = i + 1
         out.append(r)
+        i += 1
+
+        # ---- 写循环心跳（面板只读这个文件，不写）----
+        obs = r.get("observations") or []
+        ok_calls = [o for o in obs if o.get("ok")]
+        rows = sum(int(o.get("rows") or 0) for o in ok_calls)
+        if r.get("success"):
+            streak = 0
+        else:
+            streak += 1
+        if int(r.get("progress") or 0) > last_progress:
+            last_progress = int(r.get("progress") or 0)
+            since_progress = 0
+        else:
+            since_progress += 1
+        _write_loop_state(
+            running=not _STOP["requested"],
+            continuous=(n <= 0),
+            round=i,
+            topic=str(r.get("topic_id") or ""),
+            reason=str(r.get("reason") or ""),
+            generated=bool(r.get("generated")),
+            success=bool(r.get("success")),
+            progress=last_progress,
+            tool_calls=len(obs),
+            tool_ok=len(ok_calls),
+            tool_fail=len(obs) - len(ok_calls),
+            rows=rows,
+            last_error=next(
+                (str(o.get("error") or "") for o in reversed(obs) if not o.get("ok")),
+                ""),
+            no_evidence_streak=streak,
+            no_evidence_kind=(_classify_no_evidence(obs) if not r.get("success") else ""),
+            rounds_since_progress=since_progress,
+        )
+
+        tag = f"第 {i}/{n} 轮" if n > 0 else f"第 {i} 轮（不停）"
         print(
-            f"[第 {i+1}/{n} 轮] {r['topic_id']} · reason={r['reason']}"
+            f"[{tag}] {r['topic_id']} · reason={r['reason']}"
             f"{' (新生成)' if r.get('generated') else ''}"
             f" · 成功={r['success']} · 进度={r['progress']}"
+            + (f" · ⚠️ 连续 {streak} 轮没拿到证据"
+               f"（{_classify_no_evidence(obs)}）" if streak >= 3 else "")
         )
+    _write_loop_state(running=False, round=i, progress=last_progress)
     return out
 
 
@@ -341,10 +490,20 @@ def _main() -> int:
     ap.add_argument("--topic", default="", help="钉住某个知识点（不给则走课程选题）")
     ap.add_argument("--no-llm", action="store_true", help="不出题不写 SQL（仅演示骨架）")
     ap.add_argument("--iters", type=int, default=3, help="写 SQL 的迭代修正轮数")
-    ap.add_argument("--rounds", type=int, default=1, help="连跑几轮（>1 时共享状态）")
+    ap.add_argument("--rounds", type=int, default=1,
+                    help="连跑几轮；**0 = 不停**（同构原版 while True，只有点停止才退出）")
+    ap.add_argument("--max-iterations", type=int, default=0,
+                    help="不停模式下的总题数上限（0 = 不限；原版 --max-iterations 默认 160）")
     ap.add_argument("--unstale", nargs="?", const="__all__", default="",
                     help="清掉「放弃换题」标记并重置 attempts（不给值=全清，给值=清这一题）")
     a = ap.parse_args()
+
+    # 不停模式必须装信号处理器：面板「停止」发的是 SIGTERM，
+    # 我们要的是「跑完当前这道题再退」，不是被硬杀在半路。
+    global _MAX_ITERATIONS
+    if a.rounds == 0:
+        _install_stop_handler()
+        _MAX_ITERATIONS = max(0, int(a.max_iterations or 0))
 
     if a.unstale:
         # 课程被 stale 堵死时的清理口子（实测：8 个 stale 就能让 29 个节点全不可选）
@@ -356,7 +515,10 @@ def _main() -> int:
               + (f" → {touched[:15]}" if touched else ""))
         return 0
 
-    if a.rounds > 1:
+    # ⚠️ `rounds=0` 也必须走 run_rounds（0 = 不停），只有 `rounds==1` 才走单轮路径。
+    #    以前写成 `if a.rounds > 1`，于是面板传 0 想"不停"时会被当成单轮跑完就退
+    #    —— 正是「三轮就结束了」那一类问题的入口版本。
+    if a.rounds != 1:
         rs = asyncio.run(
             run_rounds(a.rounds, use_llm=not a.no_llm, max_iters=a.iters)
         )
@@ -366,9 +528,11 @@ def _main() -> int:
         # （题面在库里答不了），后者才是**它**的问题。混成一个数就没法定位。
         bad = sum(1 for r in rs
                   if r.get("reason") == "generated_but_unverifiable")
+        why_stop = "（收到停止信号，跑完手头这道题就退）" if _STOP["requested"] else ""
         print("=== 多轮汇总 ===")
         print(f"轮数 {len(rs)} · 成功 {ok} · 生成新任务 {gen}"
-              f"（其中验题没过 {bad}）· 末轮进度 {rs[-1].get('progress')}")
+              f"（其中验题没过 {bad}）· 末轮进度 "
+              f"{rs[-1].get('progress') if rs else '（一轮没跑）'}{why_stop}")
         for r in rs:
             print(f"  {r['round']}. {r['topic_id']} [{r['reason']}] 成功={r['success']}"
                   f" 技能={r.get('skill_key') or '—'}")

@@ -418,6 +418,9 @@ class TopicGraph:
             "milestones": sorted(c["milestones"]),
             "seed": c["seed"],
             "keystone": c["keystone"],
+            # keystone_score = betweenness（祖先数 × 后代数）= 有多少条前置路径
+            # 从它身上过。面板要显示"为什么它是树干最粗处"，光给名字不够。
+            "keystone_score": c.get("keystone_score"),
             "seed_unit": None,  # 种子单位（随机 (表,列)）由 scene_context 注入
         }
 

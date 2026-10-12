@@ -223,6 +223,7 @@ button,textarea,select{font:inherit}
 .dot{width:9px;height:9px;border-radius:50%;background:var(--mastery-new);display:inline-block}
 .dot.on{background:#22c55e;box-shadow:0 0 0 3px rgba(34,197,94,.18);animation:pulse 1.6s ease-in-out infinite}
 .dot.off{background:#9ca3af}
+.dot.warn{background:#f59e0b;box-shadow:0 0 0 3px rgba(245,158,11,.18);animation:pulse 1.6s ease-in-out infinite}
 /* 练习范围条：范围由知识图谱页设定，这里只显示 + 清除 */
 .scopebar{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin-top:8px;
   padding:7px 10px;border:1px dashed var(--line);border-radius:var(--radius-sm);background:rgba(255,255,255,.55)}
@@ -293,6 +294,7 @@ td.num{font-variant-numeric:tabular-nums}
 .note{border:1px solid #fde68a;border-radius:var(--radius-sm);padding:10px 12px;
       font-size:12.5px;color:#78350f;background:#fffbeb;margin-top:10px}
 .note.info{border-color:rgba(47,125,87,.28);background:rgba(237,248,240,.92);color:#17563d}
+.note.bad{border-color:rgba(220,38,38,.3);background:#fef2f2;color:#7f1d1d}
 ul{margin:6px 0 0;padding-left:20px}
 li{margin:3px 0}
 .tool{display:inline-block;background:rgba(31,41,36,.05);border:1px solid var(--line);
@@ -346,6 +348,13 @@ li{margin:3px 0}
   font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;
   max-height:460px;overflow:auto;margin-top:10px}
 .console .dim{color:#7f9a8c}
+/* 「不停」开关：同构原版 Voyager 的 while True —— 学习循环本来就不带停，
+   只有人点停止（或跑满上限）才退。面板以前写死 rounds:3，一次启动只跑 3 道题
+   就退出，29 个节点的图谱根本跑不完。这个开关让"跑几题"变成人的显式选择。 */
+.runctl-ck{display:inline-flex;align-items:center;gap:5px;font-size:12px;
+  color:#5c6f66;cursor:pointer;user-select:none}
+.runctl-ck input{accent-color:var(--brand);cursor:pointer;vertical-align:-1px}
+.runctl-ck.off{opacity:.55;cursor:not-allowed}
 </style>
 </head>
 <body>
@@ -362,6 +371,11 @@ li{margin:3px 0}
           <button class="btn btn-danger" id="runStop" disabled>■ 停止</button>
           <button class="btn btn-secondary" id="btnExport" title="把当前学习过程导出成一份 md">⬇ 导出 md</button>
           <button class="btn btn-secondary" id="mcLearn" title="先跑 MC 思路学习（提炼域无关规划思维）并入库，再自动启动标准练习循环（正常 MVE 全流程）">🧠 启动 MC 思路学习 → MVE</button>
+          <label class="runctl-ck" id="ckWrap"
+                 title="同构原版 Voyager（voyager.py:326 主循环是 while True）：学习循环不带停，只有点停止 / 跑满上限才退。勾上 = 不停；去掉勾 = 只跑一轮看看。">
+            <input type="checkbox" id="ckContinuous" checked>
+            <span>不停（跑完图谱 / 点停止才退）</span>
+          </label>
           <span class="runstate"><i class="dot off" id="runDot"></i><span id="runState">未运行</span></span>
         </div>
         <!-- 练习范围：伴学 onboarding.md:82 —— 人在知识图谱上点知识点定范围，
@@ -398,7 +412,8 @@ const TABS = [
    status:s=>(s.voyager&&s.voyager.running)?'学习中':((s.voyager&&s.voyager.completed_count)?('已学 '+(s.voyager.completed_count)+' 技能'):'空闲')},
   {id:'adaptive', icon:'🧩', label:'自适应练习',
    status:s=>(s.teaching&&s.teaching.target)?('目标难度'+s.teaching.target):'知识点图谱'},
-  {id:'console',  icon:'🖥', label:'运行日志', status:s=>s.pilot&&s.pilot.running?'运行中':'空闲'},
+  {id:'console',  icon:'🖥', label:'运行日志',
+   status:s=>{const p=s.pilot||{}; return p.running?'运行中':(p.winding_down?'收尾中':'空闲');}},
 ];
 let TAB = localStorage.getItem('mve_tab') || 'overview';
 
@@ -472,12 +487,38 @@ function renderHero(s){
     pills.map(([l,v])=>`<div class="summary-pill"><span>${ESC(l)}</span><strong>${v}</strong></div>`).join('');
 
   const p=s.pilot||{};
+  const lp=p.loop||{};
   const dot=document.getElementById('runDot');
-  dot.className='dot '+(p.running?'on':'off');
-  document.getElementById('runState').textContent =
-    p.running ? `运行中 · ${p.mode==='loop'?'连续自适应':'单题'} · 已跑 ${p.iterations||0} 题` : (p.why||'未运行');
-  document.getElementById('runStart').disabled = !!p.running;
-  document.getElementById('runStop').disabled  = !p.running;
+  // 「已停止」但循环还在收尾：pilot 收到停止信号就退，loop.py 会把手头这道题
+  // 跑完再退（60～90 秒）。这段时间数据在涨，人必须看得见。
+  const winding = !!p.winding_down;
+  dot.className='dot '+((p.running||winding)?(winding?'warn':'on'):'off');
+  let runTxt;
+  if(winding){
+    runTxt = `收尾中 · 第 ${lp.round||'?'} 轮跑完就停 · ${ESC(p.why||'')}`;
+  }else if(p.running){
+    const kind = (p.rounds===0||lp.continuous) ? '不停（同构原版 while True）'
+                                               : ('上限 '+(p.rounds||1)+' 轮');
+    runTxt = `运行中 · ${kind} · 已跑 ${lp.round||p.iterations||0} 轮`;
+  }else{
+    runTxt = p.why||'未运行';
+  }
+  document.getElementById('runState').innerHTML = runTxt;
+  document.getElementById('runStart').disabled = !!(p.running||winding);
+  document.getElementById('runStop').disabled  = !(p.running||winding);
+
+  // 「不停」开关：有练习范围时锁掉 —— 范围会把题钉死成一题，
+  // 不停只会把同一道题反复跑（进度永远 0/1），所以那时只能跑一轮。
+  const ck=document.getElementById('ckContinuous'), ckw=document.getElementById('ckWrap');
+  if(ck){
+    const scoped=!!(window.__scope&&window.__scope.active);
+    ck.disabled = p.running||winding||scoped;
+    if(scoped){ ck.checked=false; }
+    ckw.className = 'runctl-ck'+(ck.disabled?' off':'');
+    ckw.title = scoped
+      ? '已设练习范围：题被钉成一道，不停只会反复跑同一题（进度永远 0/1）。清掉范围才能不停。'
+      : '同构原版 Voyager：主循环 while True，学习不带停，只有点停止 / 跑满上限才退。';
+  }
 
   document.getElementById('statusLine').textContent = s.has_data
     ? (s.reading_text||'')
@@ -953,21 +994,82 @@ function pVoyager(s){
   </div>`;
 }
 
+/* 循环心跳条 —— 读的是**另一个状态文件**（mve/loop_state.json，只有
+   voyager_vlml/loop.py 写）。为什么要分两个文件：面板状态记的是"人做了什么"
+   （谁点了启动/停止、pid 多少），循环状态记的是"循环自己跑到哪了"。写在一起
+   会互相覆盖 —— 循环每轮重写会把人刚点的 stop_requested 抹掉，面板为显示 pid
+   重写会把循环刚落的"这轮没取到数"抹掉。
+
+   这里最重要的职责是把「它没学会」和「链路根本没跑通」**分成两条可见的信息**：
+   —— 两种情况的处置完全相反，混成一句"没成功"会让人去改根本不用改的东西。 */
+function loopHealthBar(s){
+  const p=s.pilot||{}, lp=p.loop||{};
+  if(!lp || !lp.round) return '';      // 循环一次都没跑过 → 不喧宾夺主
+
+  const KIND={
+    linkage:{c:'bad', t:'链路没跑通',
+      d:'一次工具都没调成功 —— 不是"它没学会"，是**环境没转起来**。'
+        +'先查：库文件在不在、VLML 的 10 个工具装没装（看上面「数据源与数据库」）、'
+        +'mve/db_config.json 指的哪个库。改的是配置/依赖，不是它的水平。'},
+    empty:{c:'warn', t:'取到了 0 行',
+      d:'工具调通了但没数据 —— 这是**它**的问题（SQL 口径太严 / 题面在库里没这个数据），'
+        +'链路是好的。看下面日志里它写的 SQL 卡在哪个 WHERE 上。'},
+    unproven:{c:'warn', t:'判据没过',
+      d:'取到数了，但 critic 判定这些观察不构成有效证据（多半取到的是错误对象或空壳表）。'},
+  };
+  const k=KIND[lp.no_evidence_kind]||null;
+  const streak=+(lp.no_evidence_streak||0);
+  const chips=[
+    `第 ${ESC(lp.round)} 轮`,
+    lp.continuous?'不停（同构原版 while True）':`上限轮次`,
+    `进度 ${ESC(lp.progress||0)} 个里程碑`,
+    `工具 ${ESC(lp.tool_ok||0)} 成功 / ${ESC(lp.tool_fail||0)} 失败`,
+    `取到 ${ESC(lp.rows||0)} 行`,
+  ].map(t=>`<span class="chip grey">${t}</span>`).join('');
+  const warn = (streak>=3 && k)
+    ? `<div class="note ${k.c==='bad'?'bad':'info'}" style="margin-top:8px">
+         <b>⚠️ 连续 ${streak} 轮没拿到证据 —— ${ESC(k.t)}</b>
+         <div style="font-size:12px;color:var(--muted);margin-top:4px">${k.d}</div>
+         <div style="font-size:12px;color:var(--muted);margin-top:4px">
+           注：这只是观测，**循环不会因此停下**（设计：只有点停止能改变节奏）。
+           ${lp.rounds_since_progress?`距上次解锁里程碑已 ${ESC(lp.rounds_since_progress)} 轮。`:''}
+         </div></div>`
+    : '';
+  const err = lp.last_error
+    ? `<div class="legend mono" style="word-break:break-all;margin-top:6px">
+         最近一次工具错误：${ESC(String(lp.last_error).slice(0,300))}</div>`
+    : '';
+  return `<div class="panel" style="margin-bottom:10px">
+    <div class="panel__head"><h2>循环心跳</h2>
+      <span class="hint">mve/loop_state.json —— 循环写、面板只读，与驾驶舱状态分开</span>
+      <span class="chip ${lp.running?'ok':'grey'}">${lp.running?'循环中':'已停'}</span>
+      ${lp.updated_at?`<span class="chip grey">${ESC(String(lp.updated_at).slice(11,19))}</span>`:''}</div>
+    <div>${chips}</div>
+    ${lp.topic?`<div class="legend">当前题：<span class="mono">${ESC(lp.topic)}</span>`
+      +`${lp.generated?'（这题是它自己新生成的）':''}${lp.reason?` · ${ESC(lp.reason)}`:''}</div>`:''}
+    ${warn}${err}
+  </div>`;
+}
+
 function pConsole(s){
   const p=s.pilot||{};
   const log=ESC(p.tail||'（暂无日志）');
-  return `<div class="panel">
+  const cont=(p.rounds===0)||((p.loop||{}).continuous);
+  return `${loopHealthBar(s)}
+  <div class="panel">
     <div class="panel__head"><h2>驾驶舱</h2>
-      <span class="hint">面板只负责起停与读日志，进程状态写在 mve/pilot_state.json</span>
+      <span class="hint">面板只负责起停与读日志；进程状态 mve/pilot_state.json，循环状态 mve/loop_state.json</span>
       <span class="chip ${p.running?'ok':'grey'}">${p.running?'运行中':'未运行'}</span>
       ${p.job_label?`<span class="chip ${p.running?'ok':'grey'}">${ESC(p.job_label)}</span>`:''}
-      ${p.mode?`<span class="chip grey">${ESC(p.mode==='loop'?'连续自适应':'单题')}</span>`:''}
+      <span class="chip ${cont?'ok':'grey'}">${cont?'不停（跑完图谱 / 点停止才退）':'单轮'}</span>
       ${p.topic?`<span class="chip grey">${ESC(p.topic)}</span>`:''}
       ${p.iterations?`<span class="chip grey">已跑 ${p.iterations} 次</span>`:''}
       ${p.started_at?`<span class="chip grey">起于 ${ESC(String(p.started_at).slice(11,19))}</span>`:''}</div>
     ${p.why&&!p.running?`<div class="legend">${ESC(p.why)}</div>`:''}
-    <div class="note info">loop 模式：跑完一题会<b>再问出题器要下一题</b>，一直跑到你点停止。
-      选题权在出题器手里 —— 这就是「自己接自适应出题」。单题轮数是上限，判对即停。</div>
+    <div class="note info">学习循环<b>不带停</b>（同构原版 voyager.py:326 的 while True）：
+      跑完一题，课程从图谱里提下一题，一直跑到你点<b>停止</b>为止。
+      停止是<b>优雅停</b>——把手头这道题跑完、技能落盘后才退，不是硬杀。
+      选题权在里程碑课程手里（种子里程碑 → 树干推进），单轮上限只在你想"跑一轮看看"时用。</div>
     <div class="console">${log}</div>
     <div style="margin-top:10px">
       <button class="btn btn-secondary" id="clearLog">清空日志</button>
@@ -1735,7 +1837,12 @@ async function runJob(job, opts){
   opts=opts||{};
   const b=opts.btnId?document.getElementById(opts.btnId):null;
   if(b&&b.disabled) return;
-  const body={job:job, mode:opts.mode||'once', rounds:opts.rounds||3,
+  // ⚠️ rounds 的默认值必须是 **0（不停）**，不是 3。
+  //    写成 `opts.rounds||3` 时，传 0 会被 `||` 当成假值换成 3 —— 面板上勾了
+  //    「不停」，发过去的还是 3，一次启动只跑 3 道题就退出，29 个节点的图谱
+  //    根本跑不完（用户原话：「原 voyager 学习是不带停的；你现在三轮就结束了」）。
+  const body={job:job, mode:opts.mode||'once',
+              rounds:(opts.rounds!==undefined&&opts.rounds!==null)?+opts.rounds:0,
               units:+(opts.units||1), transfer:+(opts.transfer||0),
               use_scope:opts.use_scope!==false};
   if(b){ b.disabled=true; b.innerHTML='<span class="spin"></span>'+ESC(opts.busyText||'启动中…'); }
@@ -1757,10 +1864,15 @@ async function runJob(job, opts){
 }
 async function pilotStart(){
   // 没有难度 / 选题键钮了：选题由练习范围决定（伴学 onboarding.md:82）。
-  //   有范围 → once：把范围里最优的一题跑透（判对就停）
-  //   没范围 → loop：交给出题器连续自适应出题
+  //   rounds = 0 → **不停**（同构原版 voyager.py:326 的 while True：
+  //     学习循环不带停，只有点停止 / 跑满 --max-iterations 才退）
+  //   rounds = 1 → 只跑一轮看看
+  // 有练习范围时强制 1：范围把题钉成一道，不停只会把同一道题反复跑，
+  // 进度永远停在 0/1（pilot.py:_loop 里也有同一道闸，面板这里先锁掉开关）。
   const sc=window.__scope||{active:false};
-  await runJob('practice',{mode: sc.active?'once':'loop', rounds:3, use_scope:true,
+  const ck=document.getElementById('ckContinuous');
+  const rounds=(ck&&ck.checked&&!sc.active)?0:1;
+  await runJob('practice',{mode:'loop', rounds:rounds, use_scope:true,
     btnId:'runStart', btnText:'▶ 启动 Voyager', busyText:'启动中…'});
 }
 /* MC 思路学习 → 自动启动 MVE 全流程：
@@ -1785,8 +1897,13 @@ async function mcLearnThenRun(){
       {提炼原则:d.principles, 入库:d.store.mc_thinking_count, 密度:d.densities},
       'MC 思路学习完成，已入库');
     // 自动启动正常 MVE 全流程（标准练习循环）
-    await runJob('practice',{mode:(window.__scope&&window.__scope.active)?'once':'loop',
-      rounds:3, use_scope:true, btnId:'runStart', btnText:'▶ 启动 Voyager',
+    // 与「▶ 启动 Voyager」同一套规则：默认**不停**（rounds 0），
+    // 有练习范围时才退化成一轮（范围把题钉死，不停等于反复跑同一道题）。
+    const _ck=document.getElementById('ckContinuous');
+    const _sc=window.__scope||{active:false};
+    await runJob('practice',{mode:'loop',
+      rounds:(_ck&&_ck.checked&&!_sc.active)?0:1,
+      use_scope:true, btnId:'runStart', btnText:'▶ 启动 Voyager',
       busyText:'启动中…'});
   }catch(e){ alert('MC 学习失败：'+e); }
   finally{ if(b){ b.disabled=false; b.textContent='🧠 启动 MC 思路学习 → MVE'; } }
@@ -2430,7 +2547,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, pilot.start(
                 mode=str(payload.get("mode") or "once"),
                 topic="",
-                rounds=int(payload.get("rounds") or 3),
+                # ⚠️ 默认 0 = **不停**。写成 `or 3` 时，前端传 0 会被假值判断
+                #    换成 3 —— 「不停」开关勾了也只跑 3 道题（用户原话：「原 voyager
+                #    学习是不带停的；你现在三轮就结束了，图谱都没跑完」）。
+                rounds=int(payload.get("rounds") or 0),
                 use_scope=bool(payload.get("use_scope", True)),
                 # 三种任务：practice（练题）/ placement（摸底）/ learn（学习单元）
                 job=str(payload.get("job") or "practice"),

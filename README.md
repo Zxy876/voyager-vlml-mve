@@ -141,7 +141,7 @@ Voyager 的事实集 → evaluate_vs_referee() 比对 VLML0 裁判算出的标�
 | `biome` | 数据源（rib / vlgg / DB） | 世界是什么 |
 | `nearby_blocks` | **可见表**（按进度档解锁） | 现在能摸到什么 |
 | `other_blocks` | 其它见过的表 | — |
-| `nearby_entities` | 实体可填值（库里真实取值范围） | 实查，不手写 |
+| `nearby_entities` | 实体可填值（库里真实取值范围） | 实查，不手写；**⚠️ 只进面板，不进上下文**（见下） |
 | `inventory` | 当前实体锚点（series / team / map） | — |
 | `chests` | **已学会技能**（可复用 SQL 配方） | 技能库 |
 | `completed_tasks` | 已解锁里程碑（图谱节点已完成） | — |
@@ -167,10 +167,79 @@ curriculum.update_exploration_progress()  ← 跑通 → 解锁里程碑 + 挂 S
 
 **整条链里没有 VLML 判决、没有覆盖率、没有参考答案。** 那些只在面板上。
 
+### 循环节奏：不带停（同构原版 `while True`）
+
+取证：`voyager_original/voyager/voyager.py:326` 主循环是 `while True`，
+`run_voyager_learn.py:55` 的 `--max-iterations` 默认 160。原版里**没有
+"跑 N 轮就结束"这一说**。
+
+之前这里把 `rounds` 当硬上限、面板还写死 `rounds:3` → 一次启动只跑 3 道题就
+退出，29 个节点的图谱根本跑不完。人看到的就是「三轮就结束了，图谱都没跑完」。
+
+| 节拍 | 现在的行为 | 落地 |
+|---|---|---|
+| 进入下一题 | 自动课程从**图谱节点**提（种子 → 树干 → keystone） | `topic_graph.select_next` |
+| 跳过当前题 | 初试 + 重试 ≥3 次仍跑不通 → stale 换题（**带原因**） | `MasteryStore.add_failure/add_skip` |
+| 整轮结束 | **不结束**。一直跳过、进度不涨也不结束 | `run_rounds` 的 `while True` |
+| 范围内没可拿下的题 | **不断生成新任务**，且**先验题**（验不过就换，不记失败） | `_generate_new_task` |
+| 谁能改变节奏 | 只有「停止」（SIGTERM） | `_install_stop_handler` |
+
+停止是**优雅停**：收到信号后把手头这道题跑完、技能落盘再退（原版
+"exiting learn loop after current task"），不硬杀。
+
 ```bash
-python -m voyager_vlml.loop --rounds 5        # 跑 5 轮里程碑课程
-python mve/pilot.py                            # 或面板驾驶舱「练题」
+python -m voyager_vlml.loop --rounds 0                      # 不停（默认）
+python -m voyager_vlml.loop --rounds 0 --max-iterations 60   # 跑满 60 题退
+python -m voyager_vlml.loop --rounds 1                       # 只跑一轮看看
+python mve/pilot.py                                          # 或面板驾驶舱「练题」
 ```
+
+⚠️ 钉了具体知识点（`--topic`）时自动降级成 1 轮：不停只会把**同一道题**
+反复跑，进度永远停在 0/1。面板上「练习此知识点」就是这条路径，开关会自动锁掉。
+
+### 两个状态文件：循环写自己的，面板只写自己的
+
+| 文件 | 谁写 | 内容 |
+|---|---|---|
+| `mve/loop_state.json` | **只有** `voyager_vlml/loop.py`（每轮一次） | 第几轮、工具成功/失败几次、取到几行、连续几轮没证据、离上次解锁里程碑几轮 |
+| `mve/pilot_state.json` | **只有** `mve/pilot.py` | pid、谁点了停止、起停时刻、退出码 |
+
+面板**只读** `loop_state.json`。必须分家的原因：写在一起会互相覆盖 ——
+循环每轮重写会把人刚点的 `stop_requested` 抹掉；面板为显示 pid 重写会把循环
+刚落的"这轮没取到数"抹掉。
+
+### 环境反馈清单：什么进上下文、什么只进面板
+
+进**运行时上下文**（Voyager 靠这些决定下一步）：
+
+- 解锁里程碑（图谱节点已完成 —— 布尔，**不含评分**）
+- 已学会技能（可复用 SQL 配方）
+- 任务失败（带原因）、任务跳过（带原因）
+- 环境反馈本身：工具调用成功还是失败、这次取到几行、图谱因为这轮变了什么
+
+**只进面板**（绝不进上下文，走 `scene_context.panel_only()`）：
+
+- 当前实体在库里实际存在哪些取值（`series / team / map ∈ {…}`）
+- VLML 跑一遍得到的判定结果：得分 / 覆盖率 / verdict
+
+两条是同一个理由：那不是反馈，是**尺子**（后者）或**答案候选清单**（前者）。
+进上下文会把它的重心从"把这一题的取数做通"拉到"讨好尺子 / 枚举取值凑答案"。
+
+同理，场景档位（base 层 → ext 层）的门槛也是**已解锁里程碑数 ≥3**
+（`TIER_EXT_UNLOCKS`），不是掌握度 ≥0.8 —— 掌握度是评分结果，不能当披露条件。
+
+### 连续拿不到证据：不停，但要能分辨「没学会」和「链路没跑通」
+
+不带停的循环不能靠"失败就停"兜底，所以循环把每一轮的理由写进心跳，面板按
+`no_evidence_kind` 分成三种可见的诊断：
+
+| kind | 含义 | 该去改什么 |
+|---|---|---|
+| `linkage` | 一次工具都没调成功 | **链路没跑通**：库在不在、VLML 工具装没装、`db_config.json` 指的哪个库。改配置/依赖，跟"它没学会"无关 |
+| `empty` | 工具调通了但取到 0 行 | **它**的问题：SQL 口径过严、题面在库里没这个数据。去看日志里它写的 WHERE |
+| `unproven` | 取到数但 critic 判定不构成有效证据 | 多半取到了错误对象或空壳表 |
+
+连续 ≥3 轮时面板出告警条；**循环不因此停下**（设计：只有停止能改变节奏）。
 
 ---
 
@@ -641,7 +710,9 @@ self-verification：环境里任务目标真的达成 = 成功；95% 达成 = **
 | 失败即跳过换新任务 | `curriculum.py` "Skipping to next task" | 同构 |
 | `progress = 完成数` | `curriculum.py:80` | 照抄 |
 | warm-up 收放（支架档位） | `curriculum.py default_warmup` | **同构换维**：原版调"信息量"，MVE 调"支架档位" |
-| 同题重试上限 3 | 原版 `action_agent_task_max_retries=4` | **MVE 自定简化**，如实标注 |
+| 同题重试上限 3（`--iters`） | 原版 `action_agent_task_max_retries=4`（`voyager.py:30`） | **MVE 自定简化**，如实标注（原版是 4） |
+| **外层轮数**（一道题 = 一次 iteration） | 原版 `--max-iterations=160`（`run_voyager_learn.py:55`）+ 主循环 `while True`（`voyager.py:326`） | **MVE 不照抄**：面板驾驶舱给（默认 `--rounds 3`），loop 模式跑到人点停止 |
+| 选题 LLM 重试 | 原版 `propose_next_task(max_retries=5)` | MVE 未做（选题是确定性代码，不调 LLM） |
 | 迁移考核（exam transfer / final） | README "Run Voyager with a learned skill library"：`resume=False` | 照抄；MVE 用 vlr/rib 双源当"新世界" |
 
 ### B. 照猫娘伴学
@@ -796,7 +867,21 @@ vlml/data/raw_events       → raw_events_rib   （软链，管线只认这个�
 | **知识图谱** | 21 张表 / 46 洞察 / 实体可填值；人导入收录情况（建边不建节点） |
 | **MC 真实学习** | 对照实验（真实 / 空 / 打乱的记忆对照） |
 | **自适应练习** | 摸底 → 单元 → 进程 |
-| **运行日志** | 驾驶舱日志实时 tail（排障用，不进掌握度） |
+| **运行日志** | **循环心跳条** + 驾驶舱日志实时 tail（排障用，不进掌握度） |
+
+### 循环心跳条（运行日志页顶部）
+
+读 `mve/loop_state.json`（循环写、面板只读）。因为循环是**不停**的，它不会
+用"退出码"告诉你状态 —— 心跳是唯一的窗口：
+
+- 第几轮 · 不停还是单轮 · 进度几个里程碑 · 工具成功/失败几次 · 取到几行
+- 连续 N 轮没拿到证据时出告警条，并按 `linkage / empty / unproven` 给出
+  **不同的处置建议**（见第 3 章）
+- 最近一次工具错误原文
+
+另外驾驶舱顶上有个「**不停**」开关（默认勾上）。勾上 = `rounds 0`，同构原版
+`while True`；去掉 = 只跑一轮。设了练习范围时开关自动锁掉（范围把题钉死成
+一道，不停只会反复跑同一题）。
 
 ### 两条曲线必须分清楚
 
@@ -970,6 +1055,13 @@ systemctl restart mve-panel                                     # ← 必须！
 6. **出题器会被错题卡住。** 已有冷却闸与"没进展就毕业"机制，但仍会重现。
 7. **SQL 路径出题成功率约三分之一**，会被七道闸挡下并回灌，但三轮改不动的情况存在
    —— 那是模型能力问题，不是链路问题。
+8. **技能库还没换血。** 库里 11 条里 10 条是旧后端存下的**编排代码**
+   （`async def xxx_solve(mcp)`），不是设计要的"可复用 SQL 配方"。新练习线
+   （`voyager_vlml/loop.py`）存的已经是 SQL，但历史条目没迁移 —— 上下文里
+   「已学会技能」现在会同时列出两种形态。
+9. **不停循环有 60～90 秒的收尾窗口。** 点停止后面板立刻显示"正在收尾"，
+   但循环还在把手头那道题跑完（优雅停）。这段时间 `run_log` / 技能库**还在写**，
+   不是面板自己动了。启动闸会挡住这段时间内的重复启动。
 
 ---
 
@@ -985,6 +1077,10 @@ systemctl restart mve-panel                                     # ← 必须！
 | 求助后反而更糟（不调工具） | 求助把"做法"灌进去后模型直接写结论，不再取证 | 重做时只回灌做法，数值不回灌；加 `help_wasted` 标记 |
 | 掌握度几乎全是 None | 只在有证据的轮次落值，`dont_know` 不计 → 序列断续 | 没有证据 = `unassessed` + `mastery: None`，**不是 0%** |
 | 消费取到 85 行却"回答不出来" | 答案是一张表，压不进单值事实 → 整理器交白卷 | 改用原始数据 + 叙事洞察作答（见 4.3） |
+| **「跑三轮就结束了，图谱都没跑完」** | ① `rounds` 被当硬上限，面板写死 `rounds:3`、而且 `opts.rounds\|\|3` 把传进来的 0 换成 3 ② 常量写成 `if a.rounds > 1`，传 0 走单轮路径 ③ 原版 Voyager 根本没有"跑 N 轮"这个概念（`voyager.py:326` 是 `while True`） | `rounds<=0` = 不停 + `--max-iterations`；面板加「不停」开关并默认勾上；`\|\|3` 改成显式判 undefined |
+| 连跑 3 轮全是 `generated_new_task`，2 轮失败 | ① stale 沿前置链传染，4 个卡死堵死 9 个后继（29 节点 0 可选）② 新题**生成完不验题**就跑（`JOIN weapon_types` 表根本不存在）③ `runtime_{n}` 只在内存计数，重启回到 `runtime_1`，不同题共 id 互相叠账 | stale 前置视为"已放弃不再挡路"；新题**生成即验题**（同标准）且验不过不记失败；id 改 `runtime_<md5(题面)[:8]>` |
+| 模型把布尔列当字符串比（`round_won='win'` / `='team'`） | schema 只给**列名**不给类型和值，模型只能猜；VLML 自带的 `column_definitions.yaml` 只覆盖 3 张表 | schema 三要素：**每张表行数 + 列类型 + 一行真实样例**；空表明写"查它只会得 0 行" |
+| 问「每回合每角色平均击杀」取回 0 行 | 当前库 `agg_*` 是 0 行，真实数据在 `ext_player_round_stats`（2850 行）。只给表名列名时模型挑了名字更"正规"的空表 | 同上：带行数 + 有数据的表排前面（防截断把 ext_* 截没了） |
 
 **一句要记下的教训**：这些都不是"模型学不会"，是**链路断了**。
 区分二者的办法只有落盘验伪（`MVE_DEBUG_PROMPT=1` 看 prompt 原文），
