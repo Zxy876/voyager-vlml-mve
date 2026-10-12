@@ -2,67 +2,288 @@
 
 > **线上面板**：<https://43.161.203.50:8443/mve/>（腾讯云，无鉴权，任何设备直接打开）
 > **仓库**：<https://github.com/Zxy876/voyager-vlml-mve>
+> **最后更新**：2026-10-13（后端已换成 `voyager_vlml/`，消费线 `consume.py` 通了）
 
 一个跑得起来的原型，回答一个问题：**当"学习者"不是人而是 agent 时，
 一套给人用的学习机制还剩下哪些是能直接搬的？**
 
-数据层是 **VLML**（Valorant 电竞数据，21 张表 / 46 个洞察 SQL / 8 个 MCP 工具）。
-学习机制取自**猫娘伴学**（N.E.K.O `study_companion`）—— 它有成熟的知识图谱、
-掌握度与判分契约。被考察的学习者是 **Voyager** 式的 agent。
-
----
-
-## 一、对照旧原型：哪层继承、哪层替换、哪层新写
-
-| 层 | 判定 | 内容 |
-|---|---|---|
-| 数据源 / 使用场景 / 问题背景 | **原样继承** | Valorant 赛事数据、教练视角的洞察需求 |
-| 解决问题的方式与方案 | **替换件** | 整条链路换成 VLML：MCP 把模型直接连到数据库，要数字就查、不许猜，每条主张都有库里的记录支撑 |
-| Voyager 主代理亲历学习、积累技能 | **本轮新写** | 在 VLML 链路里反复做同一批题，把「怎么组合这 21 张表」沉淀成技能 |
-| 学习面板（衡量 Voyager 的进步） | **本轮新写** | 学习插件面板本来是给人用的；这里的学习者是 Voyager，学习内容只有一个标题：**洞察与分析瓦罗兰特的游戏数据** |
-| DriftCoach 旧原型的技术与实现 | **本轮不做** | 不做任何技术讨论，只做概念映射 |
+- 数据层 **VLML**（Valorant 电竞数据，21 张原生表 + 4 张 ext 表 / 46 个洞察 SQL / 10 个 MCP 工具：`query_sql` + `get_database_info` + 8 个报告工具）
+- 学习机制取自**猫娘伴学**（N.E.K.O `study_companion`）—— 它有成熟的知识图谱、掌握度与判分契约
+- 被考察的学习者是 **Voyager** 式的 agent
 
 一句话：**继承场景，替换链路，新写「agent 当学习者」这一层。**
 
 ---
 
-## 二、界面区域指认
+## 0. 三十秒看懂
 
-面板七个分区，逐个标注它属于哪一类（形态取自伴学，数据取自 MVE）：
+### 两条线，一套能力，两个判据
 
-| 分区 | 判定 | 依据 |
+| | **练习线**（`voyager_vlml/loop.py`） | **消费线**（`voyager_vlml/consume.py`） |
 |---|---|---|
-| 📈 概览（**判据区 / 掌握度区**） | 继承结构 + 新写内容 | 五档状态与 flags 徽标照 `ui_api.py`；内容换成 **Voyager 判据层的 success 轨迹**（self-verification，见八之十）+ **伴学掌握度独立评估**，两区分离：判据区驱动学习、掌握度区只做评估 |
-| 🎯 练习（出题器派发） | 继承结构 + 新写触发者 | 照伴学 `practice_scope`：人在图谱上钉范围，界面上只剩开始/停止；触发者变成「给 Voyager 出题」 |
-| ✍️ 人导入 | **替换** | 记忆与解释的供应方换成 VLML 与其系统 LLM，不是让 Voyager 跑 |
-| 🧭 轨迹（行动序列） | **新写** | 伴学没有「工具调用序列」这个概念 |
-| 🧠 技能 · 因果 | **新写** | 技能库是 Voyager 的；因果时间线与伴学 `root_fact_seq` 同构 |
-| 🕸 知识图谱 | 继承形态 + 新写内容 | 形态照伴学；内容是**从 VLML 实查出来的 212 个事实**，不依赖题目 |
-| 🖥 运行日志 | 工具性，非学习状态 | 只为排障，不进掌握度 |
+| 谁出题 | 里程碑课程（它自己推进） | **人写一句想问的话** |
+| 它做什么 | 自己出题 → 自己写 SQL → 取数 | **用已积累的能力回答**（复用配方 → 回填实体值） |
+| 成败判据 | `success` = **有没有真的从 DB 取到数** | 答没答出来（取到数 + 给出回答） |
+| 算不算分 | **不算覆盖率、不算掌握度** | **从这里开始算**覆盖率与掌握度 |
+| 判分给谁看 | 不给任何人（它自己看 DB） | **只给人看**，绝不回灌 Voyager |
+
+两条线共用同一套能力（技能库里的 SQL 配方 + 图谱节点），但**账本分开**：
+练习不判分，消费才判分。这是有意的——VLML 的尺子不能进 Voyager 的反馈环，
+否则它学的就是"讨好裁判"，不是"取到数"。
+
+### 掌握 = 能力集合的增长，不是分数
+
+> 用户定义（2026-10-13）：**「我问你一句，Voyager 答完了，之后这题就到他的
+> 能力里了；这就是掌握！」**
+
+所以掌握度 = `已掌握的能力项 / 该掌握的总量`（图谱节点 + 消费期新增项），
+**与覆盖率彻底拆开**：覆盖率只是"这次答得全不全"的质量分，
+不参与"这题算不算学会"。
+
+### 当前快照（2026-10-13 02:30，本地实测；服务器面板干净待跑）
+
+| 项 | 值 |
+|---|---|
+| 练习 `run_log.jsonl` | 27 条（新后端里程碑课程） |
+| 撤支架考核 `exam_log.jsonl` | 26 条 |
+| 消费 `coach_log.jsonl` | 8 条（其中 5 条 `voyager_consume`） |
+| 技能库 | 11 条（8 道旧题 + `map_win_rate_summit` + `vlml_first_blood` + 1 条消费期配方） |
+| 消费掌握度 | 2 / 30（分母 = 图谱 29 节点 + 消费期能力项 1） |
+| 面板 | 9 个分区，已部署在线 |
 
 ---
 
-## 三、组合：全系统唯一的数据契约
+## 1. 这一版相对旧原型：哪层继承、哪层替换、哪层新写
 
-Voyager 的产出不是一段话，是**事实集**：
+| 层 | 判定 | 内容 |
+|---|---|---|
+| 数据源 / 使用场景 / 问题背景 | **原样继承** | Valorant 赛事数据、教练视角的洞察需求 |
+| 解决问题的方式 | **替换件** | 整条链路换成 VLML：MCP 把模型直接连到数据库，要数字就查、不许猜 |
+| Voyager 亲历学习、积累技能 | **新写（已重写一遍）** | 见第 3 章：旧后端违反设计，2026-10-12 从原版 Voyager 重建 |
+| 人问一句 → 用它积累的能力回答 | **新写** | 见第 4 章：消费线 |
+| 学习面板（衡量 Voyager 的进步） | **新写** | 学习插件面板本来给人用；这里的学习者是 Voyager |
+
+---
+
+## 2. 系统全貌
+
+```
+                    ┌──────────── 人（面板 /mve/）────────────┐
+                    │  概览 · 练习 · 人导入 · 轨迹 · 技能·因果 │
+                    │  知识图谱 · MC 真实学习 · 自适应 · 日志  │
+                    └───────────────┬───────────────────────┘
+                                    │ /api/state（4 秒轮询）
+              ┌─────────────────────┴─────────────────────┐
+              │                                           │
+    ┌─────────▼──────────┐                    ┌───────────▼───────────┐
+    │  练习线 loop.py     │                    │  消费线 consume.py     │
+    │  curriculum 选题    │                    │  人问一句 → 找配方     │
+    │  question  出题     │                    │  回填实体值 → 取数     │
+    │  action    写 SQL   │                    │  VLML 独立取一遍       │
+    │  critic    DB 取证  │                    │  比对做法 → 叙事洞察   │
+    └─────────┬──────────┘                    └───────────┬───────────┘
+              │                                           │
+              └──────────────┬────────────────────────────┘
+                             │
+              ┌──────────────▼───────────────┐
+              │  env/vlml_mcp.py（VLML MCP） │  ← 10 个工具，只回指标不回叙事
+              │  DuckDB（vlml_vlr / vlml_rib）│
+              └──────────────────────────────┘
+```
+
+### 目录地图
+
+| 路径 | 是什么 |
+|---|---|
+| `voyager_vlml/` | **当前后端**。原版 Voyager 五步的 VLML 同构版（练习 + 消费） |
+| `voyager_vlml/agents/` | `curriculum`（选题）/ `question`（出题）/ `action`（写 SQL）/ `critic`（判成败） |
+| `voyager_vlml/env/vlml_mcp.py` | 环境层：把 VLML 的 10 个 MCP 工具包成 `{ok, tool, rows, error, data}` |
+| `voyager_vlml/control_primitives/` | SQL 原语（原版 control_primitives/*.js 的同构替换） |
+| `voyager_vlml/consume.py` | **消费线**：人问一句 → 用已积累能力回答 → 判分 → 进能力库 |
+| `mve/` | 面板与数据层：`dashboard.py`（前端+API）/ `panel_data.py`（聚合）/ `coach.py`（旧 VLML 解释通路） |
+| `mve/topic_graph.py` | 图谱节点 + 掌握度账本（伴学同构） |
+| `mve/knowledge_graph.py` | VLML 侧的 21 张表 / 46 洞察 / 实体可填值图谱 |
+| `mve/tasks.py` `planner.py` `exam.py` `learn.py` | 旧题库、出题器、撤支架考核、学习进程调度（考核线仍在这套上） |
+| `mve/vlml_source/` | 数据抓取：`vlr_client` / `rib_client` / `ingest` |
+| `voyager_original/` `study_companion/` | **只读参照**（原版取证用，不分发、不改） |
+
+---
+
+## 3. 练习线：在原版 Voyager 上重建的五步
+
+### 为什么要重建（旧后端违反了一条设计硬约束）
+
+旧后端（冻结在 `mve/voyager.py` + `mve/run_mve.py --llm`）的反馈骨架是：
+
+```
+Voyager 的事实集 → evaluate_vs_referee() 比对 VLML0 裁判算出的标准答案
+                 → verdict / covered / missing / coverage / score 全部回流进 Voyager 上下文
+```
+
+那等于**拿 VLML 跑通的答案标准给 Voyager 当反馈**。设计上 VLML 的判分
+只给人看（判分权不能进学习环，否则它学的是"讨好裁判"）。2026-10-12 按用户指令
+从原版 Voyager 重建，后端整体换成 `voyager_vlml/`。
+
+### 五步同构（用户指令原文 → 落地）
+
+| # | 用户指令 | 落地 |
+|---|---|---|
+| ① | MC 初始化携带的信息 → VLML 同构版里程碑 | `agents/curriculum.py` |
+| ② | control_primitives 的 JS 代码 → SQL 原语 | `control_primitives/sql_primitives.py` |
+| ③ | 在 voyager 环境里安装 VLML MCP 依赖（DB/RIB/VLGG） | `env/vlml_mcp.py` |
+| ④ | 迭代修正机制 prompt 里的语言 → SQL | `agents/action.py` + `agents/critic.py` |
+| ⑤ | 面板后置（先验证后端闭环） | `loop.py` 冒烟 |
+
+### MC 字段 → VLML 同构对照（这是"同构"的骨架）
+
+| 原版 Minecraft | VLML | 说明 |
+|---|---|---|
+| `biome` | 数据源（rib / vlgg / DB） | 世界是什么 |
+| `nearby_blocks` | **可见表**（按进度档解锁） | 现在能摸到什么 |
+| `other_blocks` | 其它见过的表 | — |
+| `nearby_entities` | 实体可填值（库里真实取值范围） | 实查，不手写 |
+| `inventory` | 当前实体锚点（series / team / map） | — |
+| `chests` | **已学会技能**（可复用 SQL 配方） | 技能库 |
+| `completed_tasks` | 已解锁里程碑（图谱节点已完成） | — |
+| `failed_tasks` | 失败 / 跳过（**带原因**） | — |
+| `"Mine 1 wood log"` | **VLML 种子里程碑**（树干起点、无前置） | 硬编码的第一题 |
+| —（新增） | 里程碑树 `seed / trunk / keystone` + 随机 (表,列) 最小单位 | MVE 自创 |
+
+### 闭环
+
+```
+curriculum.propose_next_task()     ← 里程碑树选题（种子 → 树干，已完成排除）
+        ↓
+question.generate(topic)           ← LLM 按里程碑节点出题（只出题面，不给答案）
+        ↓
+action.solve(question)             ← LLM 写 SQL → VLML MCP 执行
+                                      失败带 critique 迭代重写（最多 3 轮）
+        ↓
+critic.check_task_success()        ← 成败 = 有没有真的从 DB 取到数（不比标准答案）
+        ↓
+curriculum.update_exploration_progress()  ← 跑通 → 解锁里程碑 + 挂 SQL 技能指针
+                                             否则记失败/跳过（带原因）
+```
+
+**整条链里没有 VLML 判决、没有覆盖率、没有参考答案。** 那些只在面板上。
+
+```bash
+python -m voyager_vlml.loop --rounds 5        # 跑 5 轮里程碑课程
+python mve/pilot.py                            # 或面板驾驶舱「练题」
+```
+
+---
+
+## 4. 消费线：人问一句，Voyager 用已积累的能力回答
+
+> 用户指令（2026-10-13）：「现在学习这块已经做好了，消费能力这块咱也得做，
+> 就是人导入；写一句你想问的话。Voyager 会用它已积累的能力回答；
+> 然后底下 VLML 的解析（调了哪些工具、取到哪些事实）照旧披露。
+> **从这块开始来计算覆盖率和掌握度最好了**」
+
+### 六步流水线
+
+```
+① 归题（找评分点）→ 同题校验      归不上就派生 / 生成新题，尺子拿错要挡掉
+② 定评分点（dimension 名）        取数之前定好，**两边共用同一份**
+③ 找已学配方                      技能库里检索（两套 ID 不通，走词面匹配）
+④ 取数：复用配方 → 回填实体值      复用不成 → 现场写，如实标 reused=False
+⑤ VLML 独立取一遍（只取数不整理）   与 Voyager 那一路并列
+⑥ 比对两边的方法与做法 → 判分       一致度即覆盖率
+⑦ 叙事洞察 → 进能力库 → 掌握
+```
+
+### 4.1 复用的是**计算**，不是数值
+
+配方是以前学会的 SQL。**复用 = 把当前这句话里的实体值回填进配方的计算**
+（换队伍 / 换地图 / 换赛事），数值必须重新算。
+
+> 用户原话：「不把『记住数值』当作成功，而是从用方法取出数值的过程开始存技能。
+> **回填不存在的，只有更快的计算**」
+
+库里没有可用配方时降级到现场写 SQL，并**如实标注 `reused=False`**
+（"这题还没学会，是现做的"——不能假装用了能力）。
+
+⚠️ 回填前先判一件事：**配方算的量与这句话问的量是不是同一个量**。
+不是就不执行它、直接现场写。实测踩过：问"崩盘"（要连败），库里只有 K/D 配方，
+模型照样把 Cloud9 填进去产出一条 K/D 查询还自称"复用了配方"
+—— 数字错还能看出来，**量错了是方向错，比报错危险得多**。
+
+### 4.2 掌握 = 能力集合的增长（判据是"答没答出来"）
+
+```
+答完了（调通工具 + 取到数 + 给出回答）
+    → mark_completed（这题标记为已掌握）
+    → 这次的取数 SQL 存成可复用配方进技能库
+```
+
+**判据与覆盖率无关**：覆盖率算不算、算出来多少，都不影响"这题进不进能力库"。
+否则就是把 VLML 的判分塞回学习判定。
+
+⚠️ 归不上已有题时**照样进能力库**：按问句 md5 登记稳定能力项 `consume_<hash8>`
+（落 `mve/runtime_topics.json`）。**归不上题 ≠ 没答出来** —— 实测：取到 1334 行、
+回答完整，却因为归不上旧题库被判"没答出来，未进能力库"。
+分母同步 +1（图谱节点 + 消费期能力项），否则掌握度会灌过 100%。
+
+### 4.3 判分 = **直接比对两边的方法与做法**
+
+> 用户（2026-10-13）：「整理事实这个事情本来就是交给 LLM 的，如果在消费侧，
+> 直接比对 voyager 和 VLML 的方法和做法，算掌握度和曲线，进能力库，
+> 然后让 LLM 产出叙事洞察就好啦」
+
+**旧判法**（已废）：两边各自整理成 `{subject, dimension, value}` → 按
+`(subject, dimension)` 键比对 → 覆盖率。
+脆在"整理"这步：答案是一张表时压不进单值事实 → 两边都交白卷 →
+覆盖率落空 + 回答为空（**实测取到 85 行却显示"Voyager 回答不出来"**）。
+
+**新判法**：把两边的 SQL 与取到的结果摊开，让 LLM 判——
+是不是同一口径？Voyager 那一路有没有硬伤（除零 / 列名错 / 粒度错 / 方向反）？
+**一致度即覆盖率**。LLM 天生擅长这种语义比对，不需要先把结果压成键值。
+
+裁判侧因此**只取数、不整理**（`_referee_observations`），省掉两次最容易交白卷的调用。
+
+### 4.4 实测踩过的坑（每条都有证据，不是推断）
+
+| 坑 | 实测证据 | 修法 |
+|---|---|---|
+| **schema 里有空表** | rib 库 `agg_*` 全 0 行，数据在 `ext_player_round_stats`(2850 行)。模型看着 agg 表名更"正规"就去查 → 0 行 → 报"没取到数" | `schema_block` 带**每张表行数**，空表明写"查它只会得 0 行"；有数据的表排前面防截断 |
+| **答出来了却进不了能力库** | 1334 行 + 完整回答，面板显示"没答出来，未进能力库" | 按问句哈希登记能力项，归不上题照样进 |
+| **两边都 0 行判了 100%** ⚠️最危险 | Cloud9/Corrode 在当前库无数据，两边各 0 行、SQL 长得一样 → 判"口径一致 100%" | **任一 0 行不判分**。等于给"都没取到数"发满分，比报错危险 |
+| **voyager_sound 被冤枉** | 裁判自己多算 deaths 算成 K/D，Voyager 明明正确却判"有硬伤"（reason 里还写着"无硬伤"） | 强制判定顺序（先看 Voyager 自己那条 SQL）+ 一致性兜底 |
+| **叙事被 token 截断** | 1334 行让它讲，逐地图铺开，输出卡在半句上 | 限制 250 字 + 不许逐行罗列 |
+| **口径不同显示红色 0%** | 误导成"它能力不行"，实际是裁判跑偏 | 新增 `judged` 字段：口径不同 = "没真正判到"，显示灰标 |
+
+### 4.5 面板上怎么看
+
+- **人导入**分区：写一句话 → 交给 Voyager 回答（后台跑 1～3 分钟，有进度条）
+- 结果**落进导入历史**（不是只弹一次回执——后台执行后刷新就没了）
+- **消费进步曲线**：主曲线 = 累计掌握数（能力集合在变大），副线 = 一致度
+- **两边做法的比对明细**表：每次消费的 Voyager 行数 / VLML 行数 / 一致度 /
+  是不是同一个量 / 判据原文
+
+```bash
+python -m voyager_vlml.consume "每个回合中各个角色的平均击杀数是多少？"
+```
+
+---
+
+## 5. 数据契约：Voyager 的产出是**事实集**，不是一段话
 
 ```jsonc
 { "subject":   {"series": "2843069", "map": "Corrode", "team": "Cloud9"},  // 交叉键字典
   "dimension": "key_metrics.team.consistency.kast.num",                    // 指标名，可点号嵌套
   "value": 109, "unit": "count",
   "base":  109,                                                            // 分母，百分比类必须有
-  "scope":  {"rounds": 59, "confidence": "Strong"},                        // 借 VLML 算好的值
+  "scope":  {"rounds": 59, "confidence": "Strong"},
   "source": {"tool": "match_analysis_report", "section": "key_metrics"} }
 ```
 
-四个决定性的设计点（都有代码与出处）：
-
-| 点 | 为什么 | 实现 |
+| 设计点 | 为什么 | 实现 |
 |---|---|---|
-| `subject` 是**交叉键字典**不是字符串路径 | 实例里有 `mitch on Skye`、`Corrode R4` 这种多维交叉，字符串拼不出；且 `round:22` 里 22 是值不是键 | `loop_core.norm_subject()` 会把模型返回的字符串也归一成字典 |
-| 必须有 `base`，且**参与评分** | `insights_reference.md:130` 是硬规则：67% (16/24) 与 67% (2/3) 数值相同但不是同一个事实 | `base < min_base` 直接判缺失，**数值对也不算数** |
-| 能同时吃下两个极端 | `query_sql` 任意 SQL → `from_sql_result()`：一行一列 = 一个事实，只记结果不记这列属于哪张表；`pattern_detection_report` 聚合 → `from_key_metrics()`：每个 key 一个 dimension，scope 直接借 VLML 算好的 rounds/confidence，不自造 | JOIN、CASE、窗口派生列都不影响 |
-| diff 单元 = `(subject, dimension)` 对 | 与 rubric 的 key_points 做**覆盖率**比对，不是路径一致性比对——避免惩罚殊途同归 | `loop_core.fact_key()` |
+| `subject` 是**交叉键字典**不是字符串路径 | `mitch on Skye`、`Corrode R4` 这种多维交叉，字符串拼不出 | `loop_core.norm_subject()` 会把字符串也归一成字典 |
+| 必须有 `base`，且**参与评分** | 67% (16/24) 与 67% (2/3) 数值相同但不是同一个事实 | `base < min_base` 直接判缺失，**数值对也不算数** |
+| 吃得起两个极端 | `query_sql` 任意 SQL → 一行一列一个事实；报告工具聚合 → 每个 key 一个 dimension | JOIN / CASE / 窗口派生列都不影响 |
+| diff 单元 = `(subject, dimension)` 对 | 与 rubric 做**覆盖率**比对，不是路径一致性——不惩罚殊途同归 | `loop_core.fact_key()` |
 
 **判定次序（确定性层先跑，不调 LLM）**：
 
@@ -74,17 +295,16 @@ Voyager 的产出不是一段话，是**事实集**：
 判不了的点 → unjudgeable，不静默算对也不静默算错
 ```
 
-`confidence` 四档（`n≥100 Strong / 50-99 Moderate / 20-49 Weak / <20 Insufficient`，
-`insights_reference.md:122-127`）**由 `base` 直接算出**，落进确定性层，不用问模型。
+`confidence` 四档（`n≥100 Strong / 50-99 Moderate / 20-49 Weak / <20 Insufficient`）
+**由 `base` 直接算出**，落进确定性层，不用问模型。
 
-### 叙事性自然语言在哪、怎么声明不参与比对
+### 叙事在哪、怎么声明不参与比对
 
 | 位置 | 标记 |
 |---|---|
-| 解释输出区（VLML + 其 LLM 产出，人可覆盖） | `comparable: false` |
+| 解释输出区（VLML + 其 LLM 产出） | `comparable: false` |
 | Voyager 答卷末尾的 narrative 段 | `comparable: false` |
 | 出题器生成的题干 | 参与比对的是 key_points，不是题干文本 |
-| covered / missing points | `string[]`（评分点名字），不是散文，参与比对 |
 
 双重标记：机器可读 `{"narrative": {"text": "...", "comparable": false}}`
 ＋ 面板上人可读的「不参与比对」标签。这条边界 VLML 自己就画好了
@@ -92,20 +312,18 @@ Voyager 的产出不是一段话，是**事实集**：
 
 ---
 
-## 四、意图是对象，不是自由文本
+## 6. 意图是对象，不是自由文本
 
 出题器产出的是**对象**：`question + answer + key_points[] + rubric{评分点: 权重}
 + solution_steps[] + difficulty(1-5) + topic + target_topic_id`。
 
-**人工导入与出题器产出不是同一种结构**，两者被一个布尔量切开 ——
+**人工导入与出题器产出不是同一种结构**，被一个布尔量切开 ——
 伴学叫 `validated_target`（`practice_outcome.py:53-67`）：
 
 | | 人工导入 | 出题器产出 |
 |---|---|---|
-| key_points / rubric | 可以有（能从题干抽） | 有 |
-| 能批改出 verdict | 能 | 能 |
 | `validated_target` | **false** | true |
-| 计入掌握度 | **否**，强制 `insufficient_evidence` | 是 |
+| 计入掌握度 | **否** | 是 |
 
 ### 行动因果时间线
 
@@ -114,173 +332,108 @@ Voyager 的产出不是一段话，是**事实集**：
 
 | fact kind | 谁产生 | 进因果 | 进掌握度 |
 |---|---|---|---|
-| `control`（人导入：出题、给解释、改范围） | 人 | ✅ | ❌ |
+| `control`（人导入） | 人 | ✅ | ❌ |
 | `attempt`（Voyager 的编排与事实集） | Voyager | ✅ | ✅ |
 | `referee`（裁判判定） | VLML0 | ✅ | ✅ |
 | `narrative`（叙事产出） | LLM | ✅ | ❌ |
 
-没有这条线，人导入就等于什么都没发生。出题器读的是**时间线（因果）+ 掌握度（评分）**两者，
-不是只看分数。
+没有这条线，人导入就等于什么都没发生。出题器读的是**时间线（因果）+ 掌握度（评分）**两者。
 
 ---
 
-## 五、三档粒度 = VLML 展开的三种深度
-
-同一套结构，三种展开深度，不需要两套结构：
+## 7. 三档粒度 = VLML 展开的三种深度
 
 | 档 | VLML 展开到 | 面板位置 | 对应伴学 |
 |---|---|---|---|
-| 最粗 | 21 张表 / 45 个洞察 / 146 个工具段 = **212 个事实节点** | 知识图谱 | 知识图谱 |
+| 最粗 | 21 张表 / 46 个洞察 / 146 个工具段 = **212 个事实节点** | 知识图谱 | 知识图谱 |
 | 中 | 展开到记录，算出每个组合归档成类的掌握程度 | 练习范围 | 练习范围详情 |
 | 最细 | 完全展开，按组合评价 Voyager 每次给出的答案 | 概览 / 轨迹 | 判分 |
 
 图谱的关键性质：**212 个事实是先于题目存在的全集**（从 VLML 实查，不依赖 rubric），
-而不是题目派生出来的投影。新题没有图谱缓存时，按题干匹配仍能召回
-（`graph_topics.match_facts`）。
+不是题目派生出来的投影。
 
 ---
 
-## 五之二、出题器：自适应到什么程度（与伴学逐条对账）
+## 8. 出题器：自适应到什么程度
 
-### 先说结论：题面仍是硬编码的，但**难度梯度层已经在跑**
+### 结论：题面曾是硬编码的，但**难度梯度层在跑**，且新题能自动生成
 
-6 道题写死在 `tasks.py` —— `question` / `rubric` / `answer_spec` 是常量。
-`difficulty` 字段也是写死的（1/2/2/3/3/4），但它是**种子难度**，不是最终难度：
-出题器（`planner.py`）在**选哪一道**上自适应（优先级链 + 冷却闸 + 停滞毕业），
-`difficulty.select()` 又在**出到什么难度、给多少支架**上自适应 ——
-每次都算出 `difficulty_target` 与支架档位，并把推导过程打印出来（见八之三 ①）。
-题面本身要**自动生成**则走 `question_gen.py`（见下）。
+`tasks.py` 的 6 道题写死（`question` / `rubric` / `answer_spec`），
+`difficulty` 是**种子难度**不是最终难度。出题器（`planner.py`）在**选哪一道**上自适应
+（优先级链 + 冷却闸 + 停滞毕业），`difficulty.select()` 在**出到什么难度、给多少支架**上自适应。
 
 ### 与伴学的对账
 
 | 伴学 | MVE | 说明 |
 |---|---|---|
-| `select_practice_selection` 优先级链 retry>due>weak>blocked>recommended>default | **继承** | 每条都带 reason + explanation |
-| 82 个种子知识点 | **替换** | 6 道硬编码题（+ `question_gen` 自动生成的），每题 = 一个知识点 × 一个**种子**难度 |
-| `difficulty_policy.select` **算出**难度 2/3/4 | **新写（同构换维）** | 见下 |
-| 题目按 (知识点, 难度) **生成** | **已做（`question_gen.py`）** | 见下「自动生成题目」 |
+| `select_practice_selection` 优先级链 retry>due>weak>blocked>recommended>default | **继承** | 每条带 reason + explanation |
+| 82 个种子知识点 | **替换** | 6 道硬编码题 + `question_gen` 自动生成的 |
+| `difficulty_policy.select` 算出难度 2/3/4 | **新写（同构换维）** | 见下 |
+| 题目按 (知识点, 难度) 生成 | **已做** | `question_gen.py` |
 
 ### 自动生成题目：生成的是**配方**，不是答案
 
-> 我上一版在这里写的是「不做 —— LLM 生成的新题没有 answer_spec，
-> 裁判无从独立算出标准答案，硬边界」。**这个判断是错的**，下面这节是更正。
+> 上一版写的是「不做 —— LLM 生成的新题没有 answer_spec，裁判无从算出标准答案」。
+> **这个判断是错的。** 错在把「不能信模型给的答案数值」等同于「不能让模型出题」。
 
-错在把「不能信模型给的答案数值」等同于「不能让模型出题」。
-`loop_core.py:165` 确实写死了：expected 与 tolerance 只从服务端私有的
-`answer_spec` 读 —— 但这只禁止**信模型给的数**，不禁止**让模型出题**。
-
-正确做法：让 LLM 出的是**可执行的取数配方**（`answer_spec`：SQL，或
-工具 + 参数 + 取值路径），而不是答案数值。配方是可执行的 → 裁判跑一遍
-就从 VLML 拿到真值。实测：
+正确做法：让 LLM 出的是**可执行的取数配方**（SQL，或工具+参数+取值路径），
+配方是可执行的 → 裁判跑一遍就从 VLML 拿到真值。实测：
 
 ```
 [裁判 VLML0] series=2843069/team=Cloud9/map=Lotus · map_win_rate = 45.8 (base=24)
-             series=2843069/team=Cloud9/map=Lotus · rounds_won   = 11
 ```
-
-**裁判能独立算出自动生成题的标准答案** —— 硬边界不成立。
 
 #### 四段闭环（照伴学 `question_generate` + `question_validate`）
 
-| # | 伴学 | MVE | 文件:行 |
-|---|---|---|---|
-| 1 | `resolve_target_question_type` 题型由服务端定 | `_dim_specs()` 口径由服务端定（percent/count/ratio/label + 要不要分母），并**枚举维度**给模型挑 | `question_gen.py` |
-| 2 | `_normalize_question` LLM 出题面 + 答案 | `propose()` 出题面 + **取数配方**（禁写答案数值，写了判废） | 同上 |
-| 3 | `question_validate` **第二个 LLM** 判三布尔 | `validate()` **确定性验题**：跑得出吗 / 值非空吗 / 量纲对吗 / 重复吗 | 同上 |
-| 4 | `enforce_mapped_question_type` 强制改回 | `enforce()` 强制改回：维度、工具、参数、percent、分母 | 同上 |
+| # | 伴学 | MVE |
+|---|---|---|
+| 1 | 题型由服务端定 | `_dim_specs()` 口径由服务端定，并**枚举维度**给模型挑 |
+| 2 | LLM 出题面 + 答案 | `propose()` 出题面 + **取数配方**（禁写答案数值，写了判废） |
+| 3 | 第二个 LLM 判三布尔 | **确定性验题**：跑得出吗 / 值非空吗 / 量纲对吗 / 重复吗 |
+| 4 | 强制改回 | `enforce()` 强制改回维度、工具、参数、percent、分母 |
 
-第 3 步是 MVE 比伴学**强**的地方：伴学「答案是否被支持」是另一个模型的
-意见（所以它还得再加一致性标志防自相矛盾）；MVE 是数据事实，跑一遍就知道。
+第 3 步是 MVE 比伴学**强**的地方：伴学"答案是否被支持"是另一个模型的意见，
+MVE 是数据事实，跑一遍就知道。
 
 #### 验题的七道闸（每条都能复盘）
 
 | 闸 | 判什么 | 实测抓到过什么 |
 |---|---|---|
-| 维度在服务端声明里吗 | 不许发明口径 | 模型把**工具名** `pattern_detection_report` 当维度填 |
-| 题面与维度定义相关吗 | 伴学的 `relevant` | 问「强起局胜率」却填 `pattern_confidence`（置信度标签） |
+| 维度在服务端声明里吗 | 不许发明口径 | 把**工具名** `pattern_detection_report` 当维度填 |
+| 题面与维度定义相关吗 | 伴学的 `relevant` | 问"强起局胜率"却填 `pattern_confidence` |
 | 与已有题 (subject, dimension) 重复吗 | 不出重复的题 | `pistol_win_rate` × {series,team} 已有 |
 | 题内两个评分点重复吗 | 两个点写成同一条查询 | 两点 SQL 一模一样 |
-| 百分比口径给分母了吗 | 问胜率却取个数 | 只给 `pistol.num`=3，真值是 3/6=50% |
+| 百分比口径给分母了吗 | 问胜率却取个数 | 只给 `pistol.num`=3，真值 3/6=50% |
 | 算出来是合法百分比吗 | 0–100 | — |
-| 计数量纲超上限吗 | ≤ 全场总回合数 59 | `SUM(round_number)`=145 被当成「打了多少回合」 |
+| 计数量纲超上限吗 | ≤ 全场总回合数 59 | `SUM(round_number)`=145 被当成"打了多少回合" |
 
 #### 失败会回灌，而且是「错在哪 + 怎么改」
 
-伴学 `entry_tutor_question_entries.py:1885` 把上一轮的 `validation_failure`
-塞进 `generation_feedback`。MVE 同构，但多给一句**怎么改** —— 只报症状
-实测三轮都改不动（模型会换一种方式犯同一个错）：
+伴学只把 `validation_failure` 塞进 feedback。MVE 多给一句**怎么改** ——
+只报症状实测三轮都改不动（模型会换一种方式犯同一个错）：
 
 ```
 修法：SQL 里这些不是 `rounds` 的列：team_name。 rounds 表没有 team_name 列，
       筛队伍用 winning_team_name
-修法：按题面看，更可能是：eco_win_rate, map_win_rate, pistol_win_rate
 ```
 
-#### 服务端能补的就不废题（照伴学 enforce 的精神）
-
-模型漏写**格式**不该判废，口径归属本来就由服务端定：
-
-- 维度填错但配方对 → 按 `value_path` 反查维度改回来（实测把 `kast_pct` 纠正成 `pistol_win_rate`）
-- 工具名错 → 按图谱 `who_produces` 改回来
-- 必填参数忘传 → 从 `subject` 照签名补（`team` → `team_name`）
-- 百分比口径给了分母却没写 `percent` → 补 `true`
-- SQL 算出两列却忘填 `base_column` → 运行时补最后一列
-
-#### 调度：什么时候才生成新题（伴学 `weak_topic`）
-
-伴学答完一题后（`entry_tutor_answer_entries.py:174`）：
-`reason == "due_review"` → 复习旧卡；否则 → `action = "generate_question"`。
-
-MVE 补齐了这一层 —— 这正是「连着 10 次停在 50%、没有可推进的题了」的出口：
-
-```
-planner.py  all_stalled
-   → suggestion {about, focus_dimension, subject_key, difficulty, why}   ← 只选点，不调 LLM
-run_mve.py  看到 action=generate_question → question_gen.generate_adopt()
-   → 验过 → 落盘 generated_tasks.json → tasks.TASKS 自动合并
-```
-
-分工照伴学：**planner 只说清「练什么」，生成题面是 entry 层的活**。
-
-跑法：
-
-```bash
-python mve/question_gen.py --about "Cloud9 在 Lotus 图上的胜率" --difficulty 2 --adopt
-python mve/run_mve.py --no-gen      # 关掉自动生成
-```
-
-⚠️ 诚实的成功率：当前 LLM 走**工具路径**出题一次就能写对；走 **SQL 路径**
-时约三分之一能过（最常见的是把工具名当表名、或造一个不存在的列）。
-七道闸会把它挡下来并回灌，但三轮都改不动的情况确实存在 ——
-这是模型能力问题，不是链路问题。
-| `apply_readiness_policy`（拿不到证据不推进） | **继承** | |
-| `ordered_scope_topics`（错题、做过、难度、id） | **继承** | `tasks.next_topic` |
-| `practice_scope` 范围模式 | **继承** | |
-| 人导入的问题归到哪一题 | **继承** | `TOPIC_HINTS` |
-| — | **MVE 自创** | `RETRY_COOLDOWN` 冷却闸、`STALE_LIMIT` 停滞毕业、`tool_coverage` 分支、`all_stalled` 如实报告 |
+⚠️ **诚实的成功率**：走**工具路径**出题一次就能写对；走 **SQL 路径**约三分之一能过。
+七道闸会挡下来并回灌，但三轮都改不动的情况确实存在——那是模型能力问题，不是链路问题。
 
 ### 梯度怎么落地的：同构换了一维
 
-伴学是「同一知识点，难度 2 → 3 → 4」（**题变难**）。MVE 的题难度写死，
-且没有「同一知识点的更难版本」，所以伴学那句 `retry → difficulty -= 1`
-在 MVE 里**无处落地**。同构关系换一维：
+```
+伴学：同一知识点，难度 2 → 3 → 4（题变难）
+MVE ：同一道题，支架 full → partial → none（题不变，扶得越来越少）
+```
 
-    伴学：同一知识点，难度 2 → 3 → 4（题变难）
-    MVE ：同一道题，支架 full → partial → none（题不变，扶得越来越少）
-
-支架只改 **prompt 给多少**，不改 `answer_spec` —— 所以评分点不变、
-裁判照样判、掌握度照样算。这是它能成立的原因。
+支架只改 **prompt 给多少**，不改 `answer_spec` —— 所以评分点不变、裁判照样判。
 
 | 档位 | 给什么 |
 |---|---|
 | `full` | ★ 声明口径路径 + critic 回灌真实候选路径 + 聚焦后的结构文档 |
 | `partial` | 聚焦结构文档，不给 ★、不给候选 |
 | `none` | 不聚焦、不给 ★、不给候选 |
-
-判据照伴学逐条同构：错题 / 停滞 / 拿不到证据 → 给足；证据不足 → 给足；
-覆盖率 100% → 放开；连对两题 → 收一档；连错两题 → 加一档；掌握度 ≥0.80 → 放开。
-另加一条 MVE 自创的硬约束：**库里没有可复用的程序就不收支架** ——
-收了不是提高难度，只是让它重犯老病。
 
 A/B（同一道题、同一输入，走不带技能库复用的干净通道）：
 
@@ -290,72 +443,65 @@ A/B（同一道题、同一输入，走不带技能库复用的干净通道）�
 | `partial` | 1.0 ❌ | 1.0 ❌ |
 | `none` | 100.0（形态错） | 1.0 ❌ |
 
-→ **支架不是摆设**：撤掉就回到「把 num/denom 的套路套到标量上」的老病。
+→ **支架不是摆设**：撤掉就回到"把 num/denom 的套路套到标量上"的老病。
 
-全局目标难度（MVE 自创，伴学无同构物）：`目标 = 1 + 已满分题数`，clamp [1,4]；
-挑题按 `|题目难度 − 目标|` 最近。跑 `--next` 或看面板能看到
-「题目 2 → 目标 4（已拿下 4 道）」与支架档位。`--hint=full|partial|none` 可强制档位做 A/B。
+另加一条硬约束：**库里没有可复用的程序就不收支架** —— 收了不是提高难度，只是让它重犯老病。
+
+### 同构生成测试题：`mve/gen_testset.py`
+
+照会议纪要：「测试题目均从已跑通的项目中同构生成，仅替换赛事编号、成员名称等数据，
+题目逻辑严谨，不存在不合理的泛化要求。」
+
+```
+python mve/gen_testset.py --topic fb_conversion_analysis   # 生成一道
+python mve/gen_testset.py --all                            # 全部题
+```
+
+做法（**确定性，不经模型**）：
+
+1. 取源题（已跑通）的逻辑骨架 = rubric 评分点 + answer_spec（服务端私有）
+2. 从当前库实查目标实体：新 series（回合数最多且 ≠ 源）、该 series 的 team / map
+3. 同构替换 subject / question / SQL 引号内实体值 / tool_args —— **只换数据，不换逻辑**
+4. 跑 VLML0 裁判校验：每个评分点的 dimension 都要在标准答案 facts 里出数才算成立
+
+实测（vlr/rib 双库）：**7/7 全部成立**（series=1067，维度覆盖 100%）。
 
 ---
 
-## 五之三、人导入文本 → 生成解释 → 影响出题（与伴学对账）
+## 9. 人导入 → 生成解释 → 影响出题（与伴学对账）
 
 ### 伴学这条链怎么走
 
-1. 人录入文本（粘贴 / 导入 / OCR）→ `study_explain_text`（`entry_tutor_explain_entries.py:169`）
+1. 人录入文本 → `study_explain_text`
 2. LLM 生成解释（`concept_explain`）
 3. 导入的**材料**经 `MaterialTopicMapper` 映射到图谱里**已存在**的知识点
-   （`material_topic_mapper.py:227`：映射到不存在的 topic 一律 rejected）
+   （映射到不存在的 topic 一律 rejected）
 4. 这些知识点成为练习范围 → 出题器按 `weak_topic` 出题
-5. **归不上时**：提示人去图谱里选一个知识点（`ui.practice.baseline_topic_prompt`）
+5. 归不上时：提示人去图谱里选一个知识点
 
-注意第 3 步：**伴学也不是从文本凭空长出新知识点，而是映射到已有知识点**。
+注意第 3 步：**伴学也不是从文本凭空长出新知识点，而是映射到已有知识点。**
 
 ### MVE 的对应
 
 | 环节 | 伴学 | MVE | 状态 |
 |---|---|---|---|
 | 录入文本 | `study_explain_text` | `coach.explain()` | ✅ 同构 |
-| 生成解释 | `concept_explain`（LLM） | VLML 取数 + `narrator` 出解释 | ✅ 同构 |
+| 生成解释 | `concept_explain` | VLML 取数 + `narrator` 出解释 | ✅ 同构 |
 | 解释写进记录 | learning record | `causal_timeline` CONTROL fact | ✅ 同构 |
 | 归到已有知识点 | `MaterialTopicMapper` | `infer_topic()` | ✅ 同构 |
-| 记录影响出题 | practice_scope / weak_topic | planner `human_focus` | ✅ 已通（实测推荐理由就是 human_focus） |
-| **归不上时** | 提示人选知识点 | **原本断线**（topic_id 空 → 出题器跳过） | ✅ 本轮补上 |
-
-### 本轮修的两个断口
-
-**断口一：`infer_topic` 漏了后加的题。**
-手写表 `TOPIC_HINTS` 里没有 `kast_adr_check`（加题时漏补），
-实测「Cloud9 这场比赛的 KAST 是多少」直接归不上 —— 题库里明明有这道题。
-改成**从 TASKS 自动派生**（`_auto_hints()`）：
-
-```
-kast_adr_check  ← kast, pct, ratio, k/d      （dimension 词干 + point 里的缩写）
-series_totals   ← rounds, total, won
-```
-
-手写表优先（人工精修的更准），自动派生作兜底且要求 ≥3 字符
-（长度闸只管自动派生 —— 手写的中文单字「崩」也是有效关键词）。
-
-**断口二：归不上就断线。**
-`coach.explain()` 加了 `auto_task`：归不上已有题时，拿这段文本去
-`question_gen` **生成一道新题**，成功就写进 `TASKS` 并挂到 control fact 上，
-出题器于是看得见。这比伴学多一条路 —— 伴学只能让人去选，MVE 能自己长出一道。
-生成失败也**不影响解释照常返回**（人看到的内容不受影响）。
+| 记录影响出题 | practice_scope / weak_topic | planner `human_focus` | ✅ 已通 |
+| **归不上时** | 提示人选知识点 | 生成一道新题（比伴学多一条路） | ✅ 已补 |
 
 ### 收录判据：不是"图谱里有没有同名维度"
 
-v1 的做法是「匹配不到就往图谱加一个维度节点」，被实测推翻了 ——
-**建谱依据本身就是错的**：
+v1 的做法是「匹配不到就往图谱加一个维度节点」，被实测推翻 —— 建谱依据本身就是错的：
 
-- 图谱的 `dimension` 层只有 15 个节点，全部从 `TASKS[].rubric` 反推
-  （`tasks.py:361` 明写"出过题的才进图"）。人问的新方向在这层**天然没有落点**。
-- 而 `insight` 层（VLML 的 46 个 SQL 洞察，各自声明了读哪些表、被哪些报告工具
-  composes）是**完全覆盖**的 —— 这才是"表展开到工具集那层"。
-- 实测最要命的一条：**`dim` 与 `insight` 之间一条边都没有**。两层根本没连起来，
-  这才是「VLML 答得出但匹配不到图谱」的真正根因 —— 不是缺节点，是缺边。
+- `dimension` 层只有 15 个节点，全部从 `TASKS[].rubric` 反推（"出过题的才进图"），
+  人问的新方向在这层**天然没有落点**
+- 而 `insight` 层（VLML 的 46 个洞察 SQL，各自声明读哪些表）是**完全覆盖**的
+- 实测最要命的一条：**`dim` 与 `insight` 之间一条边都没有**。不是缺节点，是缺边
 
-所以 v2 的判据改成（`knowledge_graph.coverage_of`）：
+所以 v2 的判据（`knowledge_graph.coverage_of`）改成：
 
 ```
 人问的题 → VLML 真跑一次取数 → 拿到真实 SQL / 工具 / 表
@@ -367,471 +513,318 @@ v1 的做法是「匹配不到就往图谱加一个维度节点」，被实测�
 
 | 边 | 含义 |
 |---|---|
-| `insight:I --application--> table:T` | 这个洞察在这张表上被实际应用过一次（伴学 `application`，焦点在 from 端） |
-| `tool:X --composes--> insight:I` | 该工具这次确实用了这个洞察（补声明里没写的） |
-| `insight:A --co_occurs--> insight:B` | 同一道题要求这两个洞察一起用（对称，同题共现） |
+| `insight:I --application--> table:T` | 这个洞察在这张表上被实际应用过一次 |
+| `tool:X --composes--> insight:I` | 该工具这次确实用了这个洞察 |
+| `insight:A --co_occurs--> insight:B` | 同一道题要求这两个洞察一起用 |
 
 两点工程约束，都是实测逼出来的：
 
-1. **必须限流**。一次问「回合胜率」用到 `rounds + games` 两张主干表，46 个洞察里
-   36 个都读它们 —— 不限流一次导入就落 **168 条边**，直接爆掉伴学
-   `GraphBudget.max_edges=30`。改成取**最小覆盖集**：按覆盖度排序只留前 3 个（168 → 12）。
-2. **覆盖要在合并时重算**。图谱重建补齐 insight 层后，落盘时判成 `table` 级的旧
-   记录会自动升级到 `insight` 级（判据输入都存在记录里，重算是免费的）。
+1. **必须限流**：一次问"回合胜率"用到 `rounds + games`，46 个洞察里 36 个都读它们
+   —— 不限流一次导入落 **168 条边**。改成取**最小覆盖集**（前 3 个，168 → 12）
+2. **覆盖要在合并时重算**：图谱重建后，旧记录会自动升级判据级别（重算是免费的）
 
-出题器相应加了**候选来源 2**：`_graph_blueprint()` 除了翻 `dim:` 节点，也翻人导入
-落的边（`source=human_link`，带 `seed_question` / 表 / 列 / 骨架）。于是
-**即使验题没过、题没进题库，人的方向照样驱动出题** —— 这是 v1 建节点方案给不了的。
+### 图谱的四层组织（照搬伴学）
 
-### 图谱的四层组织：阶段 → 学科 → 章节 → 知识点（照搬伴学）
+| 伴学 | MVE 映射 |
+|---|---|
+| **stage**（学段 = 梯度） | **工具集梯度**：`raw` → `agg` → `insight` → `tool` |
+| **subject**（学科） | **实体域**：选手 / 地图 / 团队 / 赛事，可填具体值 |
+| **chapter**（章节） | **主题域**：首血 / 经济 / 手枪局 / 连败 / 爆弹 / 模式识别 |
+| **topic**（知识点） | 维度节点 = VLML 对数据的建模 |
 
-伴学 `static/knowledge_seeds/math.json` 实测的层级：
+两个坑：
 
-| 伴学 | 取值 | MVE 映射 |
-|---|---|---|
-| **stage** | 学段 primary/junior_high/senior_high/college（**梯度**） | **工具集梯度**：`raw`(原始事件表) → `agg`(派生聚合) → `insight`(洞察 SQL) → `tool`(报告工具) |
-| **subject** | 学科（11 个 seed 文件） | **实体域**：选手 / 地图 / 团队 / 赛事，**且可填入具体值**（赛事号 / 团队名 / 选手名） |
-| **chapter** | 学科内章节（math 一个学科就 37 个） | **主题域**：首血 / 经济 / 手枪局 / 连败 / 爆弹 / 模式识别 |
-| **topic** | 知识点 | 维度节点 = VLML 对数据的建模 |
-
-两个必须点明的坑：
-
-1. **语义错位（已修）**：此前 `chapter` 存的是 `LAYER_LABEL`（主干表/派生表/聚合表），
-   那其实是**梯度**，占着伴学 `stage` 的位。现在 stage 接手梯度，chapter 回主题域。
-2. **学科的值必须实查，不能手写**：`entity_catalog.py` 连库把 series / team /
-   map / player 的实际取值查出来落盘，图谱只读缓存（不连库，面板要秒开）。
-   手写一张清单换一次库就全错。
-
-### 数据源实测
-
-| | GRID 切片（`vlml_events.duckdb`，key 已过期） | **vlr.gg（`vlml_vlr.duckdb`，现在用这个）** |
-|---|---|---|
-| 赛事 series | `2843069` → **1** | 8 场系列赛 → **8** |
-| 团队 team | Cloud9、NRG → **2** | 100T / C9 / ENVY / EG / FUR / G2 / KRÜ / LEV / LOUD / MIBR / NRG / SEN → **12** |
-| 地图 map | Corrode、Haven、Lotus → **3** | Ascent/Breeze/Haven/Lotus/Split/Summit/Sunset → **7** |
-| 选手 player | **10** | **60**（vlr 的聚合统计，见下） |
-| 回合数 | 59 | **438** |
-
-GRID 那个库是**单场系列赛切片**（298 事件 / 59 回合 / 3 场），查不到别的赛事，
-"换赛事"这条迁移轴当时根本没有数据支撑。接 vlr.gg 之后这条轴才活过来。
-
-换库：写 `mve/db_config.json` 的 `db_path`（`vlml_env.py:52` 打了补丁，VLML
-工具里写死的默认库会被换掉），然后 `python mve/entity_catalog.py` 刷新目录。
-
-出题器以前把 subject 取值权交给模型（`subj[k] = "?"`），于是永远只出 Cloud9 /
-2843069 那一道。现在每个可填值都是一个独立候选 —— 实测出题点已经能挑到
-`team=NRG`（换队伍 = 迁移）、`map=Corrode`（换地图）。
+1. **语义错位（已修）**：此前 `chapter` 存的是 `LAYER_LABEL`（主干表/派生表），
+   那其实是**梯度**，占着伴学 `stage` 的位
+2. **学科的值必须实查**：`entity_catalog.py` 连库把实际取值查出来落盘，
+   图谱只读缓存。手写一张清单换一次库就全错
 
 ### ⚠️ 2026-10-08 纠了一次方向：赛事号 / 团队名**不是**"学科"
 
-上一版把它做成「学科登记册」（人填赛事/战队 → 条目归属到该学科下）。用户指出：
-「学科下的这些知识点/这些工具集都是一样的啊，没有必要填完学科之后自己再整理工具集呀」
-—— 去伴学取证，这条批评是对的，`entry_tutor_question_entries.py:1043-1051`：
-
-```python
-topics = store.list_topics(
-    5000,
-    scope.subject or None, scope.stage or None,
-    chapter=scope.chapter or None, unit=scope.unit or None,
-    course_family=scope.course_family or None,
-)
-```
-
+去伴学取证，这条批评是对的（`entry_tutor_question_entries.py:1043-1051`）：
 **subject / stage / chapter / unit / course_family 全是 `list_topics` 的筛选参数，
-不是知识点身上的层级归属。** 知识点库是共享的一份，换这些只是"筛哪些出来练"，
-知识点与工具集本身**不重建**。所以正确的映射是：
+不是知识点身上的层级归属。** 知识点库是共享的一份，换值只是"筛哪些出来练"，
+知识点与工具集本身**不重建**。
 
 | MVE 的东西 | 伴学对应 | 性质 |
 |---|---|---|
-| 赛事号（系列赛 / 来源版本） | `course_family`（哪套教材） | 作用域**筛选参数**，知识点共享 |
-| 团队 / 选手 / 地图的具体值 | `_semantic_routing.py:149` 的 `entity`（`"max 120 chars; empty when absent"`，**不在 topics 表里**） | 运行期取数参数，**不进知识结构** |
+| 赛事号 | `course_family`（哪套教材） | 作用域**筛选参数** |
+| 团队 / 选手 / 地图的具体值 | `_semantic_routing.py:149` 的 `entity` | 运行期取数参数，**不进知识结构** |
 | 接的是哪个库 | 伴学没有对应物 | MVE 自己的 `data_source` |
 
-于是 `subjects.py` 的定位从"学科登记册"改成**可填值清单**：提供筛选候选，
-并记下"这条目这次是在哪个范围下跑出来的"。换值不重建工具集 —— 实测换到
-vlr.gg 库后：**维度仍 15、工具仍 9**（一个没变），只是可填值从 2/3/1 涨到
-**12 队 / 7 图 / 60 选手 / 8 赛事**。
+实测换到 vlr.gg 库后：**维度仍 15、工具仍 9**（一个没变），
+只是可填值从 2/3/1 涨到 **12 队 / 7 图 / 60 选手 / 8 赛事**。
 
-用户要求：「mcp 接入公开数据源（类似 grid 但不是 grid）后学科可以是自己填写的；
-到时候 vlml 或者 voyager 跑完增加到该学科下的条目就有了归属」。
-
-先去两边取证，再动手：
-
-**伴学侧**（`study_companion/`）
-
-| 取证位置 | 结论 |
-|---|---|
-| `store.py:1504-1506` | `subject = CASE WHEN topics.source='seed' THEN topics.subject ELSE excluded.subject END` —— **seed 的学科锁死，运行期条目的学科可写可改**，条目就是这样挂到学科下的 |
-| `store.py:1498, 1538` | 字段表里有 `course_family`（课程族），且 seed 空了可补 → **数据源 = 伴学的课程族**，与学科是两个独立字段 |
-| `_semantic_routing.py:23` | `ALLOWED_SUBJECTS` 是硬编码 frozenset（11 学科 + unknown），路由层强制白名单 → 伴学的学科是**预置枚举** |
-
-**VLML 侧**（换公开数据源要动哪一层）
-
-| 取证位置 | 结论 |
-|---|---|
-| `database/scripts/ingestion/download_raw_events.py:140` | 落盘结构 `data/raw_events/{year}/{tournament}/{series_id}.jsonl` |
-| `database/scripts/ingestion/parsers.py:29` | **`series_id = file_path.stem`（文件名即 id）**，year / tournament 取目录名 |
-| `database/scripts/ingestion/load_data.py` | 扫 `*.jsonl` → `process_series_bulk`，**幂等**（跳过已加载 series） |
-| `database/scripts/orchestration/run_pipeline.py` | 建表 → 载原始 → 跑变换 → 校验，四步串起来 |
-| `src/vlml/client/grid_client.py:11` | `GRIDClient(api_key, api_url)` —— 数据源就这一层，**换成别的公开源只要产出同构 jsonl，下游全不用改** |
-
-所以通路是：换掉 GRID 那一层下载器 → 文件按 `.../{year}/{tournament}/{series_id}.jsonl` 落盘 →
-`run_pipeline` 增量入库（幂等）→ 新赛事自动出现在 `series` 表 → 人在面板填（或一键同步）成学科
-→ VLML / Voyager 跑出的条目挂进去。
-
-**MVE 的实现**：新增 `mve/subjects.py`（登记册落盘 `subjects.json`）
-
-- `register(kind, value)` 人填一个学科；`sync_from_catalog()` 把库里实查到的值登记成「实查」
-  —— **人填的不会被同步覆盖**（同构伴学 `source='seed'` 那条 CASE）
-- 归属判据：条目 SQL 里的实体字面量（`team_name='NRG'` / `series_id='2843069'`）+
-  出题器显式传的 `subject={"team":…}`，去登记册里找同类别同值的学科
-- **`course_family` 归位**：此前 `knowledge_graph.py:2405` 写死 `d["subject"] = "vlml0"`，
-  把学科位被数据源占了（四层改造漏改的半步）。现在数据源回 `course_family`，
-  学科位回到赛事 / 团队 / 选手
-
-**实测（本地）**
-
-```
-1) 导入一条题（实体 Fnatic，登记册里还没有）→ 收录 True，归属 []  → 未归属 1 个
-2) 面板填学科 team=Fnatic                                        → {"ok":true,"moved":1}
-3) 重建图谱 --build（merge 重算归属）                              → Fnatic 下 1 个条目，未归属清空
-```
-
-也就是说：**先跑出条目、后填学科也成立** —— 填完当场把没归位的旧条目补挂上去
-（`_merge_imported_links` 每次合并都重算，判据输入都在记录里，重算是免费的）。
-
-⚠️ 与伴学**故意不同的一点**：伴学的学科是预置枚举（白名单校验），MVE 这里**不做白名单** ——
-数据源是会换的，预置枚举必然腐坏。代价是人填的值若在数据源里没有对应数据，
-这道题跑不出数值，会被验题闸拦下（不会混进题库）。
+⚠️ 与伴学**故意不同**：伴学的学科是预置枚举（白名单校验），MVE **不做白名单** ——
+数据源会换，预置枚举必然腐坏。代价是人填的值若库里没数据，题跑不出数值，
+会被验题闸拦下（不会混进题库）。
 
 ### 诚实的限制
 
-- **覆盖不到就不收**：表不在图谱里（或 SQL 里解析不出表）→ `adopted=False`，
-  如实返回、不建节点、也不据此出题。伴学同款：映射不上不硬造，交回人处理。
-- ~~**题一旦被采纳进题库，照旧会派生出 `dim:` 节点**~~ （2026-10-08 已改，见
-  「维度层不由题目派生」）：运行期题的维度先解析到已有维度，解析不到就**不建节点**，
-  只登记待审候选（照伴学 `knowledge_tracker.py:1555`）。服务器实测维度 **16 → 15**。
-- **验题闸仍然是硬门槛**：实测同一条导入第一次 **2/2 全被闸 0b（题面与维度相关）**
-  拦下 —— 原因是没有 dim 节点时 `desc` 退回英文原名，中文题面对英文维度 token
-  零重合。已修（`desc` 用人的原话），但这类门禁失败仍会正常发生。
+- **覆盖不到就不收**：`adopted=False` 如实返回、不建节点、也不据此出题
+- **运行期题的维度不建节点**：先解析到已有维度，解析不到就**不建节点**，
+  只登记待审候选（照伴学 `knowledge_tracker.py:1555`）
+- **验题闸仍是硬门槛**：实测同一条导入第一次 2/2 全被"题面与维度相关"闸拦下
 
 ---
 
-## 八之八、GRID 过期之后：接 vlr.gg 公开源（2026-10-08）
+## 10. 知识图谱：把 VLML 的建模声明写进节点并持久化
 
-GRID 要付费 key，过期就没得下。实测了几个候选：
+伴学的 457 个知识点每个自带 19 个字段（难度、题型、先修、典型错法…），
+出题器读节点声明定题型与口径，模型只写题面。MVE 这边一度 `pk` 是空数组、
+列只有名字没有含义。
 
-| 源 | 实测 | 结论 |
-|---|---|---|
-| **vlr.gg** | `HTTP 200`，赛事/赛程/比赛页都能公开抓 | ✅ **选它**，无需 key |
-| PandaScore | `HTTP 403`（要 token） | 要注册 |
-| henrikdev | `HTTP 401` | 现在也要 key 了 |
-| esport.is | 空响应 | 用不了 |
+VLML 里同层的"作者声明"一直都在，就在 `database/` 下四份建模文档：
 
-**做法：只换"下载那一层"**（`mve/vlml_source/`），下游一行不改：
-
-```
-vlr_client.py    抓 vlr.gg（赛事 → 赛程 → 比赛详情），标准库解析（不装 bs4）
-vlr_to_grid.py   翻译成 GRID 形态的 jsonl
-ingest.py        CLI：抓 → 落 jsonl → 跑 VLML 原管线入库 → 建聚合统计表
-```
-
-落盘位置照 GRID 的约定 `data/raw_events/{year}/{tournament}/{series_id}.jsonl`
-（`parsers.py:29`：**series_id 就是文件名**），于是 `load_data.py`（幂等）和
-`run_pipeline.py` 一行不用改。
-
-```bash
-python mve/vlml_source/ingest.py --discover              # 看看有哪些赛事
-python mve/vlml_source/ingest.py --event 2977 --max 8 \
-    --db vlml/data/vlml_vlr.duckdb                       # 抓 + 入库到新库
-```
-
-⚠️ **能力差（不能装作等价）**：GRID 是逐事件流，vlr.gg 只有回合级 + 聚合级。
-
-| VLML 表 | vlr.gg | 说明 |
-|---|---|---|
-| `series` / `games` / `rounds` | ✅ 全填 | 438 回合，含 `end_reason`（eliminated 302 / defused 70 / detonated 59 / time 7） |
-| `base_events` | ⚠️ 只有回合级事件（934 条），**`is_kill` = 0** | vlr 没有 kill/技能/伤害/坐标/装备净值。**不造假事件填进去** |
-| 选手统计 | ✅ 聚合级 → 另建 `ext_player_game_stats`（210 行，含 FK/FD） | 不塞进事件流：那是整图汇总，不是逐事件 |
-
-所以接完之后：**回合 / 图 / 赛事 / 队伍层分析照跑**；首血分析只能用聚合的
-FK/FD，没有"这回合谁先开的枪"。选手一栏在 `entity_catalog` 里会回退到
-`ext_player_game_stats`（否则显示 0 个，而数据其实有）。
-
-旧库（`vlml_events.duckdb`）**原样保留**，随时能切回去 —— 它里面有 GRID 的
-逐事件流，两个源粒度不同，混在一张表里会让"这列为什么一半是空"说不清。
-
----
-
-## 八之九、vlr.gg + rib.gg 双源（2026-10-08）
-
-vlr 接完之后还剩两个洞：**没有"这回合谁先开的枪"**、**没有经济局**。问了
-「rib.gg 还是 PandaScore 好申请」，实测结论如下：
-
-| 源 | 申请难度 | 免费能给到哪一层 | 结论 |
-|---|---|---|---|
-| **rib.gg** | **不用申请**（没有官方 API key） | 网页里就带着 `roundStats`（每回合×每选手，含 `firstKill`）、`roundEconomy`（bank/loadout/buyTier）、`economy` | ✅ **选它**，网页抓取即可 |
-| PandaScore | **最容易申请**（注册即得 token，不要信用卡） | 免费只有 **Fixtures**（赛程/结果，1000 req/hr）；逐图与选手统计在 **Historical plan €400/月起/每游戏** | ❌ 申请容易，但**补不了我们缺的那一层** |
-| henrikdev | `HTTP 401` | — | 现在也要 key |
-| esport.is | 空响应 | — | 用不了 |
-
-**合规依据（这是能不能做的前提）**：rib.gg 的 `robots.txt` 是 `Allow: /`，只
-`Disallow: /admin` 与 `/api/`。我们抓的是 `/matches/{id}` 的 HTML 页面，**不在
-禁止列表里**（对 ClaudeBot / GPTBot 同样 `Allow: /`）。这跟"绕过访问控制"是
-两回事。仍按 vlr 同款礼貌抓取：1.2 秒一个请求、正常 UA、403/429 退避。
-
-### 双源分工
-
-| 层 | vlr.gg | rib.gg |
-|---|---|---|
-| 赛事 / 图 / 回合（`series`/`games`/`rounds`） | ✅ | ✅ |
-| 整图聚合选手统计 | ✅ | ✅（还多 `firstKills`/`firstDeaths`/`clutches`/`multiKills`/`opKills`） |
-| **每回合 × 每选手** | ❌ | ✅ `ext_player_round_stats` |
-| **每回合 × 每队经济** | ❌ | ✅ `ext_round_economy` |
-| **每图经济汇总** | ❌ | ✅ `ext_game_economy` |
-| **攻防拆分** | ❌ | ✅ `ext_player_side_stats` |
-| 逐击杀事件（kill/伤害/技能） | ❌ | ❌ **都不造** |
-
-⚠️ **仍然不造 `player-killed-player`**：rib 的 `firstKill` 只说**这回合谁拿了首杀**，
-没说**杀了谁**（payload 里没有 killer→victim 配对）。首血走
-`ext_player_round_stats.first_kill` 这个布尔位。
-
-### 一个源一个库，raw 目录也要分开
-
-`knowledge_graph.data_source()` 是**按库文件名**判源的（`vlml_vlr` → `vlr.gg`、
-`vlml_rib` → `rib.gg`），混库会让这个字段只能二选一，等于丢信息。所以：
-
-```
-vlml/data/vlml_vlr.duckdb ← vlr.gg        vlml/data/vlml_rib.duckdb ← rib.gg
-```
-
-而 `load_data.py:47` 把 raw 目录**写死**成 `data/raw_events`（不可配）。若两个源
-的 jsonl 堆在同一棵树里，跑 rib 的库会把 vlr 的 series 一起吃进去。做法是
-**每源一个暂存目录 + `raw_events` 软链指向当前源**：
-
-```
-vlml/data/raw_events       → raw_events_rib   （软链，管线只认这个路径）
-vlml/data/raw_events_vlr/
-vlml/data/raw_events_rib/  ← jsonl + _parsed 解析缓存
-```
-
-第一次跑会把已有的 `raw_events/` 改名为 `raw_events_vlr/`（都是脚本自己抓的、
-可再生成的数据，且 `load_data` 按 series_id 幂等）。
-
-⚠️ **软链跟着 `--source` 翻**：跑 `--source vlr` 会把它指向 `raw_events_vlr`，
-再跑 `--source rib` 才翻回来。盘上看到软链指向哪个源，就是**最后一次跑的源**，
-跟 `db_config.json` 里连的库不一定一致 —— 无所谓，因为每次 `ingest` 都会先翻链
-再入库。但手动跑 `run_pipeline.py` 时要注意自己翻对了。
-
-```bash
-python mve/vlml_source/ingest.py --discover --source rib     # 赛事列表
-python mve/vlml_source/ingest.py --source rib --event 151 --max 12
-python mve/vlml_source/ingest.py --source vlr --repair-game-ids
-```
-
-⚠️ rib 的赛事页把**未开打**的比赛排在前面（Champions 2026 头三场 `status` 全是
-`upcoming`、maps 全是 TBD）。所以 `--max` 只数**抓到的**，不是"试过的" ——
-否则取前 N 场会一场数据都拿不到。
-
-### 顺手修掉的一个老 bug（两个源都中招）
-
-VLML 的 `db_loader` **自己生成** `game_id`（`{series_id}_game_{n}`），**不看**
-我们塞进 `platformGameId` 的源站 id。于是 ext 表里若存源站那套（rib
-`map-392a29c1` / vlr `275080`），跟 `games` / `rounds` **一行都 join 不上**。
-修法：落 ext 表时反查 `games` 表换成 VLML 的 id（已验证 `game_number` ==
-我们建的 `sequence`）；老数据用 `--repair-game-ids` 修（vlr 库 210/210 行修好）。
-
-### 实测（rib.gg，Champions 2026）
-
-| 项 | 数 |
+| 文档 | 提供什么 |
 |---|---|
-| 落 `ext_player_round_stats` | 1400 行（每回合 10 人） |
-| 落 `ext_round_economy` | 280 行 |
-| 落 `ext_game_economy` / `ext_player_side_stats` | 12 / 120 行 |
+| `DATA_MODEL.md` | 每张表的 `**Grain:**` + `**Use cases:**`；主干血缘 |
+| `DERIVED_TABLES.md` | 7 张派生表的粒度 / 上游 / 关键列 / 示例查询 |
+| `metadata/column_definitions.yaml` | 列级口径（141 行手写） |
+| `DATA_DICTIONARY.json` | 主键 / 列类型 / flag / **指标公式** |
 
-修好 join 之后才查得出的两条因果轴：
+`vlml_schema.model_specs()` 解析这四份（**读文件，断库也在**），
+写进表节点与维度节点，随 `save()` 落盘。
 
-| 轴 | 结果 |
-|---|---|
-| 经济局转化率 | eco 36.1%（36 回合）/ semi_buy 53.2% / full_buy 54.4%（均装备值 3288 → 23164） |
-| 首血 → 回合胜率 | 拿到首血 **70.0%** vs 没拿 **30.0%**（140/140 完美对分） |
-| 攻防 | attack 55.0% / defense 45.0% |
+### 声明真的被用上了（三处消费点）
 
-`base_events` 里**依然没有一行 kill** —— 这是两个公开源共同的上限，不是 bug。
+1. **出题器不再各数各的难度**：难度长在节点上（`map_fb_conv=1`、`max_losing_streak=4`）
+2. **写 SQL 时知道每列是什么**：`列的含义：fb_team_won=Conversion flag (1/0)`。
+   以前只给列名 —— 于是模型把 `fb_player` 写成 `player_name`，critique 每轮列真名它照样编。
+   **给真名不够，得给含义。**
+3. **单位**：维度节点带 `unit: %`，prompt 里明写"百分数，不是小数"（模型交过 0.55 和 55）
 
-### ⚠️ 现在的边界：数据在库里，图谱还没消费它
+### 三个坑（都踩了）
 
-实测确认：VLML 的 `query_sql`（`db_query_tools.execute_custom_sql`）**能直接查**
-这四张新表（经 `vlml_env` 引导后连的是 `db_config` 里那个库）：
-
-```
-SELECT player_name, COUNT(*) FILTER (WHERE first_kill) AS fk
-FROM ext_player_round_stats GROUP BY 1 ORDER BY fk DESC LIMIT 5
-→ lukxo 18 / BuZz 13 / Meteor 13 / N4RRATE 13 / Dambi 10
-```
-
-但**图谱里没有 `ext_*` 表节点，边也是 0**（表 27 全是 VLML 原生表）。原因：
-表节点是**从种子题的 rubric SQL 派生**的（`knowledge_graph.py:1426`），
-VLML 那 46 个洞察 SQL 一样不认我们的表 —— 所以新数据**不会自动变成知识点**。
-
-要让首血/经济这两条轴进图谱，得**加一个用 `ext_player_round_stats` 的种子题**
-（维度 15 → 16）。这属于「新增知识点」而不是「换数据源」，照上一节那条原则
-（换值不重建知识点）应当单独定，别顺手塞进去。
+- **持久化 = 缓存过期**：`_stale()` 只比 tasks.py 指纹。加 `SCHEMA_VERSION` 与建模文档指纹，
+  凑成三判据：格式版本 / 题指纹 / 建模指纹
+- **难度要从完整 SQL 数**：`semantics` 只是 SELECT 投影，里面没有 `GROUP BY`
+- **`_s` 的误判**：`max_losing_streak` 里的 "losing_**s**treak" 含 `_s`，
+  先判时间就把它错标成"秒"。判据顺序：先连败/回合，再时间
 
 ---
 
-## 八之十、判据层改造：success 布尔 + 两层分工 + 面板分区（2026-10-08）
+## 11. 判据层 vs 掌握度层：一刀切开
 
-上一节（八之七）的迁移对照只证明了「换值重跑能对」；这次把**「做对没做对」和
-「学得多牢」彻底拆成两层** —— 这是照原版 Voyager 的定义做的：
-
-**照原版，success 才是判据。** 原版 `critic.check_task_success` 是布尔 self-verification：
-环境里任务目标真的达成 = 成功；95% 达成 = **没达成**。此前 MVE 用「覆盖率 ≥0.95」
-既当判据又当掌握度证据，一个数干两件事：`verdict=correct` 但 missing 一个评分点
-照样存技能 —— 这在原版眼里就是「没全达成 = 不 success」。本次一刀切开：
+照原版 Voyager，**success 才是判据**。`critic.check_task_success` 是布尔
+self-verification：环境里任务目标真的达成 = 成功；95% 达成 = **没达成**。
 
 | 层 | 归属 | 读什么 | 用途 |
 |---|---|---|---|
-| **判据层** | Voyager（它在学习） | `ev.success` 布尔：`missing / rejected / unjudgeable` 全空 **且** 拿到证据才 True | **存技能 / 停止同题 / 推进换题 / 迁移考核**，只认它 |
-| **掌握度层** | 伴学（评估量尺） | mastery_v2 五档 + 覆盖率（仅作达成度观测喂证据） | 只衡量「独立面对公开库时运用得多好」，**不决定练什么** |
+| **判据层** | Voyager（它在学习） | `ev.success` 布尔 | **存技能 / 停止同题 / 推进换题 / 迁移考核**，只认它 |
+| **掌握度层** | 伴学（评估量尺） | mastery_v2 五档 + 覆盖率 | 只衡量"独立面对公开库时运用得多好"，**不决定练什么** |
 
-**自适应出题依据切到判据层。** `planner.select_next` 的优先级链在 `wrong_retry`
-之后新增 `transfer_weak` 分支（读 `exam.transfer_weakest()`）：迁移考核（未练题
-独立重考）覆盖率 < 0.8 的知识点优先补 —— 「接下来练什么」由它学到哪了决定，
-不再混用伴学掌握度当调度器。
+学习阶段判据（用户 2026-10-08 拍板）：
 
-**SQL/plan 路径打通跨题复用。** `_replay_saved` 原来 `topic == tid` 才重放，6/8
-道 SQL 题全卡在这。现在候选集改用 `skill_store.retrieve()`（同题优先 + 跨题相关度
-门槛），跨题重放时把当前题实体（series/team/map）注入调用参数 —— 代码路径早就
-「值在调用点传」了，plan 路径这次补上（voyager.py）。
+```
+任务完成 done = 跑通编排（有成功工具调用） + 拿到数（facts 非空） + 没翻车（无工具错误）
+```
 
-**面板分区。** 概览页拆两块：**判据区**（success 阶梯图、当前题判据、
-迁移成功率 `transfer.ok_count/count`、出题依据 reason+explanation）与
-**掌握度区**（mastery 独立评估，明确标注「不决定练什么」）；覆盖率降为判据区里的
-达成度观测虚线；轮次明细表加 success 列。
-
-**落地文件**：`loop_core.py`（Evaluation.success）、`run_mve.py`（删
-`PRACTICE_SAVE_COVERAGE`，判据统一读 `ev.success`，run_log 落 success 字段）、
-`voyager.py`（_replay_saved 跨题参数化）、`planner.py` + `exam.py`
-（transfer_weakest 判据层信号）、`panel_data.py` + `dashboard.py`（分区展示）。
-
-**验证**：success 布尔 6 场景冒烟全过（含关键用例：覆盖率 98% 但缺一个评分点 →
-`verdict=correct` 且 `success=False`，不放行）；真实状态文件冒烟
-（transfer_weakest 识别出 `map_rounds_split` 迁移薄弱 0.0、planner 正常出题、
-panel_data 带出 success_track）；`node --check` 面板 JS 语法通过。
+**不要求和 VLML 的过程一样，也不计算覆盖点** —— 这就是 Voyager 的学习时指标。
 
 ---
 
-## 八之十一、数值与公式溯源（ABA）—— 每个数字都有原项目背书
+## 12. 数值与公式溯源（ABA）
 
-原则：**MVE 里出现的公式与数值，要么直接照抄原项目（给出文档/源码出处），
+原则：**MVE 里出现的公式与数值，要么照抄原项目（给出出处），
 要么是标注过的同构换维（给出原项 + 为什么换），要么如实标注"自定/近似"。
-没有一条是随手拍的。** 行号依据：Voyager 按 2026-10-08 fetch 的
-MineDojo/Voyager `main` 分支；伴学按本地 `study_companion/`；VLML 按本地 `vlml/`。
+没有一条是随手拍的。**
 
 ### A. 照原版 Voyager（MineDojo/Voyager）
 
-| MVE 里的值/机制 | 原版出处（A） | 说明（B → 回引 A） |
+| MVE 里的值/机制 | 原版出处 | 说明 |
 |---|---|---|
-| `RETRIEVAL_TOP_K = 5`（skill_store.py:41） | `skill.py:25` `retrieval_top_k=5`；`voyager.py` 参数 `skill_manager_retrieval_top_k: int = 5` | 每题最多注入 top_k 条技能，**照抄**原版默认 5 |
-| 技能主键 + 同名覆盖（`{topic_id}解法`） | `skill.py:53-55` "Skill {program_name} already exists. Rewriting!"；主键 = program_name | **照抄**：同名走 Rewriting（覆盖旧版，不无限累积） |
-| 检索命中即直接 exec（`_reuse_skill` / `_replay_saved`） | `skill.py:67-75` `similarity_search_with_score` 取 code 直接执行 | 检索语义同构；**MVE 自标近似**：无向量库，用词面 Jaccard + 加权打分（skill_store.py:254），非 Chroma 语义向量 |
-| 成功才固化技能（`ev.success` → `skill_store.add`） | `voyager.py` 主循环 `if info["success"]: self.skill_manager.add_new_skill(info)`；`update_exploration_progress` 同读 success | **照抄**：失败不存（防污染）。`success` 布尔本身照 `critic.py` `response["success"]`（self-verification） |
-| 失败即跳过换新任务（failed 账本） | `curriculum.py` `update_exploration_progress`：失败打印 "Failed to complete task {task}. Skipping to next task." 并记入 `failed_tasks` | MVE planner 的 failed_topic / wrong_retry / due_review 账本，**同构**（MVE 用 mastery 调度重做时机，见八之十） |
-| `progress = 完成数`（裸考画像） | `curriculum.py:80` `progress = len(self.completed_tasks)` | MVE 的 exam.true_level / completed 统计，**照抄**这个定义 |
-| warm-up 收放（支架档位） | `curriculum.py` `default_warmup`（context 15 / biome 10 …）+ 完成数达标才放开信息 | **同构换维**：伴学/原版调"信息量"，MVE 调"支架档位"（difficulty.py:29 自标） |
-| 同题重试上限 `rounds=3`（run_mve.py:159） | `voyager.py` `done = (action_agent_rollout_num_iter >= action_agent_task_max_retries or success)`，默认 `action_agent_task_max_retries=4` | **MVE 自定简化**：原版 rollout 上限是 4，MVE 取 3（可 `--rounds` 调到 10）——如实标注，不是照抄 |
-| 迁移考核（exam.py transfer / final） | README "Run Voyager with a learned skill library"：`skill_library_dir` + `resume=False`，注释 "this is not learning"；摘要 "utilize the learned skill library in a new Minecraft world to solve novel tasks from scratch" | **照抄**原版"停学习→技能库迁移到新世界/新任务"的终极判据；MVE 用 vlr/rib 双源当"新世界" |
+| `RETRIEVAL_TOP_K = 5` | `skill.py:25` `retrieval_top_k=5` | 照抄 |
+| 技能主键 + 同名覆盖 | `skill.py:53-55` "already exists. Rewriting!" | 照抄（覆盖旧版，不无限累积） |
+| 检索命中即直接 exec | `skill.py:67-75` 取 code 直接执行 | **MVE 自标近似**：无向量库，词面 Jaccard，非 Chroma 语义向量 |
+| 成功才固化技能 | `voyager.py` 主循环 `if info["success"]` | 照抄：失败不存（防污染） |
+| 失败即跳过换新任务 | `curriculum.py` "Skipping to next task" | 同构 |
+| `progress = 完成数` | `curriculum.py:80` | 照抄 |
+| warm-up 收放（支架档位） | `curriculum.py default_warmup` | **同构换维**：原版调"信息量"，MVE 调"支架档位" |
+| 同题重试上限 3 | 原版 `action_agent_task_max_retries=4` | **MVE 自定简化**，如实标注 |
+| 迁移考核（exam transfer / final） | README "Run Voyager with a learned skill library"：`resume=False` | 照抄；MVE 用 vlr/rib 双源当"新世界" |
 
-### B. 照猫娘伴学（study_companion，本地源码）
+### B. 照猫娘伴学
 
-| MVE 里的值/公式 | 伴学出处（A） | 说明（B → 回引 A） |
+| MVE 里的值/公式 | 伴学出处 | 说明 |
 |---|---|---|
-| `MasteryPolicy` 全部系数（mastery_model.py:54-86） | `mastery_v2.py:31-51` `MasteryV2Policy`（correct 1.0 / partial 0.5 / wrong 0.0；难度 0.9–1.1；hint 0.85；评估置信 0.75；作答可靠性 0.6；半衰期 60 天；consistency 0.7/0.3；confidence 4.0/0.5/0.5；mastered 0.8；未消化错题封顶 0.79） | **逐条照抄**；`__post_init__` 校验也照伴学（mastery_v2.py:72-95） |
-| `confidence = 1 − exp(−Σ权重/4)` | `mastery_v2.py:278` | **照抄**（confidence_evidence_scale=4.0） |
-| `consistency = clamp(1 − 2·√variance)` | `mastery_v2.py:276` | **照抄** |
-| `mastery = clamp(quality × consistency_factor × confidence_factor)` | `mastery_v2.py:281`；factor = `0.7+0.3·consistency`、`0.5+0.5·confidence`（:279-280） | **照抄** |
-| 时间衰减 `exp(−ln2·age/半衰期)` | `mastery_v2.py:424` `_time_decay`（半衰期 60 天） | **同构换维**：伴学按天（学习者隔天复习）；Voyager 一晚跑几十轮，按天恒等于 1 —— MVE 改按会话（half_life=3 会话、gap 2h，mastery_model.py:76-78 自标差异） |
-| `used_hint` 打 0.85 折 | `mastery_v2.py:36` `hint_used_modifier: float = 0.85` | **照抄**；MVE 另照 `mastery_retention.py:46-51`：求助答对不加速遗忘（run_mve.py:364 注释） |
-| 五档：<0.20 未接触 / <0.40 薄弱 / <0.60 进行中 / <0.80 熟练 / ≥0.80 掌握 | `knowledge_tracker.py:242-250` `get_level`（value <0.20 未接触 / <0.40 薄弱 / <0.60 进行中 / <0.80 熟练 / else 掌握） | **照抄**；MVE exam.py:96-98 的 LEVELS 同此 |
-| 薄弱线 `WEAK_LIMIT=0.60` | `knowledge_tracker.py:2076` `get_weak_topics`：只收 `mastery < 0.60 或 false_mastery`，升序取最弱 | **照抄**（exam.py:100 注释同）；`get_weak_topics` 定义在 :2066-2084 |
-| 掌握线 `MASTERED_LIMIT=0.80` | `mastery_v2.py:49` `mastered_threshold: float = 0.8`；`difficulty_policy.py` 同用 0.80 | **照抄** |
-| `false_mastery`（平均分不低但波动大） | `knowledge_tracker.py:299` `accuracy > 0.6 and consistency < 0.5` | **照抄**判定形状；面板显示照 `ui_api.py:62`（false_mastery 或 <0.40 显示 weak） |
-| `attempts < 3 → low_confidence` | `knowledge_tracker.py:274`；三态 `insufficient_evidence/progressing/mastered` 照 `practice_outcome.py:7-9` | **照抄**（MVE mastery_min_attempts=3） |
-| 出题输入结构（weak_topics / due_reviews / retry_wrong / blockers / candidate_evidence） | `knowledge_tracker.py:1811-1824` 出题参数构造 | MVE planner 优先级链**同构**自这套输入 |
-| 遗忘：答对无帮助半衰期×(1+conf·w)、答错×(1−0.5·conf·w) | `mastery_retention.py:46-51` | **照抄**（run_mve.py:360-366 引用） |
+| `MasteryPolicy` 全部系数 | `mastery_v2.py:31-51` | **逐条照抄** |
+| `confidence = 1 − exp(−Σ权重/4)` | `mastery_v2.py:278` | 照抄 |
+| `consistency = clamp(1 − 2·√variance)` | `mastery_v2.py:276` | 照抄 |
+| `mastery = clamp(quality × consistency_factor × confidence_factor)` | `mastery_v2.py:281` | 照抄 |
+| 时间衰减 `exp(−ln2·age/半衰期)` | `mastery_v2.py:424`（60 天） | **同构换维**：Voyager 一晚跑几十轮，按天恒等于 1 → 改按会话 |
+| `used_hint` 打 0.85 折 | `mastery_v2.py:36` | 照抄 |
+| 五档 <0.20/0.40/0.60/0.80 | `knowledge_tracker.py:242-250` | 照抄 |
+| 薄弱线 `WEAK_LIMIT=0.60` | `knowledge_tracker.py:2076` | 照抄 |
+| 掌握线 `MASTERED_LIMIT=0.80` | `mastery_v2.py:49` | 照抄 |
+| `false_mastery` = accuracy>0.6 且 consistency<0.5 | `knowledge_tracker.py:299` | 照抄判定形状 |
+| `attempts < 3 → low_confidence` | `knowledge_tracker.py:274` | 照抄 |
 
-### C. 照 VLML（vlml/ 本地仓库）
+### C. 照 VLML
 
-| MVE 里的机制 | VLML 出处（A） | 说明（B → 回引 A） |
+| MVE 的机制 | VLML 出处 | 说明 |
 |---|---|---|
-| 裁判 VLML0 = 确定性 SQL/工具比对（不是 LLM 看观察） | README:17-18 "Tools that return structured metrics only — no narratives, no opinions"；README:97 "All reports return metrics and evidence only" | **照抄 VLML 的分工**：指标与证据由工具出；比原版 critic（LLM 看观察，会编）更强，见八之十 |
-| 叙事/洞察由 LLM 生成 | README:9 "the AI generates the coaching insights, not the server" | **照抄**：MVE 的 narrative 只建在"已通过裁判核对"的事实上（dashboard pTrace） |
-| 工具集 query_sql / get_database_info | README:64-66（Database tools） | **照抄**工具面 |
+| 裁判 VLML0 = 确定性 SQL/工具比对（不是 LLM 看观察） | README:17-18 / :97 | 照抄分工；比原版 critic（LLM 看观察，会编）更强 |
+| 叙事/洞察由 LLM 生成 | README:9 | 照抄：narrative 只建在"已通过裁判核对"的事实上 |
 
 ### D. 如实标注：MVE 自定项（无原项目背书，全部有注释）
 
 | 项 | 值 | 说明 |
 |---|---|---|
-| `CROSS_TOPIC_MIN_SIM=0.12` / `CROSS_TOPIC_MAX=2` / 同题 `score=3.0`（skill_store.py:50-51,254） | MVE 自定 | 原版无"跨题相关度"参数（原版是语义向量，天然跨题）；MVE 词面近似需要显式门槛防带偏 |
-| `RETRY_COOLDOWN=2`（planner.py:37） | MVE 自定 | 原版失败即跳过无冷却概念；MVE 照伴学 wrong_retry 需要重做冷却 |
-| difficulty 七个信号（difficulty.py:44） | MVE 自定 | 同构换维（伴学调题目难度，MVE 调支架档位），见 README 五之二 |
-| 同题连考上限取 3 | MVE 自定简化 | 原版 `action_agent_task_max_retries=4`，见上表 A |
+| `CROSS_TOPIC_MIN_SIM=0.12` / `CROSS_TOPIC_MAX=2` / 同题 `score=3.0` | 自定 | 原版是语义向量天然跨题；MVE 词面近似需要显式门槛 |
+| `RETRY_COOLDOWN=2` | 自定 | 原版失败即跳过无冷却概念 |
+| difficulty 七个信号 | 自定 | 同构换维 |
+| 消费期能力项 `consume_<hash8>` | 自定 | 伴学没有"答出来但归不上题"这个情形 |
 
 ---
 
-## 八之十二、同构设计逐条对照（Voyager × 猫娘伴学 × VLML → MVE）
+## 13. 同构设计逐条对照（Voyager × 猫娘伴学 × VLML → MVE）
 
-**总纲一句话**：判据层照原版 Voyager（success 布尔、成功固化、失败账本、
-迁移考核），掌握度层照猫娘伴学（mastery_v2 五档，只做独立评估、不当调度器），
-裁判分工照 VLML（指标与证据由工具出、洞察由 LLM 出）。世界观统一为
-「问题即任务」：一道题 = 一个知识点练习 = 一个 task。
+**总纲**：判据层照原版 Voyager（success 布尔、成功固化、失败账本、迁移考核），
+掌握度层照猫娘伴学（mastery_v2 五档，只做独立评估、不当调度器），
+裁判分工照 VLML（指标与证据由工具出、洞察由 LLM 出）。
+世界观统一为「问题即任务」：一道题 = 一个知识点练习 = 一个 task。
 
-| # | 机制 | 原版 Voyager 依据 | 你的世界观 | MVE 落点 | 状态 |
-|---|---|---|---|---|---|
-| ① | 学习单元 | `curriculum.propose_next_task()` 每次新任务（curriculum.py:240,292） | 问题即任务：一道题 = 一个知识点练习 | `Task`（loop_core.py:562） | 世界观映射 |
-| ② | 判据 | `critic.check_task_success` 返回布尔 success（critic.py:116，LLM 看环境观察） | answer_evaluate 判分契约 | `ev.success`（missing/rejected/unjudgeable 全空且拿到证据，loop_core.py） | 照抄 + VLML0 数据实查更硬 |
-| ③ | 成功固化 | `if info["success"]: add_new_skill`（voyager.py 主循环）；失败 "Skipping to next task"（curriculum.py） | mastered → 掌握度到位 | `ev.success → skill_store.add`；失败不写技能库（防污染） | 照抄 |
-| ④ | 技能库 | `program_name` 主键 + 同名 Rewriting（skill.py:53-55）；`retrieval_top_k=5`（:25）；Chroma 语义向量（:67-75） | 技能是图谱节点的"会做" | `{topic_id}解法` 覆盖主键；`RETRIEVAL_TOP_K=5`；词面 Jaccard 近似 | 照抄 + 自标近似（见八之十一 D） |
-| ⑤ | 进度 | `progress = len(completed_tasks)`（curriculum.py:80） | 掌握进度 = 独立做对 | 裸考画像 `exam.true_level` | 照抄 |
-| ⑥ | 失败处理 | 失败即跳过（curriculum.py "Skipping to next task"） | 错题进 wrong_retry / due_review（间隔复习） | failed 账本 + mastery/半衰期调度重做时机 | 融合换维（原版管"换不换题"，伴学管"何时重做"） |
-| ⑦ | 自适应出题 | curriculum 读 progress/completed/failed/skills，**不读掌握度** | 自适应依据 = 它学到哪了 | planner 优先级链（explicit > wrong_retry > transfer_weak > due_review > exam_weak > unplaced…），读判据层信号 | 照抄方向（八之十落地） |
-| ⑧ | 终极判据 | README "Run Voyager with a learned skill library"：`skill_library_dir` + `resume=False`，注释 "this is not learning" | 举一反三：相邻知识点/新库首轮做对 | exam.py transfer/final；vlr/rib 双源当"新世界"；`transfer_weak` 调度补漏 | 照抄（八之十落地） |
-| ⑨ | 掌握度 | 原版无掌握度概念 | mastery_v2 五档衡量"学得多牢" | mastery_model.py 逐条照抄伴学（系数、confidence/consistency/mastery 公式、五档线 0.20/0.40/0.60/0.80） | 照抄伴学，只做独立评估 |
-| ⑩ | 裁判分工 | —（VLML：README:9/17/97 工具只回指标、LLM 生成洞察） | 指标由工具出，洞察由 LLM 出 | VLML0 判指标；narrative 只建于"已通过裁判核对"的事实 | 照抄 VLML |
-| ⑪ | 支架 | `default_warmup` 信息量收放（curriculum.py） | 讲解四段 / 支架教学 | 支架档位 full/partial/none（difficulty.py:29 自标换维） | 同构换维 |
+| # | 机制 | 原版 Voyager 依据 | MVE 落点 | 状态 |
+|---|---|---|---|---|
+| ① | 学习单元 | `curriculum.propose_next_task()` | `Task`（loop_core） | 世界观映射 |
+| ② | 判据 | `critic.check_task_success` 布尔 | `ev.success` / 新后端 `critic.check_task_success` | 照抄 + DB 实查更硬 |
+| ③ | 成功固化 | `if info["success"]: add_new_skill` | 跑通才存技能；失败不写 | 照抄 |
+| ④ | 技能库 | `program_name` 主键 + Rewriting；`retrieval_top_k=5` | `{topic_id}解法`；词面 Jaccard 近似 | 照抄 + 自标近似 |
+| ⑤ | 进度 | `progress = len(completed_tasks)` | 裸考画像 `exam.true_level` / 消费累计掌握数 | 照抄 |
+| ⑥ | 失败处理 | 失败即跳过 | failed 账本 + mastery/半衰期调度重做时机 | 融合换维 |
+| ⑦ | 自适应出题 | curriculum 读 progress/completed/failed/skills，**不读掌握度** | planner 优先级链 | 照抄方向 |
+| ⑧ | 终极判据 | `skill_library_dir` + `resume=False` | exam transfer/final；vlr/rib 双源当"新世界" | 照抄 |
+| ⑨ | 掌握度 | 原版无掌握度概念 | mastery_v2 五档 | 照抄伴学，只做独立评估 |
+| ⑩ | 裁判分工 | VLML：工具只回指标、LLM 生成洞察 | VLML0 判指标；narrative 只建于已核对事实 | 照抄 |
+| ⑪ | 支架 | `default_warmup` 信息量收放 | 支架档位 full/partial/none | 同构换维 |
 
-**三个换维点（不是照抄，是伴学世界观下的同构平移，全部有注释）**：
+**三个换维点**（不是照抄，是同构平移，全部有注释）：
 
-- **④ 检索**：原版是语义向量天然跨题；MVE 无向量库，用词面 Jaccard + 加权
-  打分（同题 score=3.0 / 跨题下限 0.12 / 上限 2 条），并加"值在调用点传"
-  的参数化注入让技能跨题可用（voyager.py `_replay_saved` / `_reuse_skill`）。
-- **⑥ 失败**：原版失败即跳过，但伴学世界观里错题必须进复习队列；MVE 用
-  掌握度 + 半衰期（mastery_retention.py:46-51）决定**何时值得重做**，
-  既保留原版"不刷分"，又保留伴学"间隔复习"。
-- **⑪ 支架**：原版调"喂给 agent 的环境信息量"（warm_up），伴学调题目难度；
-  MVE 调支架档位（错题给足 / 证据不足给足 / 连对收档 / mastered 放开），
-  判据逐条照伴学（difficulty.py:44）。
-
-**为什么这不算"破坏伴学同构"**：四步全部复用伴学既有机制（问题即任务、
-mastery 调度、五档、weak_topic 取弱、due_review、图谱相邻出题），零新增概念；
-只是把学习判据从"同题覆盖率"换回原版 Voyager 的 self-verification 定义
-（这是对伴学本意的**恢复**——举一反三在伴学里本就内建）。
+- **④ 检索**：原版语义向量天然跨题；MVE 词面 Jaccard + 加权，并加"值在调用点传"
+  的参数化注入让技能跨题可用
+- **⑥ 失败**：原版失败即跳过，伴学错题必须进复习队列；MVE 用掌握度 + 半衰期
+  决定**何时值得重做**
+- **⑪ 支架**：原版调"喂给 agent 的环境信息量"，伴学调题目难度；MVE 调支架档位
 
 ---
 
-## 六、面板上可观测的状态清单
+## 14. 数据源：GRID → vlr.gg → rib.gg
 
-| 状态 | 判定 | 依据 |
+GRID 要付费 key，过期就没得下。实测候选：
+
+| 源 | 实测 | 结论 |
 |---|---|---|
-| 任务派发触发点 | 继承结构 + 新写触发者 | 伴学 `practice_scope` + `mode: explicit_topic` |
-| Voyager 行动序列 | **新写** | 伴学没有「工具调用序列」 |
-| 解释输出 | **替换** | 供应方换 VLML + 其 LLM，人可覆盖 |
-| covered / missing points | 继承结构 + 新写内容 | `string[]`，`evaluator_type: llm_rubric` |
-| verdict | 继承 | 四档 `correct / partial / wrong / dont_know` |
-| mastery + 等级标记 | 继承 | 三套阈值并存（见下） |
-| false_mastery / low_confidence | 继承 | 见下 |
-| FSRS / BKT / DKT / DriftCoach 技术层 | **本轮不做** | — |
+| **vlr.gg** | `HTTP 200`，无需 key | ✅ 选它 |
+| **rib.gg** | `robots.txt` 是 `Allow: /`，只禁 `/admin` 与 `/api/` | ✅ 补 vlr 缺的那两层 |
+| PandaScore | `403`（免费只有 Fixtures；逐图/选手统计 €400/月起） | ❌ 补不了缺的那一层 |
+| henrikdev | `401` | 现在也要 key |
+| esport.is | 空响应 | 用不了 |
+
+**做法：只换"下载那一层"**（`mve/vlml_source/`），下游一行不改：
+
+```
+vlr_client.py    抓 vlr.gg（赛事 → 赛程 → 比赛详情），标准库解析
+rib_client.py    抓 rib.gg（Next.js RSC payload，括号配对抠取）
+vlr_to_grid.py   翻译成 GRID 形态的 jsonl
+ingest.py        CLI：抓 → 落 jsonl → 跑 VLML 原管线入库
+```
+
+落盘照 GRID 约定 `data/raw_events/{year}/{tournament}/{series_id}.jsonl`
+（`parsers.py:29`：**series_id 就是文件名**），于是 `load_data.py`（幂等）不用改。
+
+```bash
+python mve/vlml_source/ingest.py --discover --source rib
+python mve/vlml_source/ingest.py --source rib --event 151 --max 12
+python mve/vlml_source/ingest.py --source vlr --repair-game-ids
+```
+
+### 双源分工
+
+| 层 | vlr.gg | rib.gg |
+|---|---|---|
+| 赛事 / 图 / 回合 | ✅ | ✅ |
+| 整图聚合选手统计 | ✅ | ✅ |
+| **每回合 × 每选手** | ❌ | ✅ `ext_player_round_stats` |
+| **每回合 × 每队经济** | ❌ | ✅ `ext_round_economy` |
+| **每图经济汇总 / 攻防拆分** | ❌ | ✅ |
+| 逐击杀事件（kill/伤害/技能） | ❌ | ❌ **都不造** |
+
+⚠️ **不造 `player-killed-player`**：rib 的 `firstKill` 只说谁拿了首杀，没说杀了谁。
+首血走 `first_kill` 布尔位。
+
+### 一个源一个库，raw 目录也要分开
+
+`data_source()` 是**按库文件名**判源的，混库会让这字段只能二选一。
+而 `load_data.py:47` 把 raw 目录写死成 `data/raw_events`，所以：
+
+```
+vlml/data/vlml_vlr.duckdb ← vlr.gg        vlml/data/vlml_rib.duckdb ← rib.gg
+vlml/data/raw_events       → raw_events_rib   （软链，管线只认这个路径）
+```
+
+⚠️ 软链跟着 `--source` 翻：盘上看到它指向哪个源，就是**最后一次跑的源**。
+
+### 换库
+
+写 `mve/db_config.json` 的 `db_path`（`vlml_env.py:52` 打了补丁换掉 VLML 写死的默认库），
+再 `python mve/entity_catalog.py` 刷新目录。
+
+⚠️ **换库后必须重建图谱**：`knowledge_graph.json` 被 gitignore，不跟着 push。
+服务器上图谱可能是很早的版本（实测服务器 insight 层曾为 0）。
+
+### ⚠️ 现在的边界：数据在库里，图谱还没消费它
+
+`ext_*` 四张表能查（首血榜实测跑通），但**图谱里没有 ext 表节点、边也是 0** ——
+表节点只从种子题 rubric SQL 派生。要让首血/经济进图谱，得加一个用
+`ext_player_round_stats` 的种子题（维度 15 → 16）。
+这属于「新增知识点」而不是「换数据源」，应当单独定。
+
+---
+
+## 15. 面板：九个分区
+
+打开 <https://43.161.203.50:8443/mve/>：
+
+| 分区 | 看什么 |
+|---|---|
+| **概览** | 判据区（success / done 轨迹）+ 掌握度区（独立评估，不决定练什么）+ 真实水平曲线 |
+| **练习** | 练习范围与出题器派发（驾驶舱：练题 / 摸底 / 结业考 / 学习单元） |
+| **人导入** | **消费线入口**：写一句话 → Voyager 用它已积累的能力回答；底下披露 VLML 解析、比对明细、进步曲线 |
+| **轨迹** | 行动序列（工具调用序列）—— 伴学没有这个概念 |
+| **技能 · 因果** | 技能库 + 行动因果时间线 |
+| **知识图谱** | 21 张表 / 46 洞察 / 实体可填值；人导入收录情况（建边不建节点） |
+| **MC 真实学习** | 对照实验（真实 / 空 / 打乱的记忆对照） |
+| **自适应练习** | 摸底 → 单元 → 进程 |
+| **运行日志** | 驾驶舱日志实时 tail（排障用，不进掌握度） |
+
+### 两条曲线必须分清楚
+
+- `覆盖率轨迹` 读 `run_log`（**带图谱**，恒 100%，量的是支架高度）
+- `真实水平曲线` 读 `exam_log`（**撤图谱**，量的是模型水平）
+- `消费进步曲线` 读 `coach_log`（主曲线 = 累计掌握数，副线 = 方法一致度）
+
+### 消费是后台跑的
+
+全链路串十几次 LLM 调用（找配方 → 回填 → 取数 → VLML 独立取一遍 → 比对 → 叙事），
+**1～3 分钟**。所以提交后**立即受理**，后台线程跑，前端 4 秒轮询刷新：
+
+- 提交回执说"已受理，Voyager 正在回答"
+- 页面上有进度条（已跑几秒）
+- 结果刷进**导入历史**（历史里能看到回答 + 比对结论 + 掌握情况）
+
+实测教训：改成后台之前，同步等 2～5 分钟会把 Caddy 连接拖到超时，
+人只看到按钮转圈到死，以为"Voyager 答不出来"（其实它在跑）。
+
+### 可观测的状态清单
+
+| 状态 | 说明 |
+|---|---|
+| `covered` / `missing` points | `string[]`（评分点名字），不是散文，参与比对 |
+| verdict | 四档 `correct / partial / wrong / dont_know` |
+| mastery + 等级标记 | 见下"三套阈值" |
+| `false_mastery` | 平均分不低但波动大（**蒙对的、不稳定**） |
+| `low_confidence` | 证据不足 |
 
 **掌握度三套阈值（并存）**
 
@@ -842,17 +835,13 @@ mastery 调度、五档、weak_topic 取弱、due_review、图谱相邻出题）
 | UI status | `unassessed / weak / progress / good / mastered` |
 | 三态 mastery_status | `insufficient_evidence / progressing / mastered` |
 
-两个 flag：`false_mastery` = 平均分不低但波动大（**蒙对的、不稳定**）——
-它的杀伤力在 UI 层：分数 0.95 但带 false_mastery，面板仍显示 `weak`；
-`low_confidence` = 证据不足。
+`false_mastery` 的杀伤力在 UI 层：**分数 0.95 但带 false_mastery，面板仍显示 `weak`。**
 
 **必须继承的一条原则**（`ui_api.py:41`）：
 **没有证据 = `unassessed` + `mastery: None`，不是 0%。**
 Voyager 首次接触某个组合时面板不能显示 0%，否则掌握度曲线从第一题开始就是假的。
 
----
-
-## 七、这一轮没拿到证据时，面板显示什么
+### 这一轮没拿到证据时，面板显示什么
 
 | 情况 | 判定 | 面板表现 |
 |---|---|---|
@@ -862,653 +851,158 @@ Voyager 首次接触某个组合时面板不能显示 0%，否则掌握度曲线
 | VLML MCP 连不上 / 字段不全 | 同上，且不推进 | 出题器 readiness 闸门：**没拿到证据就不出下一题** |
 
 怎么看出来：面板上掌握度显示成「掌握度 {before} → {after}」——
-**两个数值没变化，就是这轮没拿到证据**，而且不会生成新题（会重复旧题直到拿到证据）。
-
-实测样本（56 轮里正好有一轮）：
-
-```
-pistol_eco_pattern   verdict=dont_know  evidence=none  no_tool_calls=true  facts=0
-```
+**两个数值没变化，就是这轮没拿到证据**，而且不会生成新题。
 
 ---
 
-## 八、现在跑到哪了（截至 2026-10-06 21:30，56 轮）
-
-| 指标 | 值 |
-|---|---|
-| 总轮数 | 56（judge 全部为 `referee`，56/56 —— 标准答案全部由 VLML0 独立跑出） |
-| verdict | correct 3 / partial 51 / dont_know 1 |
-| 无证据轮 | 1（工具全失败，已按上节处理） |
-| 技能库 | 4 条技能，33 次写入（21 次重写 / 8 次判为膨胀跳过） |
-| 掌握度（按题，最新） | fb_conversion 0.60 / corrode 0.61 / pistol 0.57 / series_totals 0.55 / kast 0.47 / map_rounds 0.43 |
-
-### 有效果的
-
-| 项 | 结果 |
-|---|---|
-| 代码化取证（口径来自 answer_spec 的题走代码路径，值由解释器取） | `kast_adr_check` **50% → 100%**（根治后空库首轮即 100%）；pistol 100% / corrode 100% / series_totals 100% |
-| 图谱（表结构 + 口径 + 参数陷阱） | 无图谱 0% → 有图谱 100% |
-| 学习闭环接通 | 判错触发旁路学习，脱敏解法源码进技能库并注入 prompt |
-| 自己跑通 → 存程序 → 下次直接跑 | `复用技能：kast_adr_check解法（本轮未重新生成代码）` → 100% |
-| 图谱缓存过期守卫 | 加题后 `load()` 自动重建（此前 `kast_adr_check` 因图谱未重建，提示整段为空） |
-
-### 没效果的（同样重要）
-
-加了三层细节，A/B 测下来**在当前题集上全是冗余**：
-
-| 层 | A/B | 结论 |
-|---|---|---|
-| section 层（取返回里的哪一段） | 开/关各 3 次，全 100% | 冗余 |
-| 洞察层（这段由哪些 SQL 拼成） | 开/关各 3 次，全 100%，模型一次 SQL 都没多写 | 冗余 |
-| 种子层（212 个事实节点） | 新题开/关各 3 次，全 50%，失败模式一样 | 解决了「有没有」，没解决「有没有用」 |
-
-**真正被模型用上的仍然只有最早那一层：表结构 + 口径 + 参数陷阱。**
-
-### 一个必须记下来的同构边界
-
-**SQL 类不走代码路径。** 先按「全部走代码」跑，corrode 从 100% 掉到 0%。
-
-理由不是调参：原版 Voyager 的 JS 是「调用 bot 上的 API」，对应这里调 MCP 工具；
-而 SQL 是 `query_sql` 的**参数字符串**，对应原版 `bot.chat("...")` 的参数
-—— **原版从不把 chat 的字符串当程序来学**。所以按口径源分流
-（`_is_tool_path_task`）：`answer_spec.tool` 走代码路径，`answer_spec.sql` 走原路径
-（那条有图谱骨架与分层断言，正是 SQL 需要的护栏）。
-
----
-
-## 八之二、「连着 48 轮停在 50%」的根治（2026-10-06）
-
-症状：`kast_adr_check` 反复停在 50%（kd 交 1.0，真值 1.24），其余未满分的题也一起停滞。
-诊断过程见 `取证通路-原版Voyager对照.md`。**根因不是「取数能力不够」，是四个具体的 bug**：
-
-| # | bug | 证据 | 修法 |
-|---|---|---|---|
-| 1 | 结构文档**按固定条数截断**：`_MAX_PATHS=60`，而 `match_analysis_report` 正好 61 条 —— 正确路径 `key_metrics.team.consistency.kast.num` 在**抽取阶段就被砍掉** | 缓存里 61 条止于 `team_comparison.NRG.assists` | 抽取上限提到 400，**展示**改按维度聚焦（命中 → 同父兄弟 → 顶层骨架，各父节点限 8 条） |
-| 2 | 图谱是**落盘缓存且已过期**：`kast_adr_check` 是后加的题，图谱里根本没有 `kast_pct`/`kd_ratio` 节点，`graph_hints` 整段返回空 | 301 个节点全是老题种的 | `load()` 加指纹守卫（`_task_fingerprint` 变了就自动重建）；`graph_hints` 在图谱缺维度时**直接读题目自己的 rubric** |
-| 3 | critic 只说「路径不对」，**不给候选**：模型三轮交出一模一样的错路径 | 三次回灌同一份代码 | 用 AST 抽出模型写过的路径，指明「这条不在返回里」，并列出返回里真实存在的候选 |
-| 4 | 声明的口径只是**建议**不是约束：`team_comparison.*.consistency` 是一支占位值分支（Cloud9 与 NRG 的 `kd_ratio` 都是 1.0、`adr` 分母都是 59），照样能 dig 出数字 | 权威段 `key_metrics.team` 才是 1.24 / 109 | `declared_paths()` 把题干口径变成**硬约束**：prompt 里打 ★ 排最前；critic 单独判「取到值但取错分支」 |
-
-修完的表现：**空技能库、第一轮即 100%**（`kast={109/109}`、`kd=1.24`），
-工具类题（kast / pistol / corrode / series_totals）全部 100%，SQL 类无回退。
-
-### 学习循环的后半环：程序是拿来**跑**的，不是拿来读的
-
-原版 `add_new_skill` 存的是 `program_name + program_code`（自己写、跑通了的完整源码），
-下次取出来**直接 exec**。此前 MVE 只有前半环，缺的三件事这次补齐：
-
-| 原版 | 此前 MVE | 现在 |
-|---|---|---|
-| 任务完成才 `add_new_skill` | 自己跑通的那段代码从来没存过，只存观摩来的解法 | **`ev.success`（self-verification 布尔，全部评分点达成）就存**自己写的程序（原判据 `PRACTICE_SAVE_COVERAGE` 已删，见八之十），连主函数名一起存进 blueprint |
-| 主键是函数名（稳定，同名走 Rewriting） | 主键是 LLM 每轮生成的一句话（「按 team 下钻」/「按 team 拆分」）→ 永远算新技能，versions 49、膨胀率 17.5 | 主键固定为 `{topic_id}解法`；`learn()` 那条文字经验也改用同一个 key，两条通道覆盖同一条 |
-| 检索出来直接 exec | 检索出来拼进 prompt 让人**读**，模型每轮重写一遍（每次重写都是新的翻错机会） | `_reuse_skill()`：先直接执行库里的程序，维度齐全就采用（`复用技能` 打印），跑不通才让模型重写 |
-
-另外修了一处统计口径：代码路径此前从不设置 `_injected_keys`，技能的
-`hits` / `ok` / 有效性加权全是死的，面板上「本轮注入 0/5」不是没注入而是没记。
-
-### SQL 侧顺手修的一个 bug
-
-`map_rounds_split`：模型一条 `GROUP BY map_name` 查三行再按行号取值，交上
-Corrode/Haven/Lotus = 21/24/14，真值是 14/21/24 —— **数字全对，只是配错了地图**。
-这类错不报错、不取空，只有裁判比对才发现。已加 `_check_group_order` 断言
-（GROUP BY 无 ORDER BY 即驳回，并给出「每个分组一条 SQL」的骨架）。
-
-计划校验里写死的「每轮最多 3 次调用」当时也改成了 `max(3, len(rubric))`，
-但**这一处当时判断错了**：当时认为「放开上限后模型仍然只规划 3 条」，
-于是记下"缺的是结构性约束"。真实情况是 —— 计划层放开了，
-**执行层还写着 `[:3]`**（见八之三）。模型早就在规划 4 / 5 条，
-只是第四条之后在执行时就被静默丢弃，日志里看不出来。
-现象相同，根因不同，结论也就跟着错了。
-
----
-
-## 八之三、「跑得越久越该学会，但有两题一直学不会」（2026-10-07）
-
-用户提了两个问题：**① 难度梯度自适应出题现在做不做得到？**
-**② 跑得越久按理学得越多，可有些东西一直学不会，看日志。**
-
-### ① 梯度层已在运行（不是待办）
-
-`difficulty.select()` 每轮都算，吃七个信号：种子难度 × 掌握度（取平均）、
-未解决的前置阻塞（压到最低档）、错题重试（−1）、最近连对（+1 且收支架）/
-连错（−1 且加支架）、覆盖率（满分才放开）、证据量与置信度（不足就封顶 3、
-支架给足）、以及「本题是否已存下可复用的程序」。每次都把推导过程打出来可复盘：
-
-```
-难度梯度 : 题目 2 → 目标 4（已拿下 5 道 → 目标难度 4｜种子难度 2 与掌握度 0.55
-          平均 → 难度 3；覆盖率 60% → 半扶；但这题还没有可复用的程序 → 支架先不收）
-```
-
-支架档位不是摆设：`--hint=full / partial / none` 三档 A/B，覆盖率随档位下降。
-（同构换了一维：伴学按 `depth/difficulty` 排序选题，MVE 按**覆盖率**收放支架 ——
-支架收放看覆盖率而不是掌握度，因为掌握度低可能只是「证据还少」，
-用它会误收已会的题的支架。
-注意这是**支架档位的观测口径**；「做对没做对 / 存技能 / 停止 / 推进换题」
-的判据是判据层的 `success` 布尔 —— 覆盖率 100% 才放开支架 ≠ 判据是覆盖率，
-见八之十。）
-
-### ② 看日志：不是学不会，是三个 bug
-
-88 轮日志的覆盖率分布一眼就能看出分野 —— 工具路径的题全 100%，
-**SQL 路径的两道长期卡死**：
-
-```
-题                       轮数  最好   最后   形态
-map_rounds_split          47   100%   100%   ▃█▅▅▅… 长期 60%
-fb_conversion_analysis    34   100%   100%   ▆▆▆▆▆… 长期 80%
-kast_adr_check            10   100%   100%   ██████
-pistol_eco_pattern         6   100%   100%   ██████
-其余                       —    —      —     100%
-```
-
-评分点级更清楚：`Haven 图首血转换率` **0/23 一次都没取到**；
-`Corrode 上胜率` 5/43、`Haven 上胜率` 2/43。
-三个 bug，按被发现的顺序：
-
-| # | bug | 取证 | 修法 |
-|---|---|---|---|
-| 1 | **执行层硬截断 3 条调用** —— `voyager._execute` 里 `(calls or [])[:3]`。`map_rounds_split` 5 个评分点、`fb_conversion_analysis` 4 个，模型规划了 5 / 4 条，第 4 条起被**静默丢弃** | 40 多轮里轨迹永远 ≤3 条；改完当轮即变 4 / 5 条 | `_call_limit()`：`max(3, min(8, len(rubric)))`，执行层、计划校验层、裁判 `_execute`、coach `_execute` 四处统一 |
-| 2 | **critique 永远是 None** —— `_render_observation()` 读 `last_round["critique"]`，而 `last_round` 是上一轮 `run()` 末尾拍的快照，**那一刻 `learn()` 还没跑**，critique 恒为空字符串 | `MVE_DEBUG_PROMPT=1` 落盘的 prompt 里白纸黑字：`上一轮你的自我反思 Critique：None` | 改读**当前** `self.last_critique`（`learn()` 结束时才写入的那个） |
-| 3 | **反馈只点维度、不点评分点** —— `map_fb_conv` 挂着 Corrode 与 Haven 两条评分点，只说「缺 map_fb_conv」，模型以为自己已经交过（它确实交了 Corrode） | 日志里 43 轮同一句空话 | 新增 `failed_points`：回灌**点名的评分点**并写明「每个都要单独一条查询」；跨运行也从 `run_log` 恢复 |
-
-顺带修的第四个（不在上面两次追问里，但同批暴露）：
-保持度层 `mastery_retention.py` 用了 `math.exp2` —— **Python 3.11 才有**，
-本机 venv 是 3.10，`AttributeError` 不在调用方的 `(ValueError, TypeError)`
-捕获范围内，于是**每一轮都在打印「保持度未更新」**，半衰期从未动过。
-`mastery_model.py` 早先踩过同一个坑并改用 `2.0 ** x`，这一处漏改。
-
-**修完的表现（同一道题、同一模型、无其它改动）：**
-
-| 题 | 修前 | 修后 | 调用条数 |
-|---|---|---|---|
-| `map_rounds_split` | 60%（47 轮） | **100%** 第 1 轮 | 3 → 5 |
-| `fb_conversion_analysis` | 80%（34 轮） | **100%** 第 1 轮 | 3 → 4 |
-
-回归：其余五题（series_totals / pistol_eco_pattern / kast_adr_check /
-lotus_win_rate / corrode_collapse）**无回退**。保持度开始真的落盘
-（半衰期出现 3.13 / 3.14 / 3.34 的变化，此前恒为 3.0）。
-
-**一句要记下的教训**：这三处都不是「模型学不会」，是**链路断了**。
-反馈写得再准（配方、表名、WHERE 该带什么键，全写对了），
-只要 critique 进不了下一轮的 prompt、第四条调用发不出去，它就只能原地打转 ——
-而且从日志上看，长得跟"学不会"一模一样。
-区分二者的办法只有落盘验伪（`MVE_DEBUG_PROMPT=1` 看 prompt 原文），
-不能靠"我觉得反馈写了应该就到了"。
-
----
-
-### 八之四：出题器照**知识图谱**出题（2026-10-07）
-
-用户追问：「伴学插件是不是根据知识图谱出的题？去查查，然后改」——
-去伴学取证后确认：**是，而且比 MVE 做到的彻底得多。**
-
-#### 伴学的做法（取证自 `static/knowledge_seeds/math.json`，457 个数学知识点）
-
-图谱节点**每个都自带**（出现率均 100%）：
-`difficulty`（节点自带难度，如 0.25）· `question_types`（该知识点该出什么题型）·
-`typical_misconceptions`（典型错误）· `prerequisites` / `related` / `depth`（依赖与图谱深度）·
-`skills` / `examples` / `unit`。
-
-`question_type_mapping.py:131` 的 docstring 是最直白的证据：
-
-> "Choose the first declared teaching style and **map it without LLM input**.
-> Seed ordering is preserved as the **author-provided priority**."
-
-**题型由节点声明决定，不交给 LLM；难度是节点自带的，不是生成时要求模型"出个难度 4 的题"。
-伴学的题库是「知识点 × 难度」二维铺开（892 个知识点），不是靠生成时临时发挥。**
-
-#### MVE 此前的差距
-
-| 环节 | 伴学 | MVE（此前） |
-|---|---|---|
-| 难度从哪来 | 图谱节点自带 | 梯度算出来了，但**只用于选旧题**，进不了出题器 |
-| 题型从哪来 | 节点 `question_types` 声明 | LLM 自由发挥 |
-| 出题点谁选 | 图谱 | LLM 自由发挥 → 编造表名、把维度名当列名 |
-
-#### 改了什么
-
-1. **新题难度接上梯度**：`_new_topic_suggestion(settled, target=..., mode=...)`。
-   此前是 `int(task.difficulty)` 抄停滞题的种子难度 —— 梯度算出的 `target`
-   到这里就断了。`cleared`（全被拿下）时难度 = `min(4, target + 1)`，即**推进一档**。
-2. **难度分档下了定义并真的去数**：`DIFFICULTY_RUBRIC` 把每档写成**可数的 SQL 特征**
-   （1=单表聚合，2=分组，3=JOIN/条件分支，4=窗口函数/嵌套子查询），生成后逐条数，
-   不达标就判废。**判废独立于其它闸** —— 否则模型在"表名写错"那道闸就先挂了，
-   永远收不到"难度不达标"这句反馈（实测三次生成全挂在同一个错上）。
-3. **`_server_skeleton` 把图谱声明渲染出来**：SQL 维度此前只给一句
-   「需自己写 SQL，取第 N 列」，把 detail 里**本来就有的**
-   `tables` / `columns_by_table` / `semantics` / `typical_errors` 全吞了。
-   现在给出 `FROM **rounds`，可用列…，口径形态…，典型错法…。
-4. **服务端从图谱挑出题点**（`_graph_blueprint`）：照伴学，题点归服务端、
-   题面归模型。挑定 (维度 × subject 键 × 表 × 列 × 口径) 后**写死进 prompt**，
-   模型只填 WHERE 的值和题面文案。
-
-   为什么必须走到这一步（实测教训）：只把「真实列清单」放进 critique **不够** ——
-   三次生成里 critique 每次都把 `fb_player` 列在真实列中，模型照样坚持写不存在的
-   `player_name`。**让它挑，它就会按常识编**；唯一可靠的办法是不让它挑。
-5. **`about` 与出题点冲突时以出题点为准**：planner 说"用队员级范围"，
-   而图谱挑中的 `max_losing_streak` 是**回合级**口径（rounds 表没有队员列），
-   模型夹在中间把 `fb_player` 写进了 rounds 表，三次全挂。
-
-#### 实测（同一条链路跑通）
-
-```
-⚠ 这道题连着 13 次满分（全库 3 道已被拿下，目标难度 4）→ 往上一档出题
-图谱出题点 : max_losing_streak × map｜表 rounds｜列 losing_team_name、map_name、round_number、series_id
-第 1 次 ❌ SQL 里这些不是 rounds 的列：team_name → 筛队伍用 winning_team_name
-第 2 次 ✅ 验题通过（跑出 'Haven'，base=8）→ 新题已入闱
-```
-
-新题（难度 4，gaps-and-islands）交给 Voyager：**第 1 轮 0%**，
-计划校验两次拦下经典陷阱（把 `losing_team_name` 写在最内层 WHERE —— 编号前就筛掉队伍，
-剩下的回合编号必然连续，整段会被当成一块）。
-
-**这才是关键结果：不再是「首轮即满分」，学习曲线终于有的测了。**
-此前那个"题库太简单测不出学习"的死结，靠的是**系统自己上难度**解开的。
-
-顺手修的三处：`topic_id` 中文（会进日志/面板 URL）→ 服务端规范化成英文小写下划线；
-取值不是数字（取到过 `'Haven'` —— `value_column` 指到了标签列）→ 判废而非放行；
-`_bad_columns` 把 `over` / `partition` / `subquery` 等 SQL 关键字当成列名报给模型，
-属于误导性反馈 → 补进关键字表。
-
----
-
-## 八之六、学习曲线现在测不测得出：**测得出，但测出来是平线**
-
-直接回答这个问题，因为答案反直觉。
-
-跑了 5 轮 `max_losing_streak_map`（难度 4），覆盖率轨迹 `['0%','0%','0%','0%','0%']`，
-critique **五轮一字不变**。看起来是"学不会"。查下去发现不是 —— 四处基础设施
-各自在把真信号伪装成假 0%：
-
-| # | 断点 | 症状 | 修法 |
-|---|---|---|---|
-| 1 | 坏题在库里 | `value_column: 0` 指到 `map_name`，真值是地图名 `'Lotus'`；题干问"最长连败回合数"、`tolerance=0.05` → 交任何数字都错 | 闸 3b（取出的值必须是数字）+ 闸 9（"连续"语义必须有 gaps-and-islands 形状：`COUNT(*) OVER (ORDER BY)` 是累计计数，不算）+ `revalidate_store()` 复核存量 |
-| 2 | critique 把失败讲成成功 | `if not items:` 把"missing 为空"当成"全覆盖"，输出「覆盖了裁判的全部 **0** 个评分点，编排方式有效，可以固化写进技能库」 | 判据改看 `verdict`/`coverage`；新增 `not_accepted` 分支：「交了 ≠ 拿到证据」 |
-| 3 | 比对层判成不可判 | subject 里的 `'?'` 占位符无法回填，`fact_key` 与评分点声明永远对不上 → 记 `unjudgeable`，`coverage=0` 且 `missing=[]`/`rejected=[]` | `'?'` 按**通配符**匹配 |
-| 4 | 裁判缓存不过期 | 题重新生成了，裁判仍拿旧真值 `'Corrode'` 比对 —— 模型交的 `3` **是对的**，却被判"值不可比" | 缓存加 `spec_fingerprint`（配方指纹） |
-
-修完之后：**`max_losing_streak_map` 首轮 100%，`corrode_collapse` 首轮 100%**
-（后者历史是 `100/100/100/20/20/100`）。
-
-### 所以结论是什么
-
-- **能测了**：基础设施现在如实记录，不再有假 0%。上面四条任意一条存在，
-  曲线都是假的 —— 你会以为是"模型学不会"，其实是系统在骗它。
-- **但测出来是平线**：题库里**没有它还不会的题**。难度上限是 4，
-  而难度 4 的题在图谱声明 + 结构骨架面前一轮就做对了。
-- **撤支架也还是 100%**（`--hint=none`）—— 它已经会了，不是靠支架蒙对的。
-
-要真画出上升段，得满足其一：**难度 5+ 的题**（出题器 `DIFFICULTY_RUBRIC` 现在
-最高 4）、或**更难的数据口径**（多表 JOIN + 窗口函数 + 分组，当前题库没有）、
-或**换更大的数据集**（现在只有 1 个 series、59 个回合，口径空间本来就窄）。
-
-顺带一个发现：出题器给不给**结构骨架**差别很大 —— 不给骨架连试 4 次全废
-（写成累计计数、编造 `team_name` 列），给了之后第 2 次就出对。
-骨架就在图谱里（`recipe`，脱敏过，还标了 WHERE 该放哪一层）。
-
----
-
----
-
-## 八之七、照伴学自适应跑通「清库 → 摸底 → 匹配水平 → 水平上升」（2026-10-07）
-
-上一章的结论是「学习曲线测得出，但测出来是平线」。这一章把它变成**有上升段的真曲线**，
-并且用一组对照证明那段上升到底是"学会了"还是"记住了"。
-
-### 先取证：伴学到底有没有「摸底测」
-
-全仓库 grep `摸底|placement|placement_test|初始水平|水平测定` —— **零命中**。
-伴学**没有**摸底这个环节，它的做法是：
-
-| 环节 | 伴学的实现 | 位置 |
-|---|---|---|
-| 新知识点起点 | 掌握度**硬 0.0**，不从"练过几次"猜先验 | `adaptive_learning/mastery_v2.py:240-256` |
-| 等级标签 | `<0.20 未接触 / <0.40 薄弱 / <0.60 进行中 / <0.80 熟练 / ≥0.80 掌握` | `knowledge_tracker.py:240-250` |
-| 起步选哪个 | 未练过的排前面，按 `depth → difficulty` **升序**（最浅最易） | `planner.py:174-205` |
-| 薄弱点怎么挑 | `mastery < 0.60` 或 false_mastery，**升序取最低**（最弱优先） | `knowledge_tracker.py:2073-2084` |
-| 难度怎么定 | 档位 2/3/4；`(种子难度 + 掌握度)/2`，跨 0.35 / 0.65 进档 | `difficulty_policy.py:41-46, 94-124` |
-
-MVE 多出"摸底"这一维不是照抄伴学，而是**被逼出来的**：伴学的掌握度是练出来的，
-练一次就有一个数；MVE 的练习覆盖率带知识图谱，**恒 100%**（实测），
-拿它当水平就永远是满分 —— 所以必须先撤掉图谱考一次，才知道真实的起点在哪。
-
-### 三个断口（修之前曲线涨不起来）
-
-| # | 断口 | 症状 | 修法 |
-|---|---|---|---|
-| 1 | 梯度读的是**带支架**的覆盖率 | `_global_target` 数"练习 100% 的题数"→ 第一轮就等于全库，`target` 直接顶到 4，梯度根本没展开 | 改读**裸考**画像：目标难度 = 1 + 裸考 ≥80% 的题数 |
-| 2 | 选题跟"会不会做"无关 | 练习恒 100% → `wrong_retry`（`wrongs>0`）、`due_review`（`<1.0`）永不触发，出题器掉到"练没练过 + 离目标难度近不近"，那是排序不是自适应 | 新增 `exam_weak` 分支：裸考 `<0.60` **升序取最低**；再加 `unplaced`（没测过的先测） |
-| 3 | **跑通了不固化**（根因） | 8 题里 6 题走 plan 路径（SQL 类），那条路**从不产出 `program_code`** → 技能库存的是一句空话（`code=0`）→ 撤支架重考时无可复用 → 练完仍是 0% | plan 路径跑通后把**成功的调用序列**存进技能库（`_successful_calls` / `_plan_program`），重考时 `voyager._replay_saved` 重放 |
-
-第 3 条要单独说一句：此前 `voyager.py` 里有一条注释，以"原版 Voyager 从不把
-`bot.chat()` 的字符串当程序学"为由，把 SQL 类**排除在技能学习之外**。
-那是个误判 —— 它把表面形态当成了同构边界：原版的 `bot.chat()` 发的是自然语言指令，
-而 MVE 的 SQL 是**结构化检索代码**，和"按路径 dig"是同一类东西（都是"怎么把数据取出来"），
-只是写法不同。原版的判据是**跑通了没有**，不是这段东西长什么样。
-排除它的代价就是：六成的题永远学不会。
-
-### 实测：清库 → 摸底 → 8 个学习单元
-
-```
-python mve/learn.py --go 8 --transfer 3
-```
-
-摸底（清库后技能库 0 条，全库撤图谱考一遍）：
-
-| 题 | 裸考 | 等级 | | 题 | 裸考 | 等级 |
-|---|---|---|---|---|---|---|
-| corrode_collapse | 0% | 未接触 | | fb_conversion_analysis | 25% | 薄弱 |
-| kast_adr_check | 0% | 未接触 | | series_totals | 50% | 进行中 |
-| lotus_win_rate | 0% | 未接触 | | pistol_eco_pattern | 55% | 进行中 |
-| map_rounds_split | 0% | 未接触 | | max_losing_streak_map | 0% | 未接触 |
-
-**平均 16%**（给着图谱练时全库 100% —— 差的就是支架那一段）。
-
-8 个单元（每单元 = 练一题（给图谱） + 撤图谱重考同一题）：
-
-| 题 | 摸底 | → | 重考 | Δ |
-|---|---|---|---|---|
-| corrode_collapse | 0% | → | 100% | +100pp |
-| kast_adr_check | 0% | → | 100% | +100pp |
-| lotus_win_rate | 0% | → | 100% | +100pp |
-| max_losing_streak_map | 0% | → | 100% | +100pp |
-| map_rounds_split | 0% | → | 0% → 0% → 100% | +100pp |
-| fb_conversion_analysis | 25% | → | 100% | +75pp |
-| series_totals | 50% | → | 100% | +50pp |
-| pistol_eco_pattern | 55% | → | 100% | +45pp |
-
-**8/8 涨，平均 Δ +84 个百分点。** 每次重考都标了 `⟲复用技能库里的程序` ——
-涨的机制是重放自己跑通过的调用序列，不是模型临场又写对了一次。
-
-### 但这不算"学会了"—— 迁移对照
-
-曲线上升有两种解释：记住了这道题，或者真学会了。
-`--transfer N` 每 N 单元额外考一道**本单元没练过**的题，专门分辨这两者：
-
-```
-迁移对照（2 次未练题考核）：map_rounds_split 0% → 0%   没涨
-→ 上升的是「记住了这道题的解法」，不是可迁移的能力
-```
-
-**如实写：上升的是记忆，不是迁移。** 存下来的程序里写死了 `series_id` / 地图名，
-重放只对同一道题有效。这也是原版 Voyager 的实情 —— 它的技能库同样是
-"程序名 → 程序代码"，复用的是同一类任务，不做跨任务泛化。
-要测迁移得先让程序**参数化**（把 subject 的字面量抽成参数、按当前题回填），
-这属于下一步，本轮没做，不假装做了。
-
-### 新增的三个文件 / 一处面板
-
-| 文件 | 作用 |
-|---|---|
-| `mve/exam.py` | 撤支架考核。`--all` 摸底、`--final` 结业考、`--profile` 裸考画像、`--progress` 按题进程、`--curve` 流水 |
-| `mve/learn.py` | 学习进程调度：`--go N` = 清库 → 摸底 → N 个单元；`--transfer K` 迁移对照 |
-| `voyager._replay_saved` | plan 路径的技能复用（重放调用序列），维度取齐才采用 |
-| `pilot.py` 的 `--job` | 驾驶舱四种任务：`practice`（练题）/ `placement`（摸底）/ `final`（结业考）/ `learn`（学习单元） |
-| 面板「真实水平曲线」 | 按题分行显示摸底 → 重考，右上角三个键钮：摸底 / 跑学习单元 / 停止 |
-
-### 面板上怎么用
-
-打开面板 → **总览**页 → 「真实水平曲线 · 撤支架考核」卡片：
-
-1. **摸底** —— 把全库每道题**撤掉知识图谱**考一遍（约 7 分钟），得出零基础的真实水平。
-   按钮会先检查技能库：**非空就弹确认**「先清库再摸底」。这道闸是硬的，因为
-   带着技能库考出来的是"练过之后的水平"，而画像取每题**最后一次**记录 ——
-   假摸底会把真摸底**覆盖掉**，画像无声无息就废了（实测踩过两次）。
-   清库由 `reset_all` 执行，**先备份到 `mve/_backup_*` 再删**。
-2. **跑学习单元** —— 选单元数（2/4/6/8）与迁移对照频率（每 N 单元加考一道没练过的题），
-   每单元 = 练一题（给图谱） + 撤图谱重考同一题。出题器按「裸考最弱优先」自己挑题。
-3. **停止** —— SIGTERM 给驾驶舱，它会一并带走子进程（不会留孤儿继续写数据）。
-4. 跑起来的进度看**运行日志**页（驾驶舱日志 `pilot.log` 实时 tail）。
-   后台任务写在 `pilot_state.json`，**刷新页面不会丢**。
-
-命令行等价：`python mve/learn.py --go 8 --transfer 3`。
-
-面板上现在有两条曲线，必须分清楚：
-`覆盖率轨迹` 读 run_log（**带图谱**，恒 100%，量的是支架高度）；
-`真实水平曲线` 读 exam_log（**撤图谱**，量的是模型水平）。
-出题器按「最弱优先」选题，读的是后者那一列。
-
-```bash
-python mve/learn.py --go 8 --transfer 3   # 一键：清库 → 摸底 → 8 单元 → 进程
-python mve/exam.py --final                # 结业考：带着现有技能库全库撤图谱再考一遍
-python mve/exam.py --profile               # 只看裸考画像
-python mve/exam.py --progress              # 只看学习进程
-```
-
----
-
-## 九、跑法
+## 16. 跑法
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt          # duckdb + httpx，其余全是标准库
 cp .env.example mve/.env                 # 填 ZHIPU_API_KEY
 
-python mve/verify_env.py                 # 环境体检（VLML 数据层要就位）
-python mve/knowledge_graph.py --build    # 建图谱（可选 —— 见下）
-python mve/run_mve.py --llm --topic kast_adr_check --rounds 3
+python mve/verify_env.py                 # 环境体检
+python mve/knowledge_graph.py --build    # 建图谱（可选，load() 带指纹守卫会自动重建）
 python mve/dashboard.py                  # 面板 http://127.0.0.1:8777
-
-# 自适应学习闭环（八之七）：清库 → 摸底 → 按水平推题 → 水平上升
-python mve/learn.py --go 8 --transfer 3
-python mve/exam.py --profile             # 裸考画像（真实水平）
-python mve/exam.py --progress            # 按题的学习进程
-python mve/exam.py --final               # 结业考（要技能库非空，不覆盖摸底基线）
 ```
 
-> `--build` 其实可以不跑：`KnowledgeGraph.load()` 带指纹守卫，
-> 发现落盘图谱与 tasks.py 对不上会**自动重建**（加过题忘了重建是踩过的坑）。
+**练习线**（新后端）：
+
+```bash
+python -m voyager_vlml.loop --rounds 5              # 里程碑课程：自己出题写 SQL
+```
+
+**消费线**（人问一句）：
+
+```bash
+python -m voyager_vlml.consume "每个回合中各个角色的平均击杀数是多少？"
+```
+
+**考核线**（仍在旧后端 `exam.py` / `learn.py` 上，未迁到新后端）：
+
+```bash
+python mve/learn.py --go 8 --transfer 3   # 清库 → 摸底 → 8 单元（每单元练一题+撤图谱重考）
+python mve/exam.py --profile              # 裸考画像（真实水平）
+python mve/exam.py --progress             # 按题的学习进程
+python mve/exam.py --final                # 结业考（要技能库非空，不覆盖摸底基线）
+```
 
 | 开关 | 默认 | 作用 |
 |---|---|---|
-| `MVE_ACTION_CODE` | **1** | 代码化取证（仅工具路径类题生效，SQL 类自动走原路径） |
+| `MVE_ACTION_CODE` | 1 | 代码化取证（仅工具路径类题生效） |
 | `MVE_GRAPH` / `_SEED` / `_SECTION` / `_INSIGHT` / `_STAGE` | 1 | 图谱各层，都能关掉做 A/B |
 | `MVE_ASSERT` | 1 | 硬校验（关掉才能测出提示层的边际效果） |
-| `--hint=full\|partial\|none` | 由出题器算 | 强制支架档位（A/B 用，见 README 五之二） |
-| `--no-gen` | 关 | 关掉「没有可推进的题时自动生成新题」（见五之二） |
-| `MVE_DEBUG_PROMPT` | 关 | 置 1 把本轮**完整 prompt 原文**落到 `/tmp/mve_plan_prompt.txt`。链路问题只能看原文定位，不能靠猜 —— 八之三那三个 bug 全靠它取证 |
+| `--hint=full\|partial\|none` | 由出题器算 | 强制支架档位做 A/B |
+| `--no-gen` | 关 | 关掉"没有可推进的题时自动生成新题" |
+| `MVE_DEBUG_PROMPT` | 关 | 置 1 把本轮**完整 prompt 原文**落到 `/tmp/mve_plan_prompt.txt`。链路问题只能看原文定位，不能靠猜 |
 | `MVE_PANEL_HOST` / `_PORT` / `_PREFIX` | `127.0.0.1` / 8777 / 空 | 面板部署用（见 `部署.md`） |
+
+### 怎么自己验一遍（不接受"声明式结论"）
+
+三步，每步都有**可回看的落盘证据**，不靠"我觉得它学到了"：
+
+```bash
+# 1) 练习：它自己出题、自己写 SQL 取数 —— 判据是"取没取到数"
+python -m voyager_vlml.loop --rounds 3
+tail -3 mve/run_log.jsonl          # 看 done / rows：成了就是真取到数了
+
+# 2) 消费：人问一句，看它是不是**用已积累的配方**答的
+python -m voyager_vlml.consume "每个回合中各个角色的平均击杀数是多少？"
+#    打印里要看四件事：用能力（复用配方 / 现场现做）· 回答 · 掌握（进没进能力库）
+#    · 覆盖率（两边做法的比对：一致度 + 判据原文）
+
+# 3) 看曲线：消费进步曲线的主曲线是**累计掌握数**，不是分数
+python mve/exam.py --profile        # 裸考画像（撤图谱的真实水平）
+```
+
+验"是不是真会用能力"的关键一条：**打印里 `用能力` 那行**。
+`复用配方` 才是用了积累；`现场现做` 是还没学会（这是如实标注，不是失败）。
+再问同一类问题一次，第二次应当变成 `复用配方` —— 那就是能力在增长。
 
 ---
 
-## 十、部署
+## 17. 部署
 
 已部署到腾讯云 `43.161.203.50`，面板 **https://43.161.203.50:8443/mve/**（无鉴权）。
 
 这台机器只放行 22 / 8443，8443 已被猫娘的 Caddy 网关占着，所以 MVE 挂在它的子路径下：
 `Caddy(handle /mve* → 172.18.0.1:8777)` → 面板只监听 docker 网桥地址，systemd 托管、开机自启。
-为此面板支持 `--host / --prefix`：服务端剥前缀（不带前缀一律 404），
-前端 13 处 `fetch('/api/...')` 注入 `window.MVE_PREFIX` 自动加前缀。
 完整步骤、Caddy 片段与自检见 **`部署.md`**。
 
-**仓库不含**：`vlml/`（数据层，独立 git 仓库）、`voyager-fork/`、`study_companion/`
-（只读参照，不分发）、`mve/.env`、运行日志与状态文件。凭据全走 `os.getenv`，无硬编码。
-`mve/knowledge_graph.json` 也在 `.gitignore` 里 —— 它是 `build()` 的落盘缓存，
-每台机器自己建（三判据指纹守卫会让它在需要时自动重建，见八之五）。
-
-### 同步到服务器（**没有**自动同步）
-
-之前以为服务器会自动拉代码 —— **这是误判**，实测它一直停在旧的 `4562de7`。
-要手动三步，缺哪步都不算同步完：
+### ⚠️ 同步到服务器要三步，缺哪步都不算同步完
 
 ```bash
-ssh root@43.161.203.50
-cd /root/mve && git pull                       # 1. 拉代码
-.venv/bin/python mve/knowledge_graph.py --build  # 2. 重建图谱（缓存是各机自己的）
-systemctl restart mve-panel                    # 3. 重启面板（旧进程用的是旧代码）
+git add -A && git commit -m "..." && git push origin main      # 1. 本地提交推送
+
+ssh root@43.161.203.50                                          # 2. 服务器
+cd /root/mve && git pull origin main
+systemctl restart mve-panel                                     # ← 必须！
 ```
 
-第 2 步不能省：图谱是落盘缓存且被 gitignore，`git pull` 带不过去；
-不过就算省了，`load()` 的三判据守卫也会在下次访问时自动重建（只是那一刻慢一点）。
+**第 3 步不能省**：面板是 systemd 常驻服务，Python 模块在**启动时 import 一次就缓存了**。
+只 pull 不重启，面板跑的还是旧代码 —— 实测踩过：改了 export_md/panel_data，
+命令行跑出来是新判读，面板导出的仍是旧格式。
 
-**坑**：服务器上 `vlml/database/schema/*.sql` 有一个是 **GBK**（0xa3 开头，中文注释），
-本机副本恰好全是 UTF-8，所以 `read_text(encoding="utf-8")` 只在线上炸
-（`UnicodeDecodeError`，整个 build 失败）。列名全是 ASCII，加 `errors="replace"` 即可。
+另外 `knowledge_graph.json` 被 gitignore（各机自己的落盘缓存），
+改过图谱逻辑后要显式 `cd /root/mve && .venv/bin/python mve/knowledge_graph.py --build`。
+
+**仓库不含**：`vlml/`（数据层，独立 git 仓库）、`voyager-fork/`、`study_companion/`
+（只读参照）、`mve/.env`、运行日志与状态文件。凭据全走 `os.getenv`，无硬编码。
 
 ---
 
-## 八之十三、学习判据 = Voyager 尺子（done，不数覆盖点）+ 同构生成测试题
+## 18. 已知缺口与诚实限制
 
-**用户拍板（2026-10-08，会议纪要「黄海路25之17号 3」驱动）：**
-出题器给不给题，取决于 **Voyager 那个维度的学习质量**（Voyager 的尺子）——
-课程规划照原仓库学习主循环：跑一通有积累（completed/failed 账本、技能增长），
-且检验「技能能达到课程」；Voyager 就想方设法去达到这个目标。**不要求和
-VLML 的过程一样，也不计算覆盖点** —— 这就是 Voyager 的学习时指标。
-
-### 学习阶段判据：`done`（Voyager 尺子）
-
-```
-任务完成 done = 跑通编排（有成功工具调用） + 拿到数（facts 非空） + 没翻车（无工具错误）
-```
-
-- 照原版 `critic.check_task_success`（critic.py:116）：判「环境里可观测的任务
-  目标达成」，不是「覆盖了多少评分点」。
-- **存技能 / 停止同题 / 推进换题** 只认 `done`（loop_core.task_done）。
-  实测：覆盖率 25% 但只要跑通 + 拿到数，就算任务完成 —— 存技能、推进，
-  不再为涨分连考（对照此前「同题连考 3 轮看覆盖率」）。
-- **VLML 的 success / coverage 降级为观测**：只用于考核（exam transfer/final）
-  与掌握度证据，不驱动学习。
-- 出题器（planner）的 `wrong_retry` 改读 **Voyager failed 账本**
-  （`run_log.undone_counts()`：任务没完成的题），不再读 `verdict` 错题数。
-
-### 同构生成测试题：`mve/gen_testset.py`
-
-照会议纪要：「测试题目均从已跑通的项目中同构生成，仅替换赛事编号、成员名称
-等数据，题目逻辑严谨，不存在不合理的泛化要求。」
-
-```
-python mve/gen_testset.py --topic fb_conversion_analysis   # 生成一道
-python mve/gen_testset.py --all                            # 全部题
-python mve/gen_testset.py --topic X --emit-code            # 打印可入闱 Task 代码
-```
-
-做法（确定性，不经模型）：
-1. 取源题（已跑通）的逻辑骨架 = rubric 评分点 + answer_spec（服务端私有）
-2. 从当前库实查目标实体：新 series（回合数最多且 ≠ 源）、该 series 的 team/map
-3. 同构替换 subject / question / answer_spec.sql 引号内实体值 / tool_args
-   —— 只换「数据」，不换「逻辑」
-4. 跑 VLML0 裁判校验：每个评分点的 dimension 都要在标准答案 facts 里出数
-   （min_cover 门槛）才算成立；出不了数的直接丢弃（防「换库就查不到数」的假题）
-
-实测（vlr/rib 双库）：**7/7 全部成立**（series=1067，维度覆盖 100%）——
-testsets/testset_all.json 已入库，可直接当迁移考核的测试集。
-
-### 面板判据区改版
-
-- 判据区主曲线 = **done 轨迹**（Voyager 尺子，绿=任务完成 / 红=未完成）
-- VLML `success` 降为蓝灰**观测线**（考核尺子，不驱动学习）
-- 覆盖率 = 灰色虚线达成度观测（喂掌握度证据）
-- 轮次明细加 `done` 列；KPI 显示「当前题判据 done / VLML 观测 success」
+1. **考核线还没迁到新后端。** 练习线（`voyager_vlml/loop.py`）已是新后端，
+   但摸底 / 结业考 / 学习单元仍走旧 `exam.py` / `learn.py`（旧后端）。
+   两条线的"能力"是同一套技能库，但判据语义不同（旧线读覆盖率、新线读 DB 取证）。
+2. **掌握度挂在 `topic_id` 上，不是"组合归档成的类"。** 设计要的是按组合类算掌握程度，
+   代码目前按题聚合。三档粒度里最细那档做到了，但账本仍挂在题上。
+3. **技能是"绑死这道题"的，不迁移。** 8 道题练完重考全部从摸底涨到 100%
+   （平均 +84pp），但迁移对照（考本单元**没练过**的题）两次都是 0% —— **没涨**。
+   存下来的调用序列里写死了 `series_id` / 地图名。要测迁移必须先把程序**参数化**，
+   本轮没做，不假装做了。原版 Voyager 也是同样情况。
+4. **消费判分是软尺子。** 主尺子是"两边做法的比对"（LLM 判），不是题库既有的 rubric。
+   裁判自己会跑偏（实测：问击杀数，它去算 K/D）→ 这时如实显示"没真正判到"，
+   不按 0 分算它。归上旧题库时才会额外跑硬尺子（`coverage_referee`）。
+5. **图谱没消费 ext_* 表。** 见第 14 章末尾。
+6. **出题器会被错题卡住。** 已有冷却闸与"没进展就毕业"机制，但仍会重现。
+7. **SQL 路径出题成功率约三分之一**，会被七道闸挡下并回灌，但三轮改不动的情况存在
+   —— 那是模型能力问题，不是链路问题。
 
 ---
 
-## 十一、已知缺口（含与设计的失配）
+## 19. 调试档案：那些看起来像"学不会"、其实是链路断了
 
-1. **掌握度挂在 `topic_id` 上，不是「组合归档成的类」。**
-   设计要的是「按组合类算掌握程度」，代码目前按题聚合。三档粒度里最细那档（按组合评价）
-   已经做到，但账本仍挂在题上 —— 这是当前与纸面设计的**最大失配**，未修。
-2. **双路去重解释不做。** 存在的是「人导入 → VLML 解释 → 进时间线 → 反哺出题器」；
-   设计里问到的「用户提问、由 VLML 与 Voyager 去重后交 LLM 解释」那条通路**本轮不存在**，
-   也不打算做。
-3. **出题器会被错题卡住。** 实测 56 轮里 45 轮给了 `kast_adr_check`（覆盖率长期停在 50%），
-   其余 5 道题加起来只拿到 11 轮。已有冷却闸与「没进展就毕业」机制，但仍会重现。
-4. **段内定位**：`key_metrics` 下还有 `team`/`opponent` 两层，模型会翻错层。
-   工具路径类已由「题干声明口径 = 硬约束」解决（`declared_paths()`）；
-   **SQL 路径类**（靠自己写 SQL 的题）没有等价护栏。
-5. **题目不再写死，但生成成功率有限。** `question_gen.py` 已能自动生成题目
-   （生成的是**取数配方**不是答案，裁判跑一遍拿真值），并能在「没有可推进的题」
-   与「全被拿下」两种情形自动生成（见五之二、八之四）。实测：
-   生成的 `lotus_win_rate` 被判 100% 正确；生成的 `max_losing_streak_map`
-   （难度 4）让 Voyager 首轮 0% —— 后者正是能测出学习曲线的题。
-   出题点现由**服务端从图谱挑定**（`_graph_blueprint`），模型只填 WHERE 与题面，
-   所以"编造表名/列名"这类错误已基本消失；剩下的失败主要是
-   **口径写错**（如 gaps-and-islands 的过滤层级），会被计划校验与验题拦下并回灌。
-   另外生成的题默认 `validated_target=False`（**不进掌握度**）——
-   照伴学：生成 ≠ 生效，先要被确认口径。
-   **已补（八之五）**：图谱节点现在自带声明并持久化。表节点带 VLML 建模文档写的
-   `purpose / grain / pk / column_desc / metrics / upstream / layer`，
-   维度节点带伴学式的 `difficulty / unit / skills / prerequisites / related /
-   typical_misconceptions / examples / chapter / depth`。
-   **没填的字段（7 个）**：`aliases` / `curriculum_tags` / `curriculum_version` /
-   `exam_region` / `exam_type` 等在 MVE 里没有同构物 —— 不编、不填。
-6. **技能是"绑死这道题"的，不迁移。** 八之七实测：8 道题练完重考全部从摸底涨到
-   100%（平均 +84pp），但迁移对照（考本单元**没练过**的题）两次都是 0% ——
-   **没涨**。原因是存下来的调用序列里写死了 `series_id` / 地图名，重放只对同一道题
-   成立。要测迁移必须先把程序**参数化**：把 subject 的字面量抽成参数，
-   复用时按当前题的 rubric subject 回填。本轮没做，不假装做了。
-   注意这一点原版 Voyager 也是同样情况（`program_name → program_code`，
-   复用面向同类任务，不做跨任务泛化），所以它不是 MVE 的独有缺陷。
+这一章留给最有价值的教训：**现象长得跟"学不会"一模一样，根因却是基础设施在骗它。**
+
+| 症状 | 真正的原因 | 修法 |
+|---|---|---|
+| 连着 48 轮停在 50% | ① 结构文档按固定条数截断（`_MAX_PATHS=60`，而返回正好 61 条，正确路径**在抽取阶段就被砍掉**）② 图谱是落盘缓存且已过期 ③ critic 只说"路径不对"不给候选 ④ 声明口径只是建议不是约束 | 上限提到 400；`load()` 加指纹守卫；critic 列真实候选；`declared_paths()` 变成硬约束 |
+| 跑得越久越该学会，两题一直学不会 | ① 执行层硬截断 3 条调用（`[:3]`），模型规划了 5 条，第 4 条起被**静默丢弃** ② critique 永远是 None（读的是上一轮快照，那一刻 `learn()` 还没跑）③ 反馈只点维度不点评分点 | `_call_limit=max(3, min(8, len(rubric)))`；改读当前 `last_critique`；新增 `failed_points` |
+| 学习曲线测出来是平线 | ① 坏题在库里（`value_column` 指向地图名）② critique 把失败讲成成功（`if not items` 把"missing 为空"当全覆盖）③ subject 里 `'?'` 无法回填 → 记 unjudgeable ④ 裁判缓存不过期 | 闸 3b/9；判据改看 verdict/coverage；`'?'` 按通配符匹配；缓存加 `spec_fingerprint` |
+| 求助后反而更糟（不调工具） | 求助把"做法"灌进去后模型直接写结论，不再取证 | 重做时只回灌做法，数值不回灌；加 `help_wasted` 标记 |
+| 掌握度几乎全是 None | 只在有证据的轮次落值，`dont_know` 不计 → 序列断续 | 没有证据 = `unassessed` + `mastery: None`，**不是 0%** |
+| 消费取到 85 行却"回答不出来" | 答案是一张表，压不进单值事实 → 整理器交白卷 | 改用原始数据 + 叙事洞察作答（见 4.3） |
+
+**一句要记下的教训**：这些都不是"模型学不会"，是**链路断了**。
+区分二者的办法只有落盘验伪（`MVE_DEBUG_PROMPT=1` 看 prompt 原文），
+不能靠"我觉得反馈写了应该就到了"。
 
 ---
 
-## 八之五、图谱补成伴学那样：把 VLML 的建模声明写进节点并持久化
+## 20. 文档索引
 
-上一节的结尾留了个真缺口：**MVE 的图谱节点没有"作者声明"**。伴学的 457 个知识点
-每个自带 19 个字段（难度、题型、先修、典型错法…），出题器读节点声明定题型与口径，
-模型只写题面。MVE 这边呢 —— `table:rounds` 的 `pk` 是空数组，派生表的粒度只写着
-"聚合表"三个字，列**只有名字没有含义**。
-
-VLML 里同层的"作者声明"一直都在，就在 `database/` 下四份建模文档里：
-
-| 文档 | 提供什么 |
+| 文档 | 内容 |
 |---|---|
-| `DATA_MODEL.md` | 每张表的 `**Grain:**` + `**Use cases:**`；主干血缘 `series → games → rounds → base_events` |
-| `DERIVED_TABLES.md` | 7 张派生表的粒度 / 上游 Source / 关键列 / **示例查询** |
-| `metadata/column_definitions.yaml` | 列级口径（141 行手写） |
-| `DATA_DICTIONARY.json` | 主键 / 列类型 / flag / **指标公式**（`avg_survival_time = survival_time_sum_s / survival_time_denom`） |
-
-新增 `vlml_schema.model_specs()` 解析这四份（**读文件，断库也在**），
-`_add_model_declarations()` 写进表节点，`_add_dimension_declarations()` 给 15 个维度
-节点补伴学式声明，随 `save()` 落盘 `knowledge_graph.json`。
-
-### 声明真的被用上了吗（三处消费点）
-
-1. **出题器不再各数各的难度。** `_graph_blueprint` 以前自己数脱敏骨架的关键字，
-   而骨架常常没有 `GROUP BY` → 明明要分组的 `map_fb_conv` 被判成 1 档，排在最后。
-   现在难度长在节点上（`map_fb_conv=1`、`map_win_rate=3`、`max_losing_streak=4`），
-   判据与 `DIFFICULTY_RUBRIC` 同一套，只是**算一次存下来**。
-2. **写 SQL 时知道每列是什么。** prompt 里现在有
-   `列的含义：fb_team_won=Conversion flag (1/0)`、`主键：round_id（一行 = 每回合一行）`、
-   `这张表是干什么的：first blood conversion analysis…`。
-   以前只有列名 —— 于是模型把 `fb_player` 写成 `player_name`，critique 每轮都列真名，
-   它照样按常识编三次。**给真名不够，得给含义。**
-3. **单位。** 伴学知识点自带 `unit`。MVE 以前没有，模型交过 `0.55` 和 `55` 两种答案。
-   现在维度节点带 `unit: %`，prompt 里明写"百分数，不是小数"。
-
-### 三个坑（都踩了）
-
-- **持久化 = 缓存过期。** 写完代码图里还是旧的 —— 因为 `_stale()` 只比 tasks.py 的指纹。
-  加了 `SCHEMA_VERSION`（2）与建模文档指纹，凑成三判据：格式版本 / 题指纹 / 建模指纹。
-  缺任何一个都会漏：改了代码但题没变、文档也没变的情况，只有版本号能抓住。
-- **难度要从完整 SQL 数，不能从 `semantics` 数。** `semantics` 只是 SELECT 投影
-  （`ROUND(AVG(fb_team_won)*100, 1) AS conv`），里面没有 `GROUP BY`。
-- **`_s` 的误判。** `max_losing_streak` 里的 "losing_**s**treak" 含 `_s`，
-  先判时间就把它错标成"秒"（实测就是这么错的）。判据顺序：先连败/回合，再时间。
-  同理 `One row per round` 这种英文散文不能被硬翻成键列表 —— 会翻出
-  「每（one × row × per × 回合）一行」。
-
-### 实测
-
-- 图谱：维度 15 · 工具 9 · **表 22**（多出 `ability_types`）· 边 767（+3 条建模声明的上游边）。
-- 无回退：`fb_conversion_analysis` 100%、`map_rounds_split` 100%、
-  难度 4 的生成题 `max_losing_streak_map` 首轮 0%（与改动前一致）。
-6. 面板的求助按钮与 help_decision 展示还没做。
-7. **~~SQL 路径的「编排漏条」~~ （2026-10-07 已解，见八之三）** —— 曾是 60% / 80% 长期卡死，
-   根因是执行层 `[:3]` 硬截断 + critique 永远为 None + 反馈只点维度不点评分点。
-   修后两题均第 1 轮 100%。此处保留是为了记下当时走过的两条**死路**：
-   - 加提示要求「每个 subject 组合一条查询」→ 掉到 50%。原因不是提示错，
-     是执行层只跑 3 条，写 4 条反而把重试全废在条数超限上。
-   - 只改计划层的条数上限 → 没变。因为**执行层还在截**（当时误判为"模型只规划 3 条"）。
-   剩下真实未解的：`corrode_collapse`（gaps-and-islands，难度 4）**不稳定** ——
-   历史 5 次是 100/100/100/20/20/100，同轨迹、同提示，纯看模型当轮是否写对窗口函数。
-   图谱里存着正确的参考 SQL，但**事前只渲染被截断的口径骨架**（不能给完整 SQL，
-   那等于给答案）。要不要为这类题单独给"算法骨架提示"，未定。
-
----
-
-## 十二、文档
-
-- `部署.md` —— 腾讯云部署形态、Caddy 片段、自检与更新
-- `知识图谱与求助闭环.md` —— 图谱三层与学习闭环的完整取证（含负结果）
-- `取证通路-原版Voyager对照.md` —— 「原件进判定」vs「誊抄本进判定」
-- `裁判链路记录.md` / `反馈链路与旁路学习.md` / `掌握度调研-猫娘伴学对照.md`
-- `进度对照.md` / `环境体检.md` / `MVE跑通记录.md`
+| `部署.md` | 腾讯云部署形态、Caddy 片段、自检与更新 |
+| `知识图谱与求助闭环.md` | 图谱三层与学习闭环的完整取证（含负结果） |
+| `取证通路-原版Voyager对照.md` | "原件进判定" vs "誊抄本进判定" |
+| `裁判链路记录.md` | VLML0 裁判怎么独立跑出标准答案 |
+| `反馈链路与旁路学习.md` | 判错 → 旁路学习 → 脱敏解法进技能库 |
+| `掌握度调研-猫娘伴学对照.md` | mastery_v2 的逐条取证 |
+| `数据源调研.md` | GRID / vlr / rib / PandaScore 的实测对比 |
+| `环境体检.md` | `verify_env.py` 覆盖什么 |
+| `进度对照.md` | 二十六节的历史推进记录（含结论被推翻的更正） |
+| `MVE跑通记录.md` | 最早跑通时的形态 |
