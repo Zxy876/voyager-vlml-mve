@@ -35,26 +35,89 @@ from voyager_vlml.agents.question import VLMLQuestionAgent  # noqa: E402
 from voyager_vlml.env.vlml_mcp import VLMLMCPEnv  # noqa: E402
 
 
+async def _generate_new_task(curr: Any, env: Any) -> str:
+    """范围内已无可拿下的任务 → **生成一个新任务**（设计：整轮不结束，不断生成新任务）。
+
+    topic_graph 没有运行期登记接口，这里往 `curr.graph.topics` 里加一个内存节点
+    （无前置 → 立即可选），掌握度仍落在 MasteryStore 里，重启后进度不丢。
+    """
+    from voyager_vlml.llm import chat_json
+
+    schema = ""
+    try:
+        schema = await env.schema_block()
+    except Exception:
+        schema = ""
+
+    out = chat_json(
+        [
+            {
+                "role": "system",
+                "content": (
+                    "你是 Valorant 电竞数据分析的课程设计者。当前库的知识点都被拿下或"
+                    "暂时拿不下了，请**新提一个**还能用 SQL 从库里取数回答的知识点。"
+                    "只返回 JSON：{\"name\": \"知识点名（含粒度，如 回合粒度（rounds））\","
+                    " \"question\": \"一个具体题面\", \"skills\": [\"一两条取数要点\"]}"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "当前库 schema：\n"
+                    f"{schema}\n\n"
+                    "已有的知识点不要重复。请只返回 JSON。"
+                ),
+            },
+        ],
+        temperature=0.7,
+    )
+    name = str(out.get("name") or "").strip() or "运行期新任务"
+    question = str(out.get("question") or "").strip()
+    skills = [str(s) for s in (out.get("skills") or [])][:2]
+
+    n = 1
+    while f"runtime_{n}" in curr.graph.topics:
+        n += 1
+    tid = f"runtime_{n}"
+    curr.graph.topics[tid] = {
+        "id": tid,
+        "name": name,
+        "chapter": "运行期生成",
+        "depth": 9,          # 排在种子之后
+        "difficulty": 0.5,
+        "skills": skills,
+        "examples": [{"prompt": question}] if question else [],
+        "prerequisites": [],  # 无前置 → 立即可选
+    }
+    return tid
+
+
 async def run_one_round(
     scope: dict[str, Any] | None = None,
     topic_id: str | None = None,
     use_llm: bool = True,
     max_iters: int = 3,
+    curr: Any = None,
+    env: Any = None,
 ) -> dict[str, Any]:
     """跑一轮：里程碑选题 → LLM 出题 → LLM 写 SQL 取数 → DB 取证判据 → 改写图谱。"""
-    env = VLMLMCPEnv()
-    curr = VLMLCurriculumAgent(scope=scope)
+    env = env or VLMLMCPEnv()
+    curr = curr or VLMLCurriculumAgent(scope=scope)
     act = VLMLActionAgent(env=env)
     crit = VLMLCriticAgent()
 
     # ---- 选题（里程碑树）----
+    generated = False
     if topic_id:
         tid, reason = topic_id, "explicit"
     else:
         nxt = curr.propose_next_task()
         tid, reason = nxt["topic_id"], nxt["reason"]
         if not tid:
-            return {"topic_id": "", "exhausted": True, "reason": nxt["reason"]}
+            # 范围内已无可拿下的任务 → 生成新任务（设计：整轮不结束，不断生成新任务）
+            tid = await _generate_new_task(curr, env)
+            reason = "generated_new_task"
+            generated = True
     topic = curr.graph.topics.get(tid) or {}
 
     # ---- 出题（LLM；只出题面，不给参考答案）----
@@ -111,6 +174,7 @@ async def run_one_round(
     return {
         "topic_id": tid,
         "reason": reason,
+        "generated": generated,
         "question": question,
         "sql": sql,
         "observations": observations,
@@ -121,12 +185,57 @@ async def run_one_round(
     }
 
 
+async def run_rounds(
+    n: int,
+    *,
+    scope: dict[str, Any] | None = None,
+    use_llm: bool = True,
+    max_iters: int = 3,
+) -> list[dict[str, Any]]:
+    """连跑 n 轮（共享 env 与课程状态；设计：一直跑到你点停止，整轮不结束）。"""
+    env = VLMLMCPEnv()
+    curr = VLMLCurriculumAgent(scope=scope)
+    out: list[dict[str, Any]] = []
+    for i in range(n):
+        r = await run_one_round(
+            scope=scope,
+            use_llm=use_llm,
+            max_iters=max_iters,
+            curr=curr,
+            env=env,
+        )
+        r["round"] = i + 1
+        out.append(r)
+        print(
+            f"[第 {i+1}/{n} 轮] {r['topic_id']} · reason={r['reason']}"
+            f"{' (新生成)' if r.get('generated') else ''}"
+            f" · 成功={r['success']} · 进度={r['progress']}"
+        )
+    return out
+
+
 def _main() -> int:
     ap = argparse.ArgumentParser(description="VLML 同构学习循环 · 一轮（自己出题取数）")
     ap.add_argument("--topic", default="", help="钉住某个知识点（不给则走课程选题）")
     ap.add_argument("--no-llm", action="store_true", help="不出题不写 SQL（仅演示骨架）")
     ap.add_argument("--iters", type=int, default=3, help="写 SQL 的迭代修正轮数")
+    ap.add_argument("--rounds", type=int, default=1, help="连跑几轮（>1 时共享状态）")
     a = ap.parse_args()
+
+    if a.rounds > 1:
+        rs = asyncio.run(
+            run_rounds(a.rounds, use_llm=not a.no_llm, max_iters=a.iters)
+        )
+        ok = sum(1 for r in rs if r.get("success"))
+        gen = sum(1 for r in rs if r.get("generated"))
+        print("=== 多轮汇总 ===")
+        print(f"轮数 {len(rs)} · 成功 {ok} · 生成新任务 {gen} · 末轮进度 {rs[-1].get('progress')}")
+        for r in rs:
+            print(f"  {r['round']}. {r['topic_id']} [{r['reason']}] 成功={r['success']}"
+                  f" 技能={r.get('skill_key') or '—'}")
+            print(f"     题面：{r.get('question')}")
+            print(f"     SQL ：{(r.get('sql') or '').replace(chr(10), ' ')[:110]}")
+        return 0
 
     r = asyncio.run(
         run_one_round(
