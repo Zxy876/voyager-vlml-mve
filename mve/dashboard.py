@@ -725,6 +725,7 @@ function pImport(s){
   return `<div class="panel">
     <div class="panel__head"><h2>人导入意图</h2>
       <span class="hint">人提问 → Voyager 回答 · VLML 解析照旧披露</span></div>
+    ${coachRunningBar(s)}
     <div class="imp">
       <div style="font-size:12.5px;color:var(--muted);margin-bottom:8px">
         写一句你想问的话。<b>Voyager 会用它已积累的能力回答</b>——mem0 召回的既往经验、
@@ -1444,6 +1445,37 @@ function graphLinkChips(gl){
     + `｜表 ${(gl.tables||[]).length} 张</span>`;
 }
 
+/* 后台任务进度条：消费要 1～3 分钟，没有这一条人只看到按钮空转，
+   分不清「在跑」和「死了」（用户实测就问过"怎么回答不出来"）。 */
+function coachRunningBar(s){
+  if(!s.coach_running)
+    return s.coach_error
+      ? `<div class="note" style="margin:8px 0"><b>上一次消费挂了：</b>${ESC(s.coach_error)}</div>`
+      : '';
+  return `<div class="note info" style="margin:8px 0">
+    <b>Voyager 正在回答：</b>${ESC(s.coach_question||'')}
+    <span class="chip grey">已跑 ${ESC(s.coach_elapsed)} 秒</span>
+    <div style="font-size:12px;color:var(--muted);margin-top:4px">
+      要串十几次模型调用（找配方 → 回填实体值 → 取数 → 整理 → 回答 →
+      VLML 独立取一遍算覆盖率），通常 1～3 分钟。跑完会自动出现在下面导入历史里。
+    </div></div>`;
+}
+
+/* 受理回执：明确告诉人「它在跑，别盯着等」，并把它要去哪儿看结果说清楚。 */
+function renderImportBusy(res){
+  const box=document.getElementById('result'); if(!box) return;
+  box.innerHTML=`<div class="note info" style="margin-top:10px">
+    ${res.busy
+      ? `<b>上一句还在回答中</b>：${ESC(res.error||'')}`
+      : `<b>已受理，Voyager 正在回答</b>
+         <div style="margin-top:5px">${ESC(res.message||'')}</div>
+         <div style="margin-top:6px;font-size:12px;color:var(--muted)">
+           它这会儿在串行做：找已学配方 → 回填这句话的实体值 → 取数 →
+           整理事实 → 组织回答 → 再让 VLML 独立取一遍当尺子算覆盖率。
+           十几次模型调用，所以要一两分钟。</div>`}
+  </div>`;
+}
+
 function renderImportResult(res){
   const box=document.getElementById('result'); if(!box) return;
   if(!res){ box.innerHTML=''; return; }
@@ -1563,6 +1595,18 @@ async function submitImport(){
     const r=await fetch('/api/coach',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({question:v, topic_id:picked, mode:'voyager'})});
     const res=await r.json();
+    // 后台执行：受理了就**不要**同步等结果 —— 结果会随 4 秒轮询进导入历史。
+    // 实测教训：同步等 2～5 分钟会把浏览器/Caddy 连接拖到超时，人只看到
+    // 按钮卡在「正在回答」，以为 Voyager 答不出来（其实它在跑）。
+    if(res.accepted||res.busy){
+      renderImportBusy(res);
+      uiEvent('human_import',{问题:v.slice(0,300),模式:'消费（后台执行）',
+        手动指定的题: picked||'未指定'}, res.busy?('被拒：上一句还在回答中'):('已受理，后台跑'));
+      if(!res.busy){ q.value=''; q.blur(); }
+      document.getElementById('hit').textContent='归类结果会在这里显示。';
+      await load();
+      return;
+    }
     renderImportResult(res);
     uiEvent('human_import',
       {问题: v.slice(0,300),
@@ -1922,6 +1966,11 @@ setInterval(load, 4000);
 """
 
 
+# 消费通路的后台任务状态（进程内存；面板重启即清 —— 与 pilot_state 一个思路，
+# 只是它轻到不值得落盘）。
+COACH_JOB: dict = {"running": False, "question": "", "started_at": 0.0, "error": ""}
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code: int, body: bytes, ctype: str) -> None:
         self.send_response(code)
@@ -1950,7 +1999,16 @@ class Handler(BaseHTTPRequestHandler):
             body = _html().encode("utf-8")
             ctype = "text/html; charset=utf-8"
         elif path == "/api/state":
-            body = panel_data.as_json().encode("utf-8")
+            import time as _t
+            # 消费通路在后台跑（要 1～3 分钟），前端靠 4 秒轮询看它跑没跑完。
+            # 不把状态喂出来，人就只看到按钮卡在「正在回答」，不知道活着还是死了。
+            st = panel_data.build_state()
+            st["coach_running"] = bool(COACH_JOB["running"])
+            st["coach_question"] = str(COACH_JOB["question"] or "")[:80]
+            st["coach_elapsed"] = (int(_t.time() - COACH_JOB["started_at"])
+                                   if COACH_JOB["running"] else 0)
+            st["coach_error"] = str(COACH_JOB["error"] or "")
+            body = json.dumps(st, ensure_ascii=False, default=str).encode("utf-8")
             ctype = "application/json; charset=utf-8"
         elif path == "/api/graph":
             body = _graph_json().encode("utf-8")
@@ -2003,52 +2061,72 @@ class Handler(BaseHTTPRequestHandler):
             if not q:
                 self._json(400, {"ok": False, "error": "问题是空的"})
                 return
-            try:
-                import asyncio
+            mode = str(payload.get("mode") or "voyager").strip().lower()
+            if mode != "voyager":
+                # 旧通路（纯 VLML 解释）快（~30s），保持同步。
+                try:
+                    import asyncio
+                    import coach  # 会拉起 VLML 环境（chdir + 打补丁），按需加载
+                    res = asyncio.run(coach.explain(q, voyager=False))
+                    res["ok"] = True
+                except Exception as e:
+                    self._json(500, {"ok": False, "error": f"{type(e).__name__}: {e}"[:300]})
+                    return
+                self._json(200, res)
+                return
 
-                mode = str(payload.get("mode") or "voyager").strip().lower()
-                if mode == "voyager":
-                    # **消费通路**（2026-10-13 用户定）：Voyager 用**已积累的能力**
-                    # 回答 —— 检索技能库里固化的 SQL 配方，把这句话的实体值回填进
-                    # 配方的计算，执行取数；库里没有可用配方才现场写（并如实标注）。
-                    # 底下 VLML 的解析（工具 + 事实）照旧披露，覆盖率/掌握度在这里算。
-                    #
-                    # 与旧的 `coach.explain(voyager=True)` 的区别：那条只是把技能库
-                    # 的**文字**塞进 VLML 编排的 prompt（= 注入话术，不是用配方取数）。
-                    # ⚠️ 面板进程的 sys.path[0] 是 mve/（systemd 从这里拉起 dashboard），
-                    # 不含仓库根 —— 直接 import voyager_vlml 会
-                    # ModuleNotFoundError（实测：面板上点「交给 Voyager 回答」
-                    # 直接报「导入失败」）。所以先把仓库根插进 sys.path。
+            # **消费通路改后台执行**（2026-10-13 实测教训）：全链路要串行跑
+            # 十几次 LLM 调用（同题校验 + 评分点派生 + 配方回填 + 写 SQL 迭代
+            # ×3 + 事实整理 + 回答 + 裁判独立取数×3 + 裁判整理），实测 2～5 分钟。
+            # 同步等有两个恶果：Caddy 网关超时切断连接 → 前端「正在回答」转圈到死；
+            # 人以为 Voyager 挂了（用户实测就问了一句"怎么回答不出来"）。
+            # 所以这里**立即受理**，后台线程跑完落 coach_log —— 前端 4 秒轮询
+            # 会自动把结果刷进导入历史和进步曲线（与驾驶舱的 pilot 同一套模式）。
+            import threading
+            import time as _time
+            if COACH_JOB["running"]:
+                self._json(200, {
+                    "ok": False, "busy": True,
+                    "error": (f"上一句还在回答中（{COACH_JOB['question'][:40]}…，"
+                              f"已跑 {int(_time.time() - COACH_JOB['started_at'])} 秒）。"
+                              "等它出结果再问下一句。")})
+                return
+            COACH_JOB.update({"running": True, "question": q,
+                              "started_at": _time.time(), "error": ""})
+
+            def _run_consume_bg() -> None:
+                try:
+                    import asyncio
                     import sys as _sys
                     from pathlib import Path as _Path
                     _repo_root = str(_Path(__file__).resolve().parents[1])
                     if _repo_root not in _sys.path:
                         _sys.path.insert(0, _repo_root)
                     import voyager_vlml.consume as _consume
-                    res = asyncio.run(_consume.consume(
-                        q, topic_hint=str(payload.get("topic_id") or "")))
-                    res["ok"] = True
-                else:
-                    # mode=vlml：旧的纯 VLML 解释通路，保留可切回。
-                    import coach  # 会拉起 VLML 环境（chdir + 打补丁），按需加载
-                    res = asyncio.run(coach.explain(q, voyager=False))
-                    res["ok"] = True
-            except Exception as e:
-                self._json(500, {"ok": False, "error": f"{type(e).__name__}: {e}"[:300]})
-                return
-            facts = [
-                {
-                    "subject": "/".join(f"{k}={v}" for k, v in (f.get("subject") or {}).items()),
-                    "dimension": f.get("dimension"),
-                    "value": f.get("value"),
-                    "base": f.get("base"),
-                    "unit": f.get("unit"),
-                }
-                for f in (res.get("facts") or [])
-            ]
-            self._json(200, {"ok": True,
-                             **{k: v for k, v in res.items() if k != "facts"},
-                             "facts": facts})
+                    _consume.consume(q, topic_hint=str(payload.get("topic_id") or ""))
+                    # consume 内部会 _log 落 coach_log —— 前端轮询自然能看到
+                except Exception as e:  # 失败也要让人看见，不能静默吞掉
+                    COACH_JOB["error"] = f"{type(e).__name__}: {e}"[:300]
+                    try:
+                        from coach import _log_import
+                        _log_import({
+                            "question": q, "mode": "voyager_consume",
+                            "topic_id": "", "topic_hit": "", "source": "human_import",
+                            "validated_target": False, "trajectory": [], "errors":
+                            [COACH_JOB["error"]], "facts": [], "facts_count": 0,
+                            "narrative": "", "insights": [], "caveats": [],
+                            "skipped": f"消费通路挂了：{COACH_JOB['error']}",
+                        })
+                    except Exception:
+                        pass
+                finally:
+                    COACH_JOB["running"] = False
+
+            threading.Thread(target=_run_consume_bg, daemon=True).start()
+            self._json(200, {"ok": True, "accepted": True, "running": True,
+                             "message": "已受理，Voyager 正在回答（要串十几次模型调用，"
+                                        "约 1～3 分钟）。结果会自动出现在下方导入历史里，"
+                                        "不用盯着等。"})
             return
 
         if path == "/api/db/probe":
