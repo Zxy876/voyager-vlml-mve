@@ -33,18 +33,20 @@ class VLMLQuestionAgent:
     def __init__(self, env: Any = None) -> None:
         self.env = env  # 用于取真实 schema（不传则不带 schema 块）
 
-    def _schema_block(self) -> str:
-        """从库里实查表与列（env.schema_block，照伴学 entity_catalog 的"实查不写死"原则）。"""
+    async def _schema_block(self) -> str:
+        """从库里实查表与列（env.schema_block，照伴学 entity_catalog 的"实查不写死"原则）。
+
+        ⚠️ 必须是 async：闭环本身跑在事件循环里，这里再用 asyncio.run 会
+        "coroutine was never awaited"（实测踩过）。
+        """
         if self.env is None or not hasattr(self.env, "schema_block"):
             return ""
-        import asyncio
-
         try:
-            return asyncio.run(self.env.schema_block()) or ""
+            return await self.env.schema_block() or ""
         except Exception:
             return ""
 
-    def generate(self, topic: dict[str, Any]) -> str:
+    async def generate(self, topic: dict[str, Any]) -> str:
         """为一个里程碑节点出题，返回题面文本。"""
         name = str(topic.get("name") or topic.get("id") or "")
         skills = "；".join(str(s) for s in (topic.get("skills") or [])[:3])
@@ -60,7 +62,7 @@ class VLMLQuestionAgent:
             if gran
             else ""
         )
-        schema = self._schema_block()
+        schema = await self._schema_block()
         user = (
             f"【知识点】{name}\n"
             f"技能要求：{skills or '（无）'}\n"

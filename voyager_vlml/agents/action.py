@@ -9,7 +9,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -20,6 +22,40 @@ if str(_REPO_ROOT) not in sys.path:
 
 from voyager_vlml.control_primitives import render_primitives  # noqa: E402
 from voyager_vlml.env.vlml_mcp import VLMLMCPEnv  # noqa: E402
+
+
+def _extract_sql(text: str) -> str:
+    """从模型输出里抠出 SELECT。
+
+    模型可能回三种形态，都要接住（实测只按 JSON 解析会漏掉裸 SQL，导致
+    "模型没给出 SELECT" 空转三轮）：
+      1. JSON      {"sql": "SELECT ..."}
+      2. 代码围栏  ```sql SELECT ... ```
+      3. 裸文本    SELECT ...
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    # 1) JSON（含 ```json 围栏）
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.S)
+    blob = m.group(1) if m else raw
+    s, e = blob.find("{"), blob.rfind("}")
+    if s >= 0 and e > s:
+        try:
+            obj = json.loads(blob[s : e + 1])
+            if isinstance(obj, dict) and obj.get("sql"):
+                return str(obj["sql"]).strip()
+        except json.JSONDecodeError:
+            pass
+    # 2) ```sql 围栏
+    m = re.search(r"```(?:sql)?\s*(SELECT[\s\S]*?)```", raw, re.I)
+    if m:
+        return m.group(1).strip()
+    # 3) 裸 SELECT
+    m = re.search(r"(SELECT[\s\S]+?)(?:;|$)", raw, re.I)
+    if m:
+        return m.group(1).strip()
+    return ""
 
 
 class VLMLActionAgent:
@@ -52,7 +88,7 @@ class VLMLActionAgent:
 
         只收 SELECT（不接受其它语句），拿不到就返回空串由调用方判失败。
         """
-        from voyager_vlml.llm import chat_json
+        from voyager_vlml.llm import chat
 
         system = self.render_system_message()
         if schema:
@@ -65,11 +101,11 @@ class VLMLActionAgent:
             critique=critique or "（首轮，直接写一条 SELECT 回答这个问题）",
             last_sql=last_sql,
         )
-        out = chat_json(
+        text = chat(
             [{"role": "system", "content": system}, {"role": "user", "content": user}],
             temperature=0.3,
         )
-        sql = str(out.get("sql") or "").strip()
+        sql = _extract_sql(text)
         if not sql.lower().startswith("select"):
             return ""
         return sql

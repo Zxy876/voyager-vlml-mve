@@ -61,7 +61,7 @@ async def run_one_round(
     question = ""
     if use_llm:
         try:
-            question = VLMLQuestionAgent(env=env).generate(topic) or ""
+            question = await VLMLQuestionAgent(env=env).generate(topic) or ""
         except Exception as e:
             print(f"  （出题失败：{type(e).__name__}: {e}）")
     if not question:
