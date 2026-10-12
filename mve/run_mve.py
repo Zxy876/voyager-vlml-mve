@@ -55,15 +55,14 @@ from tasks import SERIES, TASKS, TASK, TASK_HARD, TASK_MID, TASK_PATTERN, next_t
 
 
 def _stable_skill_name(task: Any) -> str:
-    """技能的**稳定主键**（照原版 `program_name`）。
+    """技能的**稳定主键** = 索引到的图谱问题类型（照原版 `program_name`）。
 
-    原版技能的主键是函数名——稳定，所以同名会走 Rewriting 更新同一条。
-    MVE 此前用 LLM 每轮生成的一句话当名字，措辞一变就是"新技能"：
-    实测同一条经验被写成「按 team 维度下钻」「按 team 维度拆分」「按 team 下钻」三版，
-    于是 versions 涨到 49、膨胀率 17.5，而每一版都没被真正更新过（ok=0）。
-    名字必须由**题目**决定，不由模型当次的措辞决定。
+    设计：技能主键用「图谱问题类型」（如 `c9_win_rate`），不是模型当次措辞。
+    原版主键是函数名——稳定，所以同名走 Rewriting 更新同一条。MVE 此前用
+    LLM 每轮的一句话当名字，措辞一变就是"新技能"（实测 versions 涨到 49、
+    膨胀率 17.5，每版都没被真正更新过）。名字必须由**题目/知识点**决定。
     """
-    return f"{getattr(task, 'topic_id', '') or 'task'}解法"
+    return f"{getattr(task, 'topic_id', '') or 'task'}"
 
 
 def _plan_program(topic_id: str, calls: list[dict[str, Any]]) -> tuple[str, str]:
@@ -277,6 +276,64 @@ def _build_rubric(q: dict[str, Any], topic_id: str) -> list[Any]:
         return []
 
 
+def _resolve_scope() -> dict[str, Any] | None:
+    """练习范围（面板 practice_scope）→ 课程范围，交给 select_next 筛选。
+
+    设计：切题/改范围只决定「在哪个子课程里有序推进」，不改变循环节奏
+    （只有停止能改节奏）；范围用错也不会让循环崩。
+    """
+    try:
+        import practice_scope
+        sc = practice_scope.get_scope()
+        if isinstance(sc, dict) and sc:
+            return sc
+    except Exception:
+        pass
+    return None
+
+
+async def _generate_runtime_task() -> Any | None:
+    """设计：范围内无「可拿下」任务时，不断生成新任务继续（整轮不结束）。
+
+    用 question_gen 的确定性验题入口生成一道**带真值配方**的新题，转成 Task
+    直接作答；并在内存图谱里登记一个运行时节点，使该节点的「完成/技能」可被追踪。
+    （运行时节点不落 seed 文件——重开会清掉当前库数据，与设计的「重开趋同」一致。）
+    """
+    try:
+        import question_gen
+        from topic_graph import TopicGraph
+        rec, _ = await question_gen.generate_adopt(
+            difficulty=3, tries=3, do_adopt=True, verbose=False)
+        if not rec:
+            return None
+        task = question_gen.to_task(rec)
+        task.validated_target = True
+        tid = str(task.topic_id or "")
+        if tid:
+            graph = TopicGraph()
+            if tid not in graph.topics:
+                graph.topics[tid] = {
+                    "id": tid, "name": str(rec.get("question") or tid),
+                    "stage": "runtime", "subject": "valorant",
+                    "chapter": "runtime", "course_family": "vlml0",
+                    "depth": 5, "difficulty": 3,
+                    "prerequisites": [], "related": [], "skills": [],
+                    "question_types": [], "examples": [],
+                    "typical_misconceptions": [], "curriculum_version": 1,
+                    "exam_region": "", "exam_type": "",
+                }
+            try:
+                scene_text = scene_context.scene_injection(tid)
+                if scene_text:
+                    task.question = str(task.question or "") + "\n\n" + scene_text
+            except Exception:
+                pass
+        return task
+    except Exception as e:
+        print(f"  （生成新任务失败：{type(e).__name__}: {e}）")
+        return None
+
+
 async def run_curriculum(rounds: int, topic_id: str = "", *,
                          blind: bool = False, use_llm: bool = True,
                          help_policy: str = "auto") -> None:
@@ -307,40 +364,58 @@ async def run_curriculum(rounds: int, topic_id: str = "", *,
     print("  客观比对 → 任务完成/未完成。不再用语义评分（那只会让它讨好阅卷人）。")
     print()
     seen = 0
+    scope = _resolve_scope()
     while not _should_stop():
-        sel = graph.select_next(explicit=topic_id or None)
-        tid = sel["topic_id"]
-        mrow = graph.mastery.get(tid) or {}
-        attempt = int(mrow.get("attempts", 0))
-        # —— 出题：topic_graph 选知识点 → open_quiz 即时出一道具体题 ——
-        # generate_validated 会先拿真实库校验参考 SQL，跑不通就把具体 SQL 错误
-        # 回灌模型重试（最多 3 次），保证客观裁判永远拿得到真值。
-        q, sql_err = open_quiz.generate_validated(tid, attempt=attempt,
-                                                  memories=True, scene=True)
-        if sql_err is not None:
-            print(f"  ⚠ {tid} 参考 SQL 经重试仍不可执行（{sql_err}）→ 淘汰换题")
-            graph.mastery.update(tid, score=0.0)
-            seen += 1
-            continue
-        # 生成题必须带「服务端可执行的参考 SQL」才能有客观真值（VLML 跑一次判成功）
-        rubric = _build_rubric(q, tid)
-        if not rubric:
-            print(f"  ⚠ {tid} 生成题无参考 SQL（无法客观判分）→ 淘汰换题")
-            graph.mastery.update(tid, score=0.0)
-            seen += 1
-            continue
+        sel = graph.select_next(explicit=topic_id or None, scope=scope)
+        if sel.get("exhausted"):
+            # 设计：范围内无「可拿下」任务 → 不断生成新任务继续（整轮不结束）。
+            print(f"\n----- 范围内无「可拿下」任务 · 第 {seen + 1} 次 -----")
+            print(f"  {sel.get('explanation')}")
+            rt = await _generate_runtime_task()
+            if rt is None:
+                _stop_and_wait(
+                    why="课程在范围内已无可拿下任务，且无法生成新任务"
+                         "（检查 LLM 密钥 / 库连接 / 验题链路）。请修复后重开。")
+                stopped["flag"] = True
+                break
+            task = rt
+            tid = task.topic_id
+            question = task.question
+            print(f"\n----- 生成新任务 {tid} · 第 {seen + 1} 次 -----")
+            print(f"  问题：{question}")
+        else:
+            tid = sel["topic_id"]
+            mrow = graph.mastery.get(tid) or {}
+            attempt = int(mrow.get("attempts", 0))
+            # —— 出题：topic_graph 选知识点 → open_quiz 即时出一道具体题 ——
+            # generate_validated 会先拿真实库校验参考 SQL，跑不通就把具体 SQL 错误
+            # 回灌模型重试（最多 3 次），保证客观裁判永远拿得到真值。
+            q, sql_err = open_quiz.generate_validated(tid, attempt=attempt,
+                                                      memories=True, scene=True)
+            if sql_err is not None:
+                print(f"  ⚠ {tid} 参考 SQL 经重试仍不可执行（{sql_err}）→ 淘汰换题")
+                graph.mastery.update(tid, score=0.0)
+                seen += 1
+                continue
+            # 生成题必须带「服务端可执行的参考 SQL」才能有客观真值（VLML 跑一次判成功）
+            rubric = _build_rubric(q, tid)
+            if not rubric:
+                print(f"  ⚠ {tid} 生成题无参考 SQL（无法客观判分）→ 淘汰换题")
+                graph.mastery.update(tid, score=0.0)
+                seen += 1
+                continue
 
-        question = q.get("question") or ""
-        # —— 出生地元信息（图谱同构物）注入 agent 的题面 ——
-        scene_text = ""
-        try:
-            scene_text = scene_context.scene_injection(tid)
-        except Exception:
+            question = q.get("question") or ""
+            # —— 出生地元信息（图谱同构物）注入 agent 的题面 ——
             scene_text = ""
-        full_q = question + ("\n\n" + scene_text if scene_text else "")
-        task = _GenTask(full_q, tid, rubric=rubric)
-        print(f"\n----- 选题 {tid}（{sel.get('reason')}）· 第 {seen + 1} 次 -----")
-        print(f"  问题：{question}")
+            try:
+                scene_text = scene_context.scene_injection(tid)
+            except Exception:
+                scene_text = ""
+            full_q = question + ("\n\n" + scene_text if scene_text else "")
+            task = _GenTask(full_q, tid, rubric=rubric)
+            print(f"\n----- 选题 {tid}（{sel.get('reason')}）· 第 {seen + 1} 次 -----")
+            print(f"  问题：{question}")
 
         # —— 客观真值：VLML0 裁判执行参考 SQL 算出标准答案（服务端独立产出）——
         ref_task = asyncio.create_task(vlml0_referee.answer(task))
@@ -384,9 +459,11 @@ async def run_curriculum(rounds: int, topic_id: str = "", *,
                 pass
             if ev.success:
                 done = True
+                # 设计：任务跑通 → 图谱当前节点标记完成（不重复规划）。
+                graph.mastery.mark_completed(tid)
                 name = _store_skill_for(voyager, tid, task, result,
                                         float(ev.coverage), question)
-                print(f"  ✅ 客观完成（VLML0 核验通过）→ 存技能"
+                print(f"  ✅ 客观完成（VLML0 核验通过）→ 标记节点完成 + 存技能"
                       + (f"：{name}" if name else "（无可固化程序）"))
                 break
         if not done:

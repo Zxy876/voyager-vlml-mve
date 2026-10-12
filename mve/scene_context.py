@@ -177,17 +177,17 @@ def mastered_skills() -> dict[str, Any]:
 
 
 def unlocked_milestones() -> list[str]:
-    """里程碑等价物：已掌握（mastery≥0.8）的知识点 = 已解锁的图谱节点。进上下文。
+    """里程碑等价物：已**完成**（任务跑通）的知识点 = 已解锁的图谱节点。进上下文。
 
     同构原版 curriculum.render_observation 把 completed_tasks 写进 human message
-    —— MVE 的「已完成」就是 topic_graph 掌握度达标，标进上下文让 agent 知道
-    「哪些里程碑已经拿下了，不用再绕」。
+    —— MVE 的「已完成」就是 topic_graph 的 completed 标记（任务跑通），标进上下文
+    让 agent 知道「哪些里程碑已经拿下了，不用再绕」。这是布尔 completed，**不是
+    掌握度阈值**——评分/掌握度只进面板，不在此处驱动任何逻辑。
     """
     try:
         from topic_graph import MasteryStore
         ms = MasteryStore()
-        return [tid for tid, r in ms.all().items()
-                if r.get("mastery") is not None and float(r["mastery"]) >= 0.8]
+        return [tid for tid, r in ms.all().items() if ms.is_completed(tid)]
     except Exception:
         return []
 

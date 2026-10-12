@@ -3,7 +3,7 @@
 
 出题逻辑（移植，不 import 伴学运行时，跨进程只走 HTTP 桥）
 ----------------------------------------------------------
-1. 选题由 `topic_graph.TopicGraph.select_next` 负责（前置门控 + 薄弱优先 + 难度梯度）。
+1. 选题由 `topic_graph.TopicGraph.select_next` 负责（有序课程 + 完成门控 + 放弃机制）。
 2. 本题：拿选中的知识点（伴学 build_vlml_seed 的 29 个知识点之一）的
    `examples`（prompt=问法 / answer_outline=拿表回答步骤）、`typical_misconceptions`
    （实测踩出来的坑）、`skills`，组装成出题提示。
@@ -488,6 +488,11 @@ def generate_next(*, scope: dict[str, Any] | None = None, explicit: str | None =
     """选下一知识点并出题，一并返回选题依据。"""
     graph = TopicGraph()
     sel = graph.select_next(scope=scope, explicit=explicit)
+    # 范围内无「可拿下」任务（设计：应由调用方生成新任务）→ 直接返回选题依据，
+    # 不调 generate_for（否则 tid="" 会抛错）。
+    if sel.get("exhausted"):
+        return {"selection": sel, "exhausted": True,
+                "question": "", "reference_sql": "", "topic": ""}
     tid = sel["topic_id"]
     # attempt 数 = 该知识点已尝试次数（用于题型轮换）
     mrow = graph.mastery.get(tid)

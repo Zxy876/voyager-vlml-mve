@@ -40,11 +40,13 @@ DEFAULT_REQUIRED_MASTERY = 0.5
 # ---------------------------------------------------------------------------
 # Voyager 课程机制（替换/增强 MVE 出题器，2026-10-12 落地）
 # ---------------------------------------------------------------------------
-# 1) 放弃机制（堵 MC 161 轮死循环）：一个知识点练够 MAX_ATTEMPTS_PER_TOPIC 次、
-#    掌握度仍 < STALE_MASTERY，就标记 stale，select_next 强制跳过换题。绝不在一个
-#    知识点上无限打转（MC 实测 161 轮不换题=从不干净失败）。
-MAX_ATTEMPTS_PER_TOPIC = 6
-STALE_MASTERY = 0.6
+# 1) 放弃机制（堵 MC 161 轮死循环）：一个知识点练够 MAX_ATTEMPTS_PER_TOPIC 次
+#    （初试 + 重试，设计指定 = 3）仍没跑通 → 标记 stale，select_next 强制跳过换题。
+#    绝不在一个知识点上无限打转（MC 实测 161 轮不换题=从不干净失败）。
+#    ⚠️ 设计硬约束：放弃判定只看「次数够不够」，不读掌握度/覆盖率
+#    （评分/掌握度只进面板展示，绝不被任何推进条件读到）。
+MAX_ATTEMPTS_PER_TOPIC = 3
+STALE_MASTERY = 0.6   # 仅留作面板"是否达标"展示，不再参与放弃/选题判定
 
 # 2) 跨域基线（用户指定：技能/动作锁定 VLML 10 工具/语义层，不写裸 SQL）。
 #    这些知识点依赖 ext_* 表（首血 / 经济局），换到没有 ext 表的库（vlml_vlr）
@@ -81,6 +83,7 @@ class MasteryStore:
             except json.JSONDecodeError:
                 continue
             if isinstance(row.get("topic_id"), str):
+                row.setdefault("completed", False)
                 self._rows[row["topic_id"]] = row
 
     def get(self, topic_id: str) -> dict[str, Any] | None:
@@ -104,6 +107,7 @@ class MasteryStore:
         row = self._rows.get(topic_id) or {
             "topic_id": topic_id, "mastery": None, "attempts": 0,
             "correct": 0, "last_at": 0, "streak_wrong": 0, "stale": False,
+            "completed": False,
         }
         row["attempts"] = int(row.get("attempts", 0)) + 1
         row["correct"] = int(row.get("correct", 0)) + (1 if score >= 0.6 else 0)
@@ -116,13 +120,11 @@ class MasteryStore:
             # 指数滑动平均：新样本权重 0.4
             row["mastery"] = round(prev * 0.6 + score * 0.4, 4)
         row["last_at"] = int(time.time())
-        # 放弃机制：练够 MAX_ATTEMPTS 次仍 < STALE_MASTERY → 标记 stale。
-        # staleness 只看「次数够 + 掌握度低」两件事，与是否连错解耦，避免
-        # "刚好最后一次蒙对"把标记刷掉——次数到了就是到了。
-        row["stale"] = bool(
-            row["attempts"] >= MAX_ATTEMPTS_PER_TOPIC
-            and (row.get("mastery") is None or float(row["mastery"]) < STALE_MASTERY)
-        )
+        # 放弃机制：练够 MAX_ATTEMPTS_PER_TOPIC 次 → 标记 stale（设计指定 = 3）。
+        # ⚠️ 设计硬约束：放弃判定**只看次数**，不读掌握度/覆盖率——
+        # 评分结果不被任何推进条件读到（决定跳过、下一题、整轮结束都不读它）。
+        # "刚好最后一次蒙对"不会刷掉标记：次数到了就是到了。
+        row["stale"] = bool(row["attempts"] >= MAX_ATTEMPTS_PER_TOPIC)
         self._rows[topic_id] = row
         if commit:
             self._persist()
@@ -130,6 +132,26 @@ class MasteryStore:
 
     def is_stale(self, topic_id: str) -> bool:
         return bool((self._rows.get(topic_id) or {}).get("stale"))
+
+    def mark_completed(self, topic_id: str, *, commit: bool = True) -> dict[str, Any]:
+        """任务跑通（ev.success）→ 图谱当前节点标记完成（设计：不重复规划）。
+
+        与 mastery（展示用）解耦：completed 是布尔「做没做过」，mastery 是
+        「做得怎么样」（只进面板）。select_next 据此排除已完成的节点，不重规划。
+        """
+        row = self._rows.get(topic_id) or {
+            "topic_id": topic_id, "mastery": None, "attempts": 0,
+            "correct": 0, "last_at": 0, "streak_wrong": 0, "stale": False,
+            "completed": False,
+        }
+        row["completed"] = True
+        self._rows[topic_id] = row
+        if commit:
+            self._persist()
+        return row
+
+    def is_completed(self, topic_id: str) -> bool:
+        return bool((self._rows.get(topic_id) or {}).get("completed"))
 
     def streak_of(self, topic_id: str) -> int:
         return int((self._rows.get(topic_id) or {}).get("streak_wrong", 0))
@@ -197,18 +219,22 @@ class TopicGraph:
         return [e for e in self.edges if e["to"] == topic_id and e["relation"] == "prerequisite"]
 
     def prereq_ok(self, topic: dict[str, Any]) -> bool:
+        """前置门控：前置节点**已完成**（任务跑通）才解锁。
+
+        ⚠️ 设计硬约束：门控只看「前置节点是否 completed（布尔）」，
+        不读掌握度/覆盖率——评分结果不被任何推进条件读到。
+        有序课程（比赛→队伍→队员）由 completion 驱动，不是由分数驱动。
+        """
         for e in self.prerequisites_of(topic["id"]):
-            m = self.mastery.mastery_of(e["from"])
-            if m is None or m < float(e.get("required_mastery", DEFAULT_REQUIRED_MASTERY)):
+            if not self.mastery.is_completed(e["from"]):
                 return False
         return True
 
     def blocked_by(self, topic: dict[str, Any]) -> list[str]:
-        """返回没达标的前置 id 列表（用于给用户解释为什么这道题还没解锁）。"""
+        """返回没完成的前置 id 列表（用于解释为什么这道题还没解锁）。"""
         out = []
         for e in self.prerequisites_of(topic["id"]):
-            m = self.mastery.mastery_of(e["from"])
-            if m is None or m < float(e.get("required_mastery", DEFAULT_REQUIRED_MASTERY)):
+            if not self.mastery.is_completed(e["from"]):
                 out.append(e["from"])
         return out
 
@@ -227,21 +253,35 @@ class TopicGraph:
             f"已掌握 {mastered} 个 → 目标难度 {target}"
         )
 
+    # ---- 课程顺序（设计：有序规划课程，比赛→队伍→队员）----
+    def _chapter_rank(self, topic: dict[str, Any]) -> int:
+        """章节在种子里的出现顺序 = 课程顺序（不读掌握度/覆盖率）。"""
+        if not hasattr(self, "_chapter_order"):
+            order: dict[str, int] = {}
+            n = 0
+            for t in self.topics.values():
+                ch = str(t.get("chapter") or "")
+                if ch not in order:
+                    order[ch] = n
+                    n += 1
+            self._chapter_order = order
+        return self._chapter_order.get(str(topic.get("chapter") or ""), 999)
+
     # ---- 核心：选下一题（Voyager 课程驱动）----
     def select_next(
         self, *, scope: dict[str, Any] | None = None, explicit: str | None = None,
         ext_available: bool | None = None,
     ) -> dict[str, Any]:
         """返回 {topic_id, reason, explanation, blocked, hint, difficulty_target,
-        novelty, stale_skipped, ext_deprioritized}。
+        novelty, stale_skipped, ext_deprioritized, exhausted}。
 
-        排序键（伴学 weak-first + _by_gradient 同构，叠加 Voyager 两项）：
-            (掌握度越低越前, 离目标难度越近越前, depth, id)
-        叠加：
-          · 放弃机制：stale 知识点（练够次数仍不达标）直接踢出候选，强制换题。
-          · 场景条件化：当前库没有 ext_* 表时，依赖 ext 的知识点降权到末尾
-            （跨域基线：技能锁定工具/语义层，裸 ext 查询在缺表库上不可答）。
-          · 新奇驱动：未练过的排最前（探索新奇），并在 explanation 标注 novelty。
+        ⚠️ 设计硬约束（评分/掌握度不被任何推进条件读）：
+          · 选下一题 = **有序课程**（章节顺序 × 深度），**不读掌握度/覆盖率**。
+          · 已完成节点（任务跑通）直接排除——「不重复规划」。
+          · 放弃机制：练够 3 次仍没跑通 → stale，强制跳过换题。
+          · 前置门控：前置节点 completed 才解锁（由 completion 驱动，非分数）。
+          · 范围内无「可拿下」任务（全完成 / 全卡死）→ 返回 exhausted=True，
+            由调用方「不断生成新任务」继续（设计：整轮不结束）。
         """
         if explicit and explicit in self.topics:
             t = self.topics[explicit]
@@ -250,57 +290,68 @@ class TopicGraph:
                 "difficulty_target": self.global_target()[0],
                 "reason": "explicit", "explanation": f"已钉住知识点 {explicit}",
                 "novelty": 0.0, "stale_skipped": 0, "ext_deprioritized": False,
+                "exhausted": False,
             }
 
         if ext_available is None:
             ext_available = ext_tables_present()
 
         pool = self.topics_in_scope(scope)
-        selectable = [t for t in pool if self.prereq_ok(t)]
-        target, why_target = self.global_target()
 
-        # 放弃机制：踢出 stale 候选（强制换题，堵 MC 161 轮死循环）
-        stale_ids = [t["id"] for t in selectable if self.mastery.is_stale(t["id"])]
-        selectable = [t for t in selectable if not self.mastery.is_stale(t["id"])]
+        # —— 候选 = 在范围内、未标记完成、前置已完成、未 stale ——
+        stale_ids = [t["id"] for t in pool if self.mastery.is_stale(t["id"])]
+        selectable = [
+            t for t in pool
+            if not self.mastery.is_completed(t["id"])
+            and not self.mastery.is_stale(t["id"])
+            and self.prereq_ok(t)
+        ]
 
         if not selectable:
-            # 全被前置卡住 / 全 stale → 退回无前置的根知识点（绝不让用户卡死）
-            roots = [t for t in pool if not self.prerequisites_of(t["id"])]
-            selectable = roots or pool
-            note = "（候选全 stale/前置未达标，先推无前置的根知识点）" if roots else "（范围里无可选题，退回全量）"
-        else:
-            note = ""
+            # 范围内没有「可拿下」的任务 → 信号 exhausted，由调用方生成新任务。
+            done_n = sum(1 for t in pool if self.mastery.is_completed(t["id"]))
+            blocked_n = sum(
+                1 for t in pool
+                if not self.mastery.is_completed(t["id"])
+                and not self.mastery.is_stale(t["id"])
+                and not self.prereq_ok(t))
+            return {
+                "topic_id": "", "blocked": False, "hint": "",
+                "difficulty_target": self.global_target()[0],
+                "reason": "exhausted",
+                "explanation": (
+                    f"范围内无「可拿下」任务（完成 {done_n} / 卡死 {len(stale_ids)} "
+                    f"/ 前置未达成 {blocked_n}）→ 应由调用方生成新任务"),
+                "novelty": 0.0, "stale_skipped": len(stale_ids),
+                "ext_deprioritized": False, "exhausted": True,
+            }
 
-        # 场景条件化：缺 ext 表时，依赖 ext 的知识点降权（排到末尾，但仍在候选里，
-        # 保证极端情况下不会无题可出）。
+        # —— 有序课程：章节顺序 × 深度（不读掌握度/覆盖率）——
+        # 缺 ext 表时，依赖 ext 的知识点降权到末尾（跨域基线：技能锁定工具/
+        # 语义层，裸 ext 查询在缺表库上不可答），但仍排在已完成节点之后。
         ext_blocked = {t["id"] for t in selectable
                        if (not ext_available) and t["id"] in EXT_TOPICS}
 
         def key(t: dict[str, Any]) -> tuple:
-            m = self.mastery.mastery_of(t["id"])
-            mval = -1.0 if m is None else float(m)
-            diff = float(t.get("difficulty", 0.5))
-            # 缺 ext 表却依赖 ext 的知识点：掌握度人为压到最末（排最后）
-            if t["id"] in ext_blocked:
-                mval = 99.0
-            # 未练过的（mval=-1）全部排前面；其中按 depth 升序（地基优先），
-            # 再按离目标难度就近；已练过的按掌握度升序（薄弱优先）。
-            return (mval, int(t.get("depth", 1)), abs(diff - target), t["id"])
+            ext_pen = 1 if t["id"] in ext_blocked else 0
+            return (ext_pen, self._chapter_rank(t), int(t.get("depth", 1)), t["id"])
 
         chosen = min(selectable, key=key)
         cid = chosen["id"]
         m = self.mastery.mastery_of(cid)
         mtxt = "未练过" if m is None else f"{m:.0%}"
         blocked = self.blocked_by(chosen)
-        # 新奇分：从未练过 = 1.0（最高新奇）；练过但掌握度低 = 中等；已达标 = 0
+        # 新奇分仅作展示（不驱动选题）：从未练过 = 1.0，练过但掌握度低 = 中等。
         novelty = 1.0 if m is None else max(0.0, 0.6 - (m or 0))
+        target, why_target = self.global_target()
         return {
             "topic_id": cid,
-            "reason": "weak_first" if (m is None or m < 0.8) else "review",
+            "reason": "curriculum_order",
             "explanation": (
-                f"{cid}：当前掌握 {mtxt}，难度 {chosen.get('difficulty')}，"
-                f"离目标 {target} 最近{('；前置未达标：' + ','.join(blocked)) if blocked else ''}"
-                f"{note}｜{why_target}"
+                f"{cid}：有序课程（章节 {chosen.get('chapter')} · 深度 "
+                f"{chosen.get('depth')}）｜当前掌握 {mtxt}（仅展示，不驱动选题）"
+                f"{('；前置未达成：' + ','.join(blocked)) if blocked else ''}"
+                f"｜{why_target}"
             ),
             "blocked": bool(blocked),
             "hint": self._hint_for(chosen),
@@ -308,6 +359,7 @@ class TopicGraph:
             "novelty": round(novelty, 2),
             "stale_skipped": len(stale_ids),
             "ext_deprioritized": bool(cid in ext_blocked),
+            "exhausted": False,
         }
 
     def _hint_for(self, topic: dict[str, Any]) -> str:
@@ -326,6 +378,17 @@ class TopicGraph:
     # ---- 给面板用：四层结构 + 边 + 掌握度叠加 ----
     def to_graph_payload(self) -> dict[str, Any]:
         target, _ = self.global_target()
+        # 每个节点的技能数（设计：技能库与图谱按 topic_id 一一对应、面板同屏展示
+        # 里程碑与累计技能——"同一份存储"在节点粒度落地）。
+        skill_counts: dict[str, int] = {}
+        try:
+            import skill_store
+            for s in skill_store.all_skills():
+                tid = str(s.get("topic") or "")
+                if tid:
+                    skill_counts[tid] = skill_counts.get(tid, 0) + 1
+        except Exception:
+            skill_counts = {}
         nodes = []
         for t in self.topics.values():
             m = self.mastery.mastery_of(t["id"])
@@ -335,9 +398,11 @@ class TopicGraph:
                 "chapter": t.get("chapter", ""), "depth": int(t.get("depth", 1)),
                 "difficulty": float(t.get("difficulty", 0.5)),
                 "mastery": (None if m is None else round(m, 3)),
+                "completed": bool(self.mastery.is_completed(t["id"])),
                 "blocked": bool(self.blocked_by(t)),
                 "stale": bool(self.mastery.is_stale(t["id"])),
                 "ext_layer": bool(t["id"] in EXT_TOPICS),
+                "skill_count": int(skill_counts.get(t["id"], 0)),
                 "misconceptions": len(t.get("typical_misconceptions") or []),
                 "examples": len(t.get("examples") or []),
             })
