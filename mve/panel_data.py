@@ -328,6 +328,18 @@ def _consume_curve(limit: int = 40) -> list[dict[str, Any]]:
             "ability_total": rec.get("ability_total"),
             "skill_action": str(rec.get("skill_action") or ""),
             "reused": bool(rec.get("reused")),
+            # —— 方法与做法的比对结论（判分的依据，得让人看见"凭什么判这个分"）——
+            "judge": str(rec.get("judge") or ""),
+            "method_reason": str(rec.get("method_reason") or ""),
+            "method_diff": str(rec.get("method_diff") or ""),
+            "same_metric": bool(rec.get("same_metric")),
+            "voyager_sound": bool(rec.get("voyager_sound")),
+            "judged": bool(rec.get("judged")),
+            "referee_rows": int(rec.get("referee_rows") or 0),
+            "coverage_referee": (float(rec["coverage_referee"])
+                                 if rec.get("coverage_referee") is not None else None),
+            "verdict_referee": str(rec.get("verdict_referee") or ""),
+            "rows": int(rec.get("rows") or 0),
         })
     return out
 

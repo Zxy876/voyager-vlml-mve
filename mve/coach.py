@@ -134,6 +134,23 @@ def _log_import(result: dict[str, Any]) -> None:
         "ability_total": result.get("ability_total"),
         "skill_action": result.get("skill_action", ""),
         "mastery": result.get("mastery"),
+        # —— 方法与做法的比对（消费侧主尺子，2026-10-13 定的判法）——
+        # 判分不再靠"两边各自整理成事实再按键比对"，而是直接比两边的 SQL 与做法。
+        # 这几项就是那次比对的结论，面板要原样给出来（人得看见"凭什么判这个分"）。
+        "judge": result.get("judge", ""),
+        "method_reason": result.get("method_reason", ""),
+        "method_diff": result.get("method_diff", ""),
+        "same_metric": bool(result.get("same_metric")),
+        "voyager_sound": bool(result.get("voyager_sound")),
+        "judged": bool(result.get("judged")),
+        # 裁判（VLML）独立那一路取了什么 —— 与 Voyager 那一路并列披露
+        "referee_sql": result.get("referee_sql", ""),
+        "referee_rows": int(result.get("referee_rows") or 0),
+        # 硬尺子（只在这句话归上了有 rubric 的题时才跑），与主尺子并列
+        "coverage_referee": result.get("coverage_referee"),
+        "verdict_referee": result.get("verdict_referee", ""),
+        "covered_points": result.get("covered_points") or [],
+        "missing_points": result.get("missing_points") or [],
     }
     with COACH_LOG.open("a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")

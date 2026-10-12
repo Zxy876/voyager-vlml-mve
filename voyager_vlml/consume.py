@@ -26,11 +26,27 @@
    这是给人看的审计线索（"它是怎么答出来的"）。
 
 3. **覆盖率/掌握度只进面板，绝不进 Voyager 反馈**。
-   覆盖率由 VLML0 裁判独立跑出标准答案事实集，与 Voyager 的事实集比对得出。
    ⚠️ 这个数**不回灌**任何 prompt：不进 action 的迭代修正、不进 critic、
    不进 curriculum 的选题（选题仍是有序课程，不读分数）。
    只落 `coach_log.jsonl` 给面板 —— 与练习侧 `loop.py` 里 coverage=None 呼应：
    练习不判分，消费才判分，判给人看。
+
+判分怎么判（2026-10-13 用户定的判法，取代旧的"按键比对事实"）：
+
+    用户原话：「整理事实这个事情本来就是交给 LLM 的，如果在消费侧，
+    直接比对 voyager 和 VLML 的方法和做法，算掌握度和曲线，进能力库，
+    然后让 LLM 产出叙事洞察就好啦」
+
+    ① Voyager 用它已积累的能力取数（可能复用配方）
+    ② 裁判（VLML）**独立**取一遍：只取数，不整理
+    ③ `_method_compare`：把两边的 SQL + 取到的结果摊开，让 LLM 判
+       是不是同一口径、Voyager 的做法有没有硬伤 → **一致度即覆盖率**
+    ④ `_narrate`：LLM 基于取到的数（+ 比对结论）产出叙事洞察
+    ⑤ `_absorb`：答完了 → 这题进能力库 → 掌握
+
+    旧判法要求两边各自整理成 {subject, dimension, value} 再按键比对，
+    而"整理"这步最脆：答案是一张表时压不进单值事实 → 两边都交白卷 →
+    覆盖率落空 + 回答为空（实测取到 85 行却显示"回答不出来"）。
 """
 
 from __future__ import annotations
@@ -274,6 +290,127 @@ dimension 要能看出方向：写 max_losing_streak 这种，不要写 round_st
 # ⑤ 用取到的数回答这句话
 # ---------------------------------------------------------------------------
 
+def _method_compare(question: str, v_sql: str, v_obs: list[dict[str, Any]],
+                    r_sql: str, r_obs: list[dict[str, Any]]) -> dict[str, Any]:
+    """**直接比对 Voyager 和 VLML 的方法与做法**（用户 2026-10-13 定的判法）。
+
+    为什么不再走「两边各自整理成 {subject, dimension, value} 再按键比对」：
+      实测踩过 —— 问「每个回合中各个角色的平均击杀数」，Voyager 的 SQL 完全正确、
+      取到 85 行，但答案是一张表，压不进单值事实 → 整理器交白卷 → 回答为空 →
+      人只看到「Voyager 回答不出来」。数据是有的，病在"非要塞进结构化事实"。
+
+    所以这里把**两边的方法（SQL）和做法（取到的东西）**摊开让 LLM 判：
+      它俩在算同一个量吗？口径一致吗？Voyager 的做法有没有硬伤
+      （除零、列名错、粒度错、方向反）？给出 0-1 的一致度。
+    LLM 天生擅长这种语义比对，不需要先把结果压成键值。
+
+    返回 {agreement, same_metric, voyager_sound, reason, diff}
+    """
+    def _brief(obs: list[dict[str, Any]]) -> str:
+        return json.dumps(
+            [o.get("data") for o in obs if o.get("ok")],
+            ensure_ascii=False, default=str)[:3500]
+    def _nrow(obs: list[dict[str, Any]]) -> int:
+        return sum(int(o.get("rows") or 0) for o in obs if o.get("ok"))
+
+    payload = (
+        f"这句话：{question}\n\n"
+        f"【Voyager 的方法】SQL：\n{v_sql or '（无）'}\n"
+        f"取到 {_nrow(v_obs)} 行，结果（截断）：\n{_brief(v_obs) or '（没取到）'}\n\n"
+        f"【VLML 的方法】SQL：\n{r_sql or '（无）'}\n"
+        f"取到 {_nrow(r_obs)} 行，结果（截断）：\n{_brief(r_obs) or '（没取到）'}"
+    )
+    out = chat_json(
+        [
+            {"role": "system",
+             "content": ("你是数据分析裁判。比较**两个做法**在算什么、怎么算的，"
+                         "判断它们是不是同一口径、Voyager 的做法有没有硬伤。\n"
+                         "硬伤指：除零（x/0 得 NaN）、列名错、粒度错（要每回合却给全场合计）、"
+                         "方向反（连败说成连胜）、口径错（队伍整体说成某个选手）。\n"
+                         "⚠️ 两个判据**互相独立**，按这个顺序判，别混：\n"
+                         "  第一步 voyager_sound：**只看 Voyager 自己那条 SQL**有没有硬伤"
+                         "（列名对不对、粒度对不对、有没有 x/0、方向对不对）。\n"
+                         "  第二步 same_metric：两边算的是不是同一个量。\n"
+                         "  第三步 agreement：口径一致度（不是「谁对谁错」分）。\n"
+                         "    **两边口径不同 ≠ Voyager 有硬伤** —— 实测踩过："
+                         "问「每个回合各个角色的平均击杀数」，Voyager 算得完全正确，"
+                         "是裁判自己多算了 deaths 算成 K/D，结果 Voyager 被判"
+                         "「做法有硬伤」，面板上显示的是冤枉它。\n"
+                         "    裁判跑偏时：same_metric=false，voyager_sound 仍按第一步判，"
+                         "并在 diff 里写清「是裁判多算了什么/少算了什么」。\n"
+                         "    reason 里必须写「Voyager 无硬伤」或「Voyager 有硬伤：…」，"
+                         "与 voyager_sound 保持一致（别自相矛盾）。\n"
+                         "⚠️ 两边都取到 0 行时，SQL 再像也**没有数可比** —— "
+                         "这时 agreement 必须给 0，same_metric=false，"
+                         "reason 写明「两边都没取到数，无从比对」。别把两个空结果"
+                         "判成「口径一致」 —— 实测踩过：Cloud9/Corrode 在当前库里没有数据，"
+                         "两边各取回 0 行，方法长得一样，就被判成了 100% 一致。"
+                         "那等于给「两边都没取到数」发满分，比报错危险得多。\n"
+                         "只返回 JSON："
+                         '{"agreement": 0到1的小数, "same_metric": true/false,'
+                         ' "voyager_sound": true/false, "reason": "一句话判断依据",'
+                         ' "diff": "两边做法的具体差别（没有就写空串）"}')},
+            {"role": "user", "content": payload},
+        ],
+        temperature=0.0,
+    )
+    try:
+        ag = float(out.get("agreement") or 0.0)
+    except (TypeError, ValueError):
+        ag = 0.0
+    reason = str(out.get("reason") or "")
+    sound = bool(out.get("voyager_sound"))
+    # 一致性兜底：模型会出现"reason 写『Voyager 无硬伤』但 voyager_sound=false"
+    # 的自相矛盾（实测踩到）。布尔位会直接决定面板上"做法站得住/有硬伤"的红绿标，
+    # 与它自己给的理由打架时，以**它写的理由**为准 —— 理由是它真正的判断，
+    # 布尔位只是在两边口径不同的情境下被带偏了。
+    if not sound and reason and ("硬伤" in reason):
+        for neg in ("无硬伤", "没有硬伤", "没硬伤", "无 硬伤"):
+            if neg in reason and f"有{neg}" not in reason:
+                sound = True
+                break
+    return {
+        "agreement": max(0.0, min(1.0, ag)),
+        "same_metric": bool(out.get("same_metric")),
+        "voyager_sound": sound,
+        "reason": reason,
+        "diff": str(out.get("diff") or ""),
+    }
+
+
+def _narrate(question: str, obs: list[dict[str, Any]],
+             compare: dict[str, Any] | None = None) -> str:
+    """基于**取到的数**产出叙事洞察（答案是一张表也照样能说清楚）。"""
+    payload = json.dumps(
+        [o.get("data") for o in obs if o.get("ok")],
+        ensure_ascii=False, default=str)[:9000]
+    extra = ""
+    if compare:
+        extra = (
+            f"\n\n另外，VLML 独立取过一遍，比对结论：一致度 {compare['agreement']:.0%}，"
+            f"{'做法站得住' if compare.get('voyager_sound') else '做法有硬伤'}；"
+            f"{compare.get('reason') or ''}"
+            f"{('；差别：' + compare['diff']) if compare.get('diff') else ''}\n"
+            "回答里照实说，别替它遮掩硬伤。"
+        )
+    return chat(
+        [
+            {"role": "system",
+             "content": ("你是 Valorant 电竞数据分析师。用工具从数据库取到的**原始数据**"
+                         "回答人的问题，并给出一两条洞察。\n"
+                         "只用给出来的数，不许补充数据里没有的东西。\n"
+                         "⚠️ 结果是多行的（可能几百行）时**不要逐行罗列**："
+                         "说清维度与量级、点出最高/最低/异常的几个，再给一条洞察。\n"
+                         "⚠️ 整段控制在 250 字以内 —— 实测踩过：给 1334 行让它讲，"
+                         "它逐地图逐回合铺开，输出被截断在半句上，人读到的是一段残话。")},
+            {"role": "user",
+             "content": f"人的问题：{question}\n\n工具取到的原始数据：\n{payload}{extra}"},
+        ],
+        temperature=0.3,
+        max_tokens=900,
+    )
+
+
 def _answer_raw(question: str, obs: list[dict[str, Any]]) -> str:
     """取到数、但整理不出结构化事实时，用**原始数据**直接回答。
 
@@ -394,7 +531,14 @@ async def consume(
     rows = sum(int(o.get("rows") or 0) for o in ok_calls)
     trajectory = [str(o.get("tool") or "") for o in ok_calls]
 
-    # ---- ④ 整理事实 ----
+    # ---- ④ 整理事实（**面板披露「取到了哪些数」用，不再是判分的前提**）----
+    # ⚠️ 2026-10-13 改判法（用户原话）：「整理事实这个事情本来就是交给 LLM 的，
+    #   如果在消费侧，直接比对 voyager 和 VLML 的方法和做法，算掌握度和曲线，
+    #   进能力库，然后让 LLM 产出叙事洞察就好啦」。
+    #   旧判法 = 两边各自整理成 {subject, dimension, value} 再**按键比对**，
+    #   而整理这步恰恰最脆：答案是一张表时压不进单值事实 → 整理器交白卷 →
+    #   覆盖率落空 + 回答为空（实测取到 85 行却「回答不出来」）。
+    #   现在：事实照旧整理（审计线索给人看），判分改看 ⑤ 的**方法与做法比对**。
     out = chat_json(
         [
             {"role": "system", "content": _extract_system()},
@@ -404,25 +548,6 @@ async def consume(
         ],
         temperature=0.1,
     ) if ok_calls else {"facts": []}
-    # ⚠️ 实测踩过：工具明明取到了数（1 行），LLM 整理却返回空数组 —— 取到数交白卷，
-    # 人看到"没回答"，掌握也不涨。数据是真的在那儿，所以**重试一次**：
-    # 把"你上次返回了空数组"和原始数据再喂一遍，并明确"有数据就必须给出事实"。
-    if ok_calls and not (out.get("facts") or []):
-        rows_preview = json.dumps(
-            [o.get("data") for o in ok_calls], ensure_ascii=False, default=str)[:3000]
-        out = chat_json(
-            [
-                {"role": "system", "content": _extract_system()},
-                {"role": "user",
-                 "content": (_extract_user(question, observations, dims or None,
-                                           subs or None)
-                             + "\n\n⚠️ 你刚才返回了空数组，但工具明明取到了数据：\n"
-                             + rows_preview
-                             + "\n\n数据里有数就必须整理出事实（dimension 按上面的名字写，"
-                               "值抄数据里的，不许编）；数据确实答不了这一问才允许留空。")},
-            ],
-            temperature=0.1,
-        )
 
     facts: list[dict[str, Any]] = []
     try:
@@ -441,20 +566,64 @@ async def consume(
     except Exception as e:  # pragma: no cover
         print(f"  （事实整理失败：{type(e).__name__}: {e}）")
 
-    # ---- ⑤ 用取到的数回答 ----
+    # ---- ⑤ 裁判（VLML）独立取一遍数：**只取数，不整理** ----
+    # 裁判侧以前还要再走一遍「整理成事实」，那一遍是纯浪费且是失败源
+    # （详见 ④ 的注释）。现在它只负责把数取回来，比对交给 `_method_compare`。
+    ref_points = derived
+    if not ref_points and task is not None:
+        # 归上了有 rubric 的题 → 用**它的**评分点给裁判当"要给出哪些量"
+        # （比从这句话重新派生更准，那是题库里既有的标准）。
+        ref_points = [
+            {"point": str(getattr(p, "point", "") or getattr(p, "dimension", "")),
+             "dimension": str(getattr(p, "dimension", "")),
+             "subject": dict(getattr(p, "subject", None) or {})}
+            for p in (task.rubric or [])
+        ]
+    ref_obs: list[dict[str, Any]] = []
+    ref_sql: str = ""
+    ref_traj: list[str] = []
+    if ok_calls:
+        ref_obs, ref_sql, ref_traj = await _referee_observations(
+            question, ref_points, env=env, schema=schema)
+
+    # ---- ⑥ 直接比对两边的**方法与做法**（判分就从这里出）----
+    # ⚠️ 硬前提：**两边都得真的取到数**。实测踩过：Cloud9/Corrode 在当前库里没有数据，
+    # Voyager 取回 0 行、裁判也取回 0 行，两条 SQL 长得几乎一样 → 被判成 100% 一致。
+    # 那等于给"两边都没取到数"发满分 —— 比报错危险得多（面板上是绿油油的 100%）。
+    # 所以任何一路 0 行就不判，如实留空。
+    ref_rows = sum(int(o.get("rows") or 0) for o in ref_obs if o.get("ok"))
+    compare: dict[str, Any] = {}
+    if ref_obs and rows > 0 and ref_rows > 0:
+        try:
+            compare = _method_compare(question, sql, observations, ref_sql, ref_obs)
+        except Exception as e:  # pragma: no cover
+            print(f"  （方法比对失败：{type(e).__name__}: {e}）")
+    elif ref_obs:
+        print(f"  （不判分：Voyager 取到 {rows} 行 / VLML 取到 {ref_rows} 行，"
+              "有一路没取到数）")
+
+    # ---- ⑦ 用取到的数回答：LLM 产出**叙事洞察** ----
+    # 回答不再依赖 facts 非空 —— 取到了数就该说话，压不进单值事实不叫"没答出来"。
     answer, base_note = "", ""
-    if facts:
+    if ok_calls and rows:
+        try:
+            answer = _narrate(question, observations, compare or None) or ""
+            if answer:
+                base_note = ("（叙事洞察：LLM 基于取到的原始数据产出"
+                             + ("，并照实说了与 VLML 做法比对的结论" if compare else "") + "）")
+        except Exception as e:  # pragma: no cover
+            print(f"  （叙事洞察失败：{type(e).__name__}: {e}）")
+    if not answer and facts:
         try:
             answer = _answer(question, facts, observations) or ""
         except Exception as e:  # pragma: no cover
             print(f"  （组织回答失败：{type(e).__name__}: {e}）")
     if not answer and ok_calls and rows:
-        # 取到数但整理不出结构化事实（答案是一张表时常见）→ 用原始数据照样回答。
-        # 取到了数却不给回答是最糟的失败：数据明明在那儿，人却以为它答不出来。
+        # 兜底：叙事没出就用原始数据平铺回答。取到了数却不给回答是最糟的失败。
         try:
             answer = _answer_raw(question, observations) or ""
             if answer:
-                base_note = "（用原始数据直接回答：这一问的答案是一张表，压不进单值事实）"
+                base_note = "（用原始数据直接回答）"
         except Exception as e:  # pragma: no cover
             print(f"  （用原始数据回答失败：{type(e).__name__}: {e}）")
 
@@ -462,7 +631,9 @@ async def consume(
     # ⚠️ 必须在"进能力库"**之前**：答完了就得有归属，否则这道题明明答出来了，
     # 却因为没有 topic_id 进不了能力库 —— 掌握就变成了"只有归得上题的才算"，
     # 那是把两件事（答没答出来 vs 归不归得上）混成了一个条件。
-    if not topic_id and auto_task and facts:
+    # 判据放宽到「答出来了」（facts 或 answer 任一非空）：答案是一张表时压不进 facts，
+    # 但那也是答出来了 —— 不能因为没有结构化事实就没归属，进而进不了能力库。
+    if not topic_id and auto_task and (facts or answer):
         try:
             from coach import _task_from_text
             new_id, why = await _task_from_text(question, facts)
@@ -479,6 +650,13 @@ async def consume(
     absorbed = _absorb(question, sql, topic_id) if (answer and ok_calls) else {}
     m_tot = int(absorbed.get("mastered_total") or 0)
     a_tot = int(absorbed.get("ability_total") or 0)
+    if absorbed.get("mastered") and not topic_id:
+        # 归不上已有题但答出来了 → 它有了自己的归属（按这句话登记的能力项）。
+        # 归属必须回写，否则面板上这题永远显示"未归入任何题"，人读到的是
+        # "它没学会"，而真相是"它答出来了，只是这句话不在旧题库里"。
+        topic_id = str(absorbed.get("topic_id") or "")
+        hit = f"{hit}（这句话不在旧题库里，按它自己登记为能力项）" if hit else \
+              "（这句话不在旧题库里，按它自己登记为能力项）"
 
     base: dict[str, Any] = {
         "question": question,
@@ -503,6 +681,20 @@ async def consume(
         "facts_count": len(facts),
         "answer": answer,
         "answer_note": base_note,
+        # —— 裁判（VLML）独立取的那一路，与 Voyager 那一路并列披露 ——
+        "referee_sql": ref_sql,
+        "referee_rows": ref_rows,
+        "referee_trajectory": ref_traj,
+        # —— 方法与做法的比对结论（判分的依据，见 ⑥）——
+        "method_compare": compare or None,
+        "method_reason": str(compare.get("reason") or ""),
+        "method_diff": str(compare.get("diff") or ""),
+        "same_metric": bool(compare.get("same_metric")),
+        "voyager_sound": bool(compare.get("voyager_sound")),
+        # 两边算的不是同一个量 → 这一问**没真正判到**（多数情况是裁判自己跑偏）。
+        # 这时覆盖率是"口径一致度 0"，不是"Voyager 答错" —— 面板必须分开展示，
+        # 否则一个红彤彤的 0% 会把"没判到"说成"能力不行"。
+        "judged": bool(compare.get("same_metric")),
         # —— 覆盖率/掌握度（消费侧才算，见 ⑥）——
         "coverage": None,
         "score": None,
@@ -510,6 +702,9 @@ async def consume(
         "covered_points": [],
         "missing_points": [],
         "unjudgeable": [],
+        # 硬尺子（只有归上有 rubric 的题时才跑）附加，与主尺子并列给面板看
+        "coverage_referee": None,
+        "verdict_referee": "",
         # —— 掌握 = 能力集合的增长（"答完了这题就到他的能力里了"）——
         "mastered": bool(absorbed.get("mastered")),
         "skill_action": str(absorbed.get("skill_action") or ""),
@@ -529,108 +724,79 @@ async def consume(
         _log(base)
         return base
 
-    if task is None:
-        # 没有现成 rubric（人的自由提问大多归不上旧题库）→ 从**这句话本身**派生
-        # 评分点，让 VLML 工具链独立取一遍当尺子。这样"消费算覆盖率"才落得下去，
-        # 而不是一归不上题就整体落空。判据标注成软尺子，面板上要能看出软硬。
-        points = derived
-        if not points:
-            base["skipped"] = ("这句话既归不到有评分点的题上，也抽不出该答哪几个量 → "
-                               "覆盖率无从计算（如实留空，不编造数字）")
-            _log(base)
-            return base
-        ref_facts, ref_traj = await _referee_facts(
-            question, points, env=env, schema=schema)
-        base["referee_trajectory"] = ref_traj
-        base["derived_points"] = [str(p.get("point") or p.get("dimension"))
-                                  for p in points]
-        if not ref_facts:
-            # 两种失败必须分开说：排查方向完全不同
-            #   · 工具都没调通 → 是链路/schema 问题
-            #   · 调通了但整理不出事实 → 是评分点（dimension）对不上数据
-            base["skipped"] = (
-                "裁判侧没取到可比的事实："
-                + ("工具调用全部失败" if not ref_traj
-                   else "工具调通了，但整理不出评分点对应的事实（评分点与数据对不上）")
-                + " → 没有真值可比，覆盖率无从计算（如实留空，不拿 0 分冒充）")
-            _log(base)
-            return base
+    pts = [str(p.get("point") or p.get("dimension")) for p in (ref_points or [])]
+    base["derived_points"] = pts
+
+    if compare:
+        # 主尺子：把两边的方法（SQL）与做法（取到的东西）摊开让 LLM 判
+        # —— 不再要求两边先把结果压成 {subject, dimension, value} 单值事实。
+        # 一致度即覆盖率：它量的是"Voyager 这一路的做法，跟 VLML 独立那一路
+        # 是不是同一口径、有没有硬伤"。
+        base.update({
+            "coverage": float(compare["agreement"]),
+            "score": int(round(float(compare["agreement"]) * 100)),
+            "verdict": ("两边口径一致" if compare["same_metric"]
+                        else "两边算的不是同一个量"),
+            # 比的是做法不是键，所以"答出/缺"说的是**评分点有没有被同一口径覆盖**
+            "covered_points": pts if compare["same_metric"] else [],
+            "missing_points": [] if compare["same_metric"] else pts,
+            "unjudgeable": (
+                ([] if compare["voyager_sound"]
+                 else ["Voyager 侧做法有硬伤：" + (compare.get("reason") or "")])
+                + ([] if compare["same_metric"]
+                   else ["两边算的不是同一个量，这一问没真正判到："
+                         + (compare.get("diff") or compare.get("reason") or "")])),
+            "judge": "method_compare",
+        })
+    elif not ref_traj:
+        base["skipped"] = ("裁判（VLML）这一路一次工具都没调通 → 没有第二路做法可比，"
+                           "覆盖率无从计算（如实留空，不拿 0 分冒充）")
+    elif rows <= 0 or ref_rows <= 0:
+        # 两路都得真的取到数才判 —— 否则两个空结果会被判成"口径一致 100%"
+        # （实测：Cloud9/Corrode 在当前库没数据，两边 0 行，一样的方法，判了满分）。
+        base["skipped"] = (
+            f"有一路没取到数（Voyager {rows} 行 / VLML {ref_rows} 行）→ "
+            "没有数可比，覆盖率如实留空。**两边都是 0 行时 SQL 再像也不能判一致** —— "
+            "那等于给『两边都没取到数』发满分。")
+    else:
+        base["skipped"] = ("裁判（VLML）取到数了，但两边的做法比对没出结论 → "
+                           "覆盖率如实留空，不拿 0 分冒充")
+
+    # 技能有效性反馈（技能库自己维护，不是给 Voyager 的反馈）
+    if reused and base.get("coverage") is not None:
         try:
-            from loop_core import RubricPoint, evaluate_vs_referee
-            rubric = [
-                RubricPoint(
-                    point=str(p.get("point") or p.get("dimension")),
-                    subject=dict(p.get("subject") or {}),
-                    dimension=str(p.get("dimension")),
-                    weight=1.0, min_base=0, tolerance=0.05,
-                )
-                for p in points
-            ]
-            ev = evaluate_vs_referee(facts, rubric, ref_facts,
-                                     tool_calls=len(ok_calls))
+            import skill_store
+            skill_store.mark_result(
+                [str(s.get("key") or "") for s in skills[:2]],
+                bool(base["coverage"] >= 0.6))
+        except Exception:  # pragma: no cover
+            pass
+
+    # ---- 硬尺子：只在这句话**归上了有 rubric 的题**时才额外跑一次 ----
+    # 旧题库的 rubric 是既有的标准评分点，比从这句话派生的更硬。
+    # 它与上面的主尺子**并列**给面板看，不互相折算。
+    # ⚠️ 这里**不写** MasteryStore.update(score=coverage)：
+    #   掌握与覆盖率是两个东西（用户 2026-10-13）—— 掌握 = 答完了、进能力库
+    #   （上面 _absorb 已经做了），覆盖率只是这次答得全不全的质量分。
+    #   把 coverage 写进 mastery，等于又用分数去定义掌握，两套语义打架。
+    if task is not None:
+        try:
+            import vlml0_referee
+            from loop_core import evaluate_vs_referee
+            ref = await vlml0_referee.answer(task)
+            ev = evaluate_vs_referee(
+                facts, list(task.rubric or []), list(ref.facts or []),
+                tool_calls=len(ok_calls),
+            )
             base.update({
-                "coverage": float(ev.coverage),
-                "score": int(ev.score),
-                "verdict": str(ev.verdict),
-                "covered_points": list(ev.covered_points),
-                "missing_points": list(ev.missing_points),
-                "unjudgeable": list(ev.unjudgeable),
-                # ⚠️ 软尺子：评分点是从这句话派生的（不是题库里既有的 rubric），
-                # 真值由 VLML 工具链从 DB 独立取 —— 值仍是 DB 真值，
-                # 但"该答哪几个量"是模型提的。面板必须标出来，别和 referee 混。
-                "judge": "derived_dims",
+                "coverage_referee": float(ev.coverage),
+                "verdict_referee": str(ev.verdict),
+                "judge": (f"{base.get('judge') or ''}+referee".strip("+")
+                          or "referee"),
             })
         except Exception as e:  # pragma: no cover
-            base["skipped"] = f"比对失败，覆盖率未计算：{type(e).__name__}: {str(e)[:120]}"
-        if reused and base.get("coverage") is not None:
-            try:
-                import skill_store
-                skill_store.mark_result(
-                    [str(s.get("key") or "") for s in skills[:2]],
-                    bool(base["coverage"] >= 0.6))
-            except Exception:  # pragma: no cover
-                pass
-        _log(base)
-        return base
-
-    try:
-        import vlml0_referee
-        from loop_core import evaluate_vs_referee
-        ref = await vlml0_referee.answer(task)
-        ev = evaluate_vs_referee(
-            facts, list(task.rubric or []), list(ref.facts or []),
-            tool_calls=len(ok_calls),
-        )
-        base.update({
-            "coverage": float(ev.coverage),
-            "score": int(ev.score),
-            "verdict": str(ev.verdict),
-            "covered_points": list(ev.covered_points),
-            "missing_points": list(ev.missing_points),
-            "unjudgeable": list(ev.unjudgeable),
-            "judge": str(ev.judge),
-        })
-        # 掌握度：按题累计（指数滑动平均）。
-        # ⚠️ count_attempt=False —— 消费不该消耗练习的尝试预算：
-        # 练习侧 stale 是按「练了几次」判的，消费三次同一题就把练习题目标记成
-        # 放弃换题，那是把两条线的账本混了。
-        # ⚠️ 这里**不写** MasteryStore.update(score=coverage)。
-        # 掌握与覆盖率是两个东西（用户 2026-10-13）：掌握 = 答完了、进能力库
-        # （上面 _absorb 已经做了）；覆盖率只是这次答得全不全的质量分。
-        # 把 coverage 写进 mastery 字段，等于又用分数去定义掌握 —— 两套语义打架。
-        pass
-        # 技能有效性反馈（技能库自身维护，不是给 Voyager 的反馈）
-        if reused:
-            try:
-                import skill_store
-                skill_store.mark_result(
-                    [str(s.get("key") or "") for s in skills[:2]],
-                    bool(ev.coverage >= 0.6),
-                )
-            except Exception:  # pragma: no cover
-                pass
-    except Exception as e:  # pragma: no cover
-        base["skipped"] = f"裁判不可用，覆盖率未计算：{type(e).__name__}: {str(e)[:120]}"
+            base["referee_skipped"] = (
+                f"硬尺子未计算：{type(e).__name__}: {str(e)[:120]}")
 
     _log(base)
     return base
@@ -647,7 +813,7 @@ def _derive_dims(question: str) -> list[dict[str, Any]]:
     所以这里让 LLM 从**这句话**派生评分点。⚠️ 派生的只是**名字**
     （该答哪几个量），**不是值**——值仍由两边各自从 DB 取：
       · Voyager 侧：用它已积累的能力取（本文件 ③）
-      · 裁判侧：走 VLML 自己的工具链独立取一遍（_referee_facts）
+      · 裁判侧：走 VLML 自己的工具链独立取一遍（_referee_observations）
     两个值都是 DB 真值，比对的是两个独立取数结果，不是"模型编的参考答案"。
     """
     out = chat_json(
@@ -689,138 +855,64 @@ def _derive_dims(question: str) -> list[dict[str, Any]]:
     return pts[:4]
 
 
-async def _referee_by_sql(question: str, dims: list[str],
-                          subs: list[dict[str, Any]], env: Any,
-                          schema: str) -> list[dict[str, Any]]:
-    """裁判侧取数：独立写一条 SQL（与 Voyager 侧不同提示、不同调用），执行一次。
-    带一轮错误回灌重试。返回观察列表（成功才有值）。"""
-    want = "\n".join(
-        f"- dimension 必须逐字写成 `{d}`"
-        f"{'，subject 写成 ' + json.dumps(s, ensure_ascii=False) if s else ''}"
-        for d, s in zip(dims, subs)
-    )
-    sysmsg = ("你是原版 VLML 分析引擎（裁判）。为这句话写**一条 SELECT** 取标准答案。"
-              "只输出 SQL 本体，不要解释。\n"
-              "⚠️ 多表 JOIN 时列名必须带表名前缀（两表常有同名列，如 player_name，"
-              "裸写会被数据库判 Ambiguous reference 直接报错）。")
-    user = (f"这句话：{question}\n\n要给出的量（只给名字，值你自己从库里算）：\n{want}"
-            f"\n\n当前库真实存在的表与列（只能引用这里的名字）：\n{schema[:6000]}")
-    last_err = ""
-    for _ in range(3):
-        sql = chat(
-            [{"role": "system", "content": sysmsg},
-             {"role": "user", "content": user + (f"\n\n上一轮报错：{last_err}" if last_err else "")}],
-            temperature=0.1, max_tokens=800,
-        )
-        sql = _strip_sql(sql)
-        if not sql:
-            continue
-        obs = await env.run_sql(sql)
-        if obs.get("ok"):
-            return [{"tool": "query_sql", "args": {"sql_query": sql},
-                     "data": obs.get("data"), "error": None}]
-        last_err = str(obs.get("error") or "")[:300]
-    return []
+async def _referee_observations(question: str,
+                                 points: list[dict[str, Any]],
+                                 env: Any = None,
+                                 schema: str = ""
+                                 ) -> tuple[list[dict[str, Any]], str, list[str]]:
+    """裁判（VLML）**独立**取一遍数 —— **只取数，不整理成事实**。
 
+    ⚠️ 2026-10-13 改判法（用户原话）：「整理事实这个事情本来就是交给 LLM 的，
+       如果在消费侧，直接比对 voyager 和 VLML 的方法和做法，算掌握度和曲线，
+       进能力库，然后让 LLM 产出叙事洞察就好啦」。
 
-def _strip_sql(text: str) -> str:
-    """从模型输出里抠出一条 SELECT（它可能带围栏/前导说明）。"""
-    t = str(text or "").strip()
-    if t.startswith("```"):
-        t = t.strip("`")
-        for tag in ("sql", "SQL"):
-            if t.startswith(tag):
-                t = t[len(tag):]
-        t = t.strip()
-    i = t.upper().find("SELECT")
-    if i < 0:
-        return ""
-    t = t[i:].strip().rstrip(";").strip()
-    return t if t.upper().startswith("SELECT") else ""
+    以前裁判侧取完数还要再走一遍「整理成 {subject, dimension, value}」，
+    那一遍既多花两次 LLM 调用，又是**主要失败源**：答案是一张表时压不进
+    单值事实 → 裁判侧交白卷 → 覆盖率直接落空（明明两边都取到了数）。
+    现在裁判只负责把数取回来，比对交给 `_method_compare` 直接看两边的
+    方法与做法 —— LLM 天生擅长这种语义比对，不需要先把结果压成键值。
 
-
-def _facts_from_obs(obs: list[dict[str, Any]], dims: list[str],
-                    subs: list[dict[str, Any]], question: str) -> list[dict]:
-    """观察 → 事实（裁判侧）。整理为空时重试一次（工具取到了数就不能交白卷）。"""
-    from loop_core import make_fact
-
-    def _once(extra: str = "") -> list[dict]:
-        out = chat_json(
-            [
-                {"role": "system", "content": _extract_system()},
-                {"role": "user",
-                 "content": _extract_user(question, obs, dims, subs) + extra},
-            ],
-            temperature=0.1,
-        )
-        facts: list[dict] = []
-        for f in (out.get("facts") or []):
-            if not isinstance(f, dict) or "dimension" not in f:
-                continue
-            facts.append(make_fact(
-                subject=f.get("subject") or {},
-                dimension=str(f.get("dimension")),
-                value=f.get("value"), unit=str(f.get("unit") or "raw"),
-                base=f.get("base"), source={"tool": "query_sql", "args": {}},
-            ))
-        return facts
-
-    facts = _once()
-    if not facts:
-        rows_preview = json.dumps(
-            [o.get("data") for o in obs], ensure_ascii=False, default=str)[:3000]
-        facts = _once("\n\n⚠️ 你刚才返回了空数组，但工具明明取到了数据：\n"
-                      + rows_preview
-                      + "\n\n有数就必须整理出事实；数据确实答不了才允许留空。")
-    return facts
-
-
-async def _referee_facts(question: str,
-                         points: list[dict[str, Any]],
-                         env: Any = None,
-                         schema: str = "") -> tuple[list[dict], list[str]]:
-    """让 **VLML 自己的工具链独立取一遍数**（裁判侧），不去碰 Voyager 的取数结果。
-
-    走的是 `coach` 那套原版 VLML 编排（工具注册表 + 数据集上下文），
-    与 Voyager 侧的 env 是两条独立通路 —— 正因如此，两者的值可比。
+    返回 (observations, sql, trajectory)。取不到就返回空（调用方如实留空，不编造）。
     """
-    try:
-        from coach import _execute, _plan_prompt
-        from loop_core import make_fact
-    except Exception as e:  # pragma: no cover
-        print(f"  （裁判工具链不可用：{type(e).__name__}: {e}）")
-        return [], []
-    dims = [str(p.get("dimension")) for p in points]
-    subs = [dict(p.get("subject") or {}) for p in points]
+    dims = [str(p.get("dimension")) for p in (points or [])]
+    subs = [dict(p.get("subject") or {}) for p in (points or [])]
 
     # 裁判取数走**同一套迭代修正机制**（solve：写 SQL → 执行 → 失败带 SQL critique
     # 重写 3 轮）。之前手写的"带错重试"循环实测 3 轮都改不对列名歧义 ——
     # critique 机制是练习侧验证过能纠错的，别重造一个弱化版。
+    want = "；".join(
+        f"dimension=`{d}`" + (f"，subject={json.dumps(s, ensure_ascii=False)}" if s else "")
+        for d, s in zip(dims, subs)
+    )
+    q2 = (f"（裁判·独立取标准答案）{question}\n"
+          + (f"要给出的量（dimension 逐字用这些名字，值从库里算）：{want}\n" if want else "")
+          + "⚠️ 比值/除法必须写 NULLIF(x, 0)（如 AVG(kills)/NULLIF(AVG(deaths),0)）—— "
+            "DuckDB 里 x/0 得 NaN 不报错，取回来是个没法比的数；"
+            "且优先在聚合层做除法（先 AVG 再相除），不要对逐行比值再 MAX。\n"
+            "⚠️ 多表 JOIN 时列名必须带表名前缀（两表常有同名列，裸写会 Ambiguous）。")
     if env is not None:
         from voyager_vlml.agents.action import VLMLActionAgent
         act = VLMLActionAgent(env=env)
-        want = "；".join(
-            f"dimension=`{d}`" + (f"，subject={json.dumps(s, ensure_ascii=False)}" if s else "")
-            for d, s in zip(dims, subs)
-        )
-        q2 = (f"（裁判·独立取标准答案）{question}\n"
-              f"要给出的量（dimension 逐字用这些名字，值从库里算）：{want}\n"
-              "⚠️ 比值/除法必须写 NULLIF(x, 0)（如 AVG(kills)/NULLIF(AVG(deaths),0)）—— "
-              "DuckDB 里 x/0 得 NaN 不报错，取回来是个没法比的数；"
-              "且优先在聚合层做除法（先 AVG 再相除），不要对逐行比值再 MAX。")
         observations, sql2 = await act.solve(q2, max_iters=3)
         ok_obs = [o for o in observations if o.get("ok")]
-        if ok_obs:
-            obs = [{"tool": "query_sql", "args": {"sql_query": sql2},
-                    "data": ok_obs[-1].get("data"), "error": None}]
-            return _facts_from_obs(obs, dims, subs, question), ["query_sql"]
-        return [], []
-    # 兜底：旧 VLML 编排
+        if not ok_obs:
+            return [], sql2, []
+        last = ok_obs[-1]
+        return ([{"tool": "query_sql", "args": {"sql_query": sql2},
+                  "data": last.get("data"), "rows": last.get("rows") or 0,
+                  "error": None, "ok": True}], sql2, ["query_sql"])
+
+    # 兜底：env 不可用时走旧 VLML 编排（工具注册表 + 数据集上下文）。
     # ⚠️ 实测踩过：不注入实查 schema，裁判会犯和 Voyager 一样的**列名幻觉** ——
     # 写 `base_events.player_name`，而真实列是 actor_player_name / target_player_name
     # → 三条调用全 Binder Error → 裁判侧一条数都取不到 → 覆盖率直接落空。
     # 所以这里必须把库里真实存在的表/列给它（照 entity_catalog 的"实查不写死"）。
-    plan_user = _plan_prompt(question)
+    try:
+        from coach import _execute, _plan_prompt
+    except Exception as e:  # pragma: no cover
+        print(f"  （裁判工具链不可用：{type(e).__name__}: {e}）")
+        return [], "", []
+    plan_user = _plan_prompt(q2)
     if schema:
         plan_user += ("\n\n当前库真实存在的表与列（**只能引用这里出现的名字**，"
                       "尤其是列名，写错会直接报错）：\n" + schema[:6000])
@@ -846,29 +938,52 @@ async def _referee_facts(question: str,
         )
         obs, traj, _ = await _execute(plan2.get("calls") or [])
     if not traj:
-        return [], []
-    out = chat_json(
-        [
-            {"role": "system", "content": _extract_system()},
-            {"role": "user",
-             "content": _extract_user(question, [
-                 {"tool": o.get("tool"), "args": o.get("args"),
-                  "data": o.get("result"), "error": o.get("error")} for o in obs],
-                 dims, subs)},
-        ],
-        temperature=0.1,
-    )
-    facts: list[dict] = []
-    for f in (out.get("facts") or []):
-        if not isinstance(f, dict) or "dimension" not in f:
-            continue
-        facts.append(make_fact(
-            subject=f.get("subject") or {},
-            dimension=str(f.get("dimension")),
-            value=f.get("value"), unit=str(f.get("unit") or "raw"),
-            base=f.get("base"), source={"tool": (traj or ["?"])[0], "args": {}},
-        ))
-    return facts, traj
+        return [], "", []
+    return ([{"tool": o.get("tool"), "args": o.get("args"),
+              "data": o.get("result"), "error": o.get("error"),
+              "ok": not o.get("error")} for o in obs],
+            "", list(traj))
+
+
+_RUNTIME_TOPICS_FILE = _MVE_DIR / "runtime_topics.json"
+
+
+def _runtime_topics() -> dict[str, Any]:
+    """消费侧**答出来但归不上图谱节点**的题，落在这里（能力集合的新增项）。"""
+    try:
+        if _RUNTIME_TOPICS_FILE.exists():
+            return json.loads(_RUNTIME_TOPICS_FILE.read_text(encoding="utf-8"))
+    except Exception:  # pragma: no cover
+        pass
+    return {}
+
+
+def _runtime_topic_id(question: str) -> str:
+    """答出来了、但归不上任何已有题 → 建一个**稳定**的能力 id。
+
+    为什么必须建（用户的定义）：「我问你一句，Voyager 答完了，之后这题就到他的
+    能力里了；这就是掌握！」—— **归不上题 ≠ 没答出来**。
+    不建的话，掌握就变成了"只有归得上旧题库的才算"，那是把两件事
+    （答没答出来 vs 归不归得上）混成了一个条件。
+    实测（2026-10-13）：问「每个回合中各个角色的平均击杀数」，Voyager 取到 484 行、
+    回答也完整产出了，面板却显示「没答出来，未进能力库」—— 就是被这个条件卡住的。
+
+    稳定 = 同一句话永远得到同一个 id（问题文本的哈希），所以问第二遍不会
+    再建一个新节点把分母灌水（掌握度分母 = 图谱节点 + 这里登记的能力项）。
+    """
+    import hashlib
+    h = hashlib.md5(str(question or "").strip().encode("utf-8")).hexdigest()[:8]
+    tid = f"consume_{h}"
+    reg = _runtime_topics()
+    if tid not in reg:
+        reg[tid] = {"id": tid, "name": str(question or "")[:60],
+                    "question": str(question or ""), "source": "consume"}
+        try:
+            _RUNTIME_TOPICS_FILE.write_text(
+                json.dumps(reg, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:  # pragma: no cover
+            print(f"  （登记新能力项失败：{type(e).__name__}: {e}）")
+    return tid
 
 
 def _absorb(question: str, sql: str, topic_id: str) -> dict[str, Any]:
@@ -885,20 +1000,29 @@ def _absorb(question: str, sql: str, topic_id: str) -> dict[str, Any]:
     ⚠️ 判据是**有没有真的答出来**（调通工具 + 取到数 + 产出回答），
     **不是覆盖率**。覆盖率算不算、算出来多少，都不影响"这题进不进能力库" ——
     否则就是把 VLML 的判分塞回了学习判定，正是设计禁止的。
+
+    ⚠️ 归不上已有题时**照样进能力库**（`_runtime_topic_id` 给它一个稳定 id），
+    不能因为归不上就判"没掌握" —— 那等于把"答没答出来"和"归不归得上"
+    两个条件捆在一起（实测吃过这次亏）。
     """
     out: dict[str, Any] = {"mastered": False, "skill_action": "",
-                           "mastered_total": 0, "ability_total": 0}
-    if not topic_id or not sql:
+                           "mastered_total": 0, "ability_total": 0, "topic_id": ""}
+    if not sql:
         return out
+    tid = topic_id or _runtime_topic_id(question)
+    out["topic_id"] = tid
     try:
         import topic_graph
         st = topic_graph.MasteryStore()
-        st.mark_completed(topic_id)
+        st.mark_completed(tid)
         out["mastered"] = True
         out["mastered_total"] = sum(
             1 for r in st.all().values() if r.get("completed"))
         try:
-            out["ability_total"] = len(topic_graph.TopicGraph().topics)
+            # 分母 = 图谱节点 + 消费侧新增的能力项：能力集合变大，
+            # 分子分母同步增长 —— 只涨分子不涨分母会把掌握度灌过 100%。
+            out["ability_total"] = (len(topic_graph.TopicGraph().topics)
+                                    + len(_runtime_topics()))
         except Exception:
             out["ability_total"] = 0
     except Exception as e:  # pragma: no cover
@@ -908,13 +1032,13 @@ def _absorb(question: str, sql: str, topic_id: str) -> dict[str, Any]:
     try:
         import skill_store
         have = [k for k in (skill_store._load_raw().get("skills") or {})
-                if str(k).startswith(f"{topic_id}::")]
+                if str(k).startswith(f"{tid}::")]
         if have:
             skill_store.mark_result(have, True)
             out["skill_action"] = "已有配方，标记为用过且有效"
         else:
             _, key = skill_store.add(
-                topic_id, topic_id,
+                tid, tid,
                 f"消费时答出来的取数方法：{question[:60]}",
                 code=sql,
                 blueprint={"source": "consume", "question": question},
@@ -986,13 +1110,22 @@ def _main() -> int:
     else:
         print(f"覆盖率 {r['coverage']:.0%} · 得分 {r['score']} · 判读 {r['verdict']}"
               f" · 尺子={r.get('judge')}")
+        if r.get("method_reason"):
+            print("  比对依据:", r.get("method_reason"))
+        if r.get("method_diff"):
+            print("  两边差别:", r.get("method_diff"))
         print("  答出:", r.get("covered_points"))
         print("  缺  :", r.get("missing_points"))
         if r.get("unjudgeable"):
-            print("  裁判也没答出来:", r.get("unjudgeable"))
-        if r.get("judge") == "derived_dims":
-            print("  ⚠️ 软尺子：评分点是从这句话派生的，真值由 VLML 工具链从 DB 独立取；"
-                  "值仍是 DB 真值，但『该答哪几个量』是模型提的。")
+            print("  硬伤:", r.get("unjudgeable"))
+        if r.get("coverage_referee") is not None:
+            print(f"  硬尺子（题库 rubric）覆盖率 {r['coverage_referee']:.0%}"
+                  f" · {r.get('verdict_referee')}")
+        elif r.get("referee_skipped"):
+            print("  硬尺子:", r.get("referee_skipped"))
+        if r.get("judge") == "method_compare":
+            print("  （主尺子 = 两边方法与做法的比对：不要求答案压成单值事实，"
+                  "答案是一张表也能判）")
     return 0
 
 

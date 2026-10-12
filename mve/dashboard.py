@@ -775,18 +775,42 @@ function consumeCurve(s){
                  .map((c,i)=>({x:i+1, y:c.coverage, label:`覆盖率 ${Math.round(c.coverage*100)}% · ${c.question}`}));
   const last=cc[cc.length-1];
   const reused=cc.filter(c=>c.reused).length;
+  // 每次消费的**比对明细**：判分是"两边做法的比对"得出来的，明细必须能查，
+  // 不能只给一个百分比 —— 人看不见依据就没法判断这个分可不可信。
+  const cmpRows=cc.map((c,i)=>`<tr>
+      <td class="num">${c.i}</td>
+      <td>${ESC(c.question)}</td>
+      <td class="num">${ESC(c.rows||0)}</td>
+      <td class="num">${ESC(c.referee_rows||0)}</td>
+      <td class="num">${c.coverage===null||c.coverage===undefined?'—'
+        :(c.judged?Math.round(c.coverage*100)+'%':'未判')}</td>
+      <td>${c.coverage===null||c.coverage===undefined
+            ? '<span class="chip grey">未判</span>'
+            : (c.same_metric?'<span class="chip ok">是</span>':'<span class="chip warn">不是</span>')}</td>
+      <td>${c.coverage===null||c.coverage===undefined
+            ? '<span class="chip grey">—</span>'
+            : (c.voyager_sound?'<span class="chip ok">站得住</span>':'<span class="chip bad">有硬伤</span>')}</td>
+      <td style="font-size:12px">${ESC(c.method_reason||c.verdict||'')}${c.method_diff?'（'+ESC(c.method_diff)+'）':''}</td>
+    </tr>`).join('');
   return `<h3>消费进步曲线（${cc.length} 次消费）</h3>
     <div class="legend"><b>掌握 = 能力集合的增长</b>：答完了 → 这题进能力库 → 掌握。
-    曲线是累计会做的题数；覆盖率是另一条（这次答得全不全，只作质量参考）。</div>
+    曲线是累计会做的题数；一致度是另一条（这次的做法跟 VLML 独立那一路差多少，
+    只作质量参考）。</div>
     ${lineChart(masPts,{color:'#059669'})}
     <div class="legend" style="margin-top:4px">累计掌握 ${last.mastered_total||0} / ${tot||'?'} 题</div>
-    ${covPts.length?`<div class="legend" style="margin-top:8px">覆盖率（VLML0 裁判独立跑一遍量出来，只给人看）</div>${lineChart(covPts,{color:'#2563eb',dash:'4 3'})}`:''}
+    ${covPts.length?`<div class="legend" style="margin-top:8px">一致度（Voyager 与 VLML 两边做法的比对，只给人看）</div>${lineChart(covPts,{color:'#2563eb',dash:'4 3'})}`:''}
     <div class="legend" style="margin-top:6px">
       最近一次：${last.mastered?'<span class="chip ok">已掌握（进能力库）</span>':'<span class="chip bad">没答出来，未进能力库</span>'}
-      ${last.coverage===null||last.coverage===undefined?'':`<span class="chip grey">覆盖率 ${Math.round(last.coverage*100)}% · ${ESC(last.verdict||'')}</span>`}
+      ${last.coverage===null||last.coverage===undefined?'':`<span class="chip grey">一致度 ${Math.round(last.coverage*100)}% · ${ESC(last.verdict||'')}</span>`}
       <span class="chip grey">${reused}/${cc.length} 次复用已学配方</span>
       ${last.skill_action?`<span class="chip grey">${ESC(last.skill_action)}</span>`:''}
-    </div>`;
+    </div>
+    <h3 style="margin-top:10px">两边做法的比对明细</h3>
+    <div class="legend">Voyager 取一路、VLML 独立取一路，把两条 SQL 和取到的东西摊开让 LLM 判
+      —— 不再要求两边先把答案压成单值事实（答案是一张表也能判）。</div>
+    <table><thead><tr><th>#</th><th>问句</th><th>Voyager 行</th><th>VLML 行</th>
+      <th>一致度</th><th>同一个量</th><th>Voyager 做法</th><th>判据 / 差别</th></tr></thead>
+      <tbody>${cmpRows}</tbody></table>`;
 }
 
 function pTrace(s){
@@ -1429,7 +1453,42 @@ function importsList(s){
       ${im.narrative?`<div class="nocmp-sub">${ESC(im.narrative)}</div>`:''}
       ${(im.insights||[]).length?`<div class="nocmp-sub"><b>洞察：</b><ul>${im.insights.map(i=>`<li>${ESC(i)}</li>`).join('')}</ul></div>`:''}
       ${(im.caveats||[]).length?`<div class="nocmp-sub"><b>数据局限：</b>${im.caveats.map(c=>ESC(c)).join('；')}</div>`:''}
+      ${consumeBlock(im)}
     </div>`).join('');
+}
+
+/* 消费记录的专属块：回答 + 用了能力还是现做 + 掌握 + **两边做法的比对**。
+   ⚠️ 必须显示在**历史里**，不能只放在提交回执：消费走后台执行（全链路 1～3 分钟），
+   提交回执只说一句"已受理"，结果全靠 4 秒轮询刷进导入历史 ——
+   历史里不显示 = 人永远看不到 Voyager 的回答和判分依据。 */
+function consumeBlock(im){
+  if(im.mode!=='voyager_consume') return '';
+  const pct=v=>(v===null||v===undefined)?'—':Math.round(v*100)+'%';
+  const judged = im.coverage!==null && im.coverage!==undefined;
+  return `
+    <div style="margin-top:6px;border-top:1px dashed var(--line);padding-top:6px">
+      <span class="chip ${im.reused?'ok':'warn'}">${im.reused?'复用已学配方':'现场现做'}</span>
+      ${im.mastered
+        ? `<span class="chip ok">已掌握 · 累计 ${ESC(im.mastered_total)}/${ESC(im.ability_total)} 题</span>`
+        : '<span class="chip bad">没答出来，未进能力库</span>'}
+      ${judged
+        ? (im.judged
+            ? `<span class="chip ${im.coverage>=0.95?'ok':(im.coverage>0?'warn':'bad')}">一致度 ${pct(im.coverage)}</span>
+               <span class="chip ${im.voyager_sound?'ok':'bad'}">${im.voyager_sound?'做法站得住':'做法有硬伤'}</span>`
+            : `<span class="chip grey">口径不同，这一问没真正判到（多数是裁判自己跑偏）</span>
+               <span class="chip ${im.voyager_sound?'ok':'bad'}">${im.voyager_sound?'Voyager 做法站得住':'Voyager 做法有硬伤'}</span>`)
+        : '<span class="chip grey">未判（VLML 那一路没取到数）</span>'}
+      ${(im.coverage_referee!==null&&im.coverage_referee!==undefined)
+        ? `<span class="chip grey">硬尺子 ${pct(im.coverage_referee)}</span>`:''}
+      <span class="chip grey">工具 ${ESC(im.ok_tool_calls||0)} 次 · ${ESC(im.rows||0)} 行</span>
+    </div>
+    ${im.answer?`<div style="margin-top:6px"><b>Voyager 的回答：</b>
+      <div class="nocmp-body" style="margin-top:4px">${ESC(im.answer)}</div></div>`:''}
+    ${im.method_reason?`<div style="margin-top:5px;font-size:12px;color:var(--muted)">
+      <b>两边做法的比对：</b>${ESC(im.method_reason)}${im.method_diff?'；差别：'+ESC(im.method_diff):''}
+      <br>Voyager 取到 ${ESC(im.rows||0)} 行，VLML 独立那一路取到 ${ESC(im.referee_rows||0)} 行 ——
+      裁判只取数不整理，比对交给 LLM 直接看两条 SQL 和取到的东西。</div>`:''}
+    ${im.skipped?`<div style="margin-top:5px;font-size:12px;color:var(--muted)">${ESC(im.skipped)}</div>`:''}`;
 }
 
 /* 人导入在图谱侧落了什么 —— 收录判据是「VLML 能不能用表内覆盖的工具集
@@ -1456,8 +1515,9 @@ function coachRunningBar(s){
     <b>Voyager 正在回答：</b>${ESC(s.coach_question||'')}
     <span class="chip grey">已跑 ${ESC(s.coach_elapsed)} 秒</span>
     <div style="font-size:12px;color:var(--muted);margin-top:4px">
-      要串十几次模型调用（找配方 → 回填实体值 → 取数 → 整理 → 回答 →
-      VLML 独立取一遍算覆盖率），通常 1～3 分钟。跑完会自动出现在下面导入历史里。
+      要串十几次模型调用（找配方 → 回填实体值 → 取数 → 让 VLML 独立取一遍 →
+      比对两边做法 → LLM 产出叙事洞察），通常 1～3 分钟。
+      跑完会自动出现在下面导入历史里。
     </div></div>`;
 }
 
@@ -1471,7 +1531,7 @@ function renderImportBusy(res){
          <div style="margin-top:5px">${ESC(res.message||'')}</div>
          <div style="margin-top:6px;font-size:12px;color:var(--muted)">
            它这会儿在串行做：找已学配方 → 回填这句话的实体值 → 取数 →
-           整理事实 → 组织回答 → 再让 VLML 独立取一遍当尺子算覆盖率。
+           让 VLML 独立取一遍 → 比对两边的做法 → LLM 产出叙事洞察。
            十几次模型调用，所以要一两分钟。</div>`}
   </div>`;
 }
@@ -1503,19 +1563,51 @@ function renderImportResult(res){
       <span class="chip grey">工具调用 ${res.ok_tool_calls||0}/${res.tool_calls||0} 成功 · ${res.rows||0} 行</span>` : '';
   const pct = v => (v===null||v===undefined) ? '—' : Math.round(v*100)+'%';
   // 覆盖率/掌握度**只在消费侧算**（练习不判分）—— 这是给人看的质量数。
+  // ⚠️ 判法（2026-10-13 用户定）：不再要求两边各自整理成 {subject,dimension,value}
+  // 再按键比对 —— 而是**直接比对 Voyager 与 VLML 的方法和做法**（两边各写一条 SQL
+  // 取数，把 SQL 与结果摊开让 LLM 判是不是同一口径、有没有硬伤），一致度即覆盖率。
+  // 旧判法最脆的就是"整理"那步：答案是一张表时压不进单值事实 → 两边都交白卷 →
+  // 覆盖率落空 + 回答为空（实测取到 85 行却显示"回答不出来"）。
+  const cmpBlock = isConsume ? `
+    <div style="margin-top:9px">
+      <b>两边做法的比对（判分的依据，得让人看见"凭什么判这个分"）：</b>
+      ${res.method_compare
+        ? `<div style="margin-top:4px">
+             <span class="chip ${res.same_metric?'ok':'warn'}">${res.same_metric?'同一个量':'两边算的不是同一个量'}</span>
+             <span class="chip ${res.voyager_sound?'ok':'bad'}">${res.voyager_sound?'Voyager 做法站得住':'Voyager 做法有硬伤'}</span>
+             <span class="chip grey">一致度 ${pct(res.coverage)}</span>
+           </div>
+           ${res.method_reason?`<div style="margin-top:4px;font-size:12px"><b>依据：</b>${ESC(res.method_reason)}</div>`:''}
+           ${res.method_diff?`<div style="margin-top:4px;font-size:12px"><b>两边差别：</b>${ESC(res.method_diff)}</div>`:''}
+           <div style="margin-top:4px;font-size:12px;color:var(--muted)">
+             Voyager 那一路取到 ${ESC(res.rows||0)} 行，VLML 独立那一路取到 ${ESC(res.referee_rows||0)} 行。
+             裁判只取数、不整理 —— 比对交给 LLM 直接看两条 SQL 和取到的东西。
+           </div>`
+        : `<div style="margin-top:4px;font-size:12px;color:var(--muted)">
+             ${ESC(res.skipped||'VLML 那一路没取到数，没有第二路做法可比 —— 覆盖率如实留空，不拿 0 分冒充')}</div>`}
+      ${res.coverage_referee!==null&&res.coverage_referee!==undefined
+        ? `<div style="margin-top:4px;font-size:12px"><b>硬尺子（题库 rubric）：</b>
+             <span class="chip ${res.coverage_referee>=0.95?'ok':'warn'}">覆盖率 ${pct(res.coverage_referee)}</span>
+             ${ESC(res.verdict_referee||'')} —— 与主尺子并列，不互相折算。</div>`:''}
+    </div>` : '';
   const scoreBlock = isConsume ? `
     <div style="margin-top:9px">
-      <b>覆盖率 / 掌握度（VLML0 裁判独立跑一遍量出来，只给人看，不回灌 Voyager）：</b>
+      <b>覆盖率（质量分，只给人看，不回灌 Voyager）：</b>
       ${res.coverage===null||res.coverage===undefined
-        ? `<div style="margin-top:4px">未计算 —— ${ESC(res.skipped||'无评分点可比对')}</div>`
+        ? `<div style="margin-top:4px">未计算 —— ${ESC(res.skipped||'无第二路做法可比')}</div>`
         : `<div style="margin-top:4px">
-             <span class="chip ${res.coverage>=0.95?'ok':(res.coverage>0?'warn':'bad')}">覆盖率 ${pct(res.coverage)}</span>
+             ${res.judged
+               ? `<span class="chip ${res.coverage>=0.95?'ok':(res.coverage>0?'warn':'bad')}">一致度 ${pct(res.coverage)}</span>`
+               : `<span class="chip grey">口径不同，没真正判到</span>`}
              <span class="chip grey">得分 ${ESC(res.score)}</span>
              <span class="chip grey">判读 ${ESC(res.verdict||'')}</span>
+             ${res.judge?`<span class="chip grey">尺子 ${ESC(res.judge)}</span>`:''}
            </div>
-           ${(res.covered_points||[]).length?`<div style="margin-top:4px;font-size:12px"><b>答出：</b>${res.covered_points.map(c=>ESC(c)).join('；')}</div>`:''}
-           ${(res.missing_points||[]).length?`<div style="margin-top:4px;font-size:12px"><b>缺：</b>${res.missing_points.map(c=>ESC(c)).join('；')}</div>`:''}
-           ${(res.unjudgeable||[]).length?`<div style="margin-top:4px;font-size:12px"><b>裁判也没答出来：</b>${res.unjudgeable.map(c=>ESC(c)).join('；')}</div>`:''}`}
+           ${res.judged?'':'<div style="margin-top:4px;font-size:12px;color:var(--muted)">两边算的不是同一个量（多数是裁判自己跑偏），这一问<b>没真正判到</b> —— 不是 Voyager 答错，不按 0 分算它。</div>'}
+           ${(res.covered_points||[]).length?`<div style="margin-top:4px;font-size:12px"><b>覆盖到：</b>${res.covered_points.map(c=>ESC(c)).join('；')}</div>`:''}
+           ${(res.missing_points||[]).length?`<div style="margin-top:4px;font-size:12px"><b>没覆盖：</b>${res.missing_points.map(c=>ESC(c)).join('；')}</div>`:''}
+           ${(res.unjudgeable||[]).length?`<div style="margin-top:4px;font-size:12px"><b>硬伤：</b>${res.unjudgeable.map(c=>ESC(c)).join('；')}</div>`:''}`}
+      ${cmpBlock}
     </div>` : '';
   box.innerHTML=`<div class="note info" style="margin-top:10px">
     <div style="margin-bottom:6px">
@@ -1547,7 +1639,7 @@ function renderImportResult(res){
     ${facts?`<div style="margin-top:9px"><b>VLML 的解析 · 取到的事实（${(res.facts||[]).length} 条）：</b>${facts}
       <div style="font-size:12px;color:var(--muted);margin-top:5px">
         ${isConsume
-          ? '这些事实是 Voyager 用已积累的能力取出来的，维度名按评分点对齐，值由它自己算 —— 上面那条覆盖率就是拿它们跟 VLML0 裁判独立跑出来的标准答案比的。'
+          ? '这些事实是 Voyager 用已积累的能力取出来的（照旧披露，给你看它取到了什么）。<b>判分不用它按键比对</b> —— 上面那条一致度是把 Voyager 与 VLML 两边的 SQL 和取到的数摊开比出来的，答案是一张表、压不进单值事实也照样判。'
           : '注意：这条通路的 facts <b>没有经过裁判核对</b>，维度名也是开放式自取的 —— 它比 Voyager 那条过了裁判的事实软，不能拿来当判据。'}</div></div>`:''}
     ${(vc&&vc.memory_texts&&vc.memory_texts.length)?`<div style="margin-top:9px;font-size:12px;color:var(--muted)">
       <b>本次消费的记忆（mem0 召回）：</b><ul style="margin:4px 0 0 16px">${vc.memory_texts.map(m=>`<li>${ESC(String(m).slice(0,120))}</li>`).join('')}</ul></div>`:''}
@@ -2077,7 +2169,8 @@ class Handler(BaseHTTPRequestHandler):
 
             # **消费通路改后台执行**（2026-10-13 实测教训）：全链路要串行跑
             # 十几次 LLM 调用（同题校验 + 评分点派生 + 配方回填 + 写 SQL 迭代
-            # ×3 + 事实整理 + 回答 + 裁判独立取数×3 + 裁判整理），实测 2～5 分钟。
+            # ×3 + 事实整理 + VLML 独立取数 ×3 + 两边做法比对 + 叙事洞察），
+            # 实测 2～5 分钟。
             # 同步等有两个恶果：Caddy 网关超时切断连接 → 前端「正在回答」转圈到死；
             # 人以为 Voyager 挂了（用户实测就问了一句"怎么回答不出来"）。
             # 所以这里**立即受理**，后台线程跑完落 coach_log —— 前端 4 秒轮询

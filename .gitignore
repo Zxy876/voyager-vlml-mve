@@ -25,6 +25,8 @@
 *.pem
 *.py[cod]
 *.sqlite3
+# 消费侧答出来但归不上图谱的题，按问句登记的能力项（跑一次就会重新生成）
+mve/runtime_topics.json
 .DS_Store
 .env
 .venv/

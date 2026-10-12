@@ -157,9 +157,43 @@ class VLMLMCPEnv:
         for r in rows or []:
             if len(r) >= 2:
                 cols.setdefault(str(r[0]), []).append(str(r[1]))
-        return "\n".join(
-            f"- {t}: {', '.join(c[:max_cols])}" for t, c in list(cols.items())[:max_tables]
-        )
+
+        # ⚠️ 必须把**每张表有多少行**一起给模型（2026-10-13 实测踩的坑）：
+        #   当前库（rib）`agg_player_round_stats` 是 **0 行**，真实数据全在
+        #   `ext_player_round_stats`（2850 行）。只给表名列名的话，模型看着
+        #   agg_* 表名更"正规"就去查它 → 取回 0 行 → 报「没取到数」→
+        #   人看到的是「Voyager 回答不出来」，而数据明明在隔壁表里。
+        #   所以空表要**明写**出来：查它只会得 0 行，别去。
+        counts: dict[str, int] = {}
+        names = [t for t, _ in list(cols.items())[:max_tables]]
+        if names:
+            union = " UNION ALL ".join(
+                f"SELECT '{t}' AS t, COUNT(*) AS n FROM \"{t}\"" for t in names)
+            try:
+                obs2 = await self.run_sql(union)
+                if obs2.get("ok"):
+                    d2 = obs2.get("data") or {}
+                    r2 = d2.get("rows") if isinstance(d2, dict) else d2
+                    for r in r2 or []:
+                        if len(r) >= 2:
+                            counts[str(r[0])] = int(r[1] or 0)
+            except Exception:
+                counts = {}
+
+        def _line(t: str, c: list[str]) -> str:
+            n = counts.get(t)
+            if n is None:
+                return f"- {t}: {', '.join(c[:max_cols])}"
+            if n == 0:
+                return (f"- {t}（**0 行 · 空表，查它只会得 0 行，别查**）: "
+                        f"{', '.join(c[:max_cols])}")
+            return f"- {t}（{n} 行）: {', '.join(c[:max_cols])}"
+
+        # 有数据的表排前面、空表沉到最后：schema 文本有长度上限（max_tables），
+        # 真被截断时宁可丢空表，也不能把唯一有数据的 ext_* 表截没了
+        # （它们字母序靠后，不排序就会被先截掉）。
+        ordered = sorted(cols.items(), key=lambda kv: -(counts.get(kv[0]) or 0))
+        return "\n".join(_line(t, c) for t, c in ordered[:max_tables])
 
 
 def _rows_of(res: Any) -> int:
