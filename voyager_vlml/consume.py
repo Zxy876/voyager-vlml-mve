@@ -473,7 +473,8 @@ async def consume(
                                "覆盖率无从计算（如实留空，不编造数字）")
             _log(base)
             return base
-        ref_facts, ref_traj = await _referee_facts(question, points, schema=schema)
+        ref_facts, ref_traj = await _referee_facts(
+            question, points, env=env, schema=schema)
         base["referee_trajectory"] = ref_traj
         base["derived_points"] = [str(p.get("point") or p.get("dimension"))
                                   for p in points]
@@ -593,8 +594,81 @@ def _derive_dims(question: str) -> list[dict[str, Any]]:
     return pts[:4]
 
 
+async def _referee_by_sql(question: str, dims: list[str],
+                          subs: list[dict[str, Any]], env: Any,
+                          schema: str) -> list[dict[str, Any]]:
+    """裁判侧取数：独立写一条 SQL（与 Voyager 侧不同提示、不同调用），执行一次。
+    带一轮错误回灌重试。返回观察列表（成功才有值）。"""
+    want = "\n".join(
+        f"- dimension 必须逐字写成 `{d}`"
+        f"{'，subject 写成 ' + json.dumps(s, ensure_ascii=False) if s else ''}"
+        for d, s in zip(dims, subs)
+    )
+    sysmsg = ("你是原版 VLML 分析引擎（裁判）。为这句话写**一条 SELECT** 取标准答案。"
+              "只输出 SQL 本体，不要解释。")
+    user = (f"这句话：{question}\n\n要给出的量（只给名字，值你自己从库里算）：\n{want}"
+            f"\n\n当前库真实存在的表与列（只能引用这里的名字）：\n{schema[:6000]}")
+    last_err = ""
+    for _ in range(2):
+        sql = chat(
+            [{"role": "system", "content": sysmsg},
+             {"role": "user", "content": user + (f"\n\n上一轮报错：{last_err}" if last_err else "")}],
+            temperature=0.1, max_tokens=800,
+        )
+        sql = _strip_sql(sql)
+        if not sql:
+            continue
+        obs = await env.run_sql(sql)
+        if obs.get("ok"):
+            return [{"tool": "query_sql", "args": {"sql_query": sql},
+                     "data": obs.get("data"), "error": None}]
+        last_err = str(obs.get("error") or "")[:300]
+    return []
+
+
+def _strip_sql(text: str) -> str:
+    """从模型输出里抠出一条 SELECT（它可能带围栏/前导说明）。"""
+    t = str(text or "").strip()
+    if t.startswith("```"):
+        t = t.strip("`")
+        for tag in ("sql", "SQL"):
+            if t.startswith(tag):
+                t = t[len(tag):]
+        t = t.strip()
+    i = t.upper().find("SELECT")
+    if i < 0:
+        return ""
+    t = t[i:].strip().rstrip(";").strip()
+    return t if t.upper().startswith("SELECT") else ""
+
+
+def _facts_from_obs(obs: list[dict[str, Any]], dims: list[str],
+                    subs: list[dict[str, Any]], question: str) -> list[dict]:
+    """观察 → 事实（裁判侧）。"""
+    from loop_core import make_fact
+    out = chat_json(
+        [
+            {"role": "system", "content": _extract_system()},
+            {"role": "user", "content": _extract_user(question, obs, dims, subs)},
+        ],
+        temperature=0.1,
+    )
+    facts: list[dict] = []
+    for f in (out.get("facts") or []):
+        if not isinstance(f, dict) or "dimension" not in f:
+            continue
+        facts.append(make_fact(
+            subject=f.get("subject") or {},
+            dimension=str(f.get("dimension")),
+            value=f.get("value"), unit=str(f.get("unit") or "raw"),
+            base=f.get("base"), source={"tool": "query_sql", "args": {}},
+        ))
+    return facts
+
+
 async def _referee_facts(question: str,
                          points: list[dict[str, Any]],
+                         env: Any = None,
                          schema: str = "") -> tuple[list[dict], list[str]]:
     """让 **VLML 自己的工具链独立取一遍数**（裁判侧），不去碰 Voyager 的取数结果。
 
@@ -609,6 +683,16 @@ async def _referee_facts(question: str,
         return [], []
     dims = [str(p.get("dimension")) for p in points]
     subs = [dict(p.get("subject") or {}) for p in points]
+
+    # 主路：裁判也用**同一个 VLML MCP 环境**写 SQL 取数（与 Voyager 侧同一套表/列，
+    # 但独立提示、独立调用 —— 值都来自 DB，可比）。
+    # 为什么不用旧的 coach 编排：实测它三条调用全撞列名幻觉（base_events 里写
+    # player_name，真实列是 actor_player_name），裁判侧一条数都取不到 → 覆盖率落空。
+    if env is not None:
+        obs = await _referee_by_sql(question, dims, subs, env, schema)
+        if obs:
+            return _facts_from_obs(obs, dims, subs, question), ["query_sql"]
+    # 兜底：旧 VLML 编排
     # ⚠️ 实测踩过：不注入实查 schema，裁判会犯和 Voyager 一样的**列名幻觉** ——
     # 写 `base_events.player_name`，而真实列是 actor_player_name / target_player_name
     # → 三条调用全 Binder Error → 裁判侧一条数都取不到 → 覆盖率直接落空。
