@@ -2103,7 +2103,12 @@ class Handler(BaseHTTPRequestHandler):
                     if _repo_root not in _sys.path:
                         _sys.path.insert(0, _repo_root)
                     import voyager_vlml.consume as _consume
-                    _consume.consume(q, topic_hint=str(payload.get("topic_id") or ""))
+                    # ⚠️ consume 是 async，必须 asyncio.run —— 直接调用只会得到一个
+                    # 从未执行的协程（实测日志里就是
+                    # "RuntimeWarning: coroutine 'consume' was never awaited"，
+                    # 表现是"受理了、进度条走完，但什么都没发生"）。
+                    asyncio.run(_consume.consume(
+                        q, topic_hint=str(payload.get("topic_id") or "")))
                     # consume 内部会 _log 落 coach_log —— 前端轮询自然能看到
                 except Exception as e:  # 失败也要让人看见，不能静默吞掉
                     COACH_JOB["error"] = f"{type(e).__name__}: {e}"[:300]
