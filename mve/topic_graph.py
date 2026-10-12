@@ -37,6 +37,23 @@ MASTERY_PATH = HERE / "topic_mastery.jsonl"
 
 DEFAULT_REQUIRED_MASTERY = 0.5
 
+# ---------------------------------------------------------------------------
+# Voyager 课程机制（替换/增强 MVE 出题器，2026-10-12 落地）
+# ---------------------------------------------------------------------------
+# 1) 放弃机制（堵 MC 161 轮死循环）：一个知识点练够 MAX_ATTEMPTS_PER_TOPIC 次、
+#    掌握度仍 < STALE_MASTERY，就标记 stale，select_next 强制跳过换题。绝不在一个
+#    知识点上无限打转（MC 实测 161 轮不换题=从不干净失败）。
+MAX_ATTEMPTS_PER_TOPIC = 6
+STALE_MASTERY = 0.6
+
+# 2) 跨域基线（用户指定：技能/动作锁定 VLML 10 工具/语义层，不写裸 SQL）。
+#    这些知识点依赖 ext_* 表（首血 / 经济局），换到没有 ext 表的库（vlml_vlr）
+#    时不可答 → 出题器把它们降权，等换到有 ext 表的库（vlml_rib）再放开。
+EXT_TOPICS = {
+    "vlml_first_blood", "vlml_fb_conversion", "vlml_post_plant", "vlml_economy",
+    "vlml_trade", "vlml_opening_duel", "vlml_grain_trap", "vlml_sample_size",
+}
+
 
 # ---------------------------------------------------------------------------
 # 掌握度存储（按知识点，独立于一题一判的覆盖率）
@@ -77,13 +94,21 @@ class MasteryStore:
         return dict(self._rows)
 
     def update(self, topic_id: str, *, score: float, commit: bool = True) -> dict[str, Any]:
-        """score ∈ [0,1]：本次作答得分。更新滑动平均掌握度。"""
+        """score ∈ [0,1]：本次作答得分。更新滑动平均掌握度。
+
+        额外维护两个 Voyager 课程要用的字段：
+          streak_wrong —— 连续答错次数（连错触发加支架，见 difficulty.py）；
+          stale       —— 放弃标记：练够次数仍不达标 → 出题器强制换题
+                        （堵 MC 161 轮死循环：从不干净失败=永不换题）。
+        """
         row = self._rows.get(topic_id) or {
             "topic_id": topic_id, "mastery": None, "attempts": 0,
-            "correct": 0, "last_at": 0,
+            "correct": 0, "last_at": 0, "streak_wrong": 0, "stale": False,
         }
         row["attempts"] = int(row.get("attempts", 0)) + 1
         row["correct"] = int(row.get("correct", 0)) + (1 if score >= 0.6 else 0)
+        # 连错计数：答对清零，答错 +1（difficulty.py 的连错两题加支架读它）
+        row["streak_wrong"] = 0 if score >= 0.6 else int(row.get("streak_wrong", 0)) + 1
         prev = row.get("mastery")
         if prev is None:
             row["mastery"] = float(score)
@@ -91,10 +116,23 @@ class MasteryStore:
             # 指数滑动平均：新样本权重 0.4
             row["mastery"] = round(prev * 0.6 + score * 0.4, 4)
         row["last_at"] = int(time.time())
+        # 放弃机制：练够 MAX_ATTEMPTS 次仍 < STALE_MASTERY → 标记 stale。
+        # staleness 只看「次数够 + 掌握度低」两件事，与是否连错解耦，避免
+        # "刚好最后一次蒙对"把标记刷掉——次数到了就是到了。
+        row["stale"] = bool(
+            row["attempts"] >= MAX_ATTEMPTS_PER_TOPIC
+            and (row.get("mastery") is None or float(row["mastery"]) < STALE_MASTERY)
+        )
         self._rows[topic_id] = row
         if commit:
             self._persist()
         return row
+
+    def is_stale(self, topic_id: str) -> bool:
+        return bool((self._rows.get(topic_id) or {}).get("stale"))
+
+    def streak_of(self, topic_id: str) -> int:
+        return int((self._rows.get(topic_id) or {}).get("streak_wrong", 0))
 
     def _persist(self) -> None:
         lines = [json.dumps(r, ensure_ascii=False) for r in self._rows.values()]
@@ -189,14 +227,21 @@ class TopicGraph:
             f"已掌握 {mastered} 个 → 目标难度 {target}"
         )
 
-    # ---- 核心：选下一题 ----
+    # ---- 核心：选下一题（Voyager 课程驱动）----
     def select_next(
-        self, *, scope: dict[str, Any] | None = None, explicit: str | None = None
+        self, *, scope: dict[str, Any] | None = None, explicit: str | None = None,
+        ext_available: bool | None = None,
     ) -> dict[str, Any]:
-        """返回 {topic_id, reason, explanation, blocked, hint, difficulty_target}。
+        """返回 {topic_id, reason, explanation, blocked, hint, difficulty_target,
+        novelty, stale_skipped, ext_deprioritized}。
 
-        排序键（伴学 weak-first + _by_gradient 同构）：
+        排序键（伴学 weak-first + _by_gradient 同构，叠加 Voyager 两项）：
             (掌握度越低越前, 离目标难度越近越前, depth, id)
+        叠加：
+          · 放弃机制：stale 知识点（练够次数仍不达标）直接踢出候选，强制换题。
+          · 场景条件化：当前库没有 ext_* 表时，依赖 ext 的知识点降权到末尾
+            （跨域基线：技能锁定工具/语义层，裸 ext 查询在缺表库上不可答）。
+          · 新奇驱动：未练过的排最前（探索新奇），并在 explanation 标注 novelty。
         """
         if explicit and explicit in self.topics:
             t = self.topics[explicit]
@@ -204,24 +249,40 @@ class TopicGraph:
                 "topic_id": explicit, "blocked": False, "hint": "",
                 "difficulty_target": self.global_target()[0],
                 "reason": "explicit", "explanation": f"已钉住知识点 {explicit}",
+                "novelty": 0.0, "stale_skipped": 0, "ext_deprioritized": False,
             }
+
+        if ext_available is None:
+            ext_available = ext_tables_present()
 
         pool = self.topics_in_scope(scope)
         selectable = [t for t in pool if self.prereq_ok(t)]
         target, why_target = self.global_target()
 
+        # 放弃机制：踢出 stale 候选（强制换题，堵 MC 161 轮死循环）
+        stale_ids = [t["id"] for t in selectable if self.mastery.is_stale(t["id"])]
+        selectable = [t for t in selectable if not self.mastery.is_stale(t["id"])]
+
         if not selectable:
-            # 全被前置卡住 → 退回无前置的根知识点（绝不让用户卡死）
+            # 全被前置卡住 / 全 stale → 退回无前置的根知识点（绝不让用户卡死）
             roots = [t for t in pool if not self.prerequisites_of(t["id"])]
             selectable = roots or pool
-            note = "（部分题前置未达标，先推无前置的根知识点）" if roots else "（范围里无可选题，退回全量）"
+            note = "（候选全 stale/前置未达标，先推无前置的根知识点）" if roots else "（范围里无可选题，退回全量）"
         else:
             note = ""
+
+        # 场景条件化：缺 ext 表时，依赖 ext 的知识点降权（排到末尾，但仍在候选里，
+        # 保证极端情况下不会无题可出）。
+        ext_blocked = {t["id"] for t in selectable
+                       if (not ext_available) and t["id"] in EXT_TOPICS}
 
         def key(t: dict[str, Any]) -> tuple:
             m = self.mastery.mastery_of(t["id"])
             mval = -1.0 if m is None else float(m)
             diff = float(t.get("difficulty", 0.5))
+            # 缺 ext 表却依赖 ext 的知识点：掌握度人为压到最末（排最后）
+            if t["id"] in ext_blocked:
+                mval = 99.0
             # 未练过的（mval=-1）全部排前面；其中按 depth 升序（地基优先），
             # 再按离目标难度就近；已练过的按掌握度升序（薄弱优先）。
             return (mval, int(t.get("depth", 1)), abs(diff - target), t["id"])
@@ -231,6 +292,8 @@ class TopicGraph:
         m = self.mastery.mastery_of(cid)
         mtxt = "未练过" if m is None else f"{m:.0%}"
         blocked = self.blocked_by(chosen)
+        # 新奇分：从未练过 = 1.0（最高新奇）；练过但掌握度低 = 中等；已达标 = 0
+        novelty = 1.0 if m is None else max(0.0, 0.6 - (m or 0))
         return {
             "topic_id": cid,
             "reason": "weak_first" if (m is None or m < 0.8) else "review",
@@ -242,6 +305,9 @@ class TopicGraph:
             "blocked": bool(blocked),
             "hint": self._hint_for(chosen),
             "difficulty_target": target,
+            "novelty": round(novelty, 2),
+            "stale_skipped": len(stale_ids),
+            "ext_deprioritized": bool(cid in ext_blocked),
         }
 
     def _hint_for(self, topic: dict[str, Any]) -> str:
@@ -270,6 +336,8 @@ class TopicGraph:
                 "difficulty": float(t.get("difficulty", 0.5)),
                 "mastery": (None if m is None else round(m, 3)),
                 "blocked": bool(self.blocked_by(t)),
+                "stale": bool(self.mastery.is_stale(t["id"])),
+                "ext_layer": bool(t["id"] in EXT_TOPICS),
                 "misconceptions": len(t.get("typical_misconceptions") or []),
                 "examples": len(t.get("examples") or []),
             })
@@ -291,6 +359,42 @@ class TopicGraph:
 
 
 _GRAPH: TopicGraph | None = None
+
+
+def ext_tables_present(db_path: str | None = None) -> bool:
+    """当前库有没有 ext_* 表（首血/经济局等 rib.gg 专属层）。
+
+    这是「场景条件化」的判据：没有 ext 表时，依赖 ext 的知识点（EXT_TOPICS）
+    在出题器里被降权，因为裸 ext 查询在缺表库上必然跑不出数。换到 vlml_rib
+    这类带 ext 表的库就放开 —— 技能仍只描述「调哪个工具/取哪类事实」，不写
+    裸 SQL，所以换库只是"该层的题有没有数据"，技能本身可迁移。
+    """
+    try:
+        import json as _json
+        import duckdb
+        p = db_path
+        if not p:
+            cfg = HERE / "db_config.json"
+            try:
+                obj = _json.loads(cfg.read_text(encoding="utf-8"))
+                p = (obj or {}).get("db_path") or ""
+            except Exception:
+                p = ""
+        if not p:
+            return False
+        from pathlib import Path as _P
+        if not _P(p).exists():
+            return False
+        con = duckdb.connect(str(p), read_only=True)
+        try:
+            tabs = [r[0] for r in con.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema='main'").fetchall()]
+            return any(str(t).startswith("ext_") for t in tabs)
+        finally:
+            con.close()
+    except Exception:
+        return False
 
 
 def get_graph() -> TopicGraph:

@@ -149,7 +149,22 @@ def _entity_block() -> str:
 # ---------------------------------------------------------------------------
 # 提示组装
 # ---------------------------------------------------------------------------
-def _build_messages(topic: dict[str, Any], *, attempt: int, last_question: str = "") -> list[dict[str, str]]:
+def recall_context(task_text: str, limit: int = 5) -> list[str]:
+    """Task 3：从 mem0 长期记忆召回与本题相关的经验（带记忆系统消费）。
+
+    优雅降级：mem0 未装 / 未 seed / 连不上 → 返回空列表，不阻断出题。
+    记忆内容 = 4 条跨域规划原则 + 失败纠正经验（见 mem0_backend）。
+    """
+    try:
+        import mem0_backend
+        return mem0_backend.recall(task_text, limit=limit)
+    except Exception:
+        return []
+
+
+def _build_messages(topic: dict[str, Any], *, attempt: int, last_question: str = "",
+                    memories: list[str] | None = None,
+                    scene_text: str = "") -> list[dict[str, str]]:
     name = _as_str(topic.get("name"), topic.get("id", ""))
     chapter = _as_str(topic.get("chapter"))
     skills = _as_list(topic.get("skills"))
@@ -195,6 +210,9 @@ def _build_messages(topic: dict[str, Any], *, attempt: int, last_question: str =
         "  difficulty: 1-5 整数\n"
         "不要编造不存在的表或列；口径必须可验证。"
     )
+    scene_line = ""
+    if scene_text:
+        scene_line = f"\n{scene_text}\n"
     user = (
         f"【知识点】{name}（章节：{chapter}）\n"
         f"{style_hint}\n"
@@ -202,9 +220,11 @@ def _build_messages(topic: dict[str, Any], *, attempt: int, last_question: str =
         f"\n【问法与拿表回答示意（参考，不要照抄原题）】\n{ex_block}\n"
         f"\n【实测常见误区（出题时埋下陷阱或明确警示）】\n{mis_block}\n"
         f"\n难度建议：{topic.get('difficulty')}"
+        f"{scene_line}"
         f"{_entity_block()}"
-        f"{repeat_guard}\n"
-        "请返回 JSON。"
+        f"{repeat_guard}"
+        + (_memory_block(memories) if memories else "")
+        + "\n请返回 JSON。"
     )
     return [
         {"role": "system", "content": system},
@@ -244,21 +264,57 @@ def _normalize(raw: dict[str, Any], topic: dict[str, Any], *, attempt: int) -> d
     }
 
 
-def generate_for(topic_id: str, *, attempt: int = 0, last_question: str = "") -> dict[str, Any]:
-    """为某个知识点生成一道开放式题。失败抛异常，由调用方降级。"""
+def _memory_block(memories: list[str] | None) -> str:
+    if not memories:
+        return ""
+    bullets = "\n".join(f"  - {m}" for m in memories[:6])
+    return (
+        f"\n\n【既往经验记忆（mem0 召回，出题时可参考其取数思路/避坑）】\n"
+        f"{bullets}"
+    )
+
+
+def generate_for(topic_id: str, *, attempt: int = 0, last_question: str = "",
+                 memories: bool = True, scene: bool = True) -> dict[str, Any]:
+    """为某个知识点生成一道开放式题。失败抛异常，由调用方降级。
+
+    memories=True 时，先按知识点文本从 mem0 召回既往经验注入出题 prompt
+    （Task 3：技能消费带记忆系统——人消费路径也接记忆）。
+    scene=True 时，注入「初始场景（数据世界）」块（Task 2：渐进披露——
+    模型只能看到当前进度档允许看到的表/工具）。
+    """
     graph = TopicGraph()
     topic = graph.topics.get(topic_id)
     if topic is None:
         raise ValueError(f"未知知识点 {topic_id}")
-    messages = _build_messages(topic, attempt=attempt, last_question=last_question)
+    mem = recall_context(_memory_query(topic)) if memories else []
+    scene_text = ""
+    if scene:
+        try:
+            import scene_context
+            scene_text = scene_context.scene_injection(topic_id)
+        except Exception:
+            scene_text = ""
+    messages = _build_messages(topic, attempt=attempt, last_question=last_question,
+                               memories=mem, scene_text=scene_text)
     raw = _quiz_json(messages)
     if not raw:
         raise ValueError("出题 LLM 返回空/非 JSON")
-    return _normalize(raw, topic, attempt=attempt)
+    q = _normalize(raw, topic, attempt=attempt)
+    q["memories_recalled"] = len(mem)
+    return q
+
+
+def _memory_query(topic: dict[str, Any]) -> str:
+    """拼一条用于语义召回的任务文本（知识点名 + 技能要求）。"""
+    name = _as_str(topic.get("name"), topic.get("id", ""))
+    skills = "；".join(_as_str(s) for s in _as_list(topic.get("skills"))[:4])
+    return f"{name}｜{skills}" if skills else name
 
 
 def generate_next(*, scope: dict[str, Any] | None = None, explicit: str | None = None,
-                  last_question: str = "") -> dict[str, Any]:
+                  last_question: str = "", memories: bool = True,
+                  scene: bool = True) -> dict[str, Any]:
     """选下一知识点并出题，一并返回选题依据。"""
     graph = TopicGraph()
     sel = graph.select_next(scope=scope, explicit=explicit)
@@ -266,9 +322,46 @@ def generate_next(*, scope: dict[str, Any] | None = None, explicit: str | None =
     # attempt 数 = 该知识点已尝试次数（用于题型轮换）
     mrow = graph.mastery.get(tid)
     attempt = int((mrow or {}).get("attempts", 0))
-    q = generate_for(tid, attempt=attempt, last_question=last_question)
+    q = generate_for(tid, attempt=attempt, last_question=last_question,
+                     memories=memories, scene=scene)
     q["selection"] = sel
     return q
+
+
+def record_correction_on_failure(topic_id: str, *, user_answer: str = "",
+                                 grade: dict[str, Any] | None = None) -> int:
+    """Task 3：人消费路径的失败→纠正闭环。答错（score<0.6）时把本题的
+    「常见误区 + 漏掉要点」写成 mem0 纠正记忆，下次出题/作答可召回。
+
+    优雅降级：mem0 未装/未 seed → 返回 0，不阻断主流程。
+    与 failure_correction_loop 的区别：那里记的是「模型自己写错的 SQL 异常」
+    （取证闭环），这里记的是「人答错暴露的知识点误区」（人消费闭环）。
+    """
+    score = float((grade or {}).get("score", 1.0))
+    if score >= 0.6:
+        return 0
+    try:
+        import mem0_backend
+    except Exception:
+        return 0
+    graph = TopicGraph()
+    topic = graph.topics.get(topic_id) or {}
+    mis = _as_list(topic.get("typical_misconceptions"))[:3]
+    misses = _as_list((grade or {}).get("misses"))[:4]
+    if not (mis or misses):
+        return 0
+    entries = [{
+        "error": f"人答错知识点 {topic_id}（得分 {score:.2f}）："
+                 + (_as_str(user_answer)[:60] or "未作答"),
+        "fix": "本题关键：" + "；".join([*mis, *misses]),
+        "condition": f"涉及 {topic_id} 的出题/作答",
+        "verified": True,
+    }]
+    try:
+        added = mem0_backend.add_correction(entries, force=False)
+        return len(added)
+    except Exception:
+        return 0
 
 
 def record_result(topic_id: str, *, score: float) -> dict[str, Any]:

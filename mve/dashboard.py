@@ -2087,7 +2087,14 @@ class Handler(BaseHTTPRequestHandler):
                 g = open_quiz.grade_answer(q, ua)
                 if topic_id:
                     open_quiz.record_result(topic_id, score=g["score"])
-                self._json(200, {"ok": True, "grade": g, "topic_id": topic_id})
+                    # Task3：答错（score<0.6）把本题误区写成 mem0 纠正记忆，
+                    # 下次出题/作答可召回——人消费路径也接记忆闭环。
+                    corr_written = open_quiz.record_correction_on_failure(
+                        topic_id, user_answer=ua, grade=g)
+                else:
+                    corr_written = 0
+                self._json(200, {"ok": True, "grade": g, "topic_id": topic_id,
+                                "correction_memories": corr_written})
             except Exception as e:
                 self._json(500, {"ok": False,
                                  "error": f"{type(e).__name__}: {e}"[:300]})
