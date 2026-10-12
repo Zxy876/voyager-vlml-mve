@@ -74,6 +74,40 @@ def _infer(question: str) -> tuple[str, str, Any]:
     return tid, hit, TASKS.get(tid)
 
 
+def _same_question(question: str, task: Any) -> tuple[bool, str]:
+    """这句话与这道题，问的是**不是同一个问题**（不是"有没有同一个词"）。
+
+    为什么必须有这道校验（实测踩到）：
+      人问「哪位选手在 Corrode 这张图上的 K/D 比最高？」
+      → `infer_topic` 靠 "k/d" 这个词归到 `kast_adr_check`
+      → 但那道题问的是「Cloud9 这场比赛**队伍整体**的 KAST 和 K/D」
+        （rubric subject = {series, team:NRG}，要的是队伍口径，不是某个选手）
+      → 拿它的 rubric 去判 Voyager 那条（subject = {player_name, map_name}）
+      → 键对不上，覆盖率恒 0。
+
+    那不是「Voyager 答错了」，是**尺子拿错了**。不校验就直接判 0，
+    面板上会显示覆盖率 0%，人读到的是"它能力不行"，真实情况却是
+    "我们拿了一道别的题的标准答案来量它"。这种假性失败必须挡掉：
+    不同题 → 不套用它的 rubric，如实留空，交给生成新题那条路。
+    """
+    try:
+        out = chat_json(
+            [
+                {"role": "system",
+                 "content": ("判断两句话问的是不是**同一个问题**。看口径与对象："
+                             "队伍整体 ≠ 某个选手，全场 ≠ 某一张图，一个指标 ≠ 两个指标。"
+                             "只返回 JSON：{\"same\": true/false, \"why\": \"一句话理由\"}")},
+                {"role": "user",
+                 "content": (f"甲（人问的）：{question}\n\n"
+                             f"乙（题库里的题）：{getattr(task, 'question', '')}")},
+            ],
+            temperature=0.0,
+        )
+        return bool(out.get("same")), str(out.get("why") or "")
+    except Exception as e:  # pragma: no cover
+        return False, f"校验失败：{type(e).__name__}"
+
+
 # ---------------------------------------------------------------------------
 # ② 这句话该消费哪些已积累的能力（找配方）
 # ---------------------------------------------------------------------------
@@ -275,6 +309,13 @@ async def consume(
     topic_id, hit, task = _infer(question)
     if topic_hint:
         hit = f"{hit}（指定）" if hit else "（指定）"
+    if task is not None:
+        # 归题靠词面，会归到"有同一个词但不是同一个问题"的题上。
+        # 尺子拿错 → 覆盖率恒 0，那是假性失败，不能当能力差报给人。
+        same, why = _same_question(question, task)
+        if not same:
+            hit = f"{hit}（归到的题与这句话不是同一个问题：{why}）"
+            task = None
 
     # ---- ② 找已积累的能力（配方）----
     skills = _retrieve_skills(question, topic_hint)

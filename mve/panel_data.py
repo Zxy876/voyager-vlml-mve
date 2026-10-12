@@ -289,6 +289,39 @@ def _human_imports(limit: int = 10) -> list[dict[str, Any]]:
     return out[-limit:]
 
 
+def _consume_curve(limit: int = 40) -> list[dict[str, Any]]:
+    """**消费进步曲线** —— 用户 2026-10-13 定：「测 Voyager 的进步曲线和掌握度
+    全在消费这测就好了」。
+
+    为什么是消费而不是练习：
+      练习（run_log）不判分 —— VLML 的尺子不能进 Voyager 的反馈环，所以那条线
+      只有「取没取到数」，画出来的曲线是"链路通不通"，不是"水平高不高"。
+      消费（人问一句 → Voyager 用已积累的能力答）才是**交付**：人真的要一个答案，
+      这时候用 VLML0 裁判独立跑一遍量出覆盖率，才是真实的进步曲线。
+
+    只收 `mode == "voyager_consume"` 的记录；老的人导入（纯 VLML 解释）没有
+    coverage，一律跳过 —— 不能拿 None 补 0，那会把"没测"画成"测得 0 分"。
+    """
+    out: list[dict[str, Any]] = []
+    for i, rec in enumerate(
+        [r for r in _human_imports(limit=limit)
+         if r.get("mode") == "voyager_consume" and r.get("coverage") is not None],
+        start=1,
+    ):
+        out.append({
+            "i": i,
+            "ts": rec.get("ts", ""),
+            "question": str(rec.get("question") or "")[:80],
+            "topic_id": str(rec.get("topic_id") or ""),
+            "coverage": float(rec.get("coverage")),
+            "score": rec.get("score"),
+            "verdict": str(rec.get("verdict") or ""),
+            "mastery": rec.get("mastery"),
+            "reused": bool(rec.get("reused")),
+        })
+    return out
+
+
 def _db_view() -> dict[str, Any]:
     """当前指向哪个库（不 import vlml_env，避免面板启动就拉起整个 VLML）。"""
     try:
@@ -435,6 +468,9 @@ def build_state() -> dict[str, Any]:
             "voyager": _voyager_view(),
             "practice_scope": scope,
             "imports": imports,
+            # 消费进步曲线：run_log 为空（比如刚清库）也要照常给 ——
+            # 进步是在消费这条线上测的，练习没跑过不影响它
+            "consume_curve": _consume_curve(),
             "recommend": recommend,
             "causal": causal,
             "tasks": _task_library(),
@@ -609,6 +645,8 @@ def build_state() -> dict[str, Any]:
         "tasks": _task_library(),
         # 人导入通路：导入过什么 + 出题器因此改成推哪题
         "imports": imports,
+        # 消费进步曲线：进步与掌握度**在消费这条线上测**（练习不判分）
+        "consume_curve": _consume_curve(),
         "recommend": recommend,
         "causal": causal,
         "attempted": attempted,

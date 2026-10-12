@@ -747,10 +747,36 @@ function pImport(s){
       <div class="hit" id="hit">归类结果会在这里显示。</div>
       <div id="result"></div>
     </div>
+    ${consumeCurve(s)}
     <h3>我的导入历史（${(s.imports||[]).length} 条）</h3>
     <div class="legend">虚线框 = comparable: false，不参与比对，也不进掌握度 —— 只进因果时间线。</div>
     <div id="implist"></div>
   </div>`;
+}
+
+/* 消费进步曲线 —— 进步与掌握度**在消费这条线上测**（用户 2026-10-13 定）。
+   为什么不是练习那条：练习不判分（VLML 的尺子不能进 Voyager 反馈环），
+   run_log 里的覆盖率恒为 None，画出来没有意义。消费才是交付 —— 人真的要一个答案，
+   这时用 VLML0 裁判独立跑一遍量出覆盖率，才是真实的进步。 */
+function consumeCurve(s){
+  const cc=s.consume_curve||[];
+  if(!cc.length) return `<h3>消费进步曲线</h3>
+    <div class="empty">还没有消费记录。在上面问一句话，Voyager 会用已积累的能力回答，
+    覆盖率与掌握度从这里开始累计。</div>`;
+  const covPts=cc.map((c,i)=>({x:i+1, y:c.coverage, label:`覆盖率 ${Math.round(c.coverage*100)}% · ${c.question}`}));
+  const masPts=cc.filter(c=>c.mastery!==null&&c.mastery!==undefined)
+                 .map((c,i)=>({x:i+1, y:c.mastery, label:`掌握度 ${Math.round(c.mastery*100)}%`}));
+  const last=cc[cc.length-1];
+  const reused=cc.filter(c=>c.reused).length;
+  return `<h3>消费进步曲线（${cc.length} 次）</h3>
+    <div class="legend">每次消费的覆盖率（VLML0 裁判独立跑一遍量出来）· 掌握度是同一题的滑动平均。</div>
+    ${lineChart(covPts,{color:'#2563eb'})}
+    ${masPts.length>1?`<div class="legend" style="margin-top:6px">掌握度曲线</div>${lineChart(masPts,{color:'#059669',dash:'4 3'})}`:''}
+    <div class="legend" style="margin-top:6px">
+      最近一次：覆盖率 <b>${Math.round(last.coverage*100)}%</b>（${ESC(last.verdict||'')}）
+      · 掌握度 <b>${last.mastery===null||last.mastery===undefined?'—':Math.round(last.mastery*100)+'%'}</b>
+      · ${reused}/${cc.length} 次是复用已学配方
+    </div>`;
 }
 
 function pTrace(s){
@@ -1423,6 +1449,34 @@ function renderImportResult(res){
       <span class="chip grey">记忆召回 ${vc.memory_count||0} 条</span>
       ${(vc.skills||[]).length?`<span class="chip grey">复用技能：${vc.skills.map(k=>ESC(k.name)).join('、')}</span>`:''}
       ${vc.scene?'<span class="chip grey">场景已注入（工具/表 base·ext 分层）</span>':''}`:'';
+  // —— 消费通路（voyager_vlml/consume.py）专属披露 ——
+  // 关键区别：旧通路只是把技能库的**文字**塞进 VLML 编排的 prompt（注入话术）；
+  // 消费通路是真的把已固化的 SQL 配方拿出来、把这句话的实体值回填进配方的计算、
+  // 执行取数。所以「用了能力还是现做的」必须能一眼看出来 —— 自称用了能力但其实
+  // 张冠李戴，比承认现做更糟。
+  const isConsume = res.mode === 'voyager_consume';
+  const consumeChips = isConsume ? `
+      <span class="chip ${res.reused?'ok':'warn'}">${res.reused?'复用已学配方':'现场现做（库里没有可用配方）'}</span>
+      <span class="chip grey">技能库命中 ${res.skills_found||0} 条</span>
+      ${(res.used_skills||[]).length?`<span class="chip grey">用了：${res.used_skills.map(k=>ESC(k.name||k.topic||'')).join('、')}</span>`:''}
+      <span class="chip grey">工具调用 ${res.ok_tool_calls||0}/${res.tool_calls||0} 成功 · ${res.rows||0} 行</span>` : '';
+  const pct = v => (v===null||v===undefined) ? '—' : Math.round(v*100)+'%';
+  // 覆盖率/掌握度**只在消费侧算**（练习不判分）—— 这是给人看的质量数。
+  const scoreBlock = isConsume ? `
+    <div style="margin-top:9px">
+      <b>覆盖率 / 掌握度（VLML0 裁判独立跑一遍量出来，只给人看，不回灌 Voyager）：</b>
+      ${res.coverage===null||res.coverage===undefined
+        ? `<div style="margin-top:4px">未计算 —— ${ESC(res.skipped||'无评分点可比对')}</div>`
+        : `<div style="margin-top:4px">
+             <span class="chip ${res.coverage>=0.95?'ok':(res.coverage>0?'warn':'bad')}">覆盖率 ${pct(res.coverage)}</span>
+             <span class="chip grey">得分 ${ESC(res.score)}</span>
+             <span class="chip grey">判读 ${ESC(res.verdict||'')}</span>
+             <span class="chip grey">掌握度 ${pct(res.mastery)}</span>
+           </div>
+           ${(res.covered_points||[]).length?`<div style="margin-top:4px;font-size:12px"><b>答出：</b>${res.covered_points.map(c=>ESC(c)).join('；')}</div>`:''}
+           ${(res.missing_points||[]).length?`<div style="margin-top:4px;font-size:12px"><b>缺：</b>${res.missing_points.map(c=>ESC(c)).join('；')}</div>`:''}
+           ${(res.unjudgeable||[]).length?`<div style="margin-top:4px;font-size:12px"><b>裁判也没答出来：</b>${res.unjudgeable.map(c=>ESC(c)).join('；')}</div>`:''}`}
+    </div>` : '';
   box.innerHTML=`<div class="note info" style="margin-top:10px">
     <div style="margin-bottom:6px">
       ${res.topic_id?`<span class="chip ok">归入 ${ESC(res.topic_id)}</span>`:'<span class="chip bad">没归入任何题 → 不驱动出题</span>'}
@@ -1430,14 +1484,20 @@ function renderImportResult(res){
       <span class="chip grey">validated_target: ${ESC(res.validated_target)}</span>
       ${(res.trajectory||[]).length?`<span class="chip grey">VLML 解析：${(res.trajectory||[]).map(t=>ESC(t)).join(' → ')}</span>`:'<span class="chip bad">未取到数据</span>'}
       ${vcChips}
+      ${consumeChips}
       ${graphLinkChips(res.graph_link)}
     </div>
+    ${isConsume&&res.reuse_note?`<div style="margin-top:5px;font-size:12px"><b>配方怎么用的：</b>${ESC(res.reuse_note)}</div>`:''}
+    ${scoreBlock}
     ${res.skipped?`<div><b>未产出解释：</b>${ESC(res.skipped)}</div>`:''}
     ${(res.errors||[]).length?`<div style="margin-top:5px"><b>工具报错：</b>${(res.errors||[]).map(e=>ESC(e)).join('；')}</div>`:''}
-    ${facts?`<div style="margin-top:9px"><b>VLML 给出的事实（${(res.facts||[]).length} 条）：</b>${facts}
+    ${isConsume&&res.answer?`<div style="margin-top:9px"><b>Voyager 的回答：</b>
+      <div class="nocmp-body" style="margin-top:4px">${ESC(res.answer)}</div></div>`:''}
+    ${facts?`<div style="margin-top:9px"><b>VLML 的解析 · 取到的事实（${(res.facts||[]).length} 条）：</b>${facts}
       <div style="font-size:12px;color:var(--muted);margin-top:5px">
-        注意：这条通路的 facts <b>没有经过裁判核对</b>，维度名也是开放式自取的
-        —— 它比 Voyager 那条过了裁判的事实软，不能拿来当判据。</div></div>`:''}
+        ${isConsume
+          ? '这些事实是 Voyager 用已积累的能力取出来的，维度名按评分点对齐，值由它自己算 —— 上面那条覆盖率就是拿它们跟 VLML0 裁判独立跑出来的标准答案比的。'
+          : '注意：这条通路的 facts <b>没有经过裁判核对</b>，维度名也是开放式自取的 —— 它比 Voyager 那条过了裁判的事实软，不能拿来当判据。'}</div></div>`:''}
     ${(vc&&vc.memory_texts&&vc.memory_texts.length)?`<div style="margin-top:9px;font-size:12px;color:var(--muted)">
       <b>本次消费的记忆（mem0 召回）：</b><ul style="margin:4px 0 0 16px">${vc.memory_texts.map(m=>`<li>${ESC(String(m).slice(0,120))}</li>`).join('')}</ul></div>`:''}
     ${res.narrative?`<div class="nocmp" style="margin-top:9px">
@@ -1446,8 +1506,10 @@ function renderImportResult(res){
         ${(res.insights||[]).length?`<div class="nocmp-sub"><b>洞察：</b><ul>${res.insights.map(i=>`<li>${ESC(i)}</li>`).join('')}</ul></div>`:''}
         ${(res.caveats||[]).length?`<div class="nocmp-sub"><b>数据局限：</b>${res.caveats.map(c=>ESC(c)).join('；')}</div>`:''}
       </div>`:''}
-    <div style="margin-top:8px;font-size:12px">这条已写进因果时间线（control fact）。
-      <b>不计入掌握度</b> —— 出题器看得见，评分看不见。</div>
+    <div style="margin-top:8px;font-size:12px">这条已写进因果时间线（control fact），出题器看得见。
+      ${isConsume
+        ? '<b>消费这条线算覆盖率与掌握度</b>（练习不判分）—— 这两个数只给人看，不回灌 Voyager 的反馈。'
+        : '<b>不计入掌握度</b> —— 出题器看得见，评分看不见。'}</div>
   </div>`;
 }
 
@@ -1925,14 +1987,24 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 import asyncio
 
-                import coach  # 会拉起 VLML 环境（chdir + 打补丁），按需加载
-                # mode=voyager（默认）：由 Voyager 回答——编排前注入它已积累的
-                # 能力（mem0 记忆 + 技能库 + 场景），并披露 VLML 解析。
-                # mode=vlml：旧的纯 VLML 解释通路，保留可切回。
                 mode = str(payload.get("mode") or "voyager").strip().lower()
-                res = asyncio.run(coach.explain(
-                    q, topic_id=str(payload.get("topic_id") or ""),
-                    voyager=(mode == "voyager")))
+                if mode == "voyager":
+                    # **消费通路**（2026-10-13 用户定）：Voyager 用**已积累的能力**
+                    # 回答 —— 检索技能库里固化的 SQL 配方，把这句话的实体值回填进
+                    # 配方的计算，执行取数；库里没有可用配方才现场写（并如实标注）。
+                    # 底下 VLML 的解析（工具 + 事实）照旧披露，覆盖率/掌握度在这里算。
+                    #
+                    # 与旧的 `coach.explain(voyager=True)` 的区别：那条只是把技能库
+                    # 的**文字**塞进 VLML 编排的 prompt（= 注入话术，不是用配方取数）。
+                    import voyager_vlml.consume as _consume
+                    res = asyncio.run(_consume.consume(
+                        q, topic_hint=str(payload.get("topic_id") or "")))
+                    res["ok"] = True
+                else:
+                    # mode=vlml：旧的纯 VLML 解释通路，保留可切回。
+                    import coach  # 会拉起 VLML 环境（chdir + 打补丁），按需加载
+                    res = asyncio.run(coach.explain(q, voyager=False))
+                    res["ok"] = True
             except Exception as e:
                 self._json(500, {"ok": False, "error": f"{type(e).__name__}: {e}"[:300]})
                 return
