@@ -130,15 +130,25 @@ _REFILL_SYSTEM = """你是 Valorant 电竞数据分析师。你手里有**以前
 现在要用它回答一个**新的问法**。
 
 规则（违反任何一条都不算复用成功）：
+
+0. **先判断配方算的量，与这句话问的量，是不是同一个量。**
+   不是同一个量 → 直接返回 {"reused": false, "sql": "", "note": "原因"}，
+   不要硬改一个出来。
+   ⚠️ 实测踩过：问「Cloud9 在哪张图上崩得最厉害？」（要的是连败/崩盘），
+   库里只有一条「平均 K/D」配方，模型照样把 'Cloud9' 填进去产出一条 K/D 查询，
+   还自称"复用了配方" —— 结果取到的是 K/D 比，被下游当成"崩盘率"讲了出来。
+   **数字错还能看出来，量错了是方向错，比报错危险得多。**
+   换实体值（Cloud9→NRG）算复用；换个完全不同的量算不上复用。
+
 1. 复用的是配方的**计算方法**（用了哪些表、怎么聚合、怎么筛选），
    **不是**它上次算出来的数值 —— 数值必须重新算。
 2. 把**当前这句话里的实体值**（队伍名 / 图名 / 赛事 / 选手）填进配方对应的位置。
    配方里写死的字面量要换成当前这句话指的那个值。
 3. 当前这句话没给实体（比如问"哪支队伍最高"）→ 保留配方的分组结构，别自己造一个值。
-4. 只输出一条 SELECT。不要 INSERT/UPDATE/DROP，不要多语句，不要带分号结尾的解释。
+4. 只输出一条 SELECT。不要 INSERT/UPDATE/DROP，不要多语句。
 
 只返回一个 JSON：{"sql": "你的 SELECT", "reused": true/false,
-"note": "一句话说明你复用了配方的哪部分、把什么值填了进去"}"""
+"note": "一句话说明你复用了配方的哪部分、把什么值填了进去（没复用就说明为什么用不上）"}"""
 
 
 def _refill_sql(question: str, skills: list[dict[str, Any]], schema: str) -> dict[str, Any]:
@@ -193,12 +203,17 @@ def _extract_user(question: str, obs: list[dict[str, Any]],
         # 两边 dimension 必须同名字，否则事实集按 (subject, dimension) 对不上键，
         # 覆盖率恒为 0（那不是"答错了"，是"没法比"）。
         hint = (
-            "\n\n这一问期望覆盖的维度（**只给名字，值你自己从数据里算**，不许猜）：\n"
+            "\n\n这一问期望覆盖的维度（**只给名字，值你自己从数据里算**）：\n"
             + "\n".join(
                 f"- dimension 必须逐字写成 `{d}`"
                 f"{'，subject 写成 ' + json.dumps(s, ensure_ascii=False) if s else ''}"
                 for d, s in zip(dims, subjects or [None] * len(dims))
             )
+            + "\n\n⚠️ 硬约束：上面这些维度，工具返回的数据里**算不出来就一条都别写**，"
+            "留空数组。**绝对不许把别的数套到这个维度名上** —— 实测踩过：问的是"
+            "崩盘（要连败），取到的其实是 K/D 比，模型照样写成"
+            "`map_fb_conv = 1.146`，下游把它讲成「崩盘率 1.146」。"
+            "维度名与值不匹配 = 编造，比留空坏得多。宁可少写，不许错配。"
         )
     return f"""工具返回的真实数据：
 
@@ -277,14 +292,19 @@ async def consume(
     sql, reused, note = "", False, ""
     if skills:
         r = _refill_sql(question, skills, schema)
-        sql, reused, note = r["sql"], r["reused"], r["note"]
-        if sql:
+        # 模型自己判定"配方算的量与这句话问的不是同一个量" → **不执行它**，
+        # 直接现场写。宁可现做，也不许拿一个张冠李戴的 SQL 去取数。
+        if r["reused"] and r["sql"]:
+            sql, reused, note = r["sql"], True, r["note"]
             observations.append(await env.run_sql(sql))
+        else:
+            note = r["note"] or "（配方与这句话问的不是同一个量）"
+            print(f"  （未复用配方：{note[:100]}）")
     if not any(o.get("ok") for o in observations):
-        # 配方没复用成（库里没有 / 回填后跑不通）→ 现场写，并如实标注
+        # 配方没复用成（库里没有 / 用不上 / 回填后跑不通）→ 现场写，如实标注
         if sql:
             print(f"  （配方回填后没取到数，降级为现场写 SQL：{note[:60]}）")
-        reused = False
+        reused, sql = False, ""
         act = VLMLActionAgent(env=env)
         observations, sql = await act.solve(question, max_iters=3)
 
