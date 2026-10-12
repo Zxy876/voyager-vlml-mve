@@ -592,20 +592,35 @@ def _derive_dims(question: str) -> list[dict[str, Any]]:
                          "不给数值。2 到 4 个。只返回 JSON："
                          "{\"points\":[{\"point\":\"中文说明\",\"dimension\":\"英文维度名\","
                          "\"subject\":{\"team\":\"...\",\"map\":\"...\"}}]}\n\n"
-                         "⚠️ 两个字段不要串味（实测串过一次）：\n"
-                         "  · dimension = **量叫什么**（如 kd_ratio、total_damage、"
-                         "usage_rate），是英文指标名；\n"
-                         "  · subject = **说的是谁**（team / map / player 的真实取值，"
+                         "⚠️ 三个硬约束（每条都实测踩过）：\n"
+                         "  1. dimension 必须是**英文 snake_case 的数值指标名** —— "
+                         "kd_ratio / total_damage / usage_rate / win_rate / kast_pct 这种。\n"
+                         "     **不许写中文**（实测写成「K/D 比最高」→ 裁判照它写的 SQL "
+                         "只取了选手名、没取比值 → 一条事实都整理不出来 → 覆盖率落空）。\n"
+                         "     **不许带 最高/最低/最多 这类排序词** —— 那是问法不是指标；"
+                         "问「谁最高」时 dimension 就写那个指标本身（kd_ratio）。\n"
+                         "  2. subject = **说的是谁**（team / map / player 的真实取值，"
                          "如 {\"map\":\"Corrode\"}），不要把「K/D 比最高」这种描述塞进来，"
-                         "也不要把图名塞进 team 字段。\n"
-                         "  · 一句话问的是某个维度的最高/最低值时，dimension 就写那个维度名，"
-                         "subject 只留定位用的实体（没有就留空对象 {}）。")},
+                         "也不要把图名塞进 team 字段（实测串过一次）。\n"
+                         "  3. 每个 point 都要是**能用 SQL 算出来的一个数**，"
+                         "不是一段描述。")},
             {"role": "user", "content": question},
         ],
         temperature=0.0,
     )
-    pts = [p for p in (out.get("points") or []) if isinstance(p, dict)
-           and str(p.get("dimension") or "").strip()]
+    # 硬校验：dimension 必须是纯 ASCII 的数值指标名。
+    # 中文 dimension（如「K/D 比最高」）会让两边都写不出可比的事实 ——
+    # 宁可判"这一问抽不出可比的量"（如实留空），也不要拿一个对不齐的名字去比出 0 分。
+    pts: list[dict[str, Any]] = []
+    for p in (out.get("points") or []):
+        if not isinstance(p, dict):
+            continue
+        d = str(p.get("dimension") or "").strip()
+        if not d or not d.isascii():
+            continue
+        s = dict(p.get("subject") or {})
+        s = {k: v for k, v in s.items() if v not in (None, "", "?")}
+        pts.append({"point": str(p.get("point") or d), "dimension": d, "subject": s})
     return pts[:4]
 
 
