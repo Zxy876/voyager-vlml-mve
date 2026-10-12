@@ -660,11 +660,13 @@ async def _referee_by_sql(question: str, dims: list[str],
         for d, s in zip(dims, subs)
     )
     sysmsg = ("你是原版 VLML 分析引擎（裁判）。为这句话写**一条 SELECT** 取标准答案。"
-              "只输出 SQL 本体，不要解释。")
+              "只输出 SQL 本体，不要解释。\n"
+              "⚠️ 多表 JOIN 时列名必须带表名前缀（两表常有同名列，如 player_name，"
+              "裸写会被数据库判 Ambiguous reference 直接报错）。")
     user = (f"这句话：{question}\n\n要给出的量（只给名字，值你自己从库里算）：\n{want}"
             f"\n\n当前库真实存在的表与列（只能引用这里的名字）：\n{schema[:6000]}")
     last_err = ""
-    for _ in range(2):
+    for _ in range(3):
         sql = chat(
             [{"role": "system", "content": sysmsg},
              {"role": "user", "content": user + (f"\n\n上一轮报错：{last_err}" if last_err else "")}],
