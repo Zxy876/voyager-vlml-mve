@@ -28,6 +28,14 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+# run_log / skill_store 住在 `mve/` 下（面板读的就是那两个文件）。
+# 驾驶舱从**仓库根**拉起本脚本（cwd=仓库根），sys.path[0] 是脚本所在目录，
+# 不是 mve/ —— 不加这一段，`import run_log` 会被下面那层 except 静默吞掉，
+# 表现是「题跑通了、技能也存了，但面板曲线一条不动」。
+_MVE_DIR = _REPO_ROOT / "mve"
+if str(_MVE_DIR) not in sys.path:
+    sys.path.insert(0, str(_MVE_DIR))
+
 from voyager_vlml.agents.action import VLMLActionAgent  # noqa: E402
 from voyager_vlml.agents.critic import VLMLCriticAgent  # noqa: E402
 from voyager_vlml.agents.curriculum import VLMLCurriculumAgent  # noqa: E402

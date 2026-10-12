@@ -6,12 +6,12 @@
 　却查不到在不在跑，比不给按钮更糟。所以驾驶舱自己是一个**独立子进程**，
 　状态写在文件里，面板只读文件。
 
-   面板 ──Popen──> pilot.py _run ──Popen──> run_mve.py --llm
+   面板 ──Popen──> pilot.py _run ──Popen──> voyager_vlml/loop.py
      │                   ↑                      │
      └── 读 pilot_state.json ──────────────────┘
 
 三种任务（`--job`，面板上三个键钮）：
-  practice  —— 跑 run_mve.py：练题，**带**知识图谱
+  practice  —— 跑 voyager_vlml/loop.py：里程碑选题 → 自己出题 → 自己写 SQL 取数
   placement —— 跑 exam.py --all：**摸底**，全库撤掉图谱考一遍（~7 分钟）
   learn     —— 跑 learn.py --units N：学习单元 = 练一题 + 撤图谱重考同一题
 
@@ -19,9 +19,10 @@
   once —— 跑一题就退出（出题器选题，或钉住指定题）
   loop —— 跑完一题**再问出题器要下一题**，一直跑到人点停止。
           这才是"自己接自适应出题"：选题权在出题器手里，不在人手里。
-          （run_mve.py 不给 --topic 就会调 planner.select_next()）
+          （loop.py 不给 --topic 就走里程碑树 select_next；范围内拿完了会自己
+            生成新知识点，整轮不结束 —— 改变节奏的唯一方式是点停止）
 
-停止语义：SIGTERM 给驾驶舱进程，它转给当前在跑的 run_mve。
+停止语义：SIGTERM 给驾驶舱进程，它转给当前在跑的后端。
 另外写 stop_requested —— 防止面板重启后旧状态被误读成"还在跑"。
 """
 
@@ -353,7 +354,10 @@ def _loop(mode: str, topic: str, rounds: int, logf, job: str = "practice",
     # practice + curriculum：run_mve 内部自行循环，pilot 只拉起一个长进程，
     # 所以外层只 spawn 一次（max_iterations=1），超时也放大到 6 小时。
     max_iterations = 1 if (job != "practice" or curriculum) else (200 if mode == "loop" else 1)
-    timeout = (6 * 3600) if curriculum else JOB_TIMEOUT.get(job, 900)
+    # 单题超时要跟着轮数放大：新后端每轮是「出题 LLM + 写 SQL 迭代（最多 3 次）
+    # + MCP 取数」，实测一轮 60～90 秒，rounds=10 时旧的 900 秒会把它掐断在半路
+    # （人看到的是"已停止（退出码 -15）"，看不到题跑没跑完）。
+    timeout = (6 * 3600) if curriculum else max(JOB_TIMEOUT.get(job, 900), 240 * rounds)
 
     while iterations < max_iterations and not asked_to_stop():
         iterations += 1
@@ -374,10 +378,16 @@ def _loop(mode: str, topic: str, rounds: int, logf, job: str = "practice",
                     + (f"（每 {transfer} 单元加考一道没练过的题）" if transfer else "")
                     + f" · {_now()}")
         else:
-            cmd = [PY, str(ROOT / "run_mve.py"), "--llm"]
-            if curriculum:
-                cmd += ["--curriculum"]
-            cmd += ["--rounds", str(rounds)]
+            # 后端已换成 voyager_vlml（里程碑课程 + SQL 原语 + DB 取证判据）。
+            # 旧入口是 `run_mve.py --llm [--curriculum]`，它的反馈骨架建在
+            # 「拿 Voyager 事实集去比对 VLML 裁判标准答案」上（loop_core:295
+            # evaluate_vs_referee）→ 判决/覆盖率/得分会回流进 Voyager 上下文，
+            # 与设计「VLML 判分只给人看」相悖，故冻结不再调用。
+            #
+            # 新后端没有 --curriculum 开关：它**本身就是**课程驱动（种子里程碑
+            # → 树干推进），所以这个参数在这里被有意忽略。
+            cmd = [PY, str(PROJECT / "voyager_vlml" / "loop.py"),
+                   "--rounds", str(rounds)]
             if topic:
                 cmd += ["--topic", topic]
             what = f"第 {iterations} 题 · {_now()} · {' '.join(cmd[-4:])}"
