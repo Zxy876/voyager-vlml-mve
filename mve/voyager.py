@@ -518,8 +518,9 @@ class ScriptedVoyager:
 TOOL_CATALOG = """
 可用工具（全部只返回结构化数据，不给结论、不给建议）：
 
-1. match_summary_report(series_id, team_name?, map_name?)
+1. match_summary_report(series_id, team_name?)
    轻量摘要（metadata, team_comparison, key_metrics, benchmarks）。**先看这个拿全局**。
+   ⚠️ 不支持 map_name（VLML 上游 bug）；要按图下钻用 9. query_sql。
 
 2. match_players_report(series_id, team_name?, map_name?)
    选手视角（performance, kast_impact_analysis, opening_death_impact, highlight_rounds）。用于选手分析。
@@ -527,16 +528,20 @@ TOOL_CATALOG = """
 3. match_rounds_report(series_id, team_name?, map_name?, round_start?, round_end?)
    逐回合（round_timeline, round_situations, half_breakdown）。**很重，大数据集要用分页**。
 
-4. match_economy_report(series_id, team_name?, map_name?)
+4. match_economy_report(series_id, team_name?)
    经济与战术（economy_context, attack_patterns）。用于经济级联或可预测性分析。
+   ⚠️ 不支持 map_name（VLML 上游 bug）；要按图下钻用 9. query_sql。
 
-5. match_analysis_report(series_id, team_name?, map_name?)
+5. match_analysis_report(series_id, team_name?)
    全量 18 段。需要一次拿全时才用。
+   ⚠️ 不支持 map_name（VLML 上游 bug）；要按图下钻用 9. query_sql。
 
 6. player_profile_report(player_name, series_ids?, last_n_series?, map_name?, agent_name?)
-7. scouting_report(team_name, series_ids?, last_n_series?, map_name?)
+7. scouting_report(team_name, series_ids?, last_n_series?)
+   对手侦察。**不支持 map_name（VLML 上游 bug）；要按图下钻用 9. query_sql**。
 8. pattern_detection_report(team_name?, player_name?, tournament_name?, series_ids?, min_rounds?)
-9. query_sql(sql_query) —— 自定义 SQL，**仅 SELECT**。想按图/按回合下钻就必须用它。
+9. query_sql(sql_query) —— 自定义 SQL，**仅 SELECT**。想按图/按回合下钻就必须用它
+   （WHERE map_name='Haven' 这类永远有效，弥补上面 1/4/5/7 不能按图的缺口）。
 10. get_database_info() —— 拿表清单与用法提示。
 
 常用表（query_sql 用）：
@@ -621,6 +626,22 @@ async def _guarded_report(fn, args: dict[str, Any]):
     return await fn(**args)
 
 
+def _wrap_guarded(fn):
+    """给有 map_name bug 的报告工具套一层防护。
+
+    传 map_name 时返回干净的引导错误（'改用 query_sql'），而不是把 VLML 上游的
+    BinderException（Referenced table tgs not found）漏给调用方 —— 那个报错会
+    让 coach/voyager 的 _execute 拿不到 obs，进而整轮走 skipped 降级。
+    """
+    async def _wrapped(**kwargs):
+        return await _guarded_report(fn, kwargs)
+    try:
+        _wrapped.__name__ = getattr(fn, "__name__", "guarded")
+    except Exception:                                       # pragma: no cover
+        pass
+    return _wrapped
+
+
 TOOL_REGISTRY: dict[str, Any] = {
     "match_summary_report": match_summary_report,
     "match_players_report": match_players_report,
@@ -634,6 +655,13 @@ TOOL_REGISTRY: dict[str, Any] = {
     "execute_custom_sql": execute_custom_sql,
     "get_database_info": get_database_info,
 }
+
+# 把有 map_name bug 的 4 个报告工具换成带防护的版本。
+# 之前 _guarded_report / MAP_NAME_BUGGY_TOOLS 写了却没接进注册表 —— 是死代码，
+# 导致传 map_name 时直接撞 VLML 上游的 tgs BinderException。这里接上。
+for _name in MAP_NAME_BUGGY_TOOLS:
+    if _name in TOOL_REGISTRY:
+        TOOL_REGISTRY[_name] = _wrap_guarded(TOOL_REGISTRY[_name])
 
 # 这几个报告工具共用同一个 map_filter 拼接逻辑，都会踩同一个 bug
 MAP_NAME_BUGGY_TOOLS = {
@@ -1467,6 +1495,12 @@ class LLMVoyager:
             out += ("\n\n其它题目的经验（仅参考，注意是否适用本题）：\n"
                     + "\n".join(f"- {s['text']}" + _blueprint_hint(s)
                                  + _code_block(s) for s in others))
+        # MC 提炼的通用规划思维（topic=mc-thinking）：种子上下文，
+        # 让模型在规划/写码时总能看到"先做什么后做什么"（否则会被跨题门槛滤掉）
+        seed = skill_store.seed_thinking()
+        if seed:
+            out += ("\n\n来自 MC 的通用规划思维（域无关 · 先做什么后做什么 · 优先照做）：\n"
+                    + "\n".join(f"- {s.get('text', '')}" for s in seed))
         return out or "（暂无经验）"
 
     # ---- 计划校验：照 voyager/agents/action.py:process_ai_message ----
@@ -2142,6 +2176,12 @@ VLML 的 10 个报告工具已经封装好指标口径。能用报告工具拿�
                 skills_text = ("\n\n已学会的解法（**这些路径已被裁判验证正确，"
                                "优先照抄，不要从上面的返回结构里另挑一条**）：\n"
                                + "\n".join(blocks))
+            # MC 种子思维：作为"先做什么后做什么"的兜底上下文一起注入写码阶段
+            seed = skill_store.seed_thinking()
+            if seed:
+                skills_text += ("\n\n来自 MC 的通用规划思维（域无关 · 先做什么后做什么 · "
+                               "优先照做）：\n"
+                               + "\n".join(f"- {s.get('text', '')}" for s in seed))
         except Exception:
             skills_text = ""
             self._injected_keys = []
