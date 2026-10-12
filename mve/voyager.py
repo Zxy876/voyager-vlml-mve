@@ -2492,14 +2492,17 @@ VLML 的 10 个报告工具已经封装好指标口径。能用报告工具拿�
             #
             # lesson 不再是模板（"先取整体报告再下钻 query_sql"—— 那句是写死的，
             # 写进技能库等于什么都没写）：现在是**这套具体编排 + 它覆盖的维度**。
-            # 名字必须是**稳定主键**：`{topic}解法`。
-            # 此前这里叫 `{topic}编排`，主循环「学习①」存自己跑通的程序时
-            # 叫 `{topic}解法` —— 同一个成果落成两条，一条有源码一条没有，
-            # 注入时模型可能读到那条没有源码的（那正是"技能是伪代码注释
-            # 只被 read"的残留）。统一成一个 key，两条通道覆盖同一条：
-            # 没跑通时留文字经验，跑通了由「学习①」把**自己写的源码**补上。
+            # 名字必须是**稳定主键**：就是图谱问题类型 topic_id 本身
+            # （`run_mve._stable_skill_name` 也是 `{topic_id}`）。
+            # 此前这里叫 `{topic}解法`，与主循环存源码用的 `{topic_id}` 不是一个
+            # key —— 同一个成果落成两条：一条**纯文本无源码**、一条有源码，
+            # 注入时模型可能读到那条没源码的（那正是"技能是伪代码注释只被 read"
+            # 的残留，也违反「技能存可复用代码，而不是一两句思路」）。
+            # 两条通道统一写同一个 key：本条先留文字经验，跑通后由
+            # `_store_skill_for` 把**自己写的源码**补到同一条上（add 同 key →
+            # Rewriting 覆盖并写入 code）。最终每个图谱节点只对应一条带源码的技能。
             action, key = skill_store.add(
-                topic, f"{topic}解法", fb.lesson,
+                topic, topic, fb.lesson,
                 source="practice", blueprint=feedback_mod.blueprint_for(fb),
             )
             self._log_skill(action, key)

@@ -287,11 +287,29 @@ def _build_messages(topic: dict[str, Any], *, attempt: int, last_question: str =
     machine_type, style = _machine_type_of(topic, attempt)
     style_hint = f"本次题型风格：{style}（机器题型 {machine_type}）" if style else f"机器题型：{machine_type}"
 
+    # 口径锁定：防止出题器跨粒度串味（实测：grain_game 被出成「多少个回合」的
+    # round 题——因为 scene/实体上下文带进了上一题 grain_round 的措辞与实体，
+    # 模型沿用了上一题的计数粒度）。粒度标记取自知识点名里的括号（rounds/games/
+    # series/first_blood/economy…），并强制 question 锁定本粒度。
+    gran = ""
+    _gm = re.search(r"[（(]([^（）()]+)[）)]", name)
+    if _gm:
+        gran = _gm.group(1).strip()
+    gran_lock = (
+        f"\n【口径锁定】本题知识点是「{name}」"
+        + (f"，粒度标记为 {gran}" if gran else "")
+        + "。你出的 question 的**计数/分析对象必须严格锁定本知识点粒度**"
+        "（务必参照上方『问法示例』的口径，例如数图/数局/数系列赛/数回合/首血/"
+        "经济，不要混用）。严禁把其它粒度的问法（如本粒度是『图/局』却去问『多少个"
+        "回合』、本粒度是『回合』却去问『几张图』）套到本题；也不要照搬上一题的措辞。"
+    )
+
     repeat_guard = ""
     if last_question:
         repeat_guard = (
             f"\n⚠️ 上次练过的题是：「{last_question}」\n"
-            "请务必**换一个角度 / 换一张地图 / 换一个实体**出题，不要和上次雷同。"
+            "请务必**换一个角度 / 换一张地图 / 换一个实体 / 切换计数粒度**出题，"
+            "不要和上次雷同（尤其不要沿用上一题在数什么）。"
         )
 
     system = (
@@ -337,6 +355,7 @@ def _build_messages(topic: dict[str, Any], *, attempt: int, last_question: str =
         f"\n【实测常见误区（出题时埋下陷阱或明确警示）】\n{mis_block}\n"
         f"\n难度建议：{topic.get('difficulty')}"
         f"{scene_line}"
+        f"{gran_lock}"
         f"{_entity_block()}"
         f"{repeat_guard}"
         f"{sql_err_line}"
