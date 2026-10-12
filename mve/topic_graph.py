@@ -151,6 +151,36 @@ class MasteryStore:
     def is_stale(self, topic_id: str) -> bool:
         return bool((self._rows.get(topic_id) or {}).get("stale"))
 
+    def unstale(self, topic_id: str = "", *, reset_attempts: bool = True,
+                commit: bool = True) -> list[str]:
+        """把「放弃换题」标记清掉（给了 topic_id 就只清那一题，不给就全清）。
+
+        为什么需要这个口子（2026-10-13 实测）：stale 一旦置位就**永久**从课程里
+        排除，而图谱一共只有 29 个节点 —— 8 个 stale + 9 个前置未达成之后，
+        `select_next` 每次都返回 exhausted → 每轮都去生成新题，课程形同虚设。
+
+        更糟的是 attempts 会被**旧后端污染**：实测 `vlml_agent_role` attempts=732。
+        那不是"练了 732 次还没学会"，是旧后端每轮都 `update(count_attempt=True)`
+        累加出来的（那时 consume 与 practice 的账本没分开、stale 也是死代码）。
+        所以清理时必须能一并重置 attempts，否则清完 stale 下一轮又立刻置回去。
+
+        返回被清理的 topic_id 列表。
+        """
+        touched: list[str] = []
+        for tid, row in self._rows.items():
+            if topic_id and tid != topic_id:
+                continue
+            if not (row.get("stale") or (reset_attempts
+                                         and int(row.get("attempts") or 0) > 0)):
+                continue
+            row["stale"] = False
+            if reset_attempts:
+                row["attempts"] = 0
+            touched.append(tid)
+        if commit and touched:
+            self._persist()
+        return touched
+
     def mark_completed(self, topic_id: str, *, commit: bool = True) -> dict[str, Any]:
         """任务跑通（ev.success）→ 图谱当前节点标记完成（设计：不重复规划）。
 
@@ -410,18 +440,44 @@ class TopicGraph:
         ⚠️ 设计硬约束：门控只看「前置节点是否 completed（布尔）」，
         不读掌握度/覆盖率——评分结果不被任何推进条件读到。
         有序课程（比赛→队伍→队员）由 completion 驱动，不是由分数驱动。
+
+        ⚠️ 2026-10-13 补一条（实测死锁，必须补）：前置**已被放弃（stale）**时
+        不再挡住后继。stale 的含义是"练够次数仍跑通不了，放弃换题"，
+        而 `select_next` 会把它永久排除 —— 于是后继等的是一个**永远不会被
+        完成的前置**，整条链一起陪葬。实测的传染规模：
+
+            vlml_round_result 卡死 → first_blood / post_plant / clutch / streak 全卡
+            vlml_first_blood  被卡 → fb_conversion / trade / opening_duel 再卡一层
+            vlml_half_split   卡死 → side_conversion 卡
+            vlml_agent_role   卡死（attempts=732，旧后端污染）
+
+        4 个卡死堵死 9 个后继，29 个节点**一个都选不出来** → 每轮 exhausted
+        → 每轮去生成新题，课程形同虚设。"等一个被放弃的前置"没有意义 ——
+        而且原版 Voyager 根本没有前置概念，这是照搬伴学带来的副作用。
         """
         for e in self.prerequisites_of(topic["id"]):
-            if not self.mastery.is_completed(e["from"]):
-                return False
+            pid = str(e.get("from") or "")
+            if not pid or self.mastery.is_completed(pid):
+                continue
+            if self.mastery.is_stale(pid):
+                continue          # 前置已被放弃 → 不再挡路
+            return False
         return True
 
     def blocked_by(self, topic: dict[str, Any]) -> list[str]:
-        """返回没完成的前置 id 列表（用于解释为什么这道题还没解锁）。"""
+        """返回**还在练**但没完成的前置 id（用于解释为什么这道题还没解锁）。
+
+        与 `prereq_ok` 保持同一口径：已放弃（stale）的前置不再算作"卡着它的原因"，
+        否则解释会说"前置未完成"，而门控其实已经放行了 —— 自相矛盾。
+        """
         out = []
         for e in self.prerequisites_of(topic["id"]):
-            if not self.mastery.is_completed(e["from"]):
-                out.append(e["from"])
+            pid = str(e.get("from") or "")
+            if not pid or self.mastery.is_completed(pid):
+                continue
+            if self.mastery.is_stale(pid):
+                continue
+            out.append(pid)
         return out
 
     # ---- 全局目标难度（照伴学 _global_target：已掌握越多，目标越高）----
