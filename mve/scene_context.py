@@ -89,6 +89,12 @@ def data_source_identity() -> str:
 
 
 def _db_path() -> str:
+    """当前库路径。**相对路径按仓库根解析**（与 vlml_env._resolve_db_path 同口径）。
+
+    ⚠️ 为什么不原样返回配置值：vlml_env 会把 cwd 切到 `vlml/`，于是相对路径
+       在它那儿会被拼两遍。两边口径必须一致，否则面板显示"已切到 rib 库"、
+       实际连的还是默认库 —— 2026-10-13 在服务器上就是这么栽的。
+    """
     try:
         obj = json.loads(DB_CONFIG.read_text(encoding="utf-8"))
         p = str((obj or {}).get("db_path") or "")
@@ -96,7 +102,9 @@ def _db_path() -> str:
         p = ""
     if not p:
         return str(HERE.parent / "vlml" / "data" / "vlml_events.duckdb")
-    return p
+    return str(((HERE.parent / Path(p).expanduser()).resolve())
+               if not Path(p).expanduser().is_absolute()
+               else Path(p).expanduser())
 
 
 def available_tables(progress_tier: int = TIER_BASE) -> dict[str, list[str]]:

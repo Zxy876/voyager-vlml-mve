@@ -49,7 +49,36 @@ def _read_db_config() -> dict:
         return {}
 
 
-ACTIVE_DB_PATH = str(_read_db_config().get("db_path") or "")
+def _resolve_db_path(raw: str) -> str:
+    """把配置里的库路径解析成**绝对路径**。
+
+    ⚠️ 为什么必须显式解析（2026-10-13 服务器实测）：
+      本模块第 14 行做了 `os.chdir(VLML)`（VLML 内部查询依赖 cwd 在 vlml/ 下）。
+      于是配置里写相对路径 `vlml/data/vlml_rib.duckdb` 时，DuckDB 会拿当前
+      cwd 去拼 → `/root/mve/vlml/vlml/data/vlml_rib.duckdb` —— **路径被拼了两遍**，
+      报的是 `IO Error: database does not exist`。
+      现象极具迷惑性：它在循环侧表现为"连续三轮一次工具都没调成功"
+      （分诊给出 `linkage`），看着像"学不会"，其实是**配置里的一个相对路径**。
+      所以：相对路径一律按**仓库根**解析（人写配置时想的是仓库根，不是 vlml/）。
+    """
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = (ROOT / p).resolve()
+    return str(p)
+
+
+_RAW_DB_PATH = str(_read_db_config().get("db_path") or "")
+ACTIVE_DB_PATH = _resolve_db_path(_RAW_DB_PATH) if _RAW_DB_PATH else ""
+
+# ⚠️ 配了库但文件不在 —— **当场喊出来**。
+#   不喊的代价（2026-10-13 服务器实测）：循环连跑三轮，每轮三次工具调用
+#   全部失败，日志里只有一行 `IO Error: database does not exist`；而 panel
+#   的分诊把它归到 `linkage`（"链路没跑通"）—— 归类是对的，但人得先看见它。
+#   有这一行，启动瞬间就知道是路径问题，不用等三道题跑完再倒推。
+if ACTIVE_DB_PATH and not Path(ACTIVE_DB_PATH).exists():
+    print(f"[vlml_env] ⚠️ 配置了数据库但文件不存在：{ACTIVE_DB_PATH}"
+          f"（db_config 里写的是 {_RAW_DB_PATH!r}；相对路径按仓库根 {ROOT} 解析）",
+          file=sys.stderr, flush=True)
 if ACTIVE_DB_PATH:
     from vlml.db.manager import EventDatabase  # noqa: E402
 

@@ -55,9 +55,20 @@ def _cfg() -> dict[str, Any]:
 
 
 def _db_path() -> Path:
+    """当前库路径。**相对路径一律按仓库根解析**。
+
+    ⚠️ 为什么不能原样返回（2026-10-13 服务器实测）：
+      `vlml_env` 启动时会 `os.chdir(vlml/)`（VLML 内部查询依赖那个 cwd）。
+      于是一条相对路径 `vlml/data/vlml_rib.duckdb` 到了 DuckDB 手里会被拼成
+      `<repo>/vlml/vlml/data/vlml_rib.duckdb` —— **拼两遍**，报
+      `IO Error: database does not exist`。循环侧看到的是"连续三轮一次工具
+      都没调成功"，分诊归到 `linkage`，看着像学不会，其实是路径。
+      配置是人写的，人写相对路径时想的是仓库根，所以按仓库根解析。
+    """
     p = str(_cfg().get("db_path") or "").strip()
     if p:
-        return Path(p)
+        q = Path(p).expanduser()
+        return q if q.is_absolute() else (HERE.parent / q).resolve()
     return HERE.parent / "vlml" / "data" / "vlml_events.duckdb"
 
 

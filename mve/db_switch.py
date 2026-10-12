@@ -24,13 +24,23 @@ CONFIG = ROOT / "db_config.json"
 DEFAULT_DB = ROOT.parent / "vlml" / "data" / "vlml_events.duckdb"
 
 
+def _abs(p: str) -> str:
+    """相对路径按仓库根解析（与 vlml_env / anchor / entity_catalog 同口径）。
+
+    ⚠️ 不能按 cwd 解析：`vlml_env` 会把 cwd 切到 `vlml/`，相对路径会被拼两遍
+       （2026-10-13 服务器实测：配了 rib 却连不上，报 database does not exist）。
+    """
+    q = Path(p or "").expanduser()
+    return str(q if q.is_absolute() else (ROOT.parent / q).resolve())
+
+
 def current_path() -> str:
     try:
         obj = json.loads(CONFIG.read_text(encoding="utf-8"))
         p = str((obj or {}).get("db_path") or "")
     except Exception:
         p = ""
-    return p or str(DEFAULT_DB)
+    return _abs(p) if p else str(DEFAULT_DB)
 
 
 def is_default() -> bool:
@@ -41,13 +51,29 @@ def is_default() -> bool:
 
 
 def write(path: str) -> dict[str, Any]:
-    """切换数据库。**只写配置**，不校验 —— 校验走 probe()。"""
+    """切换数据库。**只写配置**，不校验 —— 校验走 probe()。
+
+    两个必须守住的点：
+    1. **存绝对路径**。相对路径在不同 cwd 下会指向不同的文件（vlml_env 会把
+       cwd 切到 vlml/），从源头存绝对就不再有歧义。
+    2. **保留配置里的其它字段**。以前是 `{"db_path": p}` 整体覆盖，会把同一份
+       配置里的 `anchor`（当前 series/team/map 锚点）连带抹掉 —— 换一次库，
+       锚点就得重设一次。
+    """
     p = str(path or "").strip()
+    stored = _abs(p) if p else ""
+    try:
+        obj = json.loads(CONFIG.read_text(encoding="utf-8"))
+        if not isinstance(obj, dict):
+            obj = {}
+    except Exception:
+        obj = {}
+    obj["db_path"] = stored
     CONFIG.write_text(
-        json.dumps({"db_path": p}, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    return {"ok": True, "db_path": p or str(DEFAULT_DB),
-            "is_default": not bool(p)}
+    return {"ok": True, "db_path": stored or str(DEFAULT_DB),
+            "is_default": not bool(stored)}
 
 
 def probe(path: str) -> dict[str, Any]:

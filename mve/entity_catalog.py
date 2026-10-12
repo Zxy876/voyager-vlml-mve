@@ -56,12 +56,18 @@ KIND_LABEL = {"series": "赛事", "team": "团队", "map": "地图",
 
 
 def _db_path() -> Path:
-    """当前连的是哪个库 —— `db_config.json` 可切换（见 vlml_env.py:52）。"""
+    """当前连的是哪个库 —— `db_config.json` 可切换（见 vlml_env.py:52）。
+
+    ⚠️ 相对路径按**仓库根**解析，不按当前 cwd：`vlml_env` 会把 cwd 切到
+       `vlml/`，原样返回相对路径会让 DuckDB 把 `vlml/data/x.duckdb` 拼成
+       `<repo>/vlml/vlml/data/x.duckdb`（2026-10-13 服务器实测踩到）。
+    """
     try:
         cfg = json.loads(DB_CONFIG.read_text(encoding="utf-8"))
         p = str((cfg or {}).get("db_path") or "").strip()
         if p:
-            return Path(p)
+            q = Path(p).expanduser()
+            return q if q.is_absolute() else (ROOT / q).resolve()
     except Exception:
         pass
     return ROOT / "vlml" / "data" / "vlml_events.duckdb"
