@@ -395,6 +395,21 @@ async def consume(
         except Exception as e:  # pragma: no cover
             print(f"  （组织回答失败：{type(e).__name__}: {e}）")
 
+    # 归不上已有题 → 拿这句话（+刚取到的事实）生成一道新题。
+    # ⚠️ 必须在"进能力库"**之前**：答完了就得有归属，否则这道题明明答出来了，
+    # 却因为没有 topic_id 进不了能力库 —— 掌握就变成了"只有归得上题的才算"，
+    # 那是把两件事（答没答出来 vs 归不归得上）混成了一个条件。
+    if not topic_id and auto_task and facts:
+        try:
+            from coach import _task_from_text
+            new_id, why = await _task_from_text(question, facts)
+            if new_id:
+                from tasks import TASKS
+                task = TASKS.get(new_id)
+                topic_id, hit = new_id, f"{hit}{why}"
+        except Exception as e:  # pragma: no cover
+            print(f"  （生成新题失败：{type(e).__name__}: {e}）")
+
     # ---- 答完了 → 这题进能力库 → 掌握（判据是"答没答出来"，不是覆盖率）----
     absorbed = _absorb(question, sql, topic_id) if (facts and answer) else {}
     m_tot = int(absorbed.get("mastered_total") or 0)
@@ -448,19 +463,6 @@ async def consume(
         _log(base)
         return base
 
-    if task is None and auto_task:
-        # 归不上已有题 → 拿这句话（+刚取到的事实）生成一道新题，它自带 rubric
-        try:
-            from coach import _task_from_text
-            new_id, why = await _task_from_text(question, facts)
-            if new_id:
-                from tasks import TASKS
-                task = TASKS.get(new_id)
-                topic_id, hit = new_id, f"{hit}{why}"
-                base["topic_id"], base["topic_hit"] = topic_id, hit
-        except Exception as e:  # pragma: no cover
-            print(f"  （生成评分点失败：{type(e).__name__}: {e}）")
-
     if task is None:
         base["skipped"] = ("这句话归不到有评分点的题上，也没有生成出新题 → "
                            "覆盖率无从计算（如实留空，不编造数字）")
@@ -488,12 +490,11 @@ async def consume(
         # ⚠️ count_attempt=False —— 消费不该消耗练习的尝试预算：
         # 练习侧 stale 是按「练了几次」判的，消费三次同一题就把练习题目标记成
         # 放弃换题，那是把两条线的账本混了。
-        try:
-            import topic_graph
-            topic_graph.MasteryStore().update(
-                topic_id, score=float(ev.coverage), count_attempt=False)
-        except Exception as e:  # pragma: no cover
-            print(f"  （写掌握度失败：{type(e).__name__}: {e}）")
+        # ⚠️ 这里**不写** MasteryStore.update(score=coverage)。
+        # 掌握与覆盖率是两个东西（用户 2026-10-13）：掌握 = 答完了、进能力库
+        # （上面 _absorb 已经做了）；覆盖率只是这次答得全不全的质量分。
+        # 把 coverage 写进 mastery 字段，等于又用分数去定义掌握 —— 两套语义打架。
+        pass
         # 技能有效性反馈（技能库自身维护，不是给 Voyager 的反馈）
         if reused:
             try:
