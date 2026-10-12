@@ -460,7 +460,8 @@ async def run_curriculum(rounds: int, topic_id: str = "", *,
             if ev.success:
                 done = True
                 # 设计：任务跑通 → 图谱当前节点标记完成（不重复规划）。
-                graph.mastery.mark_completed(tid)
+                # source="practice" = 去重位，不是掌握；掌握只在消费线记。
+                graph.mastery.mark_completed(tid, source="practice")
                 name = _store_skill_for(voyager, tid, task, result,
                                         float(ev.coverage), question)
                 # 设计：技能库与图谱同一份存储——技能落库后把指针挂到图谱节点，

@@ -986,6 +986,87 @@ def _runtime_topic_id(question: str) -> str:
     return tid
 
 
+def _coach_log_path() -> Path:
+    """消费线的账本路径（与 `coach._log_import` 写的是同一个文件）。"""
+    try:
+        from coach import COACH_LOG
+        return Path(COACH_LOG)
+    except Exception:  # pragma: no cover
+        return _MVE_DIR / "coach_log.jsonl"
+
+
+def _consume_book() -> set[str]:
+    """**消费侧那本能力账** —— 原版 `curriculum.py:135` 的 `completed_tasks` 的同构物。
+
+    取 `coach_log.jsonl` 里 `mode=voyager_consume` 且 `mastered` 为真的去重 topic_id。
+
+    ⚠️ 为什么**不**去数 `MasteryStore`（`topic_mastery.jsonl`）里 completed 的条数：
+      那上面的 `completed` 是个**去重位**（「这节点规划过了，`select_next` 别再规划」），
+      练习循环（`curriculum.py:296`）和旧后端（`run_mve.py:463`）也都在写。
+      拿它当"掌握"，练习线那 29 条 `runtime_*` 就混进了分子 —— 服务器实测
+      `累计 58 / 45 题（掌握度 129%）`，**分子比分母大**。
+      根因与拆法见 `topic_graph.MasteryStore.mark_completed` 的 docstring。
+
+    照原版 Voyager：
+      `voyager/agents/curriculum.py:135` 学习曲线 = `len(self.completed_tasks)`
+      —— 那是**学习循环自己那本账**，不是全局共享的 mastery 文件；
+      `:339` 只在成功时 append，**失败不计入**；原版压根没有"考试"。
+    所以：**学习时不计入**。消费线自己守住这本账，练习跑通只推进课程规划，
+    不进能力集合 —— 能力只从人真的问了、并且答出来了那侧长。
+    """
+    p = _coach_log_path()
+    book: set[str] = set()
+    if not p.exists():
+        return book
+    try:
+        for line in p.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if str(r.get("mode") or "") != "voyager_consume":
+                continue
+            # mastered 为假 = 没取到数 / 没产出回答 → 照原版**失败不计入**
+            if not r.get("mastered"):
+                continue
+            tid = str(r.get("topic_id") or "").strip()
+            if tid:
+                book.add(tid)
+    except Exception:  # pragma: no cover
+        pass
+    return book
+
+
+def _ability_universe() -> set[str]:
+    """能力全集（掌握度的**分母**）：图谱节点 ∪ **消费侧**登记的能力项。
+
+    ⚠️ 为什么要把练习线的 `runtime_*` 排掉：
+      `runtime_topics.json` 是练习线（`loop.py:_save_runtime_topic`）与消费线
+      （本文件 `_runtime_topic_id`）**共用的同一个文件**，服务器上 16 项里
+      **12 项是 `source="practice"`**。练习线登记的题是"课程打算练的"，
+      不是"人问过的"，算进分母只会稀释掌握度 —— 而且那些题消费侧大概率
+      永远不答，等于分母里躺着 12 道永远拿不到的分。
+
+    ⚠️ 为什么分母要含**还没掌握**的图谱节点：
+      分母是"这门课总共多少题"，分子是"其中会了几道" —— 这样掌握度才是
+      "啃下来多少"，而不是"答过的里面对了多少"（后者会虚假地贴近 100%）。
+    """
+    ids: set[str] = set()
+    try:
+        import topic_graph
+        ids |= set(topic_graph.TopicGraph().topics.keys())
+    except Exception:  # pragma: no cover
+        pass
+    for k, v in _runtime_topics().items():
+        k = str(k)
+        if k.startswith("consume_") or str((v or {}).get("source") or "") == "consume":
+            ids.add(k)
+    return ids
+
+
 def _absorb(question: str, sql: str, topic_id: str) -> dict[str, Any]:
     """答完了 → **这题就到他的能力里了 → 这就是掌握**（用户 2026-10-13 定）。
 
@@ -1013,18 +1094,21 @@ def _absorb(question: str, sql: str, topic_id: str) -> dict[str, Any]:
     out["topic_id"] = tid
     try:
         import topic_graph
-        st = topic_graph.MasteryStore()
-        st.mark_completed(tid)
+        # 仍然标 completed —— 但那是它**原本**的意思：「这节点规划过了，别再规划」
+        # （人已经问过并且答出来的题，课程不必再练一遍）。带 source="consume"
+        # 标明这次是消费侧标的，将来能审计；语义拆法见 mark_completed 的 docstring。
+        topic_graph.MasteryStore().mark_completed(tid, source="consume")
         out["mastered"] = True
-        out["mastered_total"] = sum(
-            1 for r in st.all().values() if r.get("completed"))
-        try:
-            # 分母 = 图谱节点 + 消费侧新增的能力项：能力集合变大，
-            # 分子分母同步增长 —— 只涨分子不涨分母会把掌握度灌过 100%。
-            out["ability_total"] = (len(topic_graph.TopicGraph().topics)
-                                    + len(_runtime_topics()))
-        except Exception:
-            out["ability_total"] = 0
+        # 分子分母**同源**：都只从消费侧这一套集合算，不再掺练习线的账。
+        # 以前分子数 MasteryStore 全部 completed（58，含练习线 29 条 runtime_*）、
+        # 分母数「图谱 29 + runtime_topics 16」（含练习线 12 条 practice 项），
+        # 两套集合口径不一致 → 实跑打出 129%（分子比分母大）。
+        book = _consume_book() | {tid}
+        # 分母再并上 book：外部传进来的 topic_id 可能既不在图谱也不在登记册，
+        # 并一下保证 mastered ≤ ability 恒成立，百分比不会越过 100%。
+        universe = _ability_universe() | book
+        out["mastered_total"] = len(book)
+        out["ability_total"] = len(universe)
     except Exception as e:  # pragma: no cover
         print(f"  （标记掌握失败：{type(e).__name__}: {e}）")
         return out

@@ -293,7 +293,10 @@ class VLMLCurriculumAgent:
             return
         try:
             if info.get("success"):
-                self.mastery.mark_completed(tid)
+                # ⚠️ source="practice"：这是**去重位**（别再规划这道题），
+                #   不代表能力。照原版 Voyager（curriculum.py:339）学习时不计入
+                #   —— 能力只从消费那侧长（consume.py 传 source="consume"）。
+                self.mastery.mark_completed(tid, source="practice")
                 skill_key = str(info.get("skill_key") or "")
                 if skill_key:
                     self.mastery.add_skill(tid, skill_key)

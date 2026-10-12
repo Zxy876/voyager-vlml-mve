@@ -401,7 +401,11 @@ li{margin:3px 0}
 const ESC = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
 const TABS = [
-  {id:'overview', icon:'📈', label:'概览',   status:s=>'判据区 / 掌握度区'},
+  {id:'overview', icon:'📈', label:'概览',
+   // 学习曲线接消费能力侧之后，这一格直接报"累计会做几道"（原版口径），
+   // 没有消费记录时报本页有什么，不报"掌握度 xx%"（练习线不判分，那个数恒空）。
+   status:s=>{const cc=s.consume_curve||[];
+     return cc.length?('会做 '+(cc[cc.length-1].mastered_total||0)+' 道'):'判据区 / 学习曲线';}},
   {id:'practice', icon:'🎯', label:'练习',   status:s=>s.topic_id||'—'},
   {id:'import',   icon:'✍️', label:'人导入', status:s=>(s.imports||[]).length+' 条导入'},
   {id:'trace',    icon:'🧭', label:'轨迹',   status:s=>s.total_rounds+' 轮'},
@@ -426,11 +430,16 @@ function lineChart(pts, opts){
   const W=560,H=190,P={l:38,r:14,t:14,b:26};
   if(!pts.length) return '<div class="empty">无数据</div>';
   const iw=W-P.l-P.r, ih=H-P.t-P.b;
+  // 纵轴刻度：默认 0..1 按百分比标；传 `opts.max` 时按**绝对数**标。
+  //   学习曲线照原版 Voyager（curriculum.py:135）画的是 `len(completed_tasks)`
+  //   —— 累计会做的题**有几道**，不是占比。
+  const maxV = Number(opts.max) || 1;
+  const fmtV = opts.fmt || (v=>Math.round(v*100)+'%');
   const X=i=>P.l+(pts.length===1?iw/2:iw*i/(pts.length-1));
-  const Y=v=>P.t+ih*(1-Math.max(0,Math.min(1,v)));
+  const Y=v=>P.t+ih*(1-Math.max(0,Math.min(1,v/maxV)));
   const grid=[0,.25,.5,.75,1].map(v=>
-    `<line x1="${P.l}" y1="${Y(v)}" x2="${W-P.r}" y2="${Y(v)}" stroke="rgba(31,41,36,.08)"/>
-     <text x="${P.l-8}" y="${Y(v)+4}" font-size="10" fill="#9ca3af" text-anchor="end">${v*100}%</text>`).join('');
+    `<line x1="${P.l}" y1="${Y(v*maxV)}" x2="${W-P.r}" y2="${Y(v*maxV)}" stroke="rgba(31,41,36,.08)"/>
+     <text x="${P.l-8}" y="${Y(v*maxV)+4}" font-size="10" fill="#9ca3af" text-anchor="end">${fmtV(v*maxV)}</text>`).join('');
   const path=pts.map((p,i)=>`${i?'L':'M'}${X(i).toFixed(1)},${Y(p.y).toFixed(1)}`).join(' ');
   const dots=pts.map((p,i)=>
     `<circle cx="${X(i).toFixed(1)}" cy="${Y(p.y).toFixed(1)}" r="3.2" fill="${opts.color}">
@@ -636,12 +645,16 @@ function pOverview(s){
   if(!s.has_data){
     const ex=s.exam_curve||{};
     if(!ex.has_data) return `<div class="panel"><div class="empty">${ESC(s.hint||'暂无运行记录')}</div>
-    <div class="note info">面板只读 run_log.jsonl（练习），摸底/考核走 exam_log.jsonl。
+    <div class="note info">面板只读 run_log.jsonl（练习）。
+      <b>进步与掌握度看下面那条「学习曲线」</b> —— 练习线有意不判分，
+      学习曲线接在<b>消费能力侧</b>（人问一句、答出来了才计入）。
       点顶部「▶ 启动 Voyager」，或先在命令行跑一次 <span class="mono">python mve/run_mve.py --llm</span>。</div></div>
+    <div class="panel">${consumeCurve(s)}</div>
     ${envCard(s)}`;
     return `<div class="note info"><b>练习记录（run_log）为空</b> —— 这是正常的：
-      摸底不入 run_log。真实水平曲线在下面；下一步点「跑学习单元」，
-      练习曲线和重考曲线就会一起长出来。</div>
+      摸底不入 run_log。<b>学习曲线在下面（消费能力侧）</b>；
+      下一步点「跑学习单元」，练习曲线和重考曲线就会一起长出来。</div>
+    <div class="panel">${consumeCurve(s)}</div>
     ${examCard(s)}
     ${envCard(s)}`;
   }
@@ -670,7 +683,7 @@ function pOverview(s){
     <div class="note ${s.reading==='learned'?'info':''}"><b>判读：</b>${ESC(s.reading_text)}</div>
     ${whyHtml}
   </div>
-  ${examCard(s)}
+  <div class="panel">${consumeCurve(s)}</div>
   <div class="panel"><div class="panel__head"><h2>判据区 · 任务完成（Voyager 尺子）</h2>
       <span class="hint">存技能 / 停止同题 / 推进换题只认这条布尔线；不数覆盖点</span></div>
       ${stepChart(suc,{yes:'#2f7d57',no:'#e5484d'})}
@@ -680,9 +693,13 @@ function pOverview(s){
       <div class="legend">蓝＝VLML 观测 success（考核尺子，不驱动学习）。</div>
       <div class="note">⚠️ <b>练习线有意不判分</b>：覆盖率 / 得分 / 掌握度在练习这条线上恒为空
         —— 它们是<b>尺子</b>，进了反馈环它学的就是讨好裁判，不是取到数。
-        判分只发生在另外两条线：<b>消费线</b>（人问一句 → 比对 Voyager 与 VLML 的做法）
-        与<b>考核线</b>（撤掉图谱重考）。进步去看「真实水平曲线」和「消费进步曲线」。</div>
+        <b>所以学习曲线接在消费能力侧</b>（上面那条）：人问一句 → 答出来了才计入，
+        练习跑通<b>不计</b> —— 照原版 Voyager
+        <span class="mono">curriculum.py:339</span> 只在成功时 append、
+        <span class="mono">:135</span> 曲线 = <span class="mono">len(completed_tasks)</span>。
+        考核线（撤掉图谱重考）在最下面。</div>
     </div>
+  ${examCard(s)}
   ${envCard(s)}`;
 }
 
@@ -794,15 +811,21 @@ function pImport(s){
    这时用 VLML0 裁判独立跑一遍量出覆盖率，才是真实的进步。 */
 function consumeCurve(s){
   const cc=s.consume_curve||[];
-  if(!cc.length) return `<h3>消费进步曲线</h3>
+  if(!cc.length) return `<h3>学习曲线 · 消费能力侧</h3>
     <div class="empty">还没有消费记录。在上面问一句话，Voyager 会用已积累的能力回答 ——
     答完了这题就进它的能力库，掌握与进步从这里开始累计。</div>`;
-  // 主曲线 = **累计已掌握数**（能力集合在变大）。掌握不是分数，是"会做的题有几道"。
+  // 主曲线 = **累计已掌握数**（能力集合在变大）。
+  //   y 轴画**绝对数**（会做的题有几道），不画百分比 —— 照原版 Voyager
+  //   `curriculum.py:135 return len(self.completed_tasks)`。
+  //   不画百分比是有理由的：一画百分比，读数就取决于"分母算哪几道题"
+  //   （分母里该不该算练习线练过的题？）这种口径争议，而绝对数没有这个问题；
+  //   且失败不计入 → 曲线单调不降，形状就是学习本身。
   const tot=cc[cc.length-1].ability_total||0;
+  const masMax=Math.max(1,...cc.map(c=>c.mastered_total||0));
   const masPts=cc.map((c,i)=>({
     x:i+1,
-    y: tot ? Math.min(1,(c.mastered_total||0)/tot) : 0,
-    label:`掌握 ${c.mastered_total||0}/${tot||'?'} · ${c.question}`}));
+    y: c.mastered_total||0,
+    label:`累计掌握 ${c.mastered_total||0} 道 · ${c.question}`}));
   // 副线 = 覆盖率（这次答得全不全，质量分，不是掌握度）
   const covPts=cc.filter(c=>c.coverage!==null&&c.coverage!==undefined)
                  .map((c,i)=>({x:i+1, y:c.coverage, label:`覆盖率 ${Math.round(c.coverage*100)}% · ${c.question}`}));
@@ -825,12 +848,17 @@ function consumeCurve(s){
             : (c.voyager_sound?'<span class="chip ok">站得住</span>':'<span class="chip bad">有硬伤</span>')}</td>
       <td style="font-size:12px">${ESC(c.method_reason||c.verdict||'')}${c.method_diff?'（'+ESC(c.method_diff)+'）':''}</td>
     </tr>`).join('');
-  return `<h3>消费进步曲线（${cc.length} 次消费）</h3>
-    <div class="legend"><b>掌握 = 能力集合的增长</b>：答完了 → 这题进能力库 → 掌握。
-    曲线是累计会做的题数；一致度是另一条（这次的做法跟 VLML 独立那一路差多少，
-    只作质量参考）。</div>
-    ${lineChart(masPts,{color:'#059669'})}
-    <div class="legend" style="margin-top:4px">累计掌握 ${last.mastered_total||0} / ${tot||'?'} 题</div>
+  return `<h3>学习曲线 · 消费能力侧（${cc.length} 次消费）</h3>
+    <div class="legend"><b>掌握 = 能力集合的增长</b>：人问一句 → Voyager 答完了 →
+    这题进它的能力库。纵轴是<b>累计会做的题有几道</b>，照原版 Voyager
+    <span class="mono">curriculum.py:135 len(completed_tasks)</span>。
+    <b>练习不计入</b>：练习线有意不判分，跑通只推进课程规划（"这题规划过了，
+    别再规划"），不算能力变大 —— 原版也是只在成功时 append
+    （<span class="mono">:339</span>），失败不计。
+    一致度是另一条（这次的做法跟 VLML 独立那一路差多少，只作质量参考）。</div>
+    ${lineChart(masPts,{color:'#059669',max:masMax,fmt:v=>Math.round(v)+' 道'})}
+    <div class="legend" style="margin-top:4px">累计掌握 ${last.mastered_total||0} / ${tot||'?'} 题
+      ${tot?`（${Math.round(100*(last.mastered_total||0)/tot)}%）`:''}</div>
     ${covPts.length?`<div class="legend" style="margin-top:8px">一致度（Voyager 与 VLML 两边做法的比对，只给人看）</div>${lineChart(covPts,{color:'#2563eb',dash:'4 3'})}`:''}
     <div class="legend" style="margin-top:6px">
       最近一次：${last.mastered?'<span class="chip ok">已掌握（进能力库）</span>':'<span class="chip bad">没答出来，未进能力库</span>'}

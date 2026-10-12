@@ -289,6 +289,36 @@ def _human_imports(limit: int = 10) -> list[dict[str, Any]]:
     return out[-limit:]
 
 
+def _ability_universe_size() -> int:
+    """能力全集的大小（掌握度的**分母**）：图谱节点 + **消费侧**登记的能力项。
+
+    ⚠️ 为什么排掉练习线的 `runtime_*`：`runtime_topics.json` 是练习线
+    （`voyager_vlml/loop.py:_save_runtime_topic`）与消费线
+    （`voyager_vlml/consume.py:_runtime_topic_id`）**共用的同一个文件**，
+    线上 16 项里 **12 项是 `source="practice"`**。练习线登记的题是
+    "课程打算练的"，不是"人问过的"，算进分母只会稀释掌握度 —— 而且消费侧
+    大概率永远不会答那些题，等于分母里躺着 12 道拿不到的分。
+
+    与 `consume._ability_universe()` 同口径（那里是集合、这里是大小）。
+    """
+    n = 0
+    try:
+        import topic_graph
+        n = len(topic_graph.TopicGraph().topics)
+    except Exception:
+        n = 0
+    try:
+        p = ROOT / "runtime_topics.json"
+        if p.exists():
+            reg = json.loads(p.read_text(encoding="utf-8"))
+            n += sum(1 for k, v in (reg or {}).items()
+                     if str(k).startswith("consume_")
+                     or str((v or {}).get("source") or "") == "consume")
+    except Exception:
+        pass
+    return n
+
+
 def _consume_curve(limit: int = 40) -> list[dict[str, Any]]:
     """**消费进步曲线** —— 用户 2026-10-13 定：「测 Voyager 的进步曲线和掌握度
     全在消费这测就好了」。
@@ -303,16 +333,35 @@ def _consume_curve(limit: int = 40) -> list[dict[str, Any]]:
     而是「答完了 → 这题进能力库 → 掌握」（用户 2026-10-13 定义）。
     所以进步 = 能力集合在变大，y 轴是"会做的题有几道"。
 
+    ⚠️ **学习时不计入**（用户 2026-10-14 定，照原版 Voyager）：
+      原版 `voyager/agents/curriculum.py:135` 学习曲线 = `len(self.completed_tasks)`，
+      `:339` **只在成功时** append，且原版压根没有"考试"这回事 ——
+      学习曲线 = **能力集合的大小**，练习跑通只推进课程规划，不算能力变大。
+      MVE 的练习线（`curriculum.py:296` / `run_mve.py:463`）也在写
+      `MasteryStore` 的 `completed`，但那是**去重位**（"规划过了别再规划"），
+      不是掌握 —— 所以这条曲线**只数消费侧答出来的题**，不读 MasteryStore。
+
+    ⚠️ `mastered_total` **在这里重算**，不信记录里当时算的那个数：
+      口径一改，历史记录里写死的旧数不会自己更新 —— 服务器上那条老记录是
+      `58 / 45`（129%，分子比分母大），直接画出来曲线第一点就贴顶还越过 100%。
+      重算规则就是原版那句：`len(completed_tasks)` —— 答出来了 +1，失败不计。
+
     覆盖率另记一条（那是这次答得全不全的质量分，不是掌握度）。
     老的人导入（纯 VLML 解释）没有这些字段，一律跳过 ——
     不能拿 None 补 0，那会把"没测"画成"测得 0 分"。
     """
     out: list[dict[str, Any]] = []
+    # y 轴用累计掌握数（原版口径），`universe` 只作"总共多少题"的参照显示
+    universe = _ability_universe_size()
+    book: set[str] = set()
     for i, rec in enumerate(
         [r for r in _human_imports(limit=limit)
          if r.get("mode") == "voyager_consume"],
         start=1,
     ):
+        # 累计：只有**答出来了**才进能力集合（失败不计入，照原版 :339）
+        if rec.get("mastered") and str(rec.get("topic_id") or "").strip():
+            book.add(str(rec.get("topic_id")).strip())
         cov = rec.get("coverage")
         out.append({
             "i": i,
@@ -322,10 +371,10 @@ def _consume_curve(limit: int = 40) -> list[dict[str, Any]]:
             "coverage": float(cov) if cov is not None else None,
             "score": rec.get("score"),
             "verdict": str(rec.get("verdict") or ""),
-            # 掌握（能力集合）
+            # 掌握（能力集合）—— 在这**重算**，不信记录里写死的旧口径数
             "mastered": bool(rec.get("mastered")),
-            "mastered_total": rec.get("mastered_total"),
-            "ability_total": rec.get("ability_total"),
+            "mastered_total": len(book),
+            "ability_total": max(universe, len(book)),
             "skill_action": str(rec.get("skill_action") or ""),
             "reused": bool(rec.get("reused")),
             # —— 方法与做法的比对结论（判分的依据，得让人看见"凭什么判这个分"）——

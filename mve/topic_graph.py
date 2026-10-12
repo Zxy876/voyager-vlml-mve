@@ -181,11 +181,36 @@ class MasteryStore:
             self._persist()
         return touched
 
-    def mark_completed(self, topic_id: str, *, commit: bool = True) -> dict[str, Any]:
-        """任务跑通（ev.success）→ 图谱当前节点标记完成（设计：不重复规划）。
+    def mark_completed(self, topic_id: str, *, commit: bool = True,
+                       source: str = "practice") -> dict[str, Any]:
+        """标 `completed`（+ `completed_source`）两个位。
 
         与 mastery（展示用）解耦：completed 是布尔「做没做过」，mastery 是
         「做得怎么样」（只进面板）。select_next 据此排除已完成的节点，不重规划。
+
+        ⚠️ 语义挤位（2026-10-13 实测发现，本参数就是为了拆开它）：
+          `completed` 原本只有**一个**意思 —— 「这个节点规划过了，`select_next`
+          别再规划它」，是个**去重位**，跟"做得怎么样"无关。
+          后来消费线（`voyager_vlml/consume.py`）把它**借**来当"掌握"用，
+          于是同一个布尔上挤了两种语义，写方有三个：
+
+            · `voyager_vlml/agents/curriculum.py` 练习循环成功 → 别再规划
+            · `mve/run_mve.py`（已冻结的旧后端）ev.success → 别再规划
+            · `voyager_vlml/consume.py` 人问一句、答出来了 → 这题我会了
+
+          面板的掌握度分子去数 `completed` 时，练习线那 29 条 `runtime_*` 就
+          混进来了 —— 服务器实测 58/45 = **129%**，分子比分母大。
+
+          `completed_source` 把两者分开：
+            `"practice"` = 练习循环标（去重位，**不代表能力**）
+            `"consume"`  = 消费线标（人问一句答出来了，**这才是能力**）
+
+          照原版 Voyager（`voyager/agents/curriculum.py:339` 只在成功时 append，
+          `:135` 学习曲线 = `len(completed_tasks)`）：**学习时不计入** ——
+          练习跑通只推进课程规划，不算"能力变大了"；能力只从消费那侧长。
+
+        升级规则：practice → consume 单向。练习先标过、后来消费答出来了 → 升级成
+        consume；消费先标过、练习再跑这道题 → **不降级**（掌握的事实不能被抹掉）。
         """
         row = self._rows.get(topic_id) or {
             "topic_id": topic_id, "mastery": None, "attempts": 0,
@@ -193,6 +218,8 @@ class MasteryStore:
             "completed": False, "skills": [], "failures": [], "skips": [],
         }
         row["completed"] = True
+        if source == "consume" or not row.get("completed_source"):
+            row["completed_source"] = source
         self._rows[topic_id] = row
         if commit:
             self._persist()
