@@ -2624,9 +2624,17 @@ class Handler(BaseHTTPRequestHandler):
                 _old = sys.argv[:]
                 sys.argv = ["reset_all.py"]       # reset_all.main() 自己读 argv
                 try:
-                    reset_all.main()
+                    # ⚠️ 返回码必须看：循环/驾驶舱还在跑时 reset_all 会**拒绝清档**
+                    # （返回 1）。以前这里把返回值丢了、一律报 ok ——
+                    # 面板显示"已清库（已备份）"，其实一个文件都没删。
+                    rc = reset_all.main()
                 finally:
                     sys.argv = _old
+                if rc != 0:
+                    self._json(409, {"ok": False,
+                                     "error": "还有任务在跑，已拒绝清档 —— 先点「■ 停止」，"
+                                              "等循环收尾完（约 1 分钟）再清"})
+                    return
                 self._json(200, {"ok": True})
             except Exception as e:
                 self._json(500, {"ok": False, "error": f"{type(e).__name__}: {e}"[:300]})
