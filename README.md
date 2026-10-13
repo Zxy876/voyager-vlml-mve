@@ -1174,7 +1174,7 @@ python mve/exam.py --progress             # 按题的学习进程
 python mve/exam.py --final                # 结业考（要技能库非空，不覆盖摸底基线）
 ```
 
-### 清库：清什么、不清什么（2026-10-13 补齐）
+### 清库的两种模式：普通清档 vs 换库清档 `--db-switch`
 
 ```bash
 python mve/reset_all.py               # 先备份到 mve/_backup_<时间戳> 再清
@@ -1274,7 +1274,7 @@ python mve/exam.py --profile        # 裸考画像（撤图谱的真实水平）
 `复用配方` 才是用了积累；`现场现做` 是还没学会（这是如实标注，不是失败）。
 再问同一类问题一次，第二次应当变成 `复用配方` —— 那就是能力在增长。
 
-### 清库：清什么、不清什么（2026-10-14 补齐）
+### 清库：19 项清单与两道闸（2026-10-14 补齐）
 
 ```bash
 python mve/reset_all.py            # 先备份到 mve/_backup_<时间戳> 再清
