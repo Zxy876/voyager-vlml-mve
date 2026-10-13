@@ -65,6 +65,7 @@ for _p in (str(_REPO_ROOT), str(_MVE_DIR)):
         sys.path.insert(0, _p)
 
 from voyager_vlml.agents.action import VLMLActionAgent  # noqa: E402
+from voyager_vlml.agents.critic import has_real_data  # noqa: E402
 from voyager_vlml.env.vlml_mcp import VLMLMCPEnv  # noqa: E402
 from voyager_vlml.llm import chat, chat_json  # noqa: E402
 
@@ -519,16 +520,25 @@ async def consume(
         else:
             note = r["note"] or "（配方与这句话问的不是同一个量）"
             print(f"  （未复用配方：{note[:100]}）")
-    if not any(o.get("ok") for o in observations):
-        # 配方没复用成（库里没有 / 用不上 / 回填后跑不通）→ 现场写，如实标注
+    # ⚠️ 降级判据必须含**真空结果**（2026-10-14 实测坑）：纯聚合 SQL 在空表上
+    #   返回 1 行 (NULL, 0) —— ok=True、rows=1，旧判据 `any(o.get("ok"))` 会
+    #   当成"复用成功"，于是坏配方被当成能力用掉，答出「0% / 样本量 0」。
+    #   原版同构点：critic 判的是"任务到底做成没有"，不是"代码跑没跑起来"。
+    if not any(has_real_data(o) for o in observations):
+        # 配方没复用成（库里没有 / 用不上 / 回填后跑不通 / 回填后取到真空值）
+        # → 现场写，如实标注
         if sql:
-            print(f"  （配方回填后没取到数，降级为现场写 SQL：{note[:60]}）")
+            print(f"  （配方回填后没取到真数，降级为现场写 SQL：{note[:60]}）")
         reused, sql = False, ""
         act = VLMLActionAgent(env=env)
         observations, sql = await act.solve(question, max_iters=3)
 
     ok_calls = [o for o in observations if o.get("ok")]
+    # 真的取到了数（ok 且非真空）—— 判分 / 回答 / 沉淀都只认这个，
+    # 披露字段（trajectory / tool_calls）仍用 ok_calls，让人看见实际发生了什么。
+    real_calls = [o for o in ok_calls if has_real_data(o)]
     rows = sum(int(o.get("rows") or 0) for o in ok_calls)
+    real_rows = sum(int(o.get("rows") or 0) for o in real_calls)
     trajectory = [str(o.get("tool") or "") for o in ok_calls]
 
     # ---- ④ 整理事实（**面板披露「取到了哪些数」用，不再是判分的前提**）----
@@ -547,7 +557,7 @@ async def consume(
                                       subs or None)},
         ],
         temperature=0.1,
-    ) if ok_calls else {"facts": []}
+    ) if real_calls else {"facts": []}
 
     facts: list[dict[str, Any]] = []
     try:
@@ -582,7 +592,9 @@ async def consume(
     ref_obs: list[dict[str, Any]] = []
     ref_sql: str = ""
     ref_traj: list[str] = []
-    if ok_calls:
+    # 裁判闸同样只认真数：Voyager 侧是真空结果时，拿它去"比"没有意义 ——
+    # 两个空结果会被判成口径一致（见 ⑥ 注释里的实测坑）。
+    if real_calls:
         ref_obs, ref_sql, ref_traj = await _referee_observations(
             question, ref_points, env=env, schema=schema)
 
@@ -591,21 +603,29 @@ async def consume(
     # Voyager 取回 0 行、裁判也取回 0 行，两条 SQL 长得几乎一样 → 被判成 100% 一致。
     # 那等于给"两边都没取到数"发满分 —— 比报错危险得多（面板上是绿油油的 100%）。
     # 所以任何一路 0 行就不判，如实留空。
+    # ⚠️ 2026-10-14 再补一刀：「0 行」要连**真空行**一起算 —— 空表上的纯聚合返回
+    #   1 行 (NULL, 0)，行数是 1 但不是数（见 critic.is_vacuous）。裁判侧同理：
+    #   两边都查了空表时，真空行会让"两路都没数"伪装成"两路都有数"。
     ref_rows = sum(int(o.get("rows") or 0) for o in ref_obs if o.get("ok"))
+    ref_real_rows = sum(
+        int(o.get("rows") or 0) for o in ref_obs
+        if o.get("ok") and has_real_data(o))
     compare: dict[str, Any] = {}
-    if ref_obs and rows > 0 and ref_rows > 0:
+    if ref_obs and real_rows > 0 and ref_real_rows > 0:
         try:
             compare = _method_compare(question, sql, observations, ref_sql, ref_obs)
         except Exception as e:  # pragma: no cover
             print(f"  （方法比对失败：{type(e).__name__}: {e}）")
     elif ref_obs:
-        print(f"  （不判分：Voyager 取到 {rows} 行 / VLML 取到 {ref_rows} 行，"
-              "有一路没取到数）")
+        print(f"  （不判分：Voyager 取到 {real_rows} 真行 / VLML 取到 "
+              f"{ref_real_rows} 真行，有一路没取到真数）")
 
     # ---- ⑦ 用取到的数回答：LLM 产出**叙事洞察** ----
     # 回答不再依赖 facts 非空 —— 取到了数就该说话，压不进单值事实不叫"没答出来"。
+    # ⚠️ 但"取到数"必须是**真数**：真空结果（1 行 (NULL, 0)）上没有叙事可言，
+    #   基于它写出来的叙事是编造（实测答出「胜率 0%、样本量 0」，真实是 100%、n=7）。
     answer, base_note = "", ""
-    if ok_calls and rows:
+    if real_calls and real_rows:
         try:
             answer = _narrate(question, observations, compare or None) or ""
             if answer:
@@ -618,7 +638,7 @@ async def consume(
             answer = _answer(question, facts, observations) or ""
         except Exception as e:  # pragma: no cover
             print(f"  （组织回答失败：{type(e).__name__}: {e}）")
-    if not answer and ok_calls and rows:
+    if not answer and real_calls and real_rows:
         # 兜底：叙事没出就用原始数据平铺回答。取到了数却不给回答是最糟的失败。
         try:
             answer = _answer_raw(question, observations) or ""
@@ -647,7 +667,9 @@ async def consume(
     # ---- 答完了 → 这题进能力库 → 掌握（判据是"答没答出来"，不是覆盖率）----
     # 判据是"答没答出来"（取到数 + 给出了回答），**不是**有没有整理成结构化事实 ——
     # 答案是一张表时压不进 facts，但那也是答出来了，照样进能力库。
-    absorbed = _absorb(question, sql, topic_id) if (answer and ok_calls) else {}
+    # ⚠️ "取到数"同样只认真数：真空结果上的"答完了"是假象，把它沉淀进能力库
+    #   等于把坏配方洗成技能（实测 fb_conversion_analysis 就是这么来的）。
+    absorbed = _absorb(question, sql, topic_id) if (answer and real_calls) else {}
     m_tot = int(absorbed.get("mastered_total") or 0)
     a_tot = int(absorbed.get("ability_total") or 0)
     if absorbed.get("mastered") and not topic_id:
@@ -675,6 +697,10 @@ async def consume(
         "tool_calls": len(observations),
         "ok_tool_calls": len(ok_calls),
         "rows": rows,
+        # 真空披露：rows 里有多少行是**真数**（ok 调用在空表纯聚合上会返回
+        # 1 行 (NULL, 0) —— rows=1 但不是数）。real_rows < rows 即命中了真空。
+        "real_rows": real_rows,
+        "vacuous": bool(ok_calls) and not real_calls,
         "sql": sql,
         "errors": [str(o.get("error") or "") for o in observations if not o.get("ok")],
         "facts": facts,
@@ -719,8 +745,12 @@ async def consume(
     # ---- ⑥ 覆盖率 / 掌握度 ----
     # ⚠️ 只在**消费**这条线上算。练习（loop.py）不判分，写 coverage=None。
     # ⚠️ 算出来只落盘给面板，**绝不回灌** Voyager 的任何 prompt。
-    if not ok_calls:
-        base["skipped"] = "一次工具都没调成功，事实无来源，不计覆盖率（避免给编造打分）"
+    # ⚠️ 只认真数：ok 调用全是真空结果（1 行 (NULL, 0)）时，facts 没有真实来源，
+    #   跟"一次都没调通"是同一回事 —— 不能拿真空行算覆盖率（实测会算出绿油油的 100%）。
+    if not real_calls:
+        base["skipped"] = ("没有取到真实数据（调用失败，或结果全是真空值："
+                           "空表上的纯聚合返回 1 行 (NULL, 0)），事实无来源，"
+                           "不计覆盖率（避免给编造打分）")
         _log(base)
         return base
 
@@ -754,8 +784,9 @@ async def consume(
     elif rows <= 0 or ref_rows <= 0:
         # 两路都得真的取到数才判 —— 否则两个空结果会被判成"口径一致 100%"
         # （实测：Cloud9/Corrode 在当前库没数据，两边 0 行，一样的方法，判了满分）。
+        # ⚠️ 真空行也算"没取到数"：空表纯聚合的 1 行 (NULL, 0) 不是数。
         base["skipped"] = (
-            f"有一路没取到数（Voyager {rows} 行 / VLML {ref_rows} 行）→ "
+            f"有一路没取到数（Voyager {real_rows} 真行 / VLML {ref_real_rows} 真行）→ "
             "没有数可比，覆盖率如实留空。**两边都是 0 行时 SQL 再像也不能判一致** —— "
             "那等于给『两边都没取到数』发满分。")
     else:
