@@ -96,11 +96,22 @@ def write(path: str) -> dict[str, Any]:
         import anchor
         before = dict(obj.get("anchor") or {})
         new_anchor = anchor.refresh(stored or str(DEFAULT_DB))
-        if new_anchor != before:
-            anchor_note = (f"锚点已跟着新库重算：{before or '空'} → "
-                           f"{new_anchor}（旧锚点在新库里查不到）")
+        # ⚠️ 必须**分字段**说，不能一句"旧锚点查不到"带过（2026-10-14 实测）：
+        #   切到 rib 时 series 1058 在库里被沿用了、只有 team 变了
+        #   （Nongshim RedForce → Karmine Corp，因为 pick 按"该 series 里
+        #   回合数最多的队"挑）。整句说成"旧锚点查不到"会让人以为全没沿用，
+        #   下次排查就照着错的线索走。
+        keys = ("series", "team", "map")
+        changed = [k for k in keys
+                   if str(before.get(k) or "") != str(new_anchor.get(k) or "")]
+        kept = [k for k in keys if k not in changed and str(before.get(k) or "")]
+        if not changed:
+            anchor_note = "锚点在新库里仍然有效，全部沿用"
         else:
-            anchor_note = "锚点在新库里仍然有效，沿用"
+            anchor_note = (f"锚点已跟着新库重算：{'/'.join(changed)} 变了"
+                           f"（{before.get(changed[0])} → {new_anchor.get(changed[0])}）")
+            if kept:
+                anchor_note += f"；{'/'.join(kept)} 在新库里仍在，已沿用"
     except Exception as e:
         anchor_note = f"锚点重算失败（{type(e).__name__}），请手动跑 python mve/anchor.py --refresh"
 
