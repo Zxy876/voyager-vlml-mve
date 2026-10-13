@@ -986,13 +986,19 @@ vlml/data/raw_events       → raw_events_rib   （软链，管线只认这个�
 
 ### 换库
 
-写 `mve/db_config.json` 的 `db_path`（`vlml_env.py:52` 打了补丁换掉 VLML 写死的默认库），
+写 `mve/db_config.json` 的 `db_path`（`vlml_env.py` 打了补丁换掉 VLML 写死的默认库），
 再 `python mve/entity_catalog.py` 刷新目录。
+
+**默认库 = rib.gg**（用户 2026-10-13 定：「接回 rib.gg，并设置为默认的库」）。
+唯一定义在 `db_switch.DEFAULT_DB`；`db_path` 为空时所有读库口
+（`vlml_env` / `anchor` / `entity_catalog` / `open_quiz` / `scene_context`）
+都落它 —— 2026-10-13 之前这些兜底各自写死 `vlml_events.duckdb` 字面量，
+配置一空就"悄悄换库"，当天已全部收敛到那一个常量。GRID 切片保留为可选项，
+`python mve/db_switch.py set <路径>` 随时切回去。
 
 ⚠️ **路径按仓库根解析，不按 cwd**。`vlml_env` 启动时会 `os.chdir(vlml/)`，
 所以相对路径 `vlml/data/x.duckdb` 会被 DuckDB 拼成 `<repo>/vlml/vlml/data/x.duckdb`
-（**vlml 出现两遍**，报 `database does not exist`）。四个读取口
-（`vlml_env` / `anchor` / `entity_catalog` / `db_switch`）现在统一按仓库根解析，
+（**vlml 出现两遍**，报 `database does not exist`）。五个读取口现在统一按仓库根解析，
 `db_switch.write()` 存绝对路径。2026-10-13 在服务器上就是这么栽的，详见第 19 章。
 
 换库后一并做的事（漏一件就会出玄学症状）：
@@ -1006,11 +1012,41 @@ python -c "import sys;sys.path.insert(0,'mve');import anchor;print(anchor.refres
 ⚠️ **换库后必须重建图谱**：`knowledge_graph.json` 被 gitignore，不跟着 push。
 服务器上图谱可能是很早的版本（实测服务器 insight 层曾为 0）。
 
-**当前服务器在跑哪个库**（2026-10-13 核对）：`vlml_rib.duckdb`
-（285 回合 / 2850 行 ext_player_round_stats，含首血与经济两条轴）。
-此前 `db_path` 是空的 → 落到默认 `vlml_events.duckdb`，那是**单场系列赛切片**
-（1 场赛事 / 59 回合 / 10 名选手 / 无 ext 层），连杀、势头、多赛事类问题在库里
-根本没有数据。三个库都还在盘上，随时可以切回去。
+**当前服务器在跑哪个库**（2026-10-13 12:29 核对）：`vlml_rib.duckdb`，
+且它就是默认库（`is_default=True`）。此前 `db_path` 是空的 → 落到默认
+`vlml_events.duckdb`，那是**单场系列赛切片**（1 场赛事 / 59 回合 / 10 名选手 /
+无 ext 层），连杀、势头、多赛事类问题在库里根本没有数据。三个库都还在盘上，
+随时可以切回去。
+
+### 三库能力面对照（2026-10-13 服务器实测，回答「rib+vlr 才能做到 grid 的能力？」）
+
+逐表行数得出的结论，和直觉不一样，所以照实测写：
+
+| | GRID | vlr | rib |
+|---|---|---|---|
+| 有行的表 | 24 | 16 | 20 |
+| ext_* 层（首血/经济/攻防） | — | 1 张 | **4 张** |
+| agg_* 派生层（选手/首血/赛后） | **9 张有行** | 0 | 0 |
+| 10 个 MCP 工具 | 10/10 | — | **9/10** |
+
+1. **vlr 是 rib 的真子集**：vlr 有行的 16 张表 rib 全有，rib 还多 4 张
+   （`ext_player_round_stats` 2850 行 / `ext_round_economy` 570 /
+   `ext_game_economy` 26 / `ext_player_side_stats` 260）。
+   **没有一张表是 vlr 独有的** —— 所以"rib+vlr 凑能力"不成立，单 rib 就是公开源里最强的。
+2. **公开源离 GRID 的差距不在数据量，在派生层**：GRID 从逐事件派生出 9 张
+   `agg_*` 表（`agg_player_game_stats` / `agg_first_blood_stats` /
+   `agg_player_win_shares` …），两个公开源这些表**全是 0 行** ——
+   公开源没有 kill 事件，VLML 的派生管线无从算起。
+3. **但原料是有的**：rib 的 `ext_player_round_stats`（含 firstKill）+
+   `ext_round_economy` + `ext_player_game_stats` 足以**现算**首血转换、
+   选手画像、经济局这些指标。缺的是"ext_* → agg_*"这一步派生
+   （照 VLML `run_pipeline` 从 base_events 派生 agg_* 的同款逻辑）。
+   这一步属于「补派生层」，要和「新增知识点」一样单独定，本轮没做。
+4. **工具侧的既有后果**：`player_profile_report` 的 VLML 实现写死查
+   `agg_player_game_stats`，在 rib/vlr 上对任何选手都返回
+   `No series found for player X` —— 探针如实报 `~`（沿用旧库结构）。
+   不打半个补丁：补了 series 查找也只会得到"结构合法但全零"的报告，
+   比诚实报错更糟。
 
 ### ⚠️ 现在的边界：数据在库里，图谱还没消费它
 
@@ -1429,10 +1465,16 @@ anchor  = 1058 / Nongshim RedForce   → rib.gg 的实体
 4. ~~服务器**当前仍是** `db_path=""` + rib 锚点的陈旧状态~~ **已修**（2026-10-13 11:55）：
    锚点已刷新为与当前库匹配的 `2843069/Cloud9/Lotus`，schema 重建 **10/10 本轮探到**
    （`match_analysis_report` 306 条，不再是旧库残留的 61 条），面板 11:55:58 重启。
-   ⚠️ 仍未决：**要不要接回 rib.gg** —— `db_path` 目前是空（GRID 默认库），
-   这是数据源的选择，等人定；定了就
-   `python mve/db_switch.py set /root/mve/vlml/data/vlml_rib.duckdb`，锚点会自动重算。
-   要不要接回 rib / vlr 是人的决定，各一条命令：
+5. ~~要不要接回 rib.gg 仍未决~~ **已决**（2026-10-13 12:24，用户定）：
+   **rib.gg 已接回并设为默认库**。`db_path` = `/root/mve/vlml/data/vlml_rib.duckdb`，
+   锚点 `1058/Karmine Corp/Sunset`，schema 重建 9/10 本轮探到
+   （`player_profile_report` 失败属公开源既有限制，见第 14 章对照与第 18 章第 11 条），
+   实体目录已按 rib 刷新（10 队 / 7 图 / 50 选手），面板 12:24:36 重启。
+   默认库的唯一定义在 `db_switch.DEFAULT_DB`，各读取口的兜底已全部收敛到它。
+   **清库已实测可用**：真实跑了一次 `reset_all`（15 个文件，备份在
+   `_backup_20261013_122535`），清后 `db_path` 仍是 rib、26 张表、
+   `is_default=True` —— `db_config.json` 本来就在 KEEP 列表，清库不碰它。
+   要切别的源，各一条命令：
    ```bash
    # 接回 rib.gg（write() 会自动把锚点一起重算）
    python mve/db_switch.py set /root/mve/vlml/data/vlml_rib.duckdb
@@ -1499,6 +1541,21 @@ systemctl restart mve-panel                                     # ← 必须！
 9. **不停循环有 60～90 秒的收尾窗口。** 点停止后面板立刻显示"正在收尾"，
    但循环还在把手头那道题跑完（优雅停）。这段时间 `run_log` / 技能库**还在写**，
    不是面板自己动了。启动闸会挡住这段时间内的重复启动。
+10. **默认库换成 rib 后，种子题只有 8/20 个评分点跑得出数**（2026-10-13 实测）。
+    6 道任务全军覆没：`corrode_collapse` / `longest_losing_streak_map` /
+    `map_win_count_nrg_haven` / `map_win_percentage` / `max_losing_streak_lotus` /
+    `series_win_loss_cloud9` —— 它们的 SQL 和文案里**写死**了 GRID 的图名/队名
+    （Corrode / Lotus / Haven / NRG / Cloud9），rib 库里这些实体不存在。
+    `SERIES`/`C9` 早就跟着锚点走了，但图名/队名没有 —— 要 revive 种子题，
+   得把 MAP/队名也锚点化，或按库重新生成（出题器那条路是通的：
+    `entity_catalog` 已在 rib 上查到 10 队 / 7 图 / 50 选手）。
+11. **`player_profile_report` 在公开源上必然失败。** VLML 实现写死查
+    `agg_player_game_stats`（GRID 派生表，rib/vlr 里 0 行），对任何选手都返回
+    `No series found for player X`。schema 探针如实报 `~` 并沿用旧库结构。
+    详见第 14 章三库对照。
+12. **公开源缺的是 `agg_*` 派生层，不是原料。** 9 张派生表在两个公开源都是
+    0 行，但 rib 的 ext_* 表里有用来现算它们的原料（见第 14 章）。
+    "ext_* → agg_*" 这一步派生没做 —— 不做不硬造，宁可以工具报错的形式露出来。
 
 ---
 
