@@ -222,7 +222,7 @@ def _report_db() -> None:
         print("  ⚠️ 当前 db_path 为空 → 重启后落在 GRID 默认库，"
               "vlr.gg / rib.gg 的数据访问不到。")
         print("     要接回某个源：面板「数据源与数据库」里选库，"
-              "或 `python mve/db_switch.py <绝对路径>`。")
+              "或 `python mve/db_switch.py set <绝对路径>`。")
 
     # 库里到底有什么 —— 报实体样例，人一眼能认出是哪个源
     try:

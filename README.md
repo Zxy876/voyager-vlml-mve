@@ -1337,6 +1337,98 @@ python mve/reset_all.py --force    # 循环还在跑也硬清（不推荐）
 `mve/voyager_learn_reset.py` 管，面板「MC 真实学习」页有自己的
 「清库 / 清记忆」两个按钮。两侧各管各的，想一次归零就两个都点。
 
+### 重启 + 清库之后，还访问得到 vlr.gg / rib.gg 吗（2026-10-14 实测）
+
+用户问的是「清库会不会把数据源弄丢」。答案是**分两半，而且两半结论相反**。
+
+**第一半：数据源文件删不掉。** `reset_all.py` 的 `ROOT = <repo>/mve`，而三个库
+在 `<repo>/vlml/data/`（`vlml_events` 14.9 MB / `vlml_rib` 11.5 MB /
+`vlml_vlr` 10.2 MB），`raw_events → raw_events_rib` 软链也在那儿。
+dry-run 清单 19 项里一个 duckdb 都没有 —— 清库碰不到数据源。
+
+**第二半：但"文件还在" ≠ "访问得到"。** 能不能访问**只取决于
+`db_config.json` 的 `db_path`**，因为 `vlml_env` 是拿它给 `EventDatabase`
+打补丁的（`vlml_env.py:52`），而 VLML 的工具全部写死 `EventDatabase(read_only=True)`
+不带参数。新进程实测（＝重启效果）：
+
+| `db_path` | 新进程连到的库 | rib 探针 |
+|---|---|---|
+| `""`（空） | **GRID 默认库** `vlml_events.duckdb` | `Split` **0 行**、无 `ext_game_economy` |
+| rib 绝对路径 | `vlml_rib.duckdb` | `LOUD` **4 行**、`Split` **3 行** |
+| vlr 绝对路径 | `vlml_vlr.duckdb` | `Split` **2 行** |
+
+所以 **`db_path` 为空 = 静默退回 GRID 库**，那里只有 Cloud9 / NRG 和
+Haven / Corrode / Lotus，没有 LOUD、没有 Split。
+
+**这个"悄悄换"已经真实发生过一次**（服务器 2026-10-13 取证）：
+
+| 时刻 | 事件 |
+|---|---|
+| 06:56:15 | `db_config.json` 被切回默认库（`db_path` 写空） |
+| 07:01~07:05 | 4 条消费记录：`mada`/`Haven` 返回 0 行、`Cloud9` 回合数 0 |
+| 10:42:37 | 面板进程才重启 |
+
+07 点那批消费读的仍是**重启前内存里的 rib 连接** —— 因为 `vlml_env` 在
+import 时就算好 `ACTIVE_DB_PATH` 并打好补丁，常驻进程不重启就不重读。
+同一条 SQL 在三个库里的实测行数反证了这一点：`rounds(2843069)` GRID **59** /
+rib **0** / vlr **0**，记录里是 0，所以读的是 rib。
+
+**顺带挖出的根因：换库没有重算锚点。** `anchor.py` 头部明写
+「换库时由 `db_switch.write()` 重算」，但 `write()` 里**从未调 `refresh()`** ——
+上一轮修「整体覆盖会把 anchor 抹掉」时改成了保留原值，治过头了。
+于是服务器上稳定复现这个状态：
+
+```
+db_path = ""                         → GRID 库（只有 Cloud9 / NRG）
+anchor  = 1058 / Nongshim RedForce   → rib.gg 的实体
+```
+
+后果不止是答错。消费记录里模型的原话：
+
+> "Voyager 计算的是 Cloud9 的回合赢得情况，而 VLML 计算的是
+> Nongshim RedForce 的回合赢得情况"
+
+而 `SERIES` / `C9` 正是从 `anchor.py` 来的（`action_code.py:89-93`），
+于是 schema 探针拿 rib 的 `1058` 去问 GRID 库 →
+`No data found for series 1058`，**6/10 个工具只探回一条 error**。
+
+四处修法：
+
+| 位置 | 改了什么 |
+|---|---|
+| `db_switch.write()` | 无条件 `anchor.refresh()`。语义两头都照顾：`pick(path, prefer=旧锚点)` —— 旧锚点在新库里**还在**就沿用，不在就按"回合数最多的那场/队/图"重挑 |
+| `action_code.probe_schemas()` | 显式认 `res["error"]` 为失败（以前只拦抛异常，`error` 返回会被抽成一条叶子路径当成功）；`force` 重探时**失败不覆盖旧的好结构**；全军覆没时不落盘 |
+| `reset_all._report_db()` | dry-run 与清完都打印：当前连哪个库 + 库里的地图/队伍样例 + **锚点是否过期** |
+| `db_switch.anchor_status()` | 拿当前库实查锚点的 series / team / map 在不在；只对"查得到结论"的字段判陈旧，查不了返回 `None` 不算陈旧 |
+
+实测（服务器，来回切三遍 + 每次重建）：
+
+| 场景 | 修复前 | 修复后 |
+|---|---|---|
+| 切回 GRID（锚点原本是 rib 的） | 锚点留在 1058/Nongshim，重建 **6/10 只探回 error** | 锚点 → 2843069/Cloud9/Lotus，重建 **10/10** |
+| 切到 rib | 同上陈旧窗口 | 锚点 → 1058/Nongshim/Sunset，重建 **10/10** |
+| 再切回 GRID | 残留 | 锚点 → 2843069/NRG/Lotus，重建 **10/10** |
+
+`match_analysis_report` 在 GRID 库探出 **306** 条、在 rib 库 **271** 条 ——
+结构本身确实跟着库变，这条同时印证了"tool_schemas 是库派生的，换库必须重建"。
+
+**诚实限制**：
+
+1. 探针参数取自锚点，锚点重算是"挑回合数最多的那场"，不等于**你想问的那场**。
+   要指定还得人自己设锚点。
+2. 失败不覆盖成功，意味着换库后若某工具探不到，缓存里留的是**上一个库**的结构
+   —— 比空强，但它属于旧库，不能当新库的结构用。
+3. 服务器**当前仍是** `db_path=""` + rib 锚点的陈旧状态（测试脚本跑完已还原）。
+   要不要接回 rib / vlr 是人的决定，各一条命令：
+   ```bash
+   # 接回 rib.gg（write() 会自动把锚点一起重算）
+   python mve/db_switch.py set /root/mve/vlml/data/vlml_rib.duckdb
+   # 或库不动、只把锚点重算到当前库上
+   python mve/anchor.py --refresh
+   # 看当前状态
+   python mve/db_switch.py
+   ```
+
 ---
 
 ## 17. 部署
