@@ -50,6 +50,13 @@
   practice_scope.json 人设的练习范围
   ui_events.jsonl     人的操作日志
 
+**数据源（.duckdb）完全不在清库范围**：本脚本 `ROOT = <repo>/mve`，
+而三个库在 `<repo>/vlml/data/`（`vlml_events` / `vlml_rib` / `vlml_vlr`），
+`raw_events` 软链也在那儿。清库删不到数据源 —— 但**"文件还在" ≠ "访问得到"**：
+能不能访问只取决于 `db_config.json` 的 `db_path`；为空就静默退回 GRID 默认库
+（那个库里没有 LOUD、没有 Split）。所以清完脚本会**打印当前连的是哪个库 +
+库里的地图/队伍样例 + 锚点是否过期**，不让人猜。详见 `_report_db()`。
+
 ⚠️ 与 Voyager（MC 真实学习）那侧**保持独立**：/root/voyager/ckpt 的
   skill / curriculum / events 由 `mve/voyager_learn_reset.py` 管，
   面板上「MC 真实学习」页有自己的「清库 / 清记忆」两个按钮。
@@ -164,6 +171,96 @@ def _pid_alive(pid: object) -> bool:
         return False
 
 
+def _report_db() -> None:
+    """清完（或 dry-run 时）报一句：**现在连的是哪个数据源**。
+
+    ⚠️ 为什么要有这一段（用户 2026-10-14 问：「重启清库之后，voyager 和 VLML
+      还可以访问到 vlr 和 rib 的数据源吗」）：
+
+      1. **数据源文件不在清库范围里**。本脚本 `ROOT = /root/mve/mve`，
+         而三个库在 `/root/mve/vlml/data/`（`vlml_events` / `vlml_rib` /
+         `vlml_vlr`），`raw_events` 软链也在那儿。实测 dry-run 清单里
+         一个 duckdb 都没有 —— 清库删不到数据源，这一步是安全的。
+
+      2. **但"文件还在" ≠ "访问得到"**。能不能访问只取决于
+         `db_config.json` 的 `db_path`：
+           - 写了绝对路径 → `vlml_env` 在 import 时给 `EventDatabase` 打补丁，
+             重启后照新文件重读，访问得到（实测：指 rib → LOUD 4 行 / Split 3 行；
+             指 vlr → Split 2 行，均随新进程生效）。
+           - **为空 → 静默退回 GRID 默认库** `vlml/data/vlml_events.duckdb`。
+             那个库里只有 Cloud9 / NRG、Haven / Corrode / Lotus，
+             **没有 LOUD、没有 Split** —— 表现就是"数据源悄悄换了"。
+
+      3. 这个"悄悄换"已经发生过（服务器 2026-10-13 实测）：
+         db_config 在 06:56 被切回默认库，但面板进程 10:42 才重启 ——
+         07:01~07:05 那几条消费记录读的仍是**重启前内存里的 rib 连接**
+         （`mada`/`Haven` 返回 0 行），而同一条 SQL 在 GRID 库里有 15 行。
+         所以清完必须把"我现在到底在哪个库上"打出来，不能让人猜。
+    """
+    print("\n  " + "-" * 64)
+    print("  数据源（不在清库范围，原样保留）")
+    print("  " + "-" * 64)
+    try:
+        import db_switch
+    except Exception as e:
+        print(f"  （读不到 db_switch，跳过：{type(e).__name__}: {e}）")
+        return
+
+    raw = ""
+    try:
+        raw = str((json.loads((ROOT / "db_config.json").read_text(
+            encoding="utf-8")) or {}).get("db_path") or "")
+    except Exception:
+        pass
+    path = db_switch.current_path()
+    is_def = db_switch.is_default()
+    print(f"  db_config.db_path : {raw!r}" + ("（空 → 静默退回默认库）" if not raw else ""))
+    print(f"  实际连接的库      : {path}")
+    print(f"  是默认库吗        : {'是（GRID 单场切片）' if is_def else '否'}")
+
+    if not raw:
+        print("  ⚠️ 当前 db_path 为空 → 重启后落在 GRID 默认库，"
+              "vlr.gg / rib.gg 的数据访问不到。")
+        print("     要接回某个源：面板「数据源与数据库」里选库，"
+              "或 `python mve/db_switch.py <绝对路径>`。")
+
+    # 库里到底有什么 —— 报实体样例，人一眼能认出是哪个源
+    try:
+        import duckdb
+        con = duckdb.connect(path, read_only=True)
+    except Exception as e:
+        print(f"  ⚠️ 连不上当前库：{type(e).__name__}: {e}")
+        return
+    try:
+        tabs = [r[0] for r in con.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema='main'").fetchall()]
+        print(f"  表               : {len(tabs)} 张")
+        for tbl, col, tag in (("games", "map_name", "地图"),
+                              ("agg_team_series_stats", "team_name", "队伍")):
+            if tbl not in tabs:
+                continue
+            try:
+                vals = [str(r[0]) for r in con.execute(
+                    f"SELECT DISTINCT {col} FROM {tbl} "
+                    f"WHERE {col} IS NOT NULL LIMIT 6").fetchall()]
+                print(f"  {tag:<16}: {', '.join(vals)}")
+            except Exception:
+                continue
+    finally:
+        con.close()
+
+    # 锚点和库对不对得上（anchor 是独立字段，切库时不会跟着动）
+    try:
+        st = db_switch.anchor_status()
+    except Exception:
+        st = {}
+    if st.get("stale"):
+        print(f"  ⚠️ 锚点过期       : {st.get('hint')}")
+    elif st.get("hint"):
+        print(f"  · 锚点           : {st.get('hint')}")
+
+
 def _running() -> list[str]:
     """还在跑的东西（读状态文件 + 核 pid，不 import pilot —— 本脚本要能独立跑）。
 
@@ -223,6 +320,10 @@ def main() -> int:
     if keep_here:
         print(f"\n  有意保留（不是学习成果）：{', '.join(keep_here)}")
 
+    # 数据源报告 dry-run 也要打 —— 人往往就是先 dry-run 看一眼"会动到什么"，
+    # 这时候还没真删，正是确认"我在哪个库上"的最后机会。
+    _report_db()
+
     if dry or not existing:
         if not existing:
             print("\n  没有可清的东西。")
@@ -249,7 +350,12 @@ def main() -> int:
     for name, _ in existing:
         (ROOT / name).unlink()
     print(f"\n  已清 {len(existing)} 个文件。现在的状态：零技能、零记录、零因果、零进度。")
-    print("  下一步：python mve/run_mve.py --llm （或面板上点「启动 Voyager」）")
+
+    # 清完第一件事是确认"我到底在哪个数据源上" —— 学习记录清了，数据源没清，
+    # 两者不同步就是"清空了但取到的还是旧库的数"这种最难查的状态。
+    _report_db()
+
+    print("\n  下一步：python mve/run_mve.py --llm （或面板上点「启动 Voyager」）")
     return 0
 
 

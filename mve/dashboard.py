@@ -2454,8 +2454,38 @@ class Handler(BaseHTTPRequestHandler):
                             else:
                                 detail["实体清单"] = ("重查失败，手动跑："
                                                       "python mve/entity_catalog.py")
+                            # ⚠️ 以前这里只补了 entity_catalog，**漏了 tool_schemas**：
+                            #   `--db-switch` 会把 tool_schemas.json 一起清掉，而
+                            #   `load_schemas()` 读不到时只返回 {}、不会重建，
+                            #   重建入口 probe_schemas() 又是 async 没有 CLI ——
+                            #   结果换库后模型拿不到工具结构文档，只能猜字段路径
+                            #   （实测：四个维度全 dig 到 None）。
+                            #   所以补一条 CLI（`action_code.py --rebuild-schemas`）
+                            #   并在这里调起来，跟 entity_catalog 同一处补齐。
+                            _r3 = subprocess.run(
+                                [sys.executable, str(ROOT / "action_code.py"),
+                                 "--rebuild-schemas"],
+                                capture_output=True, timeout=300)
+                            if _r3.returncode == 0:
+                                detail["工具结构"] = "已按新库重建"
+                            else:
+                                detail["工具结构"] = ("重建没拿全（探针默认值是 GRID 的 "
+                                                      "series/队名，新库查不到），手动跑："
+                                                      "python mve/action_code.py "
+                                                      "--rebuild-schemas")
                     except Exception:
                         detail["顺带"] = "清档失败（数据库已切换）"
+                # 锚点是 db_config 里的**独立字段**，切库不会跟着动 ——
+                # 于是会出现「题目问 Nongshim RedForce、SQL 在 GRID 库里查」。
+                # 不静默改人的配置，只把归属报出来让他自己决定。
+                try:
+                    _st = db_switch.anchor_status()
+                    if _st.get("stale"):
+                        detail["锚点"] = _st.get("hint") or "锚点不在新库里"
+                    elif _st.get("hint"):
+                        detail["锚点"] = _st.get("hint")
+                except Exception:
+                    pass
                 ui_events.append(ui_events.DB_SWITCH, detail=detail, result="ok")
                 self._json(200, {**res, "need_restart": True,
                                  "reset_detail": detail})

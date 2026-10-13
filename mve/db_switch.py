@@ -152,6 +152,110 @@ def probe(path: str) -> dict[str, Any]:
     return out
 
 
+def anchor_status() -> dict[str, Any]:
+    """锚点（series / team / map）跟**当前库**对不对得上。
+
+    ⚠️ 为什么单开这个函数（2026-10-14 服务器实测）：
+      `db_config.json` 里 `anchor` 和 `db_path` 是**两个独立字段**，
+      切库时只写 `db_path`，`anchor` 原样留着。于是会稳定复现这种状态：
+
+        db_path = ""                       → 退回 GRID 默认库
+                                             （里面只有 Cloud9 / NRG，
+                                              Haven / Corrode / Lotus）
+        anchor  = {series: "1058",
+                   team: "Nongshim RedForce",
+                   map: "Sunset"}          → 这三个全是 **rib.gg 库**的实体
+
+      后果不是报错，而是**悄悄答错**：题目照 anchor 问「Nongshim RedForce」，
+      SQL 却在 GRID 库里查。消费记录里模型的原话就是证据：
+
+        "Voyager 计算的是 Cloud9 的回合赢得情况，
+         而 VLML 计算的是 Nongshim RedForce 的回合赢得情况"
+
+      所以切库 / 清库之后必须把 anchor 的归属算出来给人看，由人决定重不重设。
+      这里**不自动删 anchor** —— 那是人的配置，静默清掉是另一种自欺。
+    """
+    out: dict[str, Any] = {"anchor": {}, "checked": False, "stale": False,
+                           "hint": ""}
+    try:
+        obj = json.loads(CONFIG.read_text(encoding="utf-8"))
+    except Exception:
+        return out
+    anchor = (obj or {}).get("anchor") or {}
+    if not isinstance(anchor, dict) or not anchor:
+        return out
+    out["anchor"] = anchor
+
+    path = current_path()
+    try:
+        import duckdb
+        con = duckdb.connect(path, read_only=True)
+    except Exception as e:
+        out["hint"] = f"连不上当前库，无法核对锚点：{type(e).__name__}: {e}"
+        return out
+
+    try:
+        tables = [r[0] for r in con.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema='main'").fetchall()]
+    except Exception as e:
+        con.close()
+        out["hint"] = f"读表清单失败：{type(e).__name__}"
+        return out
+
+    def _has(cols_needed: tuple[str, ...], value: str) -> bool | None:
+        """库里存不存在这个值。`None` = 没有可核对的列（查不了，不等于没有）。"""
+        val = str(value or "").strip()
+        if not val:
+            return None
+        for t in tables:
+            try:
+                cols = [r[0] for r in con.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    f"WHERE table_name='{t}'").fetchall()]
+            except Exception:
+                continue
+            for c in cols_needed:
+                if c not in cols:
+                    continue
+                try:
+                    n = con.execute(
+                        f"SELECT COUNT(*) FROM {t} "
+                        f"WHERE CAST({c} AS VARCHAR) = '{val}'").fetchone()[0]
+                except Exception:
+                    continue
+                if n:
+                    return True
+        return False
+
+    try:
+        series_in = _has(("series_id",), str(anchor.get("series") or ""))
+        team_in = _has(("team_name", "winning_team_name"),
+                       str(anchor.get("team") or ""))
+        map_in = _has(("map_name",), str(anchor.get("map") or ""))
+        out["checked"] = True
+        out["series_in_db"] = series_in
+        out["team_in_db"] = team_in
+        out["map_in_db"] = map_in
+        # 只对"查得到结论"的字段判陈旧：None（没列可查）不算陈旧
+        judged = [v for v in (series_in, team_in, map_in) if v is not None]
+        out["stale"] = bool(judged) and not any(judged)
+        if out["stale"]:
+            out["hint"] = (
+                f"锚点 {anchor.get('team')} / {anchor.get('map')} / series "
+                f"{anchor.get('series')} 在当前库里都查不到 —— "
+                "题目会照锚点问，SQL 却在空库里查，答案是 0 而不是报错。"
+                "请重设锚点（面板「数据源与数据库」）或切回对应的库。"
+            )
+        elif judged and not all(judged):
+            miss = [k for k, v in (("series", series_in), ("team", team_in),
+                                   ("map", map_in)) if v is False]
+            out["hint"] = "锚点部分对不上（查不到：" + "、".join(miss) + "）"
+    finally:
+        con.close()
+    return out
+
+
 if __name__ == "__main__":
     import sys
 

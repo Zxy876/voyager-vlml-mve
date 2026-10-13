@@ -1074,13 +1074,67 @@ async def collect(task: Any, *, dims: list[str] | None = None,
             "values": {}, "calls": [], "tools": []}
 
 
+def _rebuild_schemas() -> int:
+    """重建 `tool_schemas.json` —— 换库清档之后必须跑这一步。
+
+    ⚠️ 为什么必须单开一个 CLI（2026-10-14 服务器实测）：
+      `reset_all.py --db-switch` 会把 `tool_schemas.json` 清掉（它是**从旧库
+      派生**的：表名 / 列名 / 队名跟库走），但 `load_schemas()` 读不到文件时
+      **只返回 {}、不报错、也不重建**（action_code.py:227-232）。
+      于是模型拿不到工具的结构文档，只能**猜**字段路径 ——
+      实测后果：四个维度全 dig 到 None（猜的 `economy.pistol_win_rate`
+      跟真实路径 `key_metrics.economy.pistol.num` 根本不一样）。
+
+      而唯一的重建入口 `probe_schemas()` 是 `async` 且**没有 CLI**，
+      所以换库清档之后没有任何一条路径会把它补回来 —— 缺口就在这里。
+
+    另一个诚实限制：探针的默认参数取自 `tasks.py` 的 GRID 常量
+    （`SERIES='2843069'` / `C9='Cloud9'`，见 `_default_args`）。
+    切到 rib / vlr 库时这两个常量查不到数据，探针会拿到 error 结构 ——
+    所以重建**成功 ≠ 结构对得上新库**。返回值里如实标出每个工具拿到几条。
+    """
+    import db_switch
+
+    print("=" * 68)
+    print("  重建工具 schema 缓存")
+    print("=" * 68)
+    print(f"  当前连的库：{db_switch.current_path()}")
+    before = load_schemas()
+    print(f"  重建前缓存：{len(before)} 个工具")
+
+    got = asyncio.run(probe_schemas(TOOL_NAMES, force=True))
+    ok = 0
+    for t in TOOL_NAMES:
+        v = got.get(t) or []
+        bad = bool(v) and str(v[0]).startswith("<探针失败")
+        if v and not bad:
+            ok += 1
+        head = v[0] if v else "（空）"
+        mark = "✗" if (bad or not v) else "✓"
+        print(f"  {mark} {t:28s} {len(v):>4} 条   {str(head)[:66]}")
+    print(f"\n  重建完成：{ok}/{len(TOOL_NAMES)} 个工具拿到结构"
+          f"（写到 {SCHEMA_CACHE.name}）")
+    if ok < len(TOOL_NAMES):
+        print("  ⚠️ 没拿全的通常是探针默认值（GRID 的 series/队名）在新库查不到，")
+        print("     属已知限制：结构文档这时只覆盖了能跑通的工具。")
+    return 0 if ok else 1
+
+
 def _main() -> int:
     import argparse
     from tasks import TASKS
 
     ap = argparse.ArgumentParser(description="代码化取证：模型写调 MCP 的代码，执行拿原值")
-    ap.add_argument("--topic", required=True, help=f"题目 id，可选：{', '.join(TASKS)}")
+    ap.add_argument("--topic", help=f"题目 id，可选：{', '.join(TASKS)}")
+    ap.add_argument("--rebuild-schemas", action="store_true",
+                    help="重建工具 schema 缓存（换库清档后必跑）")
     args = ap.parse_args()
+
+    if args.rebuild_schemas:
+        return _rebuild_schemas()
+
+    if not args.topic:
+        ap.error("需要 --topic 或 --rebuild-schemas")
 
     task = TASKS.get(args.topic)
     if task is None:
