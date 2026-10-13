@@ -32,12 +32,24 @@ Path.mkdir = _safe_mkdir  # type: ignore[assignment]
 
 # ---- 数据库可切换 ----
 # VLML 的工具里全部写死 `EventDatabase(read_only=True)`（不带 db_path），
-# 于是一律落到默认库 vlml/data/vlml_events.duckdb。要换库只能在这里打补丁 ——
-# 和上面的 mkdir 补丁同一套路：MVE 侧绕过，不改 VLML 仓库源码。
+# 于是一律落到它自带的默认库 vlml/data/vlml_events.duckdb（GRID 切片）。
+# 要换库只能在这里打补丁 —— 和上面的 mkdir 补丁同一套路：MVE 侧绕过，
+# 不改 VLML 仓库源码。
 #
 # 用配置文件而不是环境变量：run_mve 是 pilot 起的、pilot 是面板起的，
 # 环境变量要层层传递；写文件则所有进程读到的都是同一份。
+#
+# ⚠️ db_path 为空时的兜底也必须是本项目的默认库（rib.gg，见 db_switch.DEFAULT_DB），
+#    不能留着 VLML 自带的 GRID 默认 —— 否则配置一丢，六个读库模块里这个
+#    悄悄落回 GRID，别的模块按新默认走，"数据源悄悄换了"就是这么来的
+#    （2026-10-13 服务器实测：db_config 被切空，工具实际连的是 GRID 库，
+#    而 db_switch.current_path() 报的是 rib）。
 DB_CONFIG = ROOT / "mve" / "db_config.json"
+
+# 默认库的唯一定义在 db_switch（mve/ 在 sys.path 里：面板第 33 行插入，
+# 脚本直跑时 sys.path[0] 就是 mve/）。import 失败要**响**——静默兜底
+# 就等于默认库可以悄悄分叉，那正是要防的事。
+from db_switch import DEFAULT_DB  # noqa: E402
 
 
 def _read_db_config() -> dict:
@@ -68,16 +80,19 @@ def _resolve_db_path(raw: str) -> str:
 
 
 _RAW_DB_PATH = str(_read_db_config().get("db_path") or "")
-ACTIVE_DB_PATH = _resolve_db_path(_RAW_DB_PATH) if _RAW_DB_PATH else ""
+# db_path 为空 → 落到**本项目的**默认库（rib.gg），不是 VLML 自带的 GRID 库。
+ACTIVE_DB_PATH = (_resolve_db_path(_RAW_DB_PATH) if _RAW_DB_PATH
+                  else str(DEFAULT_DB))
 
-# ⚠️ 配了库但文件不在 —— **当场喊出来**。
+# ⚠️ 库文件不在 —— **当场喊出来**（配置写的 / 默认兜底的都要喊）。
 #   不喊的代价（2026-10-13 服务器实测）：循环连跑三轮，每轮三次工具调用
 #   全部失败，日志里只有一行 `IO Error: database does not exist`；而 panel
 #   的分诊把它归到 `linkage`（"链路没跑通"）—— 归类是对的，但人得先看见它。
 #   有这一行，启动瞬间就知道是路径问题，不用等三道题跑完再倒推。
-if ACTIVE_DB_PATH and not Path(ACTIVE_DB_PATH).exists():
-    print(f"[vlml_env] ⚠️ 配置了数据库但文件不存在：{ACTIVE_DB_PATH}"
-          f"（db_config 里写的是 {_RAW_DB_PATH!r}；相对路径按仓库根 {ROOT} 解析）",
+if not Path(ACTIVE_DB_PATH).exists():
+    _src = (f"db_config 里写的是 {_RAW_DB_PATH!r}（相对路径按仓库根 {ROOT} 解析）"
+            if _RAW_DB_PATH else "db_config 的 db_path 为空，用的是默认库兜底")
+    print(f"[vlml_env] ⚠️ 要连的库文件不存在：{ACTIVE_DB_PATH}（{_src}）",
           file=sys.stderr, flush=True)
 if ACTIVE_DB_PATH:
     from vlml.db.manager import EventDatabase  # noqa: E402

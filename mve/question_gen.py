@@ -214,8 +214,8 @@ def _subject_values(key: str) -> list[str]:
     """这个学科下**可填入的具体值** —— 连数据源实查，不手写。
 
     为什么要实查：手写一张清单换一次库就全错。`entity_catalog` 会连
-    `db_config.json` 指向的库（默认 vlml/data/vlml_events.duckdb）把
-    series / team / map / player 的实际取值查出来并缓存。
+    `db_config.json` 指向的库（为空时用默认库 `db_switch.DEFAULT_DB`，
+    当前是 rib.gg）把 series / team / map / player 的实际取值查出来并缓存。
     查不到就返回空（该学科出不了题），**绝不编一个值出来**。
 
     再叠一层**人登记的学科**（`subjects.py`）：换数据源（接新的公开源）后，

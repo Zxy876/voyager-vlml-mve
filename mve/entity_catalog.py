@@ -61,6 +61,9 @@ def _db_path() -> Path:
     ⚠️ 相对路径按**仓库根**解析，不按当前 cwd：`vlml_env` 会把 cwd 切到
        `vlml/`，原样返回相对路径会让 DuckDB 把 `vlml/data/x.duckdb` 拼成
        `<repo>/vlml/vlml/data/x.duckdb`（2026-10-13 服务器实测踩到）。
+
+    ⚠️ 兜底走 `db_switch.DEFAULT_DB`（当前是 rib.gg）—— 默认库唯一定义在
+       那儿，这里不再写自己的字面量（各写一份就是"悄悄换库"的土壤）。
     """
     try:
         cfg = json.loads(DB_CONFIG.read_text(encoding="utf-8"))
@@ -70,7 +73,8 @@ def _db_path() -> Path:
             return q if q.is_absolute() else (ROOT / q).resolve()
     except Exception:
         pass
-    return ROOT / "vlml" / "data" / "vlml_events.duckdb"
+    from db_switch import DEFAULT_DB
+    return DEFAULT_DB
 
 
 def refresh() -> dict:

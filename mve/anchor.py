@@ -64,12 +64,21 @@ def _db_path() -> Path:
       `IO Error: database does not exist`。循环侧看到的是"连续三轮一次工具
       都没调成功"，分诊归到 `linkage`，看着像学不会，其实是路径。
       配置是人写的，人写相对路径时想的是仓库根，所以按仓库根解析。
+
+    ⚠️ 兜底必须是 `db_switch.DEFAULT_DB`（当前是 rib.gg，用户 2026-10-13 定），
+      不能再写一份 `vlml_events.duckdb` 字面量 —— 各模块各写一份默认库，
+      正是"db_path 一空就悄悄换库"的土壤。唯一定义在 db_switch，这里只 import。
     """
+    try:
+        from db_switch import DEFAULT_DB
+    except Exception as _e:                                  # pragma: no cover
+        raise RuntimeError(
+            f"读不到 db_switch.DEFAULT_DB（默认库唯一定义处）：{_e}") from _e
     p = str(_cfg().get("db_path") or "").strip()
     if p:
         q = Path(p).expanduser()
         return q if q.is_absolute() else (HERE.parent / q).resolve()
-    return HERE.parent / "vlml" / "data" / "vlml_events.duckdb"
+    return DEFAULT_DB
 
 
 def pick(db_path: Path | str | None = None,

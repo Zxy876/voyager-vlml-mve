@@ -53,9 +53,11 @@
 **数据源（.duckdb）完全不在清库范围**：本脚本 `ROOT = <repo>/mve`，
 而三个库在 `<repo>/vlml/data/`（`vlml_events` / `vlml_rib` / `vlml_vlr`），
 `raw_events` 软链也在那儿。清库删不到数据源 —— 但**"文件还在" ≠ "访问得到"**：
-能不能访问只取决于 `db_config.json` 的 `db_path`；为空就静默退回 GRID 默认库
-（那个库里没有 LOUD、没有 Split）。所以清完脚本会**打印当前连的是哪个库 +
-库里的地图/队伍样例 + 锚点是否过期**，不让人猜。详见 `_report_db()`。
+能不能访问只取决于 `db_config.json` 的 `db_path`；为空就静默退回默认库
+（2026-10-13 那天默认库还是 GRID 切片，于是"悄悄换库"；**默认库已于
+2026-10-13 改成 rib.gg**，见 `db_switch.DEFAULT_DB`）。所以清完脚本会
+**打印当前连的是哪个库 + 库里的地图/队伍样例 + 锚点是否过期**，不让人猜。
+详见 `_report_db()`。
 
 ⚠️ 与 Voyager（MC 真实学习）那侧**保持独立**：/root/voyager/ckpt 的
   skill / curriculum / events 由 `mve/voyager_learn_reset.py` 管，
@@ -187,9 +189,11 @@ def _report_db() -> None:
            - 写了绝对路径 → `vlml_env` 在 import 时给 `EventDatabase` 打补丁，
              重启后照新文件重读，访问得到（实测：指 rib → LOUD 4 行 / Split 3 行；
              指 vlr → Split 2 行，均随新进程生效）。
-           - **为空 → 静默退回 GRID 默认库** `vlml/data/vlml_events.duckdb`。
-             那个库里只有 Cloud9 / NRG、Haven / Corrode / Lotus，
-             **没有 LOUD、没有 Split** —— 表现就是"数据源悄悄换了"。
+           - **为空 → 落到默认库** `db_switch.DEFAULT_DB`。2026-10-13 那天
+             默认库还是 GRID 切片 `vlml_events.duckdb`（只有 Cloud9 / NRG、
+             Haven / Corrode / Lotus，没有 LOUD / Split），表现为"数据源
+             悄悄换了"；**默认库当天已改成 rib.gg**，所以现在为空 = 落 rib，
+             是预期行为 —— 但"落默认库"仍是兜底而非显式选择，照样要打出来。
 
       3. 这个"悄悄换"已经发生过（服务器 2026-10-13 实测）：
          db_config 在 06:56 被切回默认库，但面板进程 10:42 才重启 ——
@@ -214,14 +218,15 @@ def _report_db() -> None:
         pass
     path = db_switch.current_path()
     is_def = db_switch.is_default()
-    print(f"  db_config.db_path : {raw!r}" + ("（空 → 静默退回默认库）" if not raw else ""))
+    print(f"  db_config.db_path : {raw!r}" + ("（空 → 用默认库兜底）" if not raw else ""))
     print(f"  实际连接的库      : {path}")
-    print(f"  是默认库吗        : {'是（GRID 单场切片）' if is_def else '否'}")
+    # 标签跟着默认库走，别写死"GRID 单场切片" —— 默认库 2026-10-13 已改成 rib.gg。
+    print(f"  是默认库吗        : {'是（' + Path(db_switch.DEFAULT_DB).stem + '）' if is_def else '否'}")
 
     if not raw:
-        print("  ⚠️ 当前 db_path 为空 → 重启后落在 GRID 默认库，"
-              "vlr.gg / rib.gg 的数据访问不到。")
-        print("     要接回某个源：面板「数据源与数据库」里选库，"
+        print("  ⚠️ 当前 db_path 为空 → 用的是**默认库**兜底"
+              f"（{Path(db_switch.DEFAULT_DB).stem}），不是你显式选的库。")
+        print("     要显式指定：面板「数据源与数据库」里选库，"
               "或 `python mve/db_switch.py set <绝对路径>`。")
 
     # 库里到底有什么 —— 报实体样例，人一眼能认出是哪个源

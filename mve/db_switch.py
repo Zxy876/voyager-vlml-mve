@@ -21,7 +21,17 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 CONFIG = ROOT / "db_config.json"
-DEFAULT_DB = ROOT.parent / "vlml" / "data" / "vlml_events.duckdb"
+# 默认库 = rib.gg（用户 2026-10-13 定：「接回 rib.gg，并设置为默认的库」）。
+# 理由：rib 库带 ext_ 层（首血 roundStats / 经济 roundEconomy / 攻防 sideStats），
+# 可分析轴比 GRID 单场切片多；GRID 切片 `vlml_events.duckdb` 保留为可选项。
+#
+# ⚠️ 这个常量是**唯一**的默认库定义。以前 `vlml_env` / `anchor` /
+# `entity_catalog` / `open_quiz` / `scene_context` 各自写一份
+# `vlml/data/vlml_events.duckdb` 字面量 —— 那正是"db_path 一空就悄悄换库"
+# 那类 bug 的土壤（2026-10-13 服务器实测：配置被切空，六个模块里五个
+# 静默落回 GRID，只有面板显示还停在 rib）。所以那些兜底全部 import 本常量，
+# 不要再各自写死。要换默认库，只改这一行。
+DEFAULT_DB = ROOT.parent / "vlml" / "data" / "vlml_rib.duckdb"
 
 
 def _abs(p: str) -> str:

@@ -80,12 +80,21 @@ def data_source_identity() -> str:
         p = str((obj or {}).get("db_path") or "")
     except Exception:
         p = ""
-    name = Path(p).stem if p else "vlml_events(默认)"
+    # db_path 为空时用的是**默认库**（db_switch.DEFAULT_DB，当前 rib.gg）——
+    # 标签要跟着默认库走，不能再写死 "vlml_events(默认)"（2026-10-13 起因：
+    # 默认库改成 rib 后，这个标签会指着一个没在用的库）。
+    name = Path(p).stem if p else Path(_default_db()).stem
     if "vlr" in name:
         return f"{name}（vlr.gg 源：回合级 + 聚合级，无 ext 层）"
     if "rib" in name:
         return f"{name}（rib.gg 源：含首血/经济 ext 层）"
-    return f"{name}（默认 GRID 切片）"
+    return f"{name}（默认库）" if not p else f"{name}（GRID 单场切片）"
+
+
+def _default_db() -> str:
+    """默认库路径（唯一定义在 db_switch，当前 rib.gg）。"""
+    from db_switch import DEFAULT_DB
+    return str(DEFAULT_DB)
 
 
 def _db_path() -> str:
@@ -101,7 +110,7 @@ def _db_path() -> str:
     except Exception:
         p = ""
     if not p:
-        return str(HERE.parent / "vlml" / "data" / "vlml_events.duckdb")
+        return _default_db()
     return str(((HERE.parent / Path(p).expanduser()).resolve())
                if not Path(p).expanduser().is_absolute()
                else Path(p).expanduser())

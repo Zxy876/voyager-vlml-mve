@@ -155,10 +155,17 @@ def _active_db() -> Path:
         obj = json.loads(Path(cfg).read_text(encoding="utf-8"))
         p = str(obj.get("db_path") or "")
         if p:
-            return Path(p)
+            # ⚠️ 相对路径按**仓库根**解析，不能原样返回（与 vlml_env /
+            #    anchor / entity_catalog 同口径）：vlml_env 会把 cwd 切到
+            #    vlml/，原样返回会在那儿被拼两遍（2026-10-13 服务器实测）。
+            q = Path(p).expanduser()
+            return q if q.is_absolute() else (HERE.parent / q).resolve()
     except Exception:
         pass
-    return HERE.parent / "vlml" / "data" / "vlml_events.duckdb"
+    # 兜底走唯一定义处（当前是 rib.gg，用户 2026-10-13 定为默认库）——
+    # 不再各自写 vlml_events.duckdb 字面量。
+    from db_switch import DEFAULT_DB
+    return DEFAULT_DB
 
 
 _SCHEMA_CACHE: str | None = None
