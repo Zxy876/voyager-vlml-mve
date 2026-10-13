@@ -112,18 +112,25 @@ def pick(db_path: Path | str | None = None,
         # ⚠️ team 那条 SQL 里有**两个** `?`（winning / losing 各一次），
         # 只传一个参数会抛错并静默退回兜底值（实测挑出 Cloud9 —— rib 库里
         # 根本没这个队）。按占位符个数配参数。
+        # ⚠️ `ORDER BY` 必须有第二排序键（2026-10-14 实测，同一输入两次跑出两个结果）：
+        #   只按 `COUNT(*) DESC` 排时，并列的两队 / 两图谁在前由 DuckDB 决定 ——
+        #   同一个"切到 rib.gg"跑两遍，team 一次给 **Karmine Corp**、一次给
+        #   **Nongshim RedForce**；"切回 GRID"则一次 NRG、一次 Cloud9。
+        #   锚点摇摆的代价：重启之间题面会自己变（今天问这两队，明天问那两队），
+        #   排查时还以为是别的地方改了。加 `, t` / `, map_name` 让它可复现。
         for key, sql, args in (
             ("team",
              "SELECT t FROM (SELECT winning_team_name AS t FROM rounds "
              "WHERE CAST(series_id AS VARCHAR)=? UNION ALL "
              "SELECT losing_team_name FROM rounds "
              "WHERE CAST(series_id AS VARCHAR)=?) "
-             "WHERE t IS NOT NULL AND t<>'' GROUP BY 1 ORDER BY COUNT(*) DESC LIMIT 1",
+             "WHERE t IS NOT NULL AND t<>'' "
+             "GROUP BY 1 ORDER BY COUNT(*) DESC, t LIMIT 1",
              [sid, sid]),
             ("map",
              "SELECT map_name FROM rounds WHERE CAST(series_id AS VARCHAR)=? "
              "AND map_name IS NOT NULL AND map_name<>'' "
-             "GROUP BY 1 ORDER BY COUNT(*) DESC LIMIT 1",
+             "GROUP BY 1 ORDER BY COUNT(*) DESC, map_name LIMIT 1",
              [sid]),
         ):
             try:
