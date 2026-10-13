@@ -2425,11 +2425,14 @@ class Handler(BaseHTTPRequestHandler):
                     detail["说明"] = "已回到默认库"
                 if payload.get("reset"):
                     try:
-                        import reset_all
                         import subprocess
-                        subprocess.run([sys.executable, str(ROOT / "reset_all.py")],
-                                       capture_output=True, timeout=60)
-                        detail["顺带"] = "已清档"
+                        _r = subprocess.run(
+                            [sys.executable, str(ROOT / "reset_all.py")],
+                            capture_output=True, timeout=60)
+                        # ⚠️ 返回码必须看：循环还在跑时 reset_all 会拒绝清档（返回 1），
+                        #   以前一律写"已清档"，人以为清了其实一个文件都没删。
+                        detail["顺带"] = ("已清档" if _r.returncode == 0
+                                          else "已拒绝清档（还有任务在跑，请先停止）")
                     except Exception:
                         detail["顺带"] = "清档失败（数据库已切换）"
                 ui_events.append(ui_events.DB_SWITCH, detail=detail, result="ok")
