@@ -779,8 +779,9 @@ async def consume(
             "judge": "method_compare",
         })
     elif not ref_traj:
-        base["skipped"] = ("裁判（VLML）这一路一次工具都没调通 → 没有第二路做法可比，"
-                           "覆盖率无从计算（如实留空，不拿 0 分冒充）")
+        base["skipped"] = ("裁判（VLML）这一路没有取到真实数据（调用失败，或结果全是"
+                           "真空值：空表上的纯聚合返回 1 行 (NULL, 0)）→ "
+                           "没有第二路做法可比，覆盖率无从计算（如实留空，不拿 0 分冒充）")
     elif rows <= 0 or ref_rows <= 0:
         # 两路都得真的取到数才判 —— 否则两个空结果会被判成"口径一致 100%"
         # （实测：Cloud9/Corrode 在当前库没数据，两边 0 行，一样的方法，判了满分）。
@@ -920,15 +921,29 @@ async def _referee_observations(question: str,
           + "⚠️ 比值/除法必须写 NULLIF(x, 0)（如 AVG(kills)/NULLIF(AVG(deaths),0)）—— "
             "DuckDB 里 x/0 得 NaN 不报错，取回来是个没法比的数；"
             "且优先在聚合层做除法（先 AVG 再相除），不要对逐行比值再 MAX。\n"
-            "⚠️ 多表 JOIN 时列名必须带表名前缀（两表常有同名列，裸写会 Ambiguous）。")
+            "⚠️ 多表 JOIN 时列名必须带表名前缀（两表常有同名列，裸写会 Ambiguous）。\n"
+            # 2026-10-14：schema 中部虽已标注空表，实测 glm-4-flash 仍会
+            # 3 轮迭代都查 agg_team_round_summary（0 行）—— 空表纯聚合返回
+            # 1 行 (NULL, 0)，看着像取到数其实没有。在 user message 里再强调
+            # 一遍（不放答案，只放选表纪律，裁判的独立性不受影响）。
+            "⚠️ schema 里标注「0 行 · 空表」的表**查了只会得到 (NULL, 0)**，"
+            "优先选标注了行数的表；若算出来的比值全列是 NULL，说明查错了表。")
     if env is not None:
         from voyager_vlml.agents.action import VLMLActionAgent
         act = VLMLActionAgent(env=env)
         observations, sql2 = await act.solve(q2, max_iters=3)
         ok_obs = [o for o in observations if o.get("ok")]
-        if not ok_obs:
+        # ⚠️ 2026-10-14：ok ≠ 取到数。空表纯聚合返回 1 行 (NULL, 0)，
+        #   ok=True 但是真空 —— 重新打包时不能把真空洗成"成功观察"，
+        #   否则 ⑥ 的 ref_real_rows 判据被绕过，两个真空结果又会被判成口径一致。
+        #   （实测：裁判 3 轮迭代都查了 schema 里标注"0 行别查"的
+        #   agg_team_round_summary，最后一条 ok 观察正是 (None, 0)。）
+        #   另：solve 取到真数即 break，所以真数观察若存在必是最后一条，
+        #   与返回的 sql2 配套；不存在即 3 轮都没取到真数，如实返回空。
+        real_obs = [o for o in ok_obs if has_real_data(o)]
+        if not real_obs:
             return [], sql2, []
-        last = ok_obs[-1]
+        last = real_obs[-1]
         return ([{"tool": "query_sql", "args": {"sql_query": sql2},
                   "data": last.get("data"), "rows": last.get("rows") or 0,
                   "error": None, "ok": True}], sql2, ["query_sql"])
