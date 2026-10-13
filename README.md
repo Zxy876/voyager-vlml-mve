@@ -1418,10 +1418,20 @@ anchor  = 1058 / Nongshim RedForce   → rib.gg 的实体
    要指定还得人自己设锚点。
 2. 失败不覆盖成功，意味着换库后若某工具探不到，缓存里留的是**上一个库**的结构
    —— 比空强，但它属于旧库，不能当新库的结构用。
-3. **锚点重算挑队时并列会摇摆**：`pick()` 里是 `ORDER BY COUNT(*) DESC LIMIT 1`，
-   没有第二排序键。同一个"切回 GRID"跑了两次，一次给 **NRG**、一次给 **Cloud9**
-   —— 两者在 GRID 库里回合数相同。要可复现得补一个名字做 tie-break，未改。
-4. 服务器**当前仍是** `db_path=""` + rib 锚点的陈旧状态（测试脚本跑完已还原）。
+3. ~~**锚点重算挑队时并列会摇摆**~~ **已修**（commit `8e4688b`）：`pick()` 的
+   team/map 原来是 `ORDER BY COUNT(*) DESC LIMIT 1`，没有第二排序键，DuckDB 对并列行
+   不保证顺序 —— 实测同一个"切回 GRID"跑两次，一次给 **NRG**、一次给 **Cloud9**
+   （两者回合数相同）；"切到 rib"则一次 Karmine Corp、一次 Nongshim RedForce。
+   修法：`ORDER BY COUNT(*) DESC, t`（队）/ `, map_name`（图），并列时按名字升序。
+   服务器验证：3 个库 × 独立进程 2 遍，**全部一致**（GRID→Cloud9/Lotus、
+   vlr→Cloud9/Lotus、rib→Karmine Corp/Sunset）。
+   仍成立的限制：锚点是"回合数最多的那场/队"，**不等于你想问的那场**。
+4. ~~服务器**当前仍是** `db_path=""` + rib 锚点的陈旧状态~~ **已修**（2026-10-13 11:55）：
+   锚点已刷新为与当前库匹配的 `2843069/Cloud9/Lotus`，schema 重建 **10/10 本轮探到**
+   （`match_analysis_report` 306 条，不再是旧库残留的 61 条），面板 11:55:58 重启。
+   ⚠️ 仍未决：**要不要接回 rib.gg** —— `db_path` 目前是空（GRID 默认库），
+   这是数据源的选择，等人定；定了就
+   `python mve/db_switch.py set /root/mve/vlml/data/vlml_rib.duckdb`，锚点会自动重算。
    要不要接回 rib / vlr 是人的决定，各一条命令：
    ```bash
    # 接回 rib.gg（write() 会自动把锚点一起重算）
