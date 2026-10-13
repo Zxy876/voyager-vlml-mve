@@ -431,6 +431,49 @@ async def probe_schemas(tools: list[str], *, force: bool = False,
     return {t: cache[t] for t in tools if t in cache}
 
 
+def _sample_player() -> str:
+    """从**当前库**取一个真实选手名，给探针当出参。
+
+    ⚠️ 为什么不能填空串（2026-10-13 切到 rib 后实测）：
+      `player_profile_report` 的 player_name 是必填，探针原来填 `""`，
+      工具直接返回 `{'error': 'No series found for player '}` ——
+      空串不是"没传"，是传了一个查不到的选手。GRID 库上碰巧能返回结构
+      （大概走了兜底分支），rib 库上就 error，于是 rib 的 schema 重建
+      9/10，`player_profile_report` 只能沿用旧库结构。
+      取真实值才拿得到结构 —— 和 team_name=C9 / series_id=SERIES 同一道理：
+      探针出参必须是**库里存在的实体**。
+    """
+    try:
+        import duckdb
+        import db_switch
+        con = duckdb.connect(db_switch.current_path(), read_only=True)
+    except Exception:
+        return ""
+    try:
+        have = {t[0] for t in con.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema='main'").fetchall()}
+        for t in ("agg_player_series_stats", "ext_player_game_stats",
+                  "ext_player_round_stats", "ext_player_side_stats"):
+            if t not in have:
+                continue
+            try:
+                row = con.execute(
+                    f"SELECT player_name FROM {t} "
+                    "WHERE player_name IS NOT NULL AND player_name<>'' "
+                    "LIMIT 1").fetchone()
+            except Exception:
+                continue
+            if row and row[0]:
+                return str(row[0])
+        return ""
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
 def _default_args(tool: str) -> dict[str, Any]:
     """按真实参数名给探针填默认值（照 inspect.signature，不靠字符串猜）。"""
     import inspect
@@ -449,7 +492,9 @@ def _default_args(tool: str) -> dict[str, Any]:
         elif name == "series_id":
             args[name] = SERIES
         elif name == "player_name" and required:
-            args[name] = ""
+            # 必填 → 给当前库里的真实选手（空串会被当成"查不到的选手"报
+            # error，见 _sample_player 的实测注释）
+            args[name] = _sample_player()
         elif name == "sql_query":
             args[name] = "SELECT 1"
         elif required:
