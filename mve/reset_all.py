@@ -246,9 +246,15 @@ def _report_db() -> None:
             if tbl not in tabs:
                 continue
             try:
+                # ⚠️ 必须 ORDER BY：没有排序键时 DuckDB 对并列/超出 LIMIT 的行
+                #    不保证顺序，同一个库两次 dry-run 会报出不同的 top-6
+                #    （2026-10-13 实测：清库前后两次报告的队伍列表不一样，
+                #    看着像数据变了，其实是 12 支队里任意 6 支的显示顺序）。
+                #    和 anchor.pick() 的并列摇摆同一品类：不可复现的展示
+                #    会让人照着错的线索排查。
                 vals = [str(r[0]) for r in con.execute(
                     f"SELECT DISTINCT {col} FROM {tbl} "
-                    f"WHERE {col} IS NOT NULL LIMIT 6").fetchall()]
+                    f"WHERE {col} IS NOT NULL ORDER BY {col} LIMIT 6").fetchall()]
                 print(f"  {tag:<16}: {', '.join(vals)}")
             except Exception:
                 continue
