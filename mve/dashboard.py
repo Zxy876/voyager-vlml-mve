@@ -2429,6 +2429,10 @@ class Handler(BaseHTTPRequestHandler):
                 detail = {"切换到": res["db_path"]}
                 if res["is_default"]:
                     detail["说明"] = "已回到默认库"
+                # write() 现在会调 anchor.refresh()：旧锚点在新库里还在就沿用，
+                # 不在就按"回合数最多的那场/队/图"重挑。把结论报出来。
+                if res.get("anchor_note"):
+                    detail["锚点"] = res["anchor_note"]
                 if payload.get("reset"):
                     try:
                         import subprocess
@@ -2475,15 +2479,20 @@ class Handler(BaseHTTPRequestHandler):
                                                       "--rebuild-schemas")
                     except Exception:
                         detail["顺带"] = "清档失败（数据库已切换）"
-                # 锚点是 db_config 里的**独立字段**，切库不会跟着动 ——
-                # 于是会出现「题目问 Nongshim RedForce、SQL 在 GRID 库里查」。
-                # 不静默改人的配置，只把归属报出来让他自己决定。
+                # 切完之后**再核一遍**：refresh 是"按库重挑"，anchor_status 是
+                # "拿新库实查这些值在不在"。两者都报，前者说做了什么，
+                # 后者验做没做成 —— 只报一个的话，refresh 静默失败就看不出来。
                 try:
                     _st = db_switch.anchor_status()
                     if _st.get("stale"):
-                        detail["锚点"] = _st.get("hint") or "锚点不在新库里"
+                        detail["锚点核对"] = _st.get("hint") or "锚点不在新库里"
                     elif _st.get("hint"):
-                        detail["锚点"] = _st.get("hint")
+                        detail["锚点核对"] = _st.get("hint")
+                    elif _st.get("checked"):
+                        detail["锚点核对"] = (
+                            f"已验：{_st.get('anchor', {}).get('team')} / "
+                            f"{_st.get('anchor', {}).get('map')} / series "
+                            f"{_st.get('anchor', {}).get('series')} 都在新库里")
                 except Exception:
                     pass
                 ui_events.append(ui_events.DB_SWITCH, detail=detail, result="ok")

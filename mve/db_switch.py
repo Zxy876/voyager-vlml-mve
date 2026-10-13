@@ -72,8 +72,40 @@ def write(path: str) -> dict[str, Any]:
     CONFIG.write_text(
         json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+    # ⚠️ 锚点必须跟着库一起走 —— 而且要用 refresh()（"在库里就沿用"），
+    #   不是保留原值。
+    #   保留原值那版（2026-10-13 修的）是为了治「整体覆盖会把 anchor 抹掉」，
+    #   但它治过头了：anchor 留在旧库上，于是
+    #
+    #     db_path = ""                        → GRID 库（只有 Cloud9 / NRG）
+    #     anchor  = 1058 / Nongshim RedForce  → rib.gg 的实体
+    #
+    #   服务器实测后果（2026-10-14）：消费记录里模型原话 ——
+    #     "Voyager 计算的是 Cloud9 的回合赢得情况，
+    #      而 VLML 计算的是 Nongshim RedForce 的回合赢得情况"
+    #   连 schema 探针都被它带崩：`_default_args` 取 SERIES/C9（来自 anchor），
+    #   拿 rib 的 1058 去问 GRID 库 → "No data found for series 1058"，
+    #   6/10 个工具只探回一条 error。
+    #
+    #   `anchor.refresh()` 的语义正好两头都照顾到：`pick(path, prefer=旧锚点)`
+    #   —— 旧锚点在新库里**还在**就沿用（换库不无谓改题面），不在就按
+    #   "回合数最多的那场/队/图"重挑。所以这里无条件 refresh。
+    anchor_note = ""
+    try:
+        import anchor
+        before = dict(obj.get("anchor") or {})
+        new_anchor = anchor.refresh(stored or str(DEFAULT_DB))
+        if new_anchor != before:
+            anchor_note = (f"锚点已跟着新库重算：{before or '空'} → "
+                           f"{new_anchor}（旧锚点在新库里查不到）")
+        else:
+            anchor_note = "锚点在新库里仍然有效，沿用"
+    except Exception as e:
+        anchor_note = f"锚点重算失败（{type(e).__name__}），请手动跑 python mve/anchor.py --refresh"
+
     return {"ok": True, "db_path": stored or str(DEFAULT_DB),
-            "is_default": not bool(stored)}
+            "is_default": not bool(stored), "anchor_note": anchor_note}
 
 
 def probe(path: str) -> dict[str, Any]:

@@ -351,9 +351,32 @@ def focus_paths(paths: list[str], dims: list[str] | None,
     return focus[:budget], rest
 
 
+_FAIL_TAG = "<探针失败"
+
+
+def _is_failed(v: list[str] | None) -> bool:
+    """这条缓存是**失败占位**吗（不是真结构）。"""
+    return bool(v) and str(v[0]).startswith(_FAIL_TAG)
+
+
 async def probe_schemas(tools: list[str], *, force: bool = False) -> dict[str, list[str]]:
-    """调一次工具，把它返回的**结构骨架**（叶子路径，不含值）抽出来缓存。"""
+    """调一次工具，把它返回的**结构骨架**（叶子路径，不含值）抽出来缓存。
+
+    ⚠️ 两个必须守住的"不自欺"点（2026-10-14 服务器实测，都踩过）：
+
+    1. **工具返回 error ≠ 探到了结构**。以前只拦抛异常，于是
+       `{"error": "No data found for series 1058"}` 会被当成正常返回，
+       抽出一条叶子路径 `["error"]` 写进缓存 —— CLI 数它有 1 条就标 ✓，
+       实测 10/10 全"成功"，其中 6 个其实只有一条 error。
+       所以这里显式认 `res["error"]`，把它记成失败。
+
+    2. **不能用失败覆盖成功**。上面那 6 条失败把 22 KB 的真实结构缓存
+       （每个工具 38~161 条）覆盖成了垃圾 —— 而它是可再生的，但重建要连库。
+       所以 `force` 重探时，某工具这次失败而**旧缓存是好的**，就留旧的。
+       全军覆没且没有旧值可留时，干脆不落盘（写垃圾不如不写）。
+    """
     cache = load_schemas()
+    old = dict(cache)          # 留一份底稿，供"失败不覆盖成功"用
     todo = [t for t in tools if force or t not in cache]
     if not todo:
         return {t: cache[t] for t in tools if t in cache}
@@ -366,9 +389,20 @@ async def probe_schemas(tools: list[str], *, force: bool = False) -> dict[str, l
         try:
             fn = getattr(handle, t)
             res = await fn(**args)
+            if isinstance(res, dict) and res.get("error"):
+                # 探针参数（取自锚点）在当前库里查不到 —— 拿不到结构，记失败。
+                raise RuntimeError(str(res["error"])[:120])
             cache[t] = _leaf_paths(res if isinstance(res, dict) else {"result": res})
         except Exception as e:
-            cache[t] = [f"<探针失败：{type(e).__name__}: {str(e)[:80]}>"]
+            if force and t in old and not _is_failed(old[t]):
+                cache[t] = old[t]      # 这次没探到，但旧的还是好的 → 留旧的
+                continue
+            cache[t] = [f"{_FAIL_TAG}：{type(e).__name__}: {str(e)[:120]}>"]
+
+    # 全军覆没（且没有旧值可留）→ 不落盘，别把好缓存写成一堆失败占位
+    if todo and all(_is_failed(cache.get(t)) for t in todo):
+        return {t: cache[t] for t in tools if t in cache}
+
     SCHEMA_CACHE.write_text(json.dumps(cache, ensure_ascii=False, indent=1),
                             encoding="utf-8")
     return {t: cache[t] for t in tools if t in cache}
@@ -1088,10 +1122,11 @@ def _rebuild_schemas() -> int:
       而唯一的重建入口 `probe_schemas()` 是 `async` 且**没有 CLI**，
       所以换库清档之后没有任何一条路径会把它补回来 —— 缺口就在这里。
 
-    另一个诚实限制：探针的默认参数取自 `tasks.py` 的 GRID 常量
-    （`SERIES='2843069'` / `C9='Cloud9'`，见 `_default_args`）。
-    切到 rib / vlr 库时这两个常量查不到数据，探针会拿到 error 结构 ——
-    所以重建**成功 ≠ 结构对得上新库**。返回值里如实标出每个工具拿到几条。
+    另一个诚实限制：探针的默认参数取自 `SERIES` / `C9`，而这两个值来自
+    `anchor.py` —— 也就是 **db_config.json 的 anchor 字段**，不是 db_path。
+    锚点与当前库不符时（换库但没重算锚点），整轮探针都会扑空：
+    实测拿 rib 的 `1058` 去问 GRID 库 → `No data found for series 1058`，
+    6/10 个工具探不到。所以这里会先报锚点归属，再报每个工具拿到几条。
     """
     import db_switch
 
@@ -1102,21 +1137,31 @@ def _rebuild_schemas() -> int:
     before = load_schemas()
     print(f"  重建前缓存：{len(before)} 个工具")
 
+    # 探针参数取自锚点（SERIES / C9），锚点若与当前库不符，这一整轮都会失败 ——
+    # 先把锚点的归属说清楚，免得人只看见"6 个工具探不到"却不知为何。
+    try:
+        st = db_switch.anchor_status()
+        if st.get("stale"):
+            print(f"  ⚠️ 锚点过期：{st.get('hint')}")
+            print("     探针参数就是照锚点填的，所以它必然探不到 —— "
+                  "先 `python mve/anchor.py --refresh`。")
+    except Exception:
+        pass
+
     got = asyncio.run(probe_schemas(TOOL_NAMES, force=True))
     ok = 0
     for t in TOOL_NAMES:
         v = got.get(t) or []
-        bad = bool(v) and str(v[0]).startswith("<探针失败")
-        if v and not bad:
+        bad = _is_failed(v) or not v
+        if not bad:
             ok += 1
         head = v[0] if v else "（空）"
-        mark = "✗" if (bad or not v) else "✓"
-        print(f"  {mark} {t:28s} {len(v):>4} 条   {str(head)[:66]}")
+        print(f"  {'✗' if bad else '✓'} {t:28s} {len(v):>4} 条   {str(head)[:62]}")
     print(f"\n  重建完成：{ok}/{len(TOOL_NAMES)} 个工具拿到结构"
           f"（写到 {SCHEMA_CACHE.name}）")
     if ok < len(TOOL_NAMES):
-        print("  ⚠️ 没拿全的通常是探针默认值（GRID 的 series/队名）在新库查不到，")
-        print("     属已知限制：结构文档这时只覆盖了能跑通的工具。")
+        print("  ⚠️ 没拿全的工具，缓存里保留的是**上一次**的结构（失败不覆盖成功）；")
+        print("     换库场景下这份旧结构属于旧库，属于已知限制。")
     return 0 if ok else 1
 
 
