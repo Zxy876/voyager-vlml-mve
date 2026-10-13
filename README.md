@@ -23,7 +23,7 @@
 |---|---|---|
 | 谁出题 | 里程碑课程（它自己推进） | **人写一句想问的话** |
 | 它做什么 | 自己出题 → 自己写 SQL → 取数 | **用已积累的能力回答**（复用配方 → 回填实体值） |
-| 成败判据 | `success` = **有没有真的从 DB 取到数** | 答没答出来（取到数 + 给出回答） |
+| 成败判据 | `success` = **有没有真的从 DB 取到数**（且不是真空值，见第 21 章） | 答没答出来（取到真数 + 给出回答） |
 | 算不算分 | **不算覆盖率、不算掌握度** | **从这里开始算**覆盖率与掌握度 |
 | 判分给谁看 | 不给任何人（它自己看 DB） | **只给人看**，绝不回灌 Voyager |
 
@@ -40,21 +40,21 @@
 **与覆盖率彻底拆开**：覆盖率只是"这次答得全不全"的质量分，
 不参与"这题算不算学会"。
 
-### 当前快照（2026-10-13 14:47，服务器实跑后；完整走查见第 19 章）
+### 当前快照（2026-10-14 01:57 复测；10-13 19:24 起服务器侧重新计数）
 
 | 项 | 值 |
 |---|---|
-| 练习 `run_log.jsonl` | 59 条，其中成功 37（新后端里程碑课程） |
-| 技能库 | 41 条，**全部是 SQL 配方**（服务器侧没有旧后端的编排代码） |
-| 图谱进度 | 37 个里程碑（`loop_state.json`：种子 29 + 运行期生成，完成 37） |
-| 运行期新增能力项 | `runtime_*` 14（练习线自己生成的）+ `consume_*` 2（消费线答出来的） |
-| 撤支架考核 / 消费日志 | 服务器侧 0 / 6 条（考核线还没在服务器上跑过） |
+| 练习 `run_log.jsonl` | 45 条，其中成功 17（新后端里程碑课程） |
+| 技能库 | 19 条，**全部是 SQL 配方**；其中 6 条 10-14 真空审计后修复（见第 21 章） |
+| 图谱进度 | 17 个里程碑已解锁 |
+| 能力项总量 | 31（面板掌握度的分母，含种子题与运行期/消费期新增） |
+| 撤支架考核 / 消费日志 | 服务器侧 0 / 10 条（考核线还没在服务器上跑过） |
 | 数据源 | `vlml_rib.duckdb`（rib.gg；面板自检 9 张表 / 4 条编排提示，默认库） |
 | 面板 | <https://43.161.203.50:8443/mve/> · 9 个分区 |
 
 ⚠️ **练习线的 `success` 不等于"学会了"**：它只表示"这一轮真的从库里取到数了"。
 真实水平要看撤支架考核（`exam_log`）与消费线（`coach_log`）—— 那两条线在服务器
-上还没跑过。
+上还没跑过（考核 0 条；消费日志 10 条含两次同题复测）。
 
 ---
 
@@ -1738,7 +1738,149 @@ tail -f mve/pilot.log                              # 另一个终端看流水
 
 ---
 
-## 21. 文档索引
+## 21. 原版 Voyager 的技能↔里程碑关系，与 MVE 的同构落地
+
+用户问：「原 voyager 技能和里程碑是什么关系？我想迁移同构到我们这边来。」
+本章给出源码取证的回答、MVE 的落地对照，以及这次同构迁移**暴露并修掉的一个真偏差**
+（「真空成功」：练习线能学会、消费线答不出）。
+
+### 21.1 原版里两者是什么关系（全部有行号）
+
+**里程碑不是树，是 CurriculumAgent 的任务文本队列。**
+
+- `completed_tasks` 是一个**列表**，从 `curriculum/completed_tasks.json` 落盘恢复
+  （`voyager/agents/curriculum.py:51-57`）；`progress` property 就是
+  `len(self.completed_tasks)`（`curriculum.py:134-135`）—— **没有预建的技能树，
+  进度 = 做完了几道题**。
+- `update_exploration_progress(info)`：`info["success"]` 为真时把任务文本
+  `append` 进 `completed_tasks`（`curriculum.py:332-339`），失败进 `failed_tasks`。
+- `propose_next_task()` 由 LLM 根据"已完成的任务 + 当前环境状态"生成下一道题
+  （`voyager.py:335`）—— **题目是现想的，不是从树上下发的**。
+
+**技能是一次成功 rollout 的产物，入库形态是代码 + 一句话描述。**
+
+- `add_new_skill(info)`：`program_code`（完整 JS 源码）+ LLM 生成的
+  `skill_description`，`vectordb.add_texts(texts=[skill_description],
+  ids=[program_name])` 进 Chroma（`agents/skill.py:64-76`）；
+  **同名 → Rewriting**（先 `delete` 再 `add`，`skill.py:74-76`）。
+- `retrieve_skills(query)`：`similarity_search_with_score(query, k=k)`
+  按文本相似度取回，**拿回来的是 code**（`skill.py:117-129`）。
+
+**两者的连接点只有主循环里那两行**（`voyager.py:369-372`）：
+
+```python
+if info["success"]:
+    self.skill_manager.add_new_skill(info)      # 解法进技能库
+self.curriculum_agent.update_exploration_progress(info)   # 任务文本进里程碑
+```
+
+而检索发生在 rollout 之前：`skills = self.skill_manager.retrieve_skills(
+query=self.context)`（`voyager.py:195`）—— **检索键是任务文本，没有任何
+topic_id 路由层**。
+
+所以原版的关系是：**技能和里程碑不是"挂靠"，是同一件事的两种记账**——
+任务文本进了 `completed_tasks`（里程碑），这道题的解法进了技能库（技能），
+下一轮出题时又用任务文本把解法检索回来。 Milestone 回答"学到哪了"，
+skill 回答"会了什么"，中间靠**文本**握手，不靠 ID。
+
+### 21.2 MVE 的同构落地
+
+| 原版（行号） | MVE 落地 | 差异与理由 |
+|---|---|---|
+| `completed_tasks` 列表 + `progress=len()`（`curriculum.py:134`） | `mve/run_log.jsonl` + `loop_state.json` 的 `progress` | 同一语义；额外落盘是为了面板可读 |
+| `program_code`（JS 源码） | 技能库的 `code` 字段 = **一整条 SQL 配方** | VLML 世界里"代码"就是取数 SQL |
+| `skill_description`（LLM 生成） | `text` 字段（一句话方法） | 同构；MVE 的 text 带题面，检索键更实 |
+| Chroma 向量检索，键 = 任务文本（`skill.py:122`） | `skill_store.retrieve(topic, question)`：词面 Jaccard 相似 + topic 预过滤 | 无向量库环境的近似；**topic 只做预过滤不当路由**（防尺子拿错） |
+| 同名 Rewriting（`skill.py:74-76`） | `add()` 的 `rewritten` 分支（`DUP_THRESHOLD=0.62`，`skill_store.py:223-250`） | 同构；且**源码变了必须更新**（`stale_code` 旁路，`skill_store.py:231`） |
+| critic = LLM 看 events 判 success（`critic.py:119-137`） | `VLMLCriticAgent.check_task_success`：**可枚举的 DB 取证**（工具 ok + 行数 + 真实值） | **故意不用 LLM**：VLML 的成败由库里有没有数说了算，不由另一个模型的态度说了算 |
+| `qa_cache` 问句 embedding 检索（阈值 0.05） | `_same_question` 防尺子拿错 + `coach` 的 qa 缓存 | 同构 |
+
+### 21.3 同构迁移暴露的真偏差：「真空成功」
+
+**现象**（2026-10-14 用户报，附图）：练习线能学会答出
+「在 'Split' 地图上，G2 Esports 队在赢得首血之后，平均每回合能赢下多少比例的回合？
+请同时给出样本量。」，但面板上消费能力时答不出——答的是「胜率 0%、样本量 0」。
+真实答案（SQL 实查验证）：**100%、样本量 7**。
+
+**根因链**（四步，全部服务器实测）：
+
+1. 练习线曾把坏配方固化成技能：`vlml_fb_conversion` 的 SQL 查
+   `agg_team_round_summary`——该表在 rib 库 **0 行**；
+2. 纯聚合 SQL（无 GROUP BY）在空表上**照样返回 1 行 `(NULL, 0)`** →
+   `rows=1 ≥ min_rows=1` 骗过 `check_task_success` → 记 `success=True` →
+   坏配方进库（且口径本来就是错的：算的是"第 1 回合胜率"，不是"首血后胜率"）；
+3. 消费线检索正确挑中它（sim=0.825 最高）→ `_refill_sql` 复用 → 真空结果 →
+   旧降级判据 `any(o.get("ok"))` 不触发 → 叙事基于真空值 → 答出 0%/0；
+4. `_absorb` 还会把真空答案沉淀成**新**技能（`fb_conversion_analysis`
+   就是这么来的，它查的 `agg_first_blood_stats` 同样是 0 行）。
+
+**为什么原版没这个坑**：原版 critic 是 **LLM 看 events 判「任务到底做成没有」**
+（`critic.py:119` 的 `check_task_success` 收 events 让模型判）。MVE 的 critic
+刻意可枚举（无 LLM），就必须把「取到数」的定义从「工具 ok 且行数 ≥ 1」
+**收紧到「至少有一个真实值」**——全 NULL、或除了 0 之外全 NULL 的结果，
+等于没取到数（`critic.is_vacuous` / `has_real_data`，bool 先挡，因为 Python 的
+bool 是 int 子类）。
+
+**修复清单**（两个 commit：`986d6a4` 判据层、`4ad344f` 裁判侧）：
+
+| 位置 | 修法 |
+|---|---|
+| `critic.check_task_success` | 加第三条判据 `real = any(has_real_data(o))`；真空时 critique 引导换表/放宽 WHERE，照旧回灌 `action.solve` 的下一轮迭代 |
+| `consume.py` 降级判据 | `any(o.get("ok"))` → `any(has_real_data(o))`：配方回填后取到真空值 → 降级为现场写 SQL |
+| `consume.py` ④⑤⑥⑦ + `_absorb` | 事实整理 / 裁判 / 方法比对（裁判侧同样查真空）/ 叙事两处 / 沉淀，**全部只认真数** |
+| `consume.py` 覆盖率段 | 没有真实来源 → 如实 skipped，不拿真空行算覆盖率 |
+| `_referee_observations` | 不再把「最后一次 ok 调用」硬编码 `ok=True` 重新打包——真空结果会被洗成成功观察，绕过裁判侧判据 |
+| result dict | 披露 `real_rows` 与 `vacuous`，面板能区分「调用了」和「取到数了」 |
+
+**技能库审计**（`audit_skills.py`，换库后必跑）：19 条技能逐条对 rib 库实跑，
+**6 条真空**。处置：
+
+- 4 条换成已验证 SQL：`vlml_fb_conversion` / `fb_conversion_analysis`
+  （→ 100%/n=7）、`vlml_map_pool`（→ TL 在 Abyss 0 胜 1 场，诚实答案）、
+  `vlml_adr`（→ G2 防守 ADR 133.2，n=10；原 SQL 的"最近 5 场"子查询把 G2 唯一
+  series 滤掉了）；
+- 2 条死实体技能（`series_totals` / `vlml_side_conversion`，写死 Cloud9，
+  已不在 rib 库）：修**模式与口径 bug**（`=` 子查询多场次会报错改 `IN`；
+  `attack_side_conversions` 原等于 `attack_rounds` 是假指标，改真实转换率 +
+  DISTINCT 回合数），实体字面量保留——消费线 `_refill_sql` 按问句回填，
+  库里没这支队时新闸门诚实降级，不再假装答出。
+
+**实测结果**（服务器，同题复测两次）：
+
+| 轮次 | 回答 | 覆盖率 |
+|---|---|---|
+| 修复前 | 胜率 0%、样本量 0（真空叙事） | 假绿（真空行骗过判据） |
+| 修复后 | **100%、样本量 7** | **1.0（裁判独立取到数，两边口径一致）** |
+
+### 21.4 诚实的限制
+
+1. **裁判侧与练习线仍受 glm-4-flash 的能力上限**：实测裁判 3 轮迭代都无视
+   schema 里「0 行 · 空表，别查」的标注，`vlml_streak` 练习 3 连败全是
+   Binder Error（`team_name`/`round_won` 列不存在，candidate bindings 给了也不改）。
+   这是**先于本次改动存在**的系统性局限（44 轮里 27 败，10 个 topic 各 3 连败），
+   本次修复不假装解决了它——真空闸门保证的是"失败如实报失败"，
+   不是"模型一定能写对 SQL"。
+2. 修复后消费线若复用到死实体技能（Cloud9），会走「回填 → 真空 → 降级 →
+   现场写 → 仍真空 → 如实说没数据」，**答案从"假的 0%"变成"诚实的无数据"**。
+3. 判据收紧的代价：练习线再也不会把"查了空表"记成 success——这是目的，
+   但意味着**进度会变慢**（以前假成功的轮次现在算失败）。
+
+### 21.5 复现方式
+
+```bash
+# 真空检测器单测（22 项：真空/真数/布尔/report 形态/混合调用）
+python test_vacuum.py
+
+# 技能库真空审计（换数据源后必跑；服务器：.venv/bin/python audit_skills.py）
+python audit_skills.py
+
+# 消费线同题复测（期望：100%/n=7 + 覆盖率 1.0）
+#   服务器：.venv/bin/python run_consume_test.py
+```
+
+---
+
+## 22. 文档索引
 
 | 文档 | 内容 |
 |---|---|
