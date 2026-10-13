@@ -359,8 +359,20 @@ def _is_failed(v: list[str] | None) -> bool:
     return bool(v) and str(v[0]).startswith(_FAIL_TAG)
 
 
-async def probe_schemas(tools: list[str], *, force: bool = False) -> dict[str, list[str]]:
+async def probe_schemas(tools: list[str], *, force: bool = False,
+                        stats: dict[str, list[str]] | None = None
+                        ) -> dict[str, list[str]]:
     """调一次工具，把它返回的**结构骨架**（叶子路径，不含值）抽出来缓存。
+
+    `stats`（可选）回填本轮的真实结果，三个桶：
+      `probed_ok` 本轮真探到的 / `failed` 本轮失败且无旧值可留 /
+      `retained` 本轮失败、**沿用了旧缓存**（换库场景下这份是旧库的结构）。
+
+    ⚠️ 为什么必须把 `retained` 单独分出来（2026-10-14 实测，我自己踩的）：
+      「失败不覆盖成功」保住了好数据，但如果调用方只看"有没有值"来判成功，
+      沿用的旧值会被当成"本轮拿到了" —— 实测打出 `✓ match_analysis_report 61 条`，
+      而那 61 条是**旧库**的旧上限（60）探出来的，本轮其实失败了，
+      新库真实是 306 条。✓ 把"沿用"说成了"拿到"，是标准的自欺。
 
     ⚠️ 两个必须守住的"不自欺"点（2026-10-14 服务器实测，都踩过）：
 
@@ -381,6 +393,11 @@ async def probe_schemas(tools: list[str], *, force: bool = False) -> dict[str, l
     if not todo:
         return {t: cache[t] for t in tools if t in cache}
 
+    if stats is not None:
+        stats.clear()
+        for k in ("probed_ok", "retained", "failed"):
+            stats.setdefault(k, [])
+
     handle = MCPHandle()
     for t in todo:
         # 按**真实签名**填默认参数：series_id / series_ids / team_name 各自不同，
@@ -393,11 +410,17 @@ async def probe_schemas(tools: list[str], *, force: bool = False) -> dict[str, l
                 # 探针参数（取自锚点）在当前库里查不到 —— 拿不到结构，记失败。
                 raise RuntimeError(str(res["error"])[:120])
             cache[t] = _leaf_paths(res if isinstance(res, dict) else {"result": res})
+            if stats is not None:
+                stats["probed_ok"].append(t)
         except Exception as e:
             if force and t in old and not _is_failed(old[t]):
                 cache[t] = old[t]      # 这次没探到，但旧的还是好的 → 留旧的
+                if stats is not None:
+                    stats["retained"].append(t)
                 continue
             cache[t] = [f"{_FAIL_TAG}：{type(e).__name__}: {str(e)[:120]}>"]
+            if stats is not None:
+                stats["failed"].append(t)
 
     # 全军覆没（且没有旧值可留）→ 不落盘，别把好缓存写成一堆失败占位
     if todo and all(_is_failed(cache.get(t)) for t in todo):
@@ -1148,21 +1171,31 @@ def _rebuild_schemas() -> int:
     except Exception:
         pass
 
-    got = asyncio.run(probe_schemas(TOOL_NAMES, force=True))
-    ok = 0
+    stats: dict[str, list[str]] = {}
+    got = asyncio.run(probe_schemas(TOOL_NAMES, force=True, stats=stats))
+    probe_ok = set(stats.get("probed_ok") or [])
+    retained = set(stats.get("retained") or [])
+
     for t in TOOL_NAMES:
         v = got.get(t) or []
-        bad = _is_failed(v) or not v
-        if not bad:
-            ok += 1
+        if t in probe_ok:
+            mark = "✓"        # 本轮真探到的
+        elif t in retained:
+            mark = "~"        # 本轮失败，沿用了旧值（换库时这份属于旧库）
+        else:
+            mark = "✗"        # 没有结构可用
         head = v[0] if v else "（空）"
-        print(f"  {'✗' if bad else '✓'} {t:28s} {len(v):>4} 条   {str(head)[:62]}")
-    print(f"\n  重建完成：{ok}/{len(TOOL_NAMES)} 个工具拿到结构"
-          f"（写到 {SCHEMA_CACHE.name}）")
-    if ok < len(TOOL_NAMES):
-        print("  ⚠️ 没拿全的工具，缓存里保留的是**上一次**的结构（失败不覆盖成功）；")
-        print("     换库场景下这份旧结构属于旧库，属于已知限制。")
-    return 0 if ok else 1
+        print(f"  {mark} {t:28s} {len(v):>4} 条   {str(head)[:58]}")
+
+    n_ok, n_ret = len(probe_ok), len(retained)
+    print(f"\n  重建完成：{n_ok}/{len(TOOL_NAMES)} 个工具**本轮探到**"
+          + (f"；{n_ret} 个沿用旧缓存" if n_ret else "")
+          + f"（写到 {SCHEMA_CACHE.name}）")
+    print("  ✓ 本轮探到  ~ 本轮失败、沿用了旧值  ✗ 无结构")
+    if n_ret:
+        print(f"  ⚠️ 沿用的 {n_ret} 个是**旧库**的结构（失败不覆盖成功保下来的）："
+              "比空强，但对新库来说可能是错的路径。")
+    return 0 if n_ok else 1
 
 
 def _main() -> int:

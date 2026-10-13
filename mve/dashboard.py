@@ -2471,12 +2471,14 @@ class Handler(BaseHTTPRequestHandler):
                                  "--rebuild-schemas"],
                                 capture_output=True, timeout=300)
                             if _r3.returncode == 0:
-                                detail["工具结构"] = "已按新库重建"
+                                detail["工具结构"] = (
+                                    "已按新库重建（CLI 输出里 ~ 标记的是"
+                                    "本轮失败、沿用了旧库结构）")
                             else:
-                                detail["工具结构"] = ("重建没拿全（探针默认值是 GRID 的 "
-                                                      "series/队名，新库查不到），手动跑："
-                                                      "python mve/action_code.py "
-                                                      "--rebuild-schemas")
+                                detail["工具结构"] = (
+                                    "本轮一个都没探到（探针参数取自锚点，锚点不在"
+                                    "新库里就会整轮扑空）；缓存留的是旧库结构。手动跑："
+                                    "python mve/action_code.py --rebuild-schemas")
                     except Exception:
                         detail["顺带"] = "清档失败（数据库已切换）"
                 # 切完之后**再核一遍**：refresh 是"按库重挑"，anchor_status 是
