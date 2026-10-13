@@ -1180,7 +1180,17 @@ python mve/exam.py --final                # 结业考（要技能库非空，不
 python mve/reset_all.py               # 先备份到 mve/_backup_<时间戳> 再清
 python mve/reset_all.py --dry-run     # 只看会清什么
 python mve/reset_all.py --force       # 循环还在跑也硬清（不推荐）
+python mve/reset_all.py --db-switch   # 换库清档：额外清旧库派生缓存（见下）
 ```
+
+⚠️ **换库清档（面板「数据源与数据库 → □ 切换后清档」）走的是 `--db-switch`
+模式**：在 19 项之外**额外清** `entity_catalog.json` / `tool_schemas.json`
+—— 这两份是从旧库**派生**的，旧库的队名 / 图名 / series_id 在新库里查不到
+（rib 库的 team 是 LOUD / NRG，GRID 库是 Cloud9，两边对不上），留着它们
+出题器就会选出"在新库里查不到"的题。清完之后 `/api/db/switch` 会**自动按
+新库重查**实体清单（`entity_catalog.py` 自己读 `db_config.json`，此时它已
+指向新库）—— 清而不补的话出题器连可填值都没了。普通清库（库没换）这两份
+**保留**，行为不变。
 
 ⚠️ **为什么单列这一节**：原先只清 10 个文件，而 `mve/` 下真实存在的状态文件是
 **20 个**。漏掉的那批里 `topic_mastery.jsonl` 最要命 —— 它记的是「哪些节点
