@@ -1174,6 +1174,64 @@ python mve/exam.py --progress             # 按题的学习进程
 python mve/exam.py --final                # 结业考（要技能库非空，不覆盖摸底基线）
 ```
 
+### 清库：清什么、不清什么（2026-10-13 补齐）
+
+```bash
+python mve/reset_all.py               # 先备份到 mve/_backup_<时间戳> 再清
+python mve/reset_all.py --dry-run     # 只看会清什么
+python mve/reset_all.py --force       # 循环还在跑也硬清（不推荐）
+```
+
+⚠️ **为什么单列这一节**：原先只清 10 个文件，而 `mve/` 下真实存在的状态文件是
+**20 个**。漏掉的那批里 `topic_mastery.jsonl` 最要命 —— 它记的是「哪些节点
+已经规划过了」，`select_next` 据此排除，不清就等于**课程永远跑不完**。
+隔离模拟实测（不碰生产数据）：
+
+| | 清库后（原先） | 把 mastery 也清了 |
+|---|---|---|
+| 内存图谱节点 | 61（种子 29 + 注入 32） | 61 |
+| MasteryStore | 87 行 / **79 completed** | 空 |
+| `select_next()` | **`exhausted=True`**，topic_id 空 | `vlml_grain_event` ✅ |
+
+也就是清库之后 Voyager **不是从零开始学**，而是判定"课程已经跑完了"
+（"范围内无「可拿下」任务：完成 55 / 卡死 8"），只能不断生成新题。
+
+**清 19 项**，分三组：
+
+| 组 | 文件 | ★ = 本轮补 |
+|---|---|---|
+| 学习进度 | `skill_store.json`、`topic_mastery.jsonl`★、`runtime_topics.json`★、`generated_tasks.json`★、`pending_dimensions.json`★、`imported_links.json`★、`knowledge_graph.json`★ | |
+| 曲线与记录 | `run_log.jsonl`、`coach_log.jsonl`、`exam_log.jsonl`、`causal_timeline.jsonl`、`mastery_retention.jsonl`、`referee_store.json`、`referee_judge_store.json`★、`learn.log` | |
+| 进程状态 | `pilot.log`、`pilot_state.json`、`loop_state.json`★、`voyager_pilot_state.json`★ | |
+
+**有意不清**（不是学习状态，清了要人重配 / 是审计线索）：
+`db_config.json`（指向哪个库）、`entity_catalog.json` + `tool_schemas.json`
+（数据源派生，跟着库走）、`subjects.json`（人填的学科登记册）、
+`practice_scope.json`（人设的练习范围）、`ui_events.jsonl`（人的操作日志，
+**清档这个动作自己也要往里写一条**，清了就查不到"什么时候清过档"）。
+
+**两道闸**：
+
+1. **清档前检查有没有进程还在写这些文件** —— 循环继续跑的话，清完它下一轮
+   立刻把 `mastery` / `runtime_topics` / `run_log` 全写回去，清了等于没清，
+   还会留下"清了一半"的脏状态。判据是 `loop_state` / `pilot_state` /
+   `voyager_pilot_state` 的 `running` 位。
+2. **`running=true` 还要核 pid 是不是真活着**（判据同构
+   `voyager_pilot.read()`，`voyager_pilot.py:139`）。实测服务器上
+   `voyager_pilot_state.json` 是**僵尸**：`running=true`、`why=学习中`、
+   `started_at` 停在两天前、`pid 2817783` 进程早没了。只信 `running` 位的话
+   这个僵尸会让清档**永远被拒**；而面板那边已经核过 pid、显示"空闲"，
+   两处行为必须一致，否则会出现"面板说空闲、清档却说在跑"。
+
+面板两个入口（`/api/reset`、`/api/db/switch` 的"顺带清档"）原先都**丢弃**
+`reset_all` 的返回码、一律报成功 —— 被守卫拒绝时前端照样显示"已清库（已备份）"。
+已改成看返回码，非 0 报 409。
+
+⚠️ **与 Voyager（MC 真实学习）那侧保持独立**（用户 2026-10-13 定）：
+`/root/voyager/ckpt` 的 `skill` / `curriculum` / `events` 由 `mve/voyager_learn_reset.py`
+管，面板「MC 真实学习」页有自己的「清库 / 清记忆」两个按钮。两侧各管各的；
+想一次归零就两个都点。
+
 | 开关 | 默认 | 作用 |
 |---|---|---|
 | `MVE_ACTION_CODE` | 1 | 代码化取证（仅工具路径类题生效） |
@@ -1205,6 +1263,69 @@ python mve/exam.py --profile        # 裸考画像（撤图谱的真实水平）
 验"是不是真会用能力"的关键一条：**打印里 `用能力` 那行**。
 `复用配方` 才是用了积累；`现场现做` 是还没学会（这是如实标注，不是失败）。
 再问同一类问题一次，第二次应当变成 `复用配方` —— 那就是能力在增长。
+
+### 清库：清什么、不清什么（2026-10-14 补齐）
+
+```bash
+python mve/reset_all.py            # 先备份到 mve/_backup_<时间戳> 再清
+python mve/reset_all.py --dry-run  # 只看会清什么
+python mve/reset_all.py --force    # 循环还在跑也硬清（不推荐）
+```
+
+**原先只清 10 个文件，`mve/` 下真实存在的状态文件是 20 个。** 漏掉的那批里
+`topic_mastery.jsonl` 最要命 —— 它记着「哪些节点已经规划过了」，`select_next`
+据此排除，不清就等于**课程永远跑不完**：
+
+| | 清库后（原先） | 把 mastery 也清了 |
+|---|---|---|
+| 内存图谱节点 | 61（种子 29 + 从 `runtime_topics.json` 注入 32） | 61 |
+| MasteryStore | 87 行 / **79 条 completed** | 空 |
+| `select_next()` | **`exhausted=True`**，topic_id 空 | `vlml_grain_event`（`reason=curriculum_order`） |
+
+也就是清库之后 Voyager **不是从零开始学**，而是判定"课程已经跑完了"
+（"范围内无「可拿下」任务：完成 55 / 卡死 8"），只能不断生成新题。
+
+**清 19 项**（★ = 本轮补的 9 项）：
+
+| 组 | 文件 |
+|---|---|
+| 学习成果 | `skill_store.json`、★`topic_mastery.jsonl`、★`runtime_topics.json`、★`generated_tasks.json`、★`pending_dimensions.json`、★`imported_links.json`、★`knowledge_graph.json` |
+| 曲线与记录 | `run_log.jsonl`、`coach_log.jsonl`、`exam_log.jsonl`、`causal_timeline.jsonl`、`mastery_retention.jsonl`、`referee_store.json`、★`referee_judge_store.json`、`learn.log` |
+| 进程状态 | `pilot.log`、`pilot_state.json`、★`loop_state.json`、★`voyager_pilot_state.json` |
+
+**有意不清**（不是学习成果，清了要人重配），清档时会打印出来给人看：
+`db_config.json`（指向哪个库）、`entity_catalog.json` + `tool_schemas.json`
+（数据源派生，跟着库走）、`subjects.json`（人填的学科登记册）、
+`practice_scope.json`（人设的练习范围）、`ui_events.jsonl`（人的操作日志）。
+
+**两道闸**：
+
+1. **清档前检查有没有进程还在写这些文件**。循环继续跑的话，清完它下一轮
+   立刻把 `mastery` / `runtime_topics` / `run_log` 全写回去 —— 清了等于没清，
+   还会留下"清了一半"的脏状态。
+2. **`running=true` 还要核 pid 是不是真活着**（判据同构 `voyager_pilot.read()`
+   `voyager_pilot.py:139`）。服务器实测 `voyager_pilot_state.json` 是**僵尸**：
+   `running=true`、`why=学习中`、`started_at` 停在两天前、`pid 2817783` 进程早没了。
+   只信 `running` 位的话这个僵尸会让清档**永远被拒**；面板那边已经核过 pid
+   所以显示"空闲"，两处必须一致，否则会出现"面板说空闲、清档却说在跑"。
+
+守护的四种情形（隔离副本实测）：
+
+| 状态文件 | `_running()` | 清档 |
+|---|---|---|
+| `running=false` | 空 | 放行 |
+| 僵尸：`running=true` + pid 已死 | 空 | 放行 |
+| 真在跑：`running=true` + pid 活着 | 非空 | **拒绝（返回 1）** |
+| 没有 pid 字段（`loop_state.json` 那种） | 非空 | 拒绝（保守） |
+
+面板两个入口（`/api/reset`、`/api/db/switch` 的"顺带清档"）原先都**丢弃**
+`reset_all` 的返回码、一律报成功 —— 被守卫拒绝时前端照样显示"已清库（已备份）"。
+已改成看返回码，非 0 报 409 / "已拒绝清档"。
+
+⚠️ **与 Voyager（MC 真实学习）那侧保持独立**（用户 2026-10-14 定）：
+`/root/voyager/ckpt` 的 `skill` / `curriculum` / `events` 由
+`mve/voyager_learn_reset.py` 管，面板「MC 真实学习」页有自己的
+「清库 / 清记忆」两个按钮。两侧各管各的，想一次归零就两个都点。
 
 ---
 
