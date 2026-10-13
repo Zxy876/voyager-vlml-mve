@@ -61,6 +61,9 @@
     python mve/reset_all.py --dry-run  # 只看会清什么
     python mve/reset_all.py --no-backup
     python mve/reset_all.py --force    # 循环还在跑也硬清（不推荐）
+    python mve/reset_all.py --db-switch  # 换库清档：额外清旧库派生缓存
+                                         # （entity_catalog / tool_schemas ——
+                                         #   旧库的队名/图名在新库查不到）
 """
 
 from __future__ import annotations
@@ -124,6 +127,18 @@ KEEP = [
     ("ui_events.jsonl", "人的操作日志"),
 ]
 
+# ⚠️ 换库清档（--db-switch）要**额外**清的：这三份是从库里**派生**的缓存，
+#    库换了它们就是毒药 —— 旧库的队名 / 图名 / series_id 会让出题器选出
+#    在新库里查不到的题（实测踩过：rib 库的 team 是 LOUD / NRG，GRID 库
+#    是 Cloud9，两边根本对不上）。普通清库（库没换）它们留着没问题，
+#    所以不在主 TARGETS 里，只在换库清档时进 TARGETS。
+#    entity_catalog.json 清掉之后由 /api/db/switch 顺手重跑
+#    `entity_catalog.py` 按新库重查 —— 清而不补的话出题器连可填值都没了。
+DB_DERIVED = [
+    ("entity_catalog.json", "实体可填值清单（旧库实查的，换库后旧值全错）"),
+    ("tool_schemas.json", "工具 schema 缓存（新库的表名/列名可能变）"),
+]
+
 # 清档前必须确认没人还在写这些文件 —— 循环继续跑的话，
 # 清完它下一轮立刻把 mastery / runtime_topics / run_log 全写回去，清了等于没清。
 _RUNNING_FILES = [
@@ -185,20 +200,26 @@ def main() -> int:
     dry = "--dry-run" in argv
     backup = "--no-backup" not in argv
     force = "--force" in argv
+    # 换库清档：额外清掉从旧库派生的缓存（entity_catalog / tool_schemas）
+    db_switch = "--db-switch" in argv
+    targets = list(TARGETS) + (DB_DERIVED if db_switch else [])
 
     print("=" * 68)
-    print("  MVE 清档" + ("（DRY RUN，不会真的删）" if dry else ""))
+    print("  MVE 清档" + ("（DRY RUN，不会真的删）" if dry else "")
+          + ("（换库模式：额外清旧库派生缓存）" if db_switch else ""))
     print("=" * 68)
 
-    existing = [(name, desc) for name, desc in TARGETS if (ROOT / name).exists()]
+    existing = [(name, desc) for name, desc in targets if (ROOT / name).exists()]
     for name, desc in existing:
         size = (ROOT / name).stat().st_size
         print(f"  {name:26s} {size:>9,} B   {desc}")
-    missing = [n for n, _ in TARGETS if not (ROOT / n).exists()]
+    missing = [n for n, _ in targets if not (ROOT / n).exists()]
     if missing:
         print(f"  （本来就不存在：{', '.join(missing)}）")
 
-    keep_here = [n for n, _ in KEEP if (ROOT / n).exists()]
+    keep_here = [n for n, _ in KEEP
+                 if (ROOT / n).exists()
+                 and not (db_switch and n in {k for k, _ in DB_DERIVED})]
     if keep_here:
         print(f"\n  有意保留（不是学习成果）：{', '.join(keep_here)}")
 

@@ -2162,7 +2162,7 @@ async function dbSwitch(){
   const p=document.getElementById('dbPath').value.trim();
   const reset=document.getElementById('dbReset')?.checked;
   if(!confirm((p?('切换到：'+p):'回到默认库')
-      +(reset?'，并清空全部学习数据':'')
+      +(reset?'，并清空全部学习数据（含旧库派生的实体清单 / schema 缓存，清完自动按新库重查实体）':'')
       +'\n\n切换后需要重启面板进程才生效。继续？')) return;
   b.disabled=true;
   try{
@@ -2172,7 +2172,13 @@ async function dbSwitch(){
     const hit=document.getElementById('dbHit');
     hit.className='hit';
     hit.innerHTML = d.ok
-      ? `<b>已写入配置</b>：${ESC(d.db_path)}<br>现在请重启面板进程：
+      ? `<b>已写入配置</b>：${ESC(d.db_path)}`
+        +(d.reset_detail
+          ? `<br><span class="mono">${ESC(Object.entries(d.reset_detail)
+              .filter(([k])=>k!=='切换到'&&k!=='说明')
+              .map(([k,v])=>k+'：'+v).join(' · '))}</span>`
+          : '')
+        +`<br>现在请重启面板进程：
          <span class="mono">lsof -ti:8777 | xargs kill; python mve/dashboard.py</span>`
       : `<b>失败：</b>${ESC(d.error||'未知')}`;
     await load();
@@ -2426,17 +2432,33 @@ class Handler(BaseHTTPRequestHandler):
                 if payload.get("reset"):
                     try:
                         import subprocess
+                        # ⚠️ 带 --db-switch：换库清档要**额外**清掉旧库派生的
+                        #   entity_catalog / tool_schemas —— 旧库的队名/图名/
+                        #   series_id 会让出题器选出在新库里查不到的题。
                         _r = subprocess.run(
-                            [sys.executable, str(ROOT / "reset_all.py")],
-                            capture_output=True, timeout=60)
+                            [sys.executable, str(ROOT / "reset_all.py"), "--db-switch"],
+                            capture_output=True, timeout=180)
                         # ⚠️ 返回码必须看：循环还在跑时 reset_all 会拒绝清档（返回 1），
                         #   以前一律写"已清档"，人以为清了其实一个文件都没删。
-                        detail["顺带"] = ("已清档" if _r.returncode == 0
+                        detail["顺带"] = ("已清档（含旧库派生缓存）" if _r.returncode == 0
                                           else "已拒绝清档（还有任务在跑，请先停止）")
+                        if _r.returncode == 0:
+                            # 清而不补的话出题器连可填值都没有：按**新库**重查
+                            # 实体清单（entity_catalog.py 自己读 db_config.json，
+                            # 此时它已指向新库）。
+                            _r2 = subprocess.run(
+                                [sys.executable, str(ROOT / "entity_catalog.py")],
+                                capture_output=True, timeout=180)
+                            if _r2.returncode == 0:
+                                detail["实体清单"] = "已按新库重查"
+                            else:
+                                detail["实体清单"] = ("重查失败，手动跑："
+                                                      "python mve/entity_catalog.py")
                     except Exception:
                         detail["顺带"] = "清档失败（数据库已切换）"
                 ui_events.append(ui_events.DB_SWITCH, detail=detail, result="ok")
-                self._json(200, {**res, "need_restart": True})
+                self._json(200, {**res, "need_restart": True,
+                                 "reset_detail": detail})
             except Exception as e:
                 self._json(500, {"ok": False, "error": f"{type(e).__name__}: {e}"[:300]})
             return
