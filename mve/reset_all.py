@@ -66,6 +66,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 from datetime import datetime
@@ -132,18 +133,49 @@ _RUNNING_FILES = [
 ]
 
 
+def _pid_alive(pid: object) -> bool:
+    """这个 pid 还活着吗（信号 0 = 只探活，不发信号）。"""
+    if not isinstance(pid, int) or pid <= 0:
+        return True          # 没有 pid 可核 → 保守：当作在跑
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False         # 进程没了
+    except PermissionError:
+        return True          # 进程在但没权限发信号 → 算活着
+    except OSError:
+        return True
+
+
 def _running() -> list[str]:
-    """还在跑的东西（读状态文件，不 import pilot —— 本脚本要能独立跑）。"""
+    """还在跑的东西（读状态文件 + 核 pid，不 import pilot —— 本脚本要能独立跑）。
+
+    ⚠️ 为什么光读 `running` 不够，还得核 pid：
+      状态文件里的 `running` 是进程**自己写**的，进程被 `kill -9` 或被
+      OOM 杀掉之后，没人把它改回 false。实测（服务器 2026-10-13）：
+
+        voyager_pilot_state.json → running=true、why="学习中"、
+        started_at 是**两天前**、pid 2817783 早就不存在了。
+
+      只信 `running` 的话，这个僵尸状态会让清档**永远被拒**（面板上
+      「MC 真实学习」那个 tab 也永远显示"学习中"）。
+      所以 running=true 之后还要看 pid 是不是真活着；pid 没了 = 僵尸，不算在跑。
+    """
     out: list[str] = []
     for name, label in _RUNNING_FILES:
         p = ROOT / name
         if not p.exists():
             continue
         try:
-            if json.loads(p.read_text(encoding="utf-8")).get("running"):
-                out.append(f"{label}（{name}）")
+            d = json.loads(p.read_text(encoding="utf-8"))
         except Exception:
-            pass
+            continue
+        if not d.get("running"):
+            continue
+        if not _pid_alive(d.get("pid") or d.get("child_pid")):
+            continue          # 僵尸状态：进程早没了，只是没人改回 false
+        out.append(f"{label}（{name}）")
     return out
 
 
