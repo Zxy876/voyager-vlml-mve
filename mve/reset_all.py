@@ -134,18 +134,19 @@ _RUNNING_FILES = [
 
 
 def _pid_alive(pid: object) -> bool:
-    """这个 pid 还活着吗（信号 0 = 只探活，不发信号）。"""
+    """这个 pid 还活着吗（信号 0 = 只探活，不发信号）。
+
+    判据同构 `voyager_pilot.read()`（`voyager_pilot.py:139`）——
+    面板那边就是这么把"僵尸 running"识别掉的，两处行为必须一致，
+    否则会出现"面板说空闲、清档却说在跑"这种对不上的情况。
+    """
     if not isinstance(pid, int) or pid <= 0:
         return True          # 没有 pid 可核 → 保守：当作在跑
     try:
         os.kill(pid, 0)
         return True
-    except ProcessLookupError:
-        return False         # 进程没了
-    except PermissionError:
-        return True          # 进程在但没权限发信号 → 算活着
-    except OSError:
-        return True
+    except (ProcessLookupError, ValueError, PermissionError, OSError):
+        return False
 
 
 def _running() -> list[str]:
