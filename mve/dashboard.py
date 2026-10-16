@@ -38,6 +38,101 @@ import pilot  # noqa: E402
 ROOT = Path(__file__).resolve().parent
 
 
+# --- 知识图谱自检：避免 git pull 丢 json / 换库后反复 "not built" ---
+import threading as _threading
+
+_graph_build_lock = _threading.RLock()
+
+
+def _do_build_graph():
+    """在持有 _graph_build_lock 的前提下重建并落盘（不自带锁，调用方负责）。"""
+    import knowledge_graph as kg
+    # build() 内 `from tasks import TASKS` 需要仓库根；面板只注入了 mve/
+    _repo_root = str(ROOT.parent)
+    if _repo_root not in sys.path:
+        sys.path.insert(0, _repo_root)
+    g = kg.build()
+    g.save()
+    return g
+
+
+def _ensure_knowledge_graph(verbose: bool = True) -> bool:
+    """启动自检：图谱缺失或过期就就地重建。
+
+    过期判据 = schema_version + 题指纹 + 建模文档指纹（复用 knowledge_graph._stale）
+    + 默认 duckdb 比图谱新（换库）。这样 pull 丢掉的被 gitignore 的 json、
+    以及换库后内容过期都会自动重建，不再需要人工跑 --build。重建失败不影响启动。
+    """
+    try:
+        import knowledge_graph as kg
+    except Exception as e:
+        if verbose:
+            print(f"[图谱自检] 无法导入 knowledge_graph：{type(e).__name__}: {e}")
+        return False
+
+    gp = kg.GRAPH_PATH
+    need, reason = True, "未知"
+    if gp.exists() and gp.stat().st_size > 0:
+        try:
+            raw = json.loads(gp.read_text(encoding="utf-8", errors="replace"))
+            need = kg._stale(raw)
+            reason = "schema/题/建模文档指纹过期" if need else ""
+            if not need:
+                # 换库检测：默认 duckdb 比图谱新 → 过期
+                db = ROOT.parent / "vlml" / "data" / "vlml_rib.duckdb"
+                if db.exists() and db.stat().st_mtime > gp.stat().st_mtime:
+                    need, reason = True, f"数据库更新（{db.name}）"
+        except Exception as e:
+            need, reason = True, f"图谱读取失败：{type(e).__name__}"
+
+    if not need:
+        if verbose:
+            print(f"[图谱自检] 图谱已是最新（{gp.name}）")
+        return True
+
+    if verbose:
+        print(f"[图谱自检] {reason}，开始自动重建图谱…")
+    try:
+        with _graph_build_lock:
+            g = _do_build_graph()
+        s = g.to_dict()["summary"]
+        if verbose:
+            print(f"[图谱自检] 重建完成：维度 {s['dimensions']} · 工具 {s['tools']} "
+                  f"· 表 {s['tables']} · 边 {s['edges']}")
+        return True
+    except Exception as e:
+        if verbose:
+            print(f"[图谱自检] 重建失败（面板照常启动，/api/graph 会回退提示）："
+                  f"{type(e).__name__}: {e}")
+        return gp.exists()
+
+
+def _rebuild_graph_if_missing() -> bool:
+    """热路径兜底：图谱确实缺失/空（如运行时被 baseline exam 清库删除）时重建。"""
+    try:
+        import knowledge_graph as kg
+    except Exception:
+        return False
+    gp = kg.GRAPH_PATH
+    try:
+        if gp.exists() and gp.stat().st_size > 0 and kg.KnowledgeGraph.load().nodes:
+            return True
+    except Exception:
+        pass
+    with _graph_build_lock:
+        try:
+            if gp.exists() and gp.stat().st_size > 0 and kg.KnowledgeGraph.load().nodes:
+                return True
+        except Exception:
+            pass
+        try:
+            _do_build_graph()
+            return True
+        except Exception as e:
+            print(f"[图谱自检] 兜底重建失败：{type(e).__name__}: {e}")
+            return False
+
+
 def _graph_json() -> str:
     """知识图谱：读落盘的 json，**不 import vlml_env**（保持面板轻量、秒开）。
 
@@ -50,6 +145,13 @@ def _graph_json() -> str:
     except Exception as e:
         return json.dumps({"empty": True, "error": f"{type(e).__name__}: {e}"},
                           ensure_ascii=False)
+    if not g.nodes:
+        # 启动自检一般已重建；这里兜底（如运行时被 baseline exam 清库删除）
+        if _rebuild_graph_if_missing():
+            try:
+                g = knowledge_graph.KnowledgeGraph.load()
+            except Exception:
+                pass
     if not g.nodes:
         return json.dumps({"empty": True, "error": "图谱未构建，先跑 python mve/knowledge_graph.py --build"},
                           ensure_ascii=False)
@@ -2813,6 +2915,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
+    _ensure_knowledge_graph()   # 启动自检：图谱缺失/过期自动重建，杜绝 "not built"
     print(f"MVE 面板已启动：http://{HOST}:{PORT}")
     print("停止：Ctrl-C")
     try:
