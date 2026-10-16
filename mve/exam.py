@@ -52,6 +52,12 @@ from typing import Any
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+# 仓库根也要插：llm_client.chat 惰性导入 voyager_vlml.llm（英文网关），
+# 它住在 mve/ 的上一级。驾驶舱 pilot.py 派生的子进程不继承 dashboard 的路径注入，
+# 缺这一行会崩溃：ModuleNotFoundError: No module named 'voyager_vlml'。
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 EXAM_LOG = HERE / "exam_log.jsonl"
 
@@ -329,7 +335,8 @@ def final_blocked() -> str:
 async def exam(topic_id: str, *, verbose: bool = True,
                kind: str = "practice_exam",
                extra: dict[str, Any] | None = None,
-               force: bool = False) -> dict[str, Any]:
+               force: bool = False,
+               tag: str = "") -> dict[str, Any]:
     """考一道题：撤掉图谱，只留题干 + 工具 + 自己的技能库。
 
     `kind` 区分四种考核，事后能对得上曲线是怎么涨的：
@@ -379,6 +386,11 @@ async def exam(topic_id: str, *, verbose: bool = True,
             "skills": int(skill_store.stats().get("skills") or 0),
             "practice_rounds": _practice_rounds(),
             "reused_skill": bool(result.get("reused_skill")),
+            # 分组标签。跨域对照实验（mve/mc_experiment.py）会在同一份
+            # exam_log.jsonl 里落下 A/B/C 三组记录，没有 tag 事后分不清
+            # 哪条属于哪组 —— 而**分不清组就等于没有实验**。
+            "tag": str(tag or ""),
+            "store": str(skill_store.STORE.name),
         }
         append(rec)
         if verbose:
@@ -503,6 +515,10 @@ def _main() -> int:
     ap.add_argument("--force", action="store_true",
                     help="强制重测（不管有没有摸过底、不管技能库是不是空的）")
     ap.add_argument("--clear", action="store_true", help="清空考核记录")
+    ap.add_argument("--kind", default="practice_exam",
+                    help="落盘的考核种类（placement/final/transfer/practice_exam）")
+    ap.add_argument("--tag", default="",
+                    help="分组标签，跨域对照实验靠它把记录分开（如 A_empty / B_real25）")
     args = ap.parse_args()
 
     if args.clear:
@@ -567,7 +583,7 @@ def _main() -> int:
     if not args.topic:
         ap.print_help()
         return 1
-    asyncio.run(exam(args.topic))
+    asyncio.run(exam(args.topic, kind=args.kind, tag=args.tag))
     return 0
 
 

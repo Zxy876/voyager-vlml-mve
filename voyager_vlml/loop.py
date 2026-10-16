@@ -460,6 +460,9 @@ async def run_one_round(
     else:
         skill_hits = _retrieve_skills(tid, question)
         injected_keys = [str(s.get("key") or "") for s in skill_hits]
+        # 同构原版 voyager.py:340 —— rollout 之前先打印任务，让人看清单前这一轮要做什么、
+        # 哪一轮失败了。
+        print(f"开始任务 {tid}（reason={reason}，最多尝试 {max_iters} 次）")
         observations, sql = await act.solve(
             question, max_iters=max_iters,
             hints=list(topic.get("skills") or [])[:3],

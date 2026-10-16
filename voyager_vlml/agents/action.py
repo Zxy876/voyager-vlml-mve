@@ -137,7 +137,12 @@ class VLMLActionAgent:
         observations: list[dict[str, Any]] = []
         sql = ""
         critique = ""
-        for _ in range(max_iters):
+        n_skills = len(list(skills or []))
+        # 同构原版 voyager.py:196-198 —— 打印注入了多少条已学会配方（原版只打印数量，
+        # 不打印整条 system 消息：把 schema + 配方库全打出来会把日志淹没）。
+        print(f"[Action Agent] 用 {n_skills} 条已学会配方渲染 system 消息")
+        print(f"[Action Agent] 任务: {question[:140]}")
+        for i in range(max_iters):
             sql = self.write_sql(
                 question, schema=schema, critique=critique, last_sql=sql,
                 skills=list(skills or []),
@@ -147,8 +152,11 @@ class VLMLActionAgent:
                     {"ok": False, "tool": "write_sql", "rows": 0,
                      "error": "模型没给出 SELECT 语句"}
                 )
+                print(f"  [第 {i + 1}/{max_iters} 次] 没产出 SELECT，重试")
                 critique = "上一轮没给出 SELECT。请只输出一条以 SELECT 开头的查询。"
                 continue
+            # 同构原版 voyager.py:218 —— 打印模型给出的动作（AI 消息）。
+            print(f"  [第 {i + 1}/{max_iters} 次] 提案 SQL: {sql[:200]}")
             obs = await self.run_sql(sql)
             observations.append(obs)
             ok, critique = critic.check_task_success(
@@ -156,7 +164,15 @@ class VLMLActionAgent:
                 task={"task": question, "hints": list(hints or [])},
             )
             if ok:
+                print(f"  [第 {i + 1}/{max_iters} 次] 成功 -> 工具={obs.get('tool')} 行数={obs.get('rows')}")
+                print(f"[Action Agent] 任务在第 {i + 1} 次尝试成功")
                 break
+            # 同构原版 voyager.py:293 / 274 —— 展示环境反馈 + critic 判决，然后重试。
+            print(f"  [第 {i + 1}/{max_iters} 次] 失败 -> {str(obs.get('error') or '没取回数据')[:160]}")
+            print(f"  [critic] {critique[:240]}")
+            print("  -> 重试！")
+        else:
+            print(f"[Action Agent] 任务在 {max_iters} 次尝试后失败（最后 critique: {critique[:240]}）")
         return observations, sql
 
     # ---------- 迭代修正的 prompt（语言 = SQL） ----------

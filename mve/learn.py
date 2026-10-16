@@ -44,6 +44,12 @@ from typing import Any
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+# 仓库根也要插：llm_client.chat 惰性导入 voyager_vlml.llm（英文网关）。
+# 驾驶舱 pilot.py 派生的子进程不继承 dashboard 的路径注入，缺这一行会崩溃：
+# ModuleNotFoundError: No module named 'voyager_vlml'。
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 LOG_PATH = HERE / "learn.log"
 
