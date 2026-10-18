@@ -1133,11 +1133,27 @@ def _absorb(question: str, sql: str, topic_id: str) -> dict[str, Any]:
     两个条件捆在一起（实测吃过这次亏）。
     """
     out: dict[str, Any] = {"mastered": False, "skill_action": "",
-                           "mastered_total": 0, "ability_total": 0, "topic_id": ""}
+                           "mastered_total": 0, "ability_total": 0, "topic_id": "",
+                           "cold_start": False, "root_scene": "", "node_status": ""}
     if not sql:
         return out
     tid = topic_id or _runtime_topic_id(question)
     out["topic_id"] = tid
+    # 1→n 泛化：当前场景（冷启动节点与技能都归属它）
+    try:
+        from scenes import current_scene_id as _cur
+        _scene_id = _cur()
+    except Exception:
+        _scene_id = "A"
+    out["root_scene"] = _scene_id
+    # 冷启动登记：在图谱上建/升级一枚带场景归属的节点，并标记 cold_start
+    try:
+        import cold_start
+        _info = cold_start.ensure_cold_start_node(tid, question, _scene_id)
+        out["cold_start"] = bool(_info.get("cold_start"))
+        out["node_status"] = str(_info.get("status") or "")
+    except Exception as e:  # pragma: no cover
+        print(f"  （冷启动图谱登记失败：{type(e).__name__}: {e}）")
     try:
         import topic_graph
         # 仍然标 completed —— 但那是它**原本**的意思：「这节点规划过了，别再规划」
@@ -1173,8 +1189,15 @@ def _absorb(question: str, sql: str, topic_id: str) -> dict[str, Any]:
                 code=sql,
                 blueprint={"source": "consume", "question": question},
                 source="consume",
+                source_scene=_scene_id,
             )
             out["skill_action"] = f"新配方入库：{key}" if key else "（内容太短未入库）"
+            # 确保技能归属当前场景（兜底：即便上面的 source_scene 没传也补上）
+            try:
+                import cold_start
+                cold_start.mark_skill_scene(tid, _scene_id)
+            except Exception:
+                pass
     except Exception as e:  # pragma: no cover
         print(f"  （存配方失败：{type(e).__name__}: {e}）")
     return out
