@@ -49,8 +49,11 @@
 from __future__ import annotations
 
 import inspect
+import json
+import os
 import typing
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
 # 条目类型（照 neko 的 EntryKind；MVE 用到的两种）
@@ -59,6 +62,13 @@ VIEW = "view"            # 只读视图（面板卡片）
 
 # 场景 → {条目名: ActionSpec}
 _REGISTRY: dict[str, dict[str, "ActionSpec"]] = {}
+
+# 注册表快照落盘处（与 scenes.json / skill_store.json 同目录，gitignored）。
+# ⚠️ 为什么必须落盘：注册表是**进程内存态**，面板一重启就没了 —— 实测
+# `action_count {"A":0}` 而独立进程里反射出 10 条。场景卡会显示「0 个可执行
+# 动作 → 硬拒绝」，把明明能跑的场景误判成跑不起来。所以每注册一次就落盘，
+# 面板启动时恢复。
+SNAPSHOT = Path(__file__).resolve().parent / "action_registry.json"
 
 # 装饰器打在函数上的标记
 _SPEC_ATTR = "__mve_action_spec__"
@@ -76,6 +86,9 @@ class ActionSpec:
     input_schema: dict[str, Any] = field(default_factory=dict)
     # 来源可追溯：builtin（通用 MCP 自带）/ learned（学到的技能）/ plugin（场景插件）
     origin: str = "builtin"
+    # impl 描述（可序列化）："module:qualified_name" —— 快照里只存这个，
+    # 靠它恢复可调用实现，而不是把函数对象写进 json（那不可能）。
+    impl: str = ""
 
     def to_entry(self) -> dict[str, Any]:
         """给 UI 的条目视图（仿 `PluginMeta.entries`）。"""
@@ -86,6 +99,7 @@ class ActionSpec:
             "input_schema": self.input_schema,
             "scene_id": self.scene_id,
             "origin": self.origin,
+            "impl": self.impl,
         }
 
 
@@ -170,6 +184,77 @@ def action(*, kind: str = ACTION, name: str | None = None,
 # ---------------------------------------------------------------------------
 # 注册表
 # ---------------------------------------------------------------------------
+def _impl_ref(fn: Callable[..., Any]) -> str:
+    """函数的可序列化引用：`module:qualified_name`。"""
+    mod = getattr(fn, "__module__", "") or ""
+    qual = getattr(fn, "__qualname__", "") or getattr(fn, "__name__", "") or ""
+    return f"{mod}:{qual}" if mod else qual
+
+
+def _resolve_impl(ref: str) -> Callable[..., Any] | None:
+    """按 `module:qualified_name` 找回可调用实现。找不到返回 None（如实报缺）。"""
+    if not ref or ":" not in ref:
+        return None
+    mod_name, _, qual = ref.partition(":")
+    try:
+        import importlib
+        mod = importlib.import_module(mod_name)
+    except Exception:
+        return None
+    obj: Any = mod
+    for part in qual.split("."):
+        obj = getattr(obj, part, None)
+        if obj is None:
+            return None
+    return obj if callable(obj) else None
+
+
+def _save_snapshot() -> None:
+    """把注册表快照落盘（只存可序列化字段 + impl 引用）。"""
+    try:
+        data = {"version": 1, "scenes": {
+            sid: [s.to_entry() for s in specs.values()]
+            for sid, specs in _REGISTRY.items()
+        }}
+        SNAPSHOT.write_text(json.dumps(data, ensure_ascii=False, indent=1),
+                            encoding="utf-8")
+    except Exception:
+        pass
+
+
+def restore() -> dict[str, int]:
+    """从快照恢复注册表（面板启动时调，避免重启后「0 个可执行动作」误报）。
+
+    返回每场景恢复到的条目数。恢复不了的 impl（模块不在）就跳过并如实少算 ——
+    不编一个假的补上。
+    """
+    if not SNAPSHOT.exists():
+        return {}
+    try:
+        data = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    out: dict[str, int] = {}
+    for sid, entries in (data.get("scenes") or {}).items():
+        n = 0
+        for e in entries or []:
+            if not isinstance(e, dict):
+                continue
+            fn = _resolve_impl(str(e.get("impl") or ""))
+            if fn is None:
+                continue
+            _REGISTRY.setdefault(sid, {})[e["name"]] = ActionSpec(
+                name=e["name"], description=str(e.get("description") or ""),
+                fn=fn, scene_id=sid, kind=str(e.get("kind") or ACTION),
+                input_schema=dict(e.get("input_schema") or {}),
+                origin=str(e.get("origin") or "builtin"),
+                impl=str(e.get("impl") or ""),
+            )
+            n += 1
+        out[sid] = n
+    return out
+
+
 def register(scene_id: str, fn: Callable[..., Any], *,
              origin: str = "plugin") -> ActionSpec | None:
     """把一个带 `@action` 标记的函数注册进某场景的命名空间。"""
@@ -178,7 +263,9 @@ def register(scene_id: str, fn: Callable[..., Any], *,
         return None
     spec.scene_id = str(scene_id)
     spec.origin = origin
+    spec.impl = _impl_ref(spec.fn)
     _REGISTRY.setdefault(str(scene_id), {})[spec.name] = spec
+    _save_snapshot()
     return spec
 
 
@@ -214,9 +301,12 @@ def register_builtin_actions(scene_id: str) -> dict[str, Any]:
             scene_id=str(scene_id),
             input_schema=_reflect_schema(fn),
             origin="builtin",
+            impl=_impl_ref(fn),
         )
         _REGISTRY.setdefault(str(scene_id), {})[t] = spec
         n += 1
+    if n:
+        _save_snapshot()
     return {"added": n, "tools": tools, "reason": ""}
 
 
@@ -225,6 +315,7 @@ def unregister(scene_id: str, name: str) -> bool:
     if not bucket or name not in bucket:
         return False
     del bucket[name]
+    _save_snapshot()
     return True
 
 

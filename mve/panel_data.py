@@ -827,6 +827,13 @@ def scenes_view() -> dict[str, Any]:
         import scenes as _sc
         import actions as _acts
         import routing as _rt
+        # 热路径兜底：注册表是进程内存态，重启后就丢（实测 action_count 全 0）。
+        # 这里在取数前先 restore + 反射补齐，与面板启动自检同一套逻辑，
+        # 避免「明明能跑的场景显示 0 个可执行动作」的假告警。
+        _acts.restore()
+        for sid in [s["id"] for s in scene_list]:
+            if _acts.entry_count(sid) == 0:
+                _acts.register_builtin_actions(sid)
         g = kg.KnowledgeGraph.load()
         for sid in scene_ids:
             exclusive[sid] = g.scene_specific_node_count(sid)

@@ -133,6 +133,43 @@ def _rebuild_graph_if_missing() -> bool:
             return False
 
 
+def _restore_action_registry(verbose: bool = False) -> dict[str, int]:
+    """启动自检：恢复可执行动作注册表（1→n 泛化）。
+
+    ⚠️ 为什么需要：注册表是**进程内存态**，面板一重启就丢了。实测重启后
+    `action_count {"A": 0}`，而同一份代码在独立进程里反射出 10 条 ——
+    场景卡于是显示「⛔ 0 个可执行动作（不许插入）」，把明明能跑的场景
+    误判成跑不起来（这是**假告警**，比没有告警更糟）。
+
+    恢复两步走：
+      1. `actions.restore()` 从 `action_registry.json` 快照恢复（含 impl 引用）；
+      2. 快照缺失/过旧时，对每个已注册场景重跑 `register_builtin_actions()`
+         反射真实签名（**不手写名单**）。
+    """
+    try:
+        import actions
+    except Exception as e:
+        print(f"[动作自检] 无法导入 actions：{type(e).__name__}: {e}")
+        return {}
+    restored = actions.restore()
+    try:
+        import scenes as _sc
+        for s in _sc.list_scenes():
+            sid = str(s.get("id") or "")
+            if not sid or actions.entry_count(sid) > 0:
+                continue
+            reg = actions.register_builtin_actions(sid)
+            if verbose:
+                print(f"[动作自检] {sid}: 反射注册 {reg.get('added')} 个原语"
+                      f"（{str(reg.get('reason'))[:60]}）")
+            restored[sid] = actions.entry_count(sid)
+    except Exception as e:
+        print(f"[动作自检] 反射注册失败（面板照常启动）：{type(e).__name__}: {e}")
+    if verbose:
+        print(f"[动作自检] 恢复后 = {restored}")
+    return restored
+
+
 def _graph_json() -> str:
     """知识图谱：读落盘的 json，**不 import vlml_env**（保持面板轻量、秒开）。
 
@@ -3355,6 +3392,7 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> None:
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     _ensure_knowledge_graph()   # 启动自检：图谱缺失/过期自动重建，杜绝 "not built"
+    _restore_action_registry()  # 启动自检：可执行动作条目从快照恢复，杜绝 "0 个动作"误报
     print(f"MVE 面板已启动：http://{HOST}:{PORT}")
     print("停止：Ctrl-C")
     try:
