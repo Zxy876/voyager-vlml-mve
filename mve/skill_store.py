@@ -154,8 +154,14 @@ def add(
     source: str = "practice",
     blueprint: dict[str, Any] | None = None,
     code: str = "",
+    source_scene: str = "default",
 ) -> tuple[str, str]:
     """写一条技能。返回 (动作, key)，动作 ∈ added / rewritten / skipped。
+
+    `source_scene` 是 1→n 泛化加的**场景归属**标记：技能全局共享，但每条记着自己
+    来自哪个场景命名空间（见 mve/scenes.py）。跨场景复用某条技能时，它的
+    `source_scene` 仍是原场景 —— 这样面板能显示「这条技能来自 Scene A」，也能
+    统计「场景专属技能条数」（与知识图谱的 Δ 场景专属节点数口径一致）。
 
     照 SkillManager.add_new_skill：同名 → Rewriting，不是 append。
 
@@ -222,6 +228,8 @@ def add(
         s["updated"] = now
         s["versions"] = int(s.get("versions") or 1) + 1
         s["source"] = str(source or s.get("source") or "practice")
+        # 场景归属：已有则保持原场景（技能属于它学到的那个场景），否则按本次标注
+        s.setdefault("source_scene", str(source_scene or "default"))
         if blueprint:
             s["blueprint"] = blueprint
         if code:
@@ -235,6 +243,7 @@ def add(
         "hits": 0, "ok": 0, "created": now, "updated": now,
         "versions": 1, "history": [],
         "source": str(source or "practice"),
+        "source_scene": str(source_scene or "default"),
         "blueprint": dict(blueprint or {}),
         "code": str(code or ""),
     }
@@ -340,6 +349,25 @@ def stats() -> dict[str, Any]:
 def all_skills() -> list[dict[str, Any]]:
     data = _load_raw()
     return [dict(s, key=k) for k, s in data["skills"].items()]
+
+
+def by_scene(scene_id: str) -> list[dict[str, Any]]:
+    """返回归属某场景的技能（缺 source_scene 字段的旧条目按 'default' 计）。
+
+    用于面板统计「场景专属技能条数」，与知识图谱的 Δ 场景专属节点数口径一致。
+    注意：跨场景被 B 复用的 A 技能仍归属 A，不会计入 B。
+    """
+    sid = str(scene_id or "default")
+    out = []
+    for k, s in _load_raw()["skills"].items():
+        if str(s.get("source_scene", "default")) == sid:
+            out.append(dict(s, key=k))
+    return out
+
+
+def scene_skill_count(scene_id: str) -> int:
+    """某场景专属技能条数（不含跨场景复用的外来技能）。"""
+    return len(by_scene(scene_id))
 
 
 def load() -> list[str]:

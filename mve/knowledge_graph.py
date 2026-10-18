@@ -82,7 +82,7 @@ DATA_DICT = (HERE.parent / "vlml" / "database" / "DATA_DICTIONARY.json")
 # 落盘格式版本。**改了节点的声明字段就必须 +1** —— 否则已经存在的
 # knowledge_graph.json 永远"看起来没过期"（指纹只覆盖 tasks.py），新声明就
 # 一辈子进不了图。这是"持久化"最容易踩的坑：写了代码，图里还是旧的。
-SCHEMA_VERSION = 2      # 2 = 表节点带 VLML 建模声明，维度节点带伴学式声明
+SCHEMA_VERSION = 3      # 3 = 节点带场景归属（root_scene）/ 状态（status）/ 证据数（evidence），支撑 1→n 可插拔场景
 
 # --------------------------------------------------------------------------
 # 边的关系类型（比伴学的 10 种少：只保留 MVE 真的用得上的）
@@ -171,10 +171,20 @@ class Node:
     kind: str                      # dimension / tool / table
     label: str = ""
     detail: dict[str, Any] = field(default_factory=dict)
+    # 1→n 泛化加的三项（SCHEMA_VERSION 已 bump）：
+    #   root_scene —— 节点归属哪个场景命名空间（见 mve/scenes.py）。
+    #                预存在的节点（build 出来的 VLML 图）一律归属默认场景 "A"。
+    #   status     —— verified（多轮固化）/ unverified（待验证）/ cold_start_guess
+    #                （冷启动单次证据支撑，见设计 B 冷启动期）。
+    #   evidence   —— 成功消费/验证次数。1 = 单次证据（冷启动猜测）；≥2 = 稳固。
+    root_scene: str = "A"
+    status: str = "verified"
+    evidence: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         return {"id": self.id, "kind": self.kind, "label": self.label,
-                "detail": self.detail}
+                "detail": self.detail, "root_scene": self.root_scene,
+                "status": self.status, "evidence": int(self.evidence)}
 
 
 @dataclass
@@ -242,6 +252,65 @@ class KnowledgeGraph:
         self.edges.append(edge)
         self._out.setdefault(edge.src, []).append(edge)
         self._in.setdefault(edge.dst, []).append(edge)
+
+    # ---- 1→n 场景化（命名空间 / 冷启动 / 增量指标） ----
+
+    def ensure_scene_root(self, scene_id: str) -> None:
+        """确保每个场景在图里有一个根节点（root_scene == 该场景）。
+
+        新场景初始图谱为空，只有根节点 —— 随消费侧提问动态挂载子节点。
+        """
+        rid = f"scene:{scene_id}"
+        if rid not in self.nodes:
+            self.add_node(Node(id=rid, kind="scene_root", label=f"场景 {scene_id}",
+                              root_scene=scene_id, status="verified", evidence=1))
+
+    def add_cold_start_node(self, scene_id: str, node_id: str, kind: str,
+                            label: str = "", detail: dict[str, Any] | None = None) -> Node:
+        """冷启动期：消费侧导入问题、归不上现有图谱时，新建一个待验证节点。
+
+        设计 B 冷启动期：
+          · 新建临时节点，标 status="unverified"（先建）+ 现场解题
+          · 解题成功 → 升级为 status="cold_start_guess"、evidence=1、计入分母
+          · 该节点 root_scene 归属当前场景，使 Δ 场景专属节点数 +1（证明插进来了）
+        返回新建/合并后的节点。
+        """
+        self.ensure_scene_root(scene_id)
+        node = Node(id=node_id, kind=kind, label=label or node_id,
+                    detail=detail or {}, root_scene=scene_id,
+                    status="cold_start_guess", evidence=1)
+        self.add_node(node)
+        return self.nodes[node_id]
+
+    def promote_node(self, node_id: str) -> None:
+        """同一个冷启动节点再次被消费线命中并成功 → 升级为稳固节点。
+
+        设计 Q2：冷启动节点（空心圆/淡黄/证据数1）再次验证后变实心圆/深绿/证据数≥2。
+        """
+        n = self.nodes.get(node_id)
+        if n is None:
+            return
+        n.evidence = max(int(n.evidence), 0) + 1
+        if n.evidence >= 2:
+            n.status = "verified"
+
+    def scene_specific_node_count(self, scene_id: str) -> int:
+        """Δ 场景专属节点数（设计 Q3 的核心指标）。
+
+        口径（纯净、可复现）：
+          只数 root_scene == scene_id 且 status != 'deleted' 的节点，
+          **排除** scene_root 占位节点（它不算"资产"），
+          **排除** 从别的场景跨场景引用过来、但挂在 A 名下的技能节点
+          （它的 root_scene 仍是原场景，自然不会被数进本场景）。
+        插入 Scene B 之前读数 0，冷启动一题成功后变 1，切回 A 读数不变 —— 证明
+        「第二个场景真的插进来了」且没有污染 A 的统计。
+        """
+        return sum(
+            1 for n in self.nodes.values()
+            if n.root_scene == scene_id
+            and n.status != "deleted"
+            and n.kind != "scene_root"
+        )
 
     # ---- 查询 ----
     def who_produces(self, dimension: str) -> list[str]:
@@ -806,7 +875,10 @@ class KnowledgeGraph:
                 pass          # 重建失败就退回旧图，总比没有强
         for n in raw.get("nodes") or []:
             g.add_node(Node(id=n["id"], kind=n["kind"],
-                            label=n.get("label", ""), detail=n.get("detail") or {}))
+                            label=n.get("label", ""), detail=n.get("detail") or {},
+                            root_scene=n.get("root_scene") or "A",
+                            status=n.get("status") or "verified",
+                            evidence=int(n.get("evidence") or 1)))
         for e in raw.get("edges") or []:
             g.add_edge(Edge(src=e["from"], dst=e["to"], relation=e["relation"],
                             origin=e.get("origin", "declared"),

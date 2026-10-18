@@ -52,6 +52,7 @@ mve/pilot_state.json
 mve/practice_scope.json
 mve/referee_store.json
 mve/skill_store.json
+mve/scenes.json
 mve/tool_schemas.json
 venv/
 mve/entity_catalog.json
