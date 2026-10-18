@@ -471,8 +471,32 @@ async def consume(
 ) -> dict[str, Any]:
     env = env or VLMLMCPEnv()
 
+    # 当前场景：人导入的问题归属哪个命名空间（1→n 泛化）。
+    # 取不到就按默认 A —— 但**必须取**，否则整条消费线没有场景归属，
+    # 切回 A 时无法证明「这条记录属于谁」。
+    _scene_id = "A"
+    try:
+        import scenes as _sc
+        _scene_id = str(_sc.current_scene_id() or "A")
+    except Exception:
+        pass
+
     # ---- ① 归题（找评分点）----
     topic_id, hit, task = _infer(question)
+
+    # ---- ② 命中判定（照 neko material_topic_mapper.py:204-215 的双阈值）----
+    # 「命中」= 相似度分数阈值，**不是**人审核通过、**也不是**「答对且能对上」。
+    #   · max_score >= 40 且 exact_match 且 meaningful_match → 高置信
+    #   · max_score >= 10 且重复命中 >= 2                    → 中置信
+    #   · 否则                                                → 未命中 → 新建节点
+    # 人审是匹配**之后**的下游动作，不参与命中判定；匹配与答案对错无关。
+    route_info: dict[str, Any] = {}
+    try:
+        import routing as _rt
+        route_info = _rt.route(question, _scene_id)
+    except Exception:
+        route_info = {"decision": "REJECTED", "max_score": 0,
+                      "matched_on": "路由层不可用"}
     if topic_hint:
         hit = f"{hit}（指定）" if hit else "（指定）"
     if task is not None:
@@ -739,9 +763,14 @@ async def consume(
         # 掌握度 = 已掌握 / 该掌握的总量（不是覆盖率的折算）
         "mastery": (round(m_tot / a_tot, 4) if a_tot else None),
         # —— 1→n 泛化：场景归属 + 冷启动标记（补 ⑤ 缺口，使记录可按场景隔离）——
-        "root_scene": str(absorbed.get("root_scene") or ""),
+        "root_scene": str(absorbed.get("root_scene") or _scene_id),
         "cold_start": bool(absorbed.get("cold_start")),
         "node_status": str(absorbed.get("node_status") or ""),
+        # —— 路由命中判定（双阈值，非人审）——
+        "route_decision": str(route_info.get("decision") or ""),
+        "route_score": int(route_info.get("max_score") or 0),
+        "route_matched_on": str(route_info.get("matched_on") or ""),
+        "route_node": str(route_info.get("node_id") or ""),
         # 判定结果枚举（设计《判定结果状态与写入证明规格》）：写入图谱的充分条件。
         #   written              —— 成功写入图谱（节点已存在/已验证，已提交终态）
         #   insufficient_evidence —— 冷启动单次证据（节点 cold_start_guess，待巩固）

@@ -2403,6 +2403,8 @@ button.btn.sm{padding:4px 9px;font-size:12px}
 .badge.loaded{background:#e6f5ec;color:var(--brand-2)}
 .badge.seed{background:var(--seed-bg);color:#8a6a00;border:1px dashed var(--seed)}
 .badge.alert{background:var(--alert-bg);color:#9a4711}
+.badge.act{background:#e8f0fb;color:#2f5596}
+.badge.pend{background:#f0e8fa;color:#6b4796}
 .stat{display:flex;justify-content:space-between;font-size:13px;padding:3px 0;
   border-bottom:1px dashed var(--line)}
 .stat:last-child{border-bottom:none}
@@ -2457,8 +2459,74 @@ th{color:var(--muted);font-weight:600}
       <tbody id="skillBody"></tbody>
     </table>
   </div>
+
+  <h2>人导入题目（学习闭环起点）</h2>
+  <div class="panel">
+    <div class="hint">导入一个问题 → 系统先按<b>双阈值判定</b>（≥40 高置信 / ≥10 且重复命中≥2 中置信 / 否则未命中）。<b>命中</b>就归入已有节点；<b>未命中</b>先落待审区、解题成功才升为活节点。匹配只看文本相似度，<b>与答案对错无关</b>。</div>
+    <div class="create">
+      <input type="text" id="qInput" placeholder="导入一个问题，如：iPhone 15 销量多少">
+      <button class="btn" onclick="previewRoute()">🔍 只判定命中（不拉数据）</button>
+      <button class="btn alt" onclick="importQuestion()">🚀 导入并解题</button>
+    </div>
+    <div id="routeOut" style="margin-top:12px"></div>
+    <div id="importLog" style="margin-top:10px"></div>
+  </div>
 </div>
 <div class="toast" id="toast"></div>
+
+<script>
+const P = window.MVE_PREFIX || '';
+const api = (p) => P + p;
+const fmtTime = (t) => {
+  if(!t) return '—';
+  const d = new Date(t*1000);
+  return d.toLocaleString('zh-CN', {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
+};
+function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),1800);}
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+
+/* ---- 命中判定 + 导入题目 ---- */
+function currentScene(){const chips=document.querySelectorAll('#switcher .chip.cur');return '';}
+async function previewRoute(){
+  const q=document.getElementById('qInput').value.trim();
+  if(!q){toast('先写问题');return;}
+  const out=document.getElementById('routeOut');
+  out.innerHTML='<span class="muted">判定中…</span>';
+  try{
+    const r=await fetch(api('/api/route'),{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({question:q})}).then(x=>x.json());
+    if(r.error){out.innerHTML='<span class="muted">'+esc(r.error)+'</span>';return;}
+    const badge = r.decision==='HIGH_CONFIDENCE'
+      ? '<span class="badge act">高置信命中</span>'
+      : r.decision==='MEDIUM_CONFIDENCE'
+      ? '<span class="badge pend">中置信命中</span>'
+      : '<span class="badge alert">未命中</span>';
+    const act = r.action==='create_new_node'
+      ? '→ <b>新建图谱节点</b>（先落待审区，解题成功才升活节点）'
+      : '→ <b>归入已有节点</b> '+esc(r.node_id||'');
+    out.innerHTML='<div class="stat"><span class="k">'+badge+'</span>'
+      +'<span class="v">分数 '+esc(r.max_score)+' / chunk_hits '+esc(r.chunk_hits)+'</span></div>'
+      +'<div style="font-size:13px;margin-top:6px">'+act+'</div>';
+  }catch(e){out.innerHTML='<span class="muted">判定失败：'+esc(String(e))+'</span>';}
+}
+async function importQuestion(){
+  const q=document.getElementById('qInput').value.trim();
+  if(!q){toast('先写问题');return;}
+  const log=document.getElementById('importLog');
+  log.innerHTML='<span class="muted">已受理，后台跑（约 1～5 分钟），结果会出现在下面的判定区与主面板导入历史里…</span>';
+  toast('已受理，后台执行');
+  try{
+    const r=await fetch(api('/api/coach'),{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({question:q, mode:'voyager'})}).then(x=>x.json());
+    if(r.accepted||r.busy){
+      log.innerHTML='<div class="stat"><span class="k">受理结果</span>'
+        +'<span class="v">'+(r.busy?'上一句还在回答中':'已受理，后台跑')+'</span></div>'
+        +'<div class="hint" style="margin-top:6px">跑完后回来点「只判定命中」再问一次 —— 这次应该变成<b>命中</b>（可达）。</div>';
+    }else{
+      log.innerHTML='<span class="muted">未能受理：'+esc(r.error||'未知')+'</span>';
+    }
+  }catch(e){log.innerHTML='<span class="muted">导入失败：'+esc(String(e))+'</span>';}
+}
 
 <script>
 const P = window.MVE_PREFIX || '';
@@ -2494,9 +2562,15 @@ async function loadScenes(){
     const gs = (r.graph_sparsity||{})[sid]||'dense';
     const ec = (r.entity_catalog||{})[sid]||'present';
     const fp = (r.fingerprint||{})[sid]||{};
-    const badges = `<span class="badge loaded">✓ 已加载</span>`;
+  const badges = `<span class="badge loaded">✓ 已加载</span>`;
     const seedBadge = gs==='seeding' ? `<span class="badge seed">🌱 种子态·节点随消费增长</span>` : '';
     const ecBadge = ec==='missing' ? `<span class="badge alert">🟠 实体目录缺失·需补充</span>` : '';
+    const actN = (r.action_count||{})[sid]||0;
+    const pendN = (r.pending_nodes||{})[sid]||0;
+    const actBadge = actN===0
+      ? `<span class="badge alert">⛔ 0 个可执行动作（不许插入）</span>`
+      : `<span class="badge act">⚙ ${actN} 个可执行动作</span>`;
+    const pendBadge = pendN>0 ? `<span class="badge pend">📥 待审 ${pendN}</span>` : '';
     const card = document.createElement('div');
     card.className = 'card'+(cur?' cur':'');
     card.innerHTML =
@@ -2504,12 +2578,14 @@ async function loadScenes(){
          <strong>${esc(s.name||sid)}</strong>${cur?'<span class="badge loaded">当前</span>':''}
        </div>
        <div class="muted" style="font-size:12px">${esc(sid)} · ${esc(s.description||'')}</div>
-       <div class="badges">${badges}${seedBadge}${ecBadge}</div>
+       <div class="badges">${badges}${seedBadge}${ecBadge}${actBadge}${pendBadge}</div>
        <div class="bignum">${n} <small>专属节点（Δ）</small></div>
        <div style="margin-top:8px">
          <div class="stat"><span class="k">续跑点 cursor</span><span class="v">${esc(fp.cursor==null?'—':fp.cursor)}</span></div>
          <div class="stat"><span class="k">上次活动</span><span class="v">${fmtTime(fp.updated_at)}</span></div>
          <div class="stat"><span class="k">本场景消费记录</span><span class="v">${esc(fp.consume_count==null?'—':fp.consume_count)}</span></div>
+         <div class="stat"><span class="k">可执行动作</span><span class="v">${actN} 个</span></div>
+         <div class="stat"><span class="k">待审区</span><span class="v">${pendN} 条</span></div>
          <div class="stat"><span class="k">状态指纹 hash</span><span class="v">${esc(fp.state_hash||'—')}</span></div>
        </div>`;
     cards.appendChild(card);
@@ -2680,6 +2756,35 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(500, {"matched": False, "error": f"{type(e).__name__}: {e}"[:200]})
             return
 
+        if path == "/api/route":
+            # 1→n 泛化：只做命中判定（双阈值），不执行取数
+            # 设计案 §3.1：「命中」= 相似度分数阈值，**不是**人审通过、
+            # **也不是**「答对且能对上」。匹配与答案对错无关。
+            try:
+                q = str(payload.get("question") or "").strip()
+                if not q:
+                    self._json(400, {"error": "问题是空的"})
+                    return
+                import routing as _rt
+                import scenes as _sc
+                sid = str(payload.get("scene_id") or "").strip() \
+                    or _sc.current_scene_id()
+                m = _rt.route(q, sid)
+                self._json(200, {
+                    "scene_id": sid,
+                    "decision": m["decision"],
+                    "max_score": m["max_score"],
+                    "chunk_hits": m["chunk_hits"],
+                    "exact_match": m["exact_match"],
+                    "node_id": m["node_id"],
+                    "node_label": m.get("node_label", ""),
+                    "action": m["action"],
+                    "matched_on": m["matched_on"],
+                })
+            except Exception as e:
+                self._json(500, {"error": f"{type(e).__name__}: {e}"[:200]})
+            return
+
         if path in ("/api/scene/switch", "/api/scene/create"):
             try:
                 import scenes as _sc
@@ -2699,9 +2804,32 @@ class Handler(BaseHTTPRequestHandler):
                         self._json(400, {"ok": False, "error": "场景名不能为空"})
                         return
                     desc = str(payload.get("description") or "")
-                    new_id = _sc.create_scene(name, description=desc)
+                    ds = str(payload.get("data_source") or "")
+                    new_id = _sc.create_scene(name, description=desc, data_source=ds)
+                    # 硬拒绝项校验：可执行动作（取数原语）= 0 → 不许插入
+                    # 设计案「可执行动作缺了不许插入」的原文含义：动作本身缺席，
+                    # Voyager 在这个场景里什么数据都取不到。
+                    try:
+                        import orchestrate as _orch
+                        av = _orch.init_scene(new_id, data_source=ds)
+                        allowed = bool(av.get("insert_allowed"))
+                        breason = str(av.get("blocking_reason") or "")
+                    except Exception as e:
+                        allowed, breason = True, f"动作注册检查失败：{type(e).__name__}: {e}"
+                    if not allowed:
+                        # 拒绝插入：撤掉刚建的命名空间，别留一个跑不起来的空场景
+                        try:
+                            _sc.delete_scene(new_id)
+                        except Exception:
+                            pass
+                        self._json(400, {"ok": False,
+                                         "error": f"拒绝插入场景 {new_id}：{breason}",
+                                         "blocked": True})
+                        return
                     self._json(200, {"ok": True, "scene_id": new_id,
-                                     "current": _sc.current_scene_id()})
+                                     "current": _sc.current_scene_id(),
+                                     "action_count": len(
+                                         __import__("actions").entries(new_id))})
             except Exception as e:
                 self._json(500, {"ok": False, "error": f"{type(e).__name__}: {e}"[:200]})
             return

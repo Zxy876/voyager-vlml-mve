@@ -806,6 +806,8 @@ def scenes_view() -> dict[str, Any]:
       · `entity_catalog` —— `missing`（实体目录缺失·橙色告警）/`present`
       · `fingerprint`    —— 状态指纹（续跑点/上次活动/消费数/状态 hash），
                             切回 A 后可逐项核对「没被覆盖」
+      · `action_count`   —— 本场景注册的可执行动作条数（0 = 硬拒绝：不许插入）
+      · `pending_nodes`  —— 本场景待审区条目数（未命中且未人审）
     """
     try:
         import scenes as _sc
@@ -818,23 +820,35 @@ def scenes_view() -> dict[str, Any]:
     sparsity: dict[str, str] = {}
     catalog: dict[str, str] = {}
     fp: dict[str, Any] = {}
+    acts: dict[str, int] = {}
+    pending: dict[str, int] = {}
     try:
         import knowledge_graph as kg
         import scenes as _sc
+        import actions as _acts
+        import routing as _rt
         g = kg.KnowledgeGraph.load()
         for sid in scene_ids:
             exclusive[sid] = g.scene_specific_node_count(sid)
             sparsity[sid] = _sc.graph_sparsity(sid)
             catalog[sid] = _sc.entity_catalog_status(sid)
             fp[sid] = _sc.scene_state_fingerprint(sid)
+            acts[sid] = _acts.entry_count(sid)
+            try:
+                pending[sid] = len(_rt.pending_for_scene(sid))
+            except Exception:
+                pending[sid] = 0
     except Exception:
         exclusive = {sid: 0 for sid in scene_ids}
         sparsity = {sid: "seeding" for sid in scene_ids}
         catalog = {sid: "present" for sid in scene_ids}
         fp = {sid: {} for sid in scene_ids}
+        acts = {sid: 0 for sid in scene_ids}
+        pending = {sid: 0 for sid in scene_ids}
     return {"scenes": scene_list, "current": current,
             "exclusive_nodes": exclusive, "graph_sparsity": sparsity,
-            "entity_catalog": catalog, "fingerprint": fp}
+            "entity_catalog": catalog, "fingerprint": fp,
+            "action_count": acts, "pending_nodes": pending}
 
 
 def skill_traceability() -> dict[str, Any]:
