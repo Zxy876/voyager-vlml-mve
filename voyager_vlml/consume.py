@@ -497,6 +497,19 @@ async def consume(
     except Exception:
         route_info = {"decision": "REJECTED", "max_score": 0,
                       "matched_on": "路由层不可用"}
+    # 未命中 → **先落待审区**（设计案 §3.1，同构 neko candidate_knowledge_items）：
+    # 不挂活图谱、不丢弃，冷启动解题成功才升活节点；被拒项留审计、不删。
+    # ⚠️ 之前这条没接线 —— 面板场景卡的「待审 N」徽章因此恒为 0，人导入了
+    # 域外问题却在任何地方都看不到痕迹（2026-10-18 实测特斯拉问题踩中）。
+    try:
+        if str(route_info.get("decision") or "") == "REJECTED":
+            import routing as _rt2
+            _rt2.add_pending(
+                question, _scene_id,
+                reason=(f"双阈值未命中（score={route_info.get('max_score', 0)}，"
+                        f"matched_on={route_info.get('matched_on') or '—'}）"))
+    except Exception:
+        pass                                     # 待审区写不进去不能拦消费
     if topic_hint:
         hit = f"{hit}（指定）" if hit else "（指定）"
     if task is not None:

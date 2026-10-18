@@ -193,6 +193,43 @@ def _graph_json() -> str:
         return json.dumps({"empty": True, "error": "图谱未构建，先跑 python mve/knowledge_graph.py --build"},
                           ensure_ascii=False)
     out = g.to_dict()
+    # ---- 1→n：图谱**按当前场景过滤**（每个场景一张图）----
+    # A 的种子图谱（VLML Valorant：表→工具→维度，root_scene 缺省即 A）只属于 A；
+    # Scene B 冷启动只有场景根节点，随本场景的导入动态挂载。
+    # 不过滤的后果（2026-10-18 实测）：人在 B 里问"特斯拉股价"，图谱页照样画着
+    # A 的 360 个 Valorant 节点，读起来像"这个问题归到了 VLML 图"—— 实际是串 scene。
+    try:
+        import scenes as _scn
+        sid = str(_scn.current_scene_id() or "A")
+        keep = {nid for nid, n in g.nodes.items()
+                if str(getattr(n, "root_scene", "A") or "A") == sid}
+        out["total_nodes"] = len(out.get("nodes") or [])
+        out["nodes"] = [n for n in (out.get("nodes") or [])
+                        if str(n.get("id")) in keep]
+        out["edges"] = [e for e in (out.get("edges") or [])
+                        if str(e.get("from")) in keep and str(e.get("to")) in keep]
+        out["scene_id"] = sid
+        out["scene_nodes"] = len(out["nodes"])
+        out["scene_edges"] = len(out["edges"])
+        # Δ 场景专属节点数（证明量：排除根占位与已删除）
+        out["scene_specific_nodes"] = sum(
+            1 for n in g.nodes.values()
+            if str(getattr(n, "root_scene", "A") or "A") == sid
+            and str(getattr(n, "kind", "")) != "scene_root"
+            and str(getattr(n, "status", "")) != "deleted")
+        # 摘要按本场景重算（前端计数行「N 维度 · M 工具 · K 表 · J 边」）
+        sm = dict(out.get("summary") or {})
+        kinds: dict[str, int] = {}
+        for n in out["nodes"]:
+            k = str(n.get("kind") or "")
+            kinds[k] = kinds.get(k, 0) + 1
+        sm.update({"dimensions": kinds.get("dimension", 0),
+                   "tools": kinds.get("tool", 0),
+                   "tables": kinds.get("table", 0),
+                   "edges": len(out["edges"])})
+        out["summary"] = sm
+    except Exception as e:
+        out["scene_filter_error"] = f"{type(e).__name__}: {e}"[:160]
     # 待审候选：运行期题带进来的新维度名，**不建节点**（照伴学：运行期新建的
     # 知识点不进权威层）。单独返回，前端据此在图谱页顶上显示一条。
     try:
@@ -939,6 +976,10 @@ function pImport(s){
         出题器读这条线决定下一题。
       </div>
       <div style="font-size:12px;color:var(--muted);margin-bottom:8px">
+        导入的问题归入<b>当前场景</b>的图谱（顶部场景栏切换；每个场景一张图，A=VLML Valorant 库）。
+        未命中先落本场景待审区，解题成功才升活节点；相关问题会给出「➜ 新建场景并迁过去」。
+      </div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:8px">
         <b>收录判据</b>（不是"图谱里有没有同名维度"）：VLML 这次取数读到的表，
         有没有被图谱里<b>表内覆盖的工具集</b>（46 个 SQL 洞察）覆盖到。
         覆盖得到 → 收录，落法是<b>建边、不建节点</b>（伴学同款：材料映射不上
@@ -980,8 +1021,21 @@ async function previewRoute(){
     const act=r.action==='create_new_node'
       ? '→ <b>新建图谱节点</b>（先落待审区，解题成功才升活节点）'
       : '→ <b>归入已有节点</b> '+ESC(r.node_id||'');
+    // 判定基准：相关度是拿这句话和**当前场景的图谱节点文本**比的。把它显示出来，
+    // 人才知道"相关度低"是问题不好还是归错了场景（2026-10-18 特斯拉问题触发）。
+    const basis=`<div class="hint" style="margin-top:4px">判定基准：Scene ${ESC(r.scene_id)} 的图谱 · `+
+      `${ESC(r.scene_nodes==null?'?':r.scene_nodes)} 个节点`+
+      (r.scene_sample&&r.scene_sample.length
+        ? `（如：${r.scene_sample.map(ESC).join('、')}）` : '（空 —— 冷启动期）')+'</div>';
+    const ood = r.out_of_domain ? `<div class="note warn" style="margin-top:6px">
+      <b>域外问题</b>：这句话和当前场景的图谱<b>没有任何文本重合</b>（相关度 ${ESC(r.max_score)}/100）。
+      它问的领域和 Scene ${ESC(r.scene_id)} 不是一回事 —— 相关度低不是"答错了"，是<b>归错了场景</b>。
+      <div style="margin-top:5px"><button class="btn btn-secondary" style="padding:4px 10px;font-size:12px"
+        data-migrate-q="${ESC(text)}">➜ 新建场景，并把这个问题导过去</button></div></div>`
+      : (r.scene_nodes===0 ? `<div class="note info" style="margin-top:6px">当前场景图谱还是空的（冷启动期）——
+        导入后会在这里落下第一个节点。</div>` : '');
     hit.innerHTML=`<div class="imp-row">${dec}<span class="hint">分数 ${ESC(r.max_score)} · 重复命中 ${ESC(r.chunk_hits)}（双阈值，不是人审、也不是答对）</span></div>
-      <div style="font-size:12.5px;margin-top:4px">${act}</div>`;
+      <div style="font-size:12.5px;margin-top:4px">${act}</div>`+basis+ood;
   }catch(e){hit.innerHTML='<span class="muted">判定失败：'+ESC(String(e))+'</span>';}
 }
 
@@ -1141,9 +1195,11 @@ function switchScene(sid){
     body:JSON.stringify({scene_id:sid})}).then(x=>x.json()).then(r=>{
     alert(r.ok?('已切换到场景 '+sid+'。之后的导入与学习曲线都按这个场景隔离。')
               :('切换失败：'+(r.error||'')));
+    GRAPH=null;                       // 图谱缓存作废：每个场景一张图，重拉本场景的
     loadSceneBar();
     const cs2=document.getElementById('curveScene');
     if(cs2&&[...cs2.options].some(o=>o.value===sid)){cs2.value=sid;switchCurveScene(sid);}
+    load();
   });
 }
 function createScene(){
@@ -1476,8 +1532,8 @@ function envCard(s){
    布局用**分层**（表 → 工具 → 维度，从左到右）而不是力导向 ——
    图谱小且层次天然固定，分层比力导向可读，也不会每次刷新都跳。 */
 let GRAPH=null;
-async function loadGraph(){
-  if(GRAPH) return GRAPH;
+async function loadGraph(force){
+  if(GRAPH && !force) return GRAPH;
   try{ const r=await fetch('/api/graph?t='+Date.now()); GRAPH=await r.json(); }
   catch(e){ GRAPH={empty:true,error:String(e)}; }
   return GRAPH;
@@ -1488,6 +1544,16 @@ const REL={produced_by:['#2f7d5f','产出','实线'],derived_from:['#8a94a6','�
 function renderGraph(g){
   if(g.empty) return `<div class="empty">${ESC(g.error||'图谱为空')}</div>`;
   const nodes=g.nodes||[], edges=g.edges||[];
+  // 1→n：当前场景的图谱横幅（2026-10-18）。每个场景一张图 —— A 的 360 个
+  // Valorant 节点不画进 B 的图谱，反过来也一样。空图谱是冷启动的**正常态**
+  // （只有场景根节点），不是"图谱坏了"。
+  const sceneId=g.scene_id||'A';
+  const sceneSpecific=g.scene_specific_nodes;
+  const sceneBanner=`<div class="note info" style="margin-bottom:8px">
+    <b>当前场景 Scene ${ESC(sceneId)} 的图谱</b> ·
+    ${sceneSpecific==null?'—':sceneSpecific+' 个专属节点'} · ${edges.length} 条边
+    <span class="hint">（全库图谱共 ${g.total_nodes==null?'—':g.total_nodes} 个节点；
+    <b>其它场景的节点不画在这里</b> —— 场景间按命名空间隔离，切场景看各自的图）</span></div>`;
   const byId={}; nodes.forEach(n=>byId[n.id]=n);
   // 只画**有边**的节点：孤立工具（VLML 有 9 个但多数没被任何题用到）
   // 画进来只会让图变乱，且有边的才有信息量。
@@ -1496,7 +1562,15 @@ function renderGraph(g){
   const cols={table:[],tool:[],dimension:[]};
   nodes.filter(n=>linked.has(n.id)).forEach(n=>{(cols[n.kind]||(cols[n.kind]=[])).push(n);});
   ['table','tool','dimension'].forEach(k=>cols[k].sort((a,b)=>a.label.localeCompare(b.label)));
-  if(!cols.dimension.length) return `<div class="empty">图谱里还没有连上边的维度</div>`;
+  if(!cols.dimension.length){
+    // 场景图谱为空（只有场景根节点）= 冷启动期：说清楚"这是正常的、下一步干嘛"，
+    // 不要报"图谱里还没有连上边的维度"那种像故障的文案。
+    if(sceneSpecific===0) return sceneBanner+`<div class="empty">
+      Scene ${ESC(sceneId)} 的图谱还是<b>空的</b>（冷启动期只有场景根节点）。
+      <br>去「人导入」问一个<b>属于这个场景</b>的问题：未命中会先落待审区，
+      解题成功后第一个节点就挂上来，Δ 专属节点 0 → 1。</div>`;
+    return sceneBanner+`<div class="empty">图谱里还没有连上边的维度</div>`;
+  }
 
   // 待审候选条：运行期题带来的新维度名**不占节点位**（照伴学：运行期新建的
   // 知识点不进权威层，只登记待审）。维度层只由种子题的 rubric 派生。
@@ -1591,8 +1665,8 @@ ${ESC(REL[e.relation]&&REL[e.relation][1]||e.relation)}${e.origin==='observed'?'
   }).join('');
 
   const sm=g.summary||{};
-  return scopeBarHtml() + pendHtml + `<div class="panel__head"><h2>维度 → 工具 → 表</h2>
-      <span class="hint">${sm.dimensions||0} 维度 · ${sm.tools||0} 工具 · ${sm.tables||0} 表 · ${sm.edges||0} 边</span></div>
+  return scopeBarHtml() + sceneBanner + pendHtml + `<div class="panel__head"><h2>维度 → 工具 → 表 · Scene ${ESC(sceneId)}</h2>
+      <span class="hint">${sm.dimensions||0} 维度 · ${sm.tools||0} 工具 · ${sm.tables||0} 表 · ${sm.edges||0} 边（本场景）</span></div>
     <svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px;background:#fff;border-radius:8px">
       ${colTitle}${es}${ns}
     </svg>
@@ -1776,6 +1850,9 @@ document.addEventListener('click',e=>{
   if(e.target.closest('[data-subject-sync]')){ syncSubjects(); return; }
   const sd=e.target.closest('[data-subject-del]');
   if(sd){ delSubject(sd.dataset.subjectDel); return; }
+  // 域外问题一键迁场（新建场景 → 切换 → 重新导入同一个问题）
+  const mq=e.target.closest('[data-migrate-q]');
+  if(mq){ migrateToNewScene(mq.dataset.migrateQ||''); return; }
 });
 
 /* ---------------- 自适应练习（伴学出题/图谱移植） ---------------- */
@@ -1940,7 +2017,13 @@ function consumeBlock(im){
       ${(im.coverage_referee!==null&&im.coverage_referee!==undefined)
         ? `<span class="chip grey">硬尺子 ${pct(im.coverage_referee)}</span>`:''}
       <span class="chip grey">工具 ${ESC(im.ok_tool_calls||0)} 次 · ${ESC(im.rows||0)} 行</span>
+      ${im.root_scene?`<span class="chip grey">Scene ${ESC(im.root_scene)}</span>`:''}
+      ${im.route_decision==='HIGH_CONFIDENCE'?'<span class="chip ok">高置信命中</span>'
+        :im.route_decision==='MEDIUM_CONFIDENCE'?'<span class="chip warn">中置信命中</span>'
+        :im.route_decision==='REJECTED'?'<span class="chip grey">未命中 → 新建节点</span>':''}
+      ${im.judgment_result?`<span class="chip ${im.judgment_result==='written'?'ok':(im.judgment_result==='failed'?'bad':'grey')}">${{written:'✅ 写入图谱',insufficient_evidence:'🌱 冷启动单证据',fetched_empty:'取到真空',failed:'失败'}[im.judgment_result]||ESC(im.judgment_result)}</span>`:''}
     </div>
+    ${outOfDomainNote(im)}
     ${im.answer?`<div style="margin-top:6px"><b>Voyager 的回答：</b>
       <div class="nocmp-body" style="margin-top:4px">${ESC(im.answer)}</div></div>`:''}
     ${im.method_reason?`<div style="margin-top:5px;font-size:12px;color:var(--muted)">
@@ -1948,6 +2031,47 @@ function consumeBlock(im){
       <br>Voyager 取到 ${ESC(im.rows||0)} 行，VLML 独立那一路取到 ${ESC(im.referee_rows||0)} 行 ——
       裁判只取数不整理，比对交给 LLM 直接看两条 SQL 和取到的东西。</div>`:''}
     ${im.skipped?`<div style="margin-top:5px;font-size:12px;color:var(--muted)">${ESC(im.skipped)}</div>`:''}`;
+}
+
+/* 域外问题引导（2026-10-18，用户实测「特斯拉股价」导入后相关度 0 触发）。
+   判定签名：消费记录里 取到真空（fetched_empty）或（未命中 且 相关度<10 且 0 行）
+   —— 这个问题和**当前场景**的图谱/数据源不是同一个领域。按设计它仍归当前场景
+   （未命中 → 新建节点），但面板必须说清"为什么相关度低、去哪"，并给一键迁场。 */
+function outOfDomainNote(im){
+  if(im.mode!=='voyager_consume') return '';
+  const score=+(im.route_score||0);
+  const rows=+(im.rows||0);
+  const emptyFetch = im.judgment_result==='fetched_empty';
+  const noHit = im.route_decision==='REJECTED' && score<10 && !rows;
+  if(!(emptyFetch||noHit)) return '';
+  return `<div class="note warn" style="margin-top:6px">
+    <b>这个问题大概率不属于当前场景。</b>Scene ${ESC(im.root_scene||'A')} 的图谱里没有和它对得上的节点
+    （相关度 ${score}/100，双阈值要 ≥10 才中置信、≥40 才高置信），当前场景的数据源里也取不到数（${rows} 行）。
+    它问的领域和这张图谱不是一回事 —— <b>相关度低不是"答错了"，是"归错了场景"</b>。
+    <div style="margin-top:5px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <button class="btn btn-secondary" style="padding:4px 10px;font-size:12px"
+        data-migrate-q="${ESC(im.question||'')}">➜ 新建场景，并把这个问题导过去</button>
+      <span class="hint">新场景 = 独立图谱（节点从 0 长起）+ 独立待审区 + 独立学习曲线；
+      数据源默认继承当前库，要接真数据在建场景时填 duckdb 路径。</span>
+    </div></div>`;
+}
+async function migrateToNewScene(q){
+  if(!q) return;
+  const ds=prompt('新场景的数据源 duckdb 路径（留空 = 继承当前默认库）：')||'';
+  const name='域外导入 · '+String(q).slice(0,16);
+  let c;
+  try{
+    c=await fetch('/api/scene/create',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name:name,data_source:ds,description:'由域外问题一键新建：'+String(q).slice(0,80)})}).then(r=>r.json());
+  }catch(e){ alert('新建场景失败：'+e); return; }
+  if(!c.ok){ alert('插入被拒：'+(c.error||'')+'（可执行动作缺席的场景不许插入）'); return; }
+  await fetch('/api/scene/switch',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({scene_id:c.scene_id})}).catch(()=>{});
+  const r=await fetch('/api/coach',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({question:q,mode:'voyager'})}).then(x=>x.json()).catch(()=>({}));
+  alert('已新建并切换到 Scene '+c.scene_id+'（独立图谱，Δ 专属节点从 0 开始长）。\n'
+    +'原问题已在新场景重新提交'+(r.accepted?'（后台跑 1~3 分钟，结果进导入历史与曲线）':'(未能受理：'+(r.error||'')+')')+'。');
+  GRAPH=null; loadSceneBar(); load();
 }
 
 /* 人导入在图谱侧落了什么 —— 收录判据是「VLML 能不能用表内覆盖的工具集
@@ -2676,6 +2800,22 @@ class Handler(BaseHTTPRequestHandler):
                 sid = str(payload.get("scene_id") or "").strip() \
                     or _sc.current_scene_id()
                 m = _rt.route(q, sid)
+                # 判定基准：这句话是在跟**哪个场景的哪张图谱**比。不返回它，
+                # 面板上就只有一个光秃秃的分数 —— 人无法判断"相关度低"是
+                # 问题不好还是**归错了场景**（2026-10-18 实测特斯拉问题踩中）。
+                scene_nodes, scene_sample = 0, []
+                try:
+                    import knowledge_graph as _kg
+                    _g = _kg.KnowledgeGraph.load()
+                    sn = [n for n in _g.nodes.values()
+                          if str(getattr(n, "root_scene", "A") or "A") == sid
+                          and str(getattr(n, "kind", "")) != "scene_root"
+                          and str(getattr(n, "status", "")) != "deleted"]
+                    scene_nodes = len(sn)
+                    scene_sample = [str(getattr(n, "label", "") or n.id)
+                                    for n in sn[:8]]
+                except Exception:
+                    pass
                 self._json(200, {
                     "scene_id": sid,
                     "decision": m["decision"],
@@ -2686,6 +2826,14 @@ class Handler(BaseHTTPRequestHandler):
                     "node_label": m.get("node_label", ""),
                     "action": m["action"],
                     "matched_on": m["matched_on"],
+                    "scene_nodes": scene_nodes,
+                    "scene_sample": scene_sample,
+                    # 域外签名：本场景有节点、这句话却一个都对不上 → 大概率问的是
+                    # 另一个领域（该引导新建场景，而不是硬塞进当前场景）。
+                    "out_of_domain": bool(
+                        m["decision"] == "REJECTED"
+                        and int(m["max_score"]) < 10
+                        and scene_nodes > 0),
                 })
             except Exception as e:
                 self._json(500, {"error": f"{type(e).__name__}: {e}"[:200]})
