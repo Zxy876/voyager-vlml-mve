@@ -1340,21 +1340,29 @@ ${ESC(REL[e.relation]&&REL[e.relation][1]||e.relation)}${e.origin==='observed'?'
   // 维度节点可点：点了就把它设成练习范围（同「练习此知识点」按钮）
   const ns=Object.entries(pos).map(([id,p])=>{
     const n=byId[id]||{};
-    const fill={dimension:'#e8f2ee',tool:'#eaf0fb',table:'#f2f0e8'}[n.kind]||'#eee';
-    const stroke={dimension:'#2f7d5f',tool:'#48679c',table:'#a8976a'}[n.kind]||'#999';
+    const cold = n.status==='cold_start_guess';          // 🌱 冷启动：淡黄 + 金黄虚线
+    let fill={dimension:'#e8f2ee',tool:'#eaf0fb',table:'#f2f0e8'}[n.kind]||'#eee';
+    let stroke={dimension:'#2f7d5f',tool:'#48679c',table:'#a8976a'}[n.kind]||'#999';
+    let sw=1.2;
+    if(cold){ fill='#fff4cc'; stroke='#d9a900'; sw=1.5; }
     const deg=edges.filter(e=>e.from===id||e.to===id).length;
     const clickable = n.kind==='dimension'
       ? ` data-scope-set="${ESC(n.label||id)}" style="cursor:pointer"` : '';
     const isScope = n.kind==='dimension' && window.__scope && window.__scope.active
       && window.__scope.label===n.label;
+    const labelTxt=(cold?'⚠ ':'')+ESC(n.label||id);
+    const tip='\n状态：'+(cold?'冷启动猜测（单次证据支撑）':(n.status||'verified'))
+      +'\n证据数：'+(n.evidence!=null?n.evidence:'?')
+      +(n.root_scene?'\n归属场景：'+n.root_scene:'');
     return `<g${clickable}><rect x="${p.x}" y="${p.y-NH/2}" width="${NW}" height="${NH}" rx="5"
-      fill="${isScope?'#d9efe3':fill}" stroke="${stroke}" stroke-width="${isScope?2.4:1.2}"/>
-      <text x="${p.x+8}" y="${p.y+4}" font-size="11" fill="#22303a">${ESC(n.label||id)}</text>
+      fill="${isScope?'#d9efe3':fill}" stroke="${stroke}" stroke-width="${isScope?2.4:sw}"
+      ${cold?'stroke-dasharray="4 3"':''}/>
+      <text x="${p.x+8}" y="${p.y+4}" font-size="11" fill="#22303a">${labelTxt}</text>
       ${isScope?'<text x="'+(p.x+NW-6)+'" y="'+(p.y+4)+'" font-size="10" fill="#2f7d5f" '
         +'text-anchor="end">练习中</text>':''}
       <title>${ESC(n.label||id)}
 类型：${ESC(n.kind)}
-连边：${deg}${n.detail&&n.detail.topic_id?'\n题：'+ESC(n.detail.topic_id):''}${n.detail&&n.detail.required_by?'\n被题要求：'+ESC((n.detail.required_by).join('、')):''}${n.kind==='dimension'?'\n点击设为练习范围':''}</title></g>`;
+连边：${deg}${n.detail&&n.detail.topic_id?'\n题：'+ESC(n.detail.topic_id):''}${n.detail&&n.detail.required_by?'\n被题要求：'+ESC((n.detail.required_by).join('、')):''}${n.kind==='dimension'?'\n点击设为练习范围':''}${tip}</title></g>`;
   }).join('');
 
   // 下方位清单：照伴学 relation_groups —— 图看结构，清单看内容
@@ -2331,6 +2339,245 @@ setInterval(load, 4000);
 """
 
 
+# ---------------------------------------------------------------------------
+# 1→n 泛化 · 场景命名空间管理页（任务174 新建路由页面）
+# 复用主页面的 PREFIX 注入思路：把 window.MVE_PREFIX 写进 head，JS 用 api() 拼地址。
+# ---------------------------------------------------------------------------
+def _scenes_html() -> str:
+    prefix_script = (f'<script>window.MVE_PREFIX="{PREFIX}";</script>'
+                    if PREFIX else '<script>window.MVE_PREFIX="";</script>')
+    return SCENES_HTML.replace("<head>", "<head>\n" + prefix_script, 1)
+
+
+SCENES_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MVE · 场景命名空间（1→n 可插拔）</title>
+<style>
+:root{
+  color-scheme:light;
+  font-family:"Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+  --bg:#f3f7f1; --paper:#fff; --ink:#1f2924; --muted:#607168;
+  --line:rgba(31,41,36,.12); --brand:#2f7d57; --brand-2:#17563d;
+  --accent:#d58b2b; --seed:#e0a800; --seed-bg:#fff4cc;
+  --alert:#e8762b; --alert-bg:#fde3d2; --ok:#2f9e6b; --bad:#d9534f;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);padding:24px;line-height:1.5}
+a{color:var(--brand-2);text-decoration:none}
+.wrap{max-width:1080px;margin:0 auto}
+.topbar{display:flex;align-items:center;justify-content:space-between;
+  margin-bottom:18px;flex-wrap:wrap;gap:10px}
+h1{font-size:22px;margin:0}
+h2{font-size:17px;margin:22px 0 10px}
+.hint{color:var(--muted);font-size:13px;margin:0 0 8px}
+.back{font-size:13px;background:var(--paper);border:1px solid var(--line);
+  padding:6px 12px;border-radius:8px}
+.panel{background:var(--paper);border:1px solid var(--line);border-radius:12px;
+  padding:16px 18px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.04)}
+.switcher{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:6px}
+.chip{display:inline-flex;flex-direction:column;align-items:flex-start;
+  border:1px solid var(--line);border-radius:10px;padding:8px 12px;cursor:pointer;
+  background:var(--paper);font-size:13px;min-width:120px}
+.chip .nm{font-weight:600}
+.chip .sub{color:var(--muted);font-size:11px}
+.chip.cur{border-color:var(--brand);box-shadow:0 0 0 2px rgba(47,125,87,.18)}
+.chip.cur .nm::after{content:" ✓";color:var(--brand)}
+.create{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;align-items:center}
+.create input,.create textarea{border:1px solid var(--line);border-radius:8px;
+  padding:7px 9px;font-size:13px;font-family:inherit}
+.create input[type=text]{min-width:150px}
+button.btn{border:none;border-radius:8px;padding:8px 14px;font-size:13px;
+  cursor:pointer;background:var(--brand);color:#fff;font-weight:600}
+button.btn.alt{background:var(--paper);color:var(--brand-2);border:1px solid var(--brand)}
+button.btn.ghost{background:var(--paper);border:1px solid var(--line);color:var(--ink)}
+button.btn.sm{padding:4px 9px;font-size:12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
+.card{background:var(--paper);border:1px solid var(--line);border-radius:12px;
+  padding:14px 16px}
+.card.cur{border-color:var(--brand);box-shadow:0 0 0 2px rgba(47,125,87,.15)}
+.badges{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}
+.badge{font-size:12px;border-radius:20px;padding:3px 10px;font-weight:600}
+.badge.loaded{background:#e6f5ec;color:var(--brand-2)}
+.badge.seed{background:var(--seed-bg);color:#8a6a00;border:1px dashed var(--seed)}
+.badge.alert{background:var(--alert-bg);color:#9a4711}
+.stat{display:flex;justify-content:space-between;font-size:13px;padding:3px 0;
+  border-bottom:1px dashed var(--line)}
+.stat:last-child{border-bottom:none}
+.stat .k{color:var(--muted)}
+.stat .v{font-variant-numeric:tabular-nums;font-weight:600}
+.bignum{font-size:30px;font-weight:700;color:var(--brand);line-height:1.1}
+.bignum small{font-size:13px;color:var(--muted);font-weight:400}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:600}
+.tag{display:inline-block;border-radius:6px;padding:2px 7px;font-size:11px;font-weight:600}
+.tag.ok{background:#e6f5ec;color:var(--ok)}
+.tag.stale{background:#fdeaea;color:var(--bad)}
+.tag.unused{background:#eef0ef;color:var(--muted)}
+.muted{color:var(--muted)}
+.right{text-align:right}
+.row-ops{display:flex;gap:5px;flex-wrap:wrap}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);
+  background:#1f2924;color:#fff;padding:9px 16px;border-radius:10px;font-size:13px;
+  opacity:0;transition:opacity .2s;pointer-events:none}
+.toast.show{opacity:.95}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <h1>场景命名空间 · 1→n 可插拔</h1>
+    <a class="back" id="backLink" href="/">← 返回主面板</a>
+  </div>
+  <p class="hint">任意用户场景作为可插拔件：插入不重启、不清库、不重训，只向共享知识图谱与技能库注册一个命名空间。切回 A 时 A 的续跑点与活动指纹不变。</p>
+
+  <div class="panel">
+    <h2 style="margin-top:0">场景切换器</h2>
+    <div class="hint">点击切换当前场景；新建场景初始只有根节点（图谱为空），随消费侧提问动态挂载。</div>
+    <div class="switcher" id="switcher"></div>
+    <div class="create">
+      <input type="text" id="newName" placeholder="场景名（如：我的学习场景）">
+      <input type="text" id="newDs" placeholder="专属数据源路径（留空继承默认库）">
+      <input type="text" id="newDesc" placeholder="描述（可选）">
+      <button class="btn" onclick="createScene()">＋ 新建场景</button>
+    </div>
+  </div>
+
+  <h2>场景卡片（降级标记 + Δ 专属节点数 + 状态指纹）</h2>
+  <div class="grid" id="cards"></div>
+
+  <h2>跨场景技能溯源（任务173）</h2>
+  <div class="panel">
+    <div class="hint" id="skillSummary"></div>
+    <table id="skillTable">
+      <thead><tr><th>技能</th><th>归属场景</th><th>命中/成功</th><th>复用状态</th><th class="right">操作</th></tr></thead>
+      <tbody id="skillBody"></tbody>
+    </table>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const P = window.MVE_PREFIX || '';
+const api = (p) => P + p;
+const fmtTime = (t) => {
+  if(!t) return '—';
+  const d = new Date(t*1000);
+  return d.toLocaleString('zh-CN', {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
+};
+function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),1800);}
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+
+async function loadScenes(){
+  const r = await fetch(api('/api/scenes')).then(x=>x.json());
+  document.getElementById('backLink').href = P || '/';
+  // 切换器
+  const sw = document.getElementById('switcher'); sw.innerHTML='';
+  (r.scenes||[]).forEach(s=>{
+    const sid = s.id, cur = sid===r.current;
+    const n = (r.exclusive_nodes||{})[sid]||0;
+    const div = document.createElement('div');
+    div.className = 'chip'+(cur?' cur':'');
+    div.innerHTML = `<span class="nm">${esc(s.name||sid)}</span>`+
+      `<span class="sub">${esc(sid)} · 专属节点 ${n}</span>`;
+    div.onclick = ()=>switchScene(sid, cur);
+    sw.appendChild(div);
+  });
+  // 卡片
+  const cards = document.getElementById('cards'); cards.innerHTML='';
+  (r.scenes||[]).forEach(s=>{
+    const sid = s.id, cur = sid===r.current;
+    const n = (r.exclusive_nodes||{})[sid]||0;
+    const gs = (r.graph_sparsity||{})[sid]||'dense';
+    const ec = (r.entity_catalog||{})[sid]||'present';
+    const fp = (r.fingerprint||{})[sid]||{};
+    const badges = `<span class="badge loaded">✓ 已加载</span>`;
+    const seedBadge = gs==='seeding' ? `<span class="badge seed">🌱 种子态·节点随消费增长</span>` : '';
+    const ecBadge = ec==='missing' ? `<span class="badge alert">🟠 实体目录缺失·需补充</span>` : '';
+    const card = document.createElement('div');
+    card.className = 'card'+(cur?' cur':'');
+    card.innerHTML =
+      `<div style="display:flex;justify-content:space-between;align-items:center">
+         <strong>${esc(s.name||sid)}</strong>${cur?'<span class="badge loaded">当前</span>':''}
+       </div>
+       <div class="muted" style="font-size:12px">${esc(sid)} · ${esc(s.description||'')}</div>
+       <div class="badges">${badges}${seedBadge}${ecBadge}</div>
+       <div class="bignum">${n} <small>专属节点（Δ）</small></div>
+       <div style="margin-top:8px">
+         <div class="stat"><span class="k">续跑点 cursor</span><span class="v">${esc(fp.cursor==null?'—':fp.cursor)}</span></div>
+         <div class="stat"><span class="k">上次活动</span><span class="v">${fmtTime(fp.updated_at)}</span></div>
+         <div class="stat"><span class="k">本场景消费记录</span><span class="v">${esc(fp.consume_count==null?'—':fp.consume_count)}</span></div>
+         <div class="stat"><span class="k">状态指纹 hash</span><span class="v">${esc(fp.state_hash||'—')}</span></div>
+       </div>`;
+    cards.appendChild(card);
+  });
+}
+
+function switchScene(sid, cur){
+  if(cur){toast('已在该场景');return;}
+  fetch(api('/api/scene/switch'),{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({scene_id:sid})}).then(x=>x.json()).then(r=>{
+    if(r.ok){toast('已切换到 '+sid);loadScenes();} else toast('切换失败：'+(r.error||''));
+  });
+}
+function createScene(){
+  const name=document.getElementById('newName').value.trim();
+  if(!name){toast('场景名不能为空');return;}
+  const ds=document.getElementById('newDs').value.trim();
+  const desc=document.getElementById('newDesc').value.trim();
+  fetch(api('/api/scene/create'),{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({name,description:desc,data_source:ds})}).then(x=>x.json()).then(r=>{
+    if(r.ok){toast('已新建场景 '+r.scene_id);document.getElementById('newName').value='';
+      document.getElementById('newDs').value='';document.getElementById('newDesc').value='';
+      loadScenes();} else toast('新建失败：'+(r.error||''));
+  });
+}
+
+async function loadSkills(){
+  const r = await fetch(api('/api/skill-traceability')).then(x=>x.json());
+  const byScene = r.by_scene||{};
+  document.getElementById('skillSummary').textContent =
+    `技能总数 ${r.total||0} 条；按场景归属：` +
+    Object.entries(byScene).map(([k,v])=>`${k}=${v}`).join('  ');
+  const tb = document.getElementById('skillBody'); tb.innerHTML='';
+  (r.skills||[]).forEach(s=>{
+    const tagCls = s.status==='stale'?'stale':(s.status==='unused'?'unused':'ok');
+    const tagTxt = s.status==='stale'?'🔴 失效':(s.status==='unused'?'⚪ 未验证':'🟢 正常复用');
+    const tr=document.createElement('tr');
+    tr.innerHTML =
+      `<td><div><strong>${esc(s.name||s.key)}</strong></div>
+         <div class="muted" style="font-size:11px">${esc(s.topic||'')}</div></td>
+       <td>Scene ${esc(s.source_scene)}</td>
+       <td>${s.hits}/${s.ok}`+(s.ratio!=null?` (${Math.round(s.ratio*100)}%)`:'')+`</td>
+       <td><span class="tag ${tagCls}">${tagTxt}</span></td>
+       <td class="right"><div class="row-ops">
+         <button class="btn sm alt" onclick="operate('${esc(s.key)}','boost')">提升</button>
+         <button class="btn sm ghost" onclick="operate('${esc(s.key)}','demote')">失效</button>
+         <button class="btn sm ghost" onclick="operate('${esc(s.key)}','delete')">删除</button>
+       </div></td>`;
+    tb.appendChild(tr);
+  });
+}
+function operate(key,action){
+  fetch(api('/api/skill/operate'),{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({key,action})}).then(x=>x.json()).then(r=>{
+    if(r.ok){toast(({boost:'已提升',demote:'已标记失效',delete:'已删除'})[action]||'已操作');loadSkills();}
+    else toast('操作失败：'+(r.error||''));
+  });
+}
+
+loadScenes();
+loadSkills();
+setInterval(loadScenes, 8000);
+</script>
+</body>
+</html>
+"""
+
+
 # 消费通路的后台任务状态（进程内存；面板重启即清 —— 与 pilot_state 一个思路，
 # 只是它轻到不值得落盘）。
 COACH_JOB: dict = {"running": False, "question": "", "started_at": 0.0, "error": ""}
@@ -2363,6 +2610,14 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/", "/index.html"):
             body = _html().encode("utf-8")
             ctype = "text/html; charset=utf-8"
+        elif path == "/scenes":
+            # 1→n 泛化：场景命名空间管理页（任务174 新建路由页面）
+            body = _scenes_html().encode("utf-8")
+            ctype = "text/html; charset=utf-8"
+        elif path == "/api/skill-traceability":
+            # 1→n 泛化：跨场景技能溯源（任务173）
+            body = json.dumps(panel_data.skill_traceability(), ensure_ascii=False).encode("utf-8")
+            ctype = "application/json; charset=utf-8"
         elif path == "/api/state":
             import time as _t
             # 消费通路在后台跑（要 1～3 分钟），前端靠 4 秒轮询看它跑没跑完。
@@ -2380,6 +2635,10 @@ class Handler(BaseHTTPRequestHandler):
             ctype = "application/json; charset=utf-8"
         elif path == "/api/practice-scope":
             body = _scope_json().encode("utf-8")
+            ctype = "application/json; charset=utf-8"
+        elif path == "/api/scenes":
+            # 1→n 泛化：场景命名空间视图（列表 + 当前 + 每场景专属节点数）
+            body = json.dumps(panel_data.scenes_view(), ensure_ascii=False).encode("utf-8")
             ctype = "application/json; charset=utf-8"
         elif path == "/api/teaching-graph":
             # 教学图谱（伴学 29 知识点种子 + 前置门控 + 掌握度叠加）。
@@ -2419,6 +2678,58 @@ class Handler(BaseHTTPRequestHandler):
                 })
             except Exception as e:
                 self._json(500, {"matched": False, "error": f"{type(e).__name__}: {e}"[:200]})
+            return
+
+        if path in ("/api/scene/switch", "/api/scene/create"):
+            try:
+                import scenes as _sc
+                if path == "/api/scene/switch":
+                    sid = str(payload.get("scene_id") or "").strip()
+                    if not sid:
+                        self._json(400, {"ok": False, "error": "scene_id 为空"})
+                        return
+                    if sid not in [s["id"] for s in _sc.list_scenes()]:
+                        self._json(400, {"ok": False, "error": f"场景 {sid} 不存在"})
+                        return
+                    _sc.switch_scene(sid)
+                    self._json(200, {"ok": True, "current": _sc.current_scene_id()})
+                else:  # create
+                    name = str(payload.get("name") or "").strip()
+                    if not name:
+                        self._json(400, {"ok": False, "error": "场景名不能为空"})
+                        return
+                    desc = str(payload.get("description") or "")
+                    new_id = _sc.create_scene(name, description=desc)
+                    self._json(200, {"ok": True, "scene_id": new_id,
+                                     "current": _sc.current_scene_id()})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": f"{type(e).__name__}: {e}"[:200]})
+            return
+
+        if path == "/api/skill/operate":
+            # 1→n 泛化：溯源卡片三操作（任务173）
+            try:
+                import skill_store as _ss
+                key = str(payload.get("key") or "").strip()
+                action = str(payload.get("action") or "").strip().lower()
+                if not key:
+                    self._json(400, {"ok": False, "error": "key 为空"})
+                    return
+                if action == "boost":
+                    ok = _ss.boost_skill(key)
+                elif action == "demote":
+                    ok = _ss.demote_skill(key)
+                elif action == "delete":
+                    ok = _ss.delete_skill(key)
+                else:
+                    self._json(400, {"ok": False, "error": f"未知操作 {action}"})
+                    return
+                if not ok:
+                    self._json(404, {"ok": False, "error": "技能不存在"})
+                    return
+                self._json(200, {"ok": True, "action": action})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": f"{type(e).__name__}: {e}"[:200]})
             return
 
         if path == "/api/coach":

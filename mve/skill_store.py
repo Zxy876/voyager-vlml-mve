@@ -328,6 +328,53 @@ def mark_result(keys: list[str], ok: bool) -> None:
         _save(data)
 
 
+# ---------------- 1→n 泛化 · 溯源卡片三操作（任务173） ----------------
+
+def boost_skill(key: str) -> bool:
+    """溯源卡片操作①：标记为有效（复用提升）。
+
+    把该技能的命中成功数 +1，使其在检索里上浮（「这条技能确实好用」）。
+    返回是否命中到技能。
+    """
+    data = _load_raw()
+    if key not in data["skills"]:
+        return False
+    s = data["skills"][key]
+    s["ok"] = int(s.get("ok") or 0) + 1
+    if int(s.get("hits") or 0) == 0:
+        s["hits"] = 1
+    _save(data)
+    return True
+
+
+def demote_skill(key: str) -> bool:
+    """溯源卡片操作②：标记为失效（降权）。
+
+    把命中成功数清零（保留技能本体，但下次检索自然沉底，视为「这条不再可信」）。
+    返回是否命中到技能。
+    """
+    data = _load_raw()
+    if key not in data["skills"]:
+        return False
+    data["skills"][key]["ok"] = 0
+    _save(data)
+    return True
+
+
+def delete_skill(key: str) -> bool:
+    """溯源卡片操作③：从技能库删除该条技能（本体移除，不可恢复）。
+
+    返回是否真的删到了。删除前不连带删图谱/能力项（那些是共享资产，按场景归属）。
+    """
+    data = _load_raw()
+    if key not in data["skills"]:
+        return False
+    del data["skills"][key]
+    data["writes"] = int(data.get("writes") or 0) + 1
+    _save(data)
+    return True
+
+
 # ---------------- 观测与兼容 ----------------
 
 def stats() -> dict[str, Any]:

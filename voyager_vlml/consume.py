@@ -738,6 +738,22 @@ async def consume(
         "ability_total": a_tot,
         # 掌握度 = 已掌握 / 该掌握的总量（不是覆盖率的折算）
         "mastery": (round(m_tot / a_tot, 4) if a_tot else None),
+        # —— 1→n 泛化：场景归属 + 冷启动标记（补 ⑤ 缺口，使记录可按场景隔离）——
+        "root_scene": str(absorbed.get("root_scene") or ""),
+        "cold_start": bool(absorbed.get("cold_start")),
+        "node_status": str(absorbed.get("node_status") or ""),
+        # 判定结果枚举（设计《判定结果状态与写入证明规格》）：写入图谱的充分条件。
+        #   written              —— 成功写入图谱（节点已存在/已验证，已提交终态）
+        #   insufficient_evidence —— 冷启动单次证据（节点 cold_start_guess，待巩固）
+        #   fetched_empty        —— 取到真空结果，未写图（= neko no_data）
+        #   failed               —— 答完但写图/标掌握失败
+        "judgment_result": (
+            "fetched_empty" if not real_calls else
+            ("insufficient_evidence"
+             if (absorbed.get("mastered")
+                 and absorbed.get("node_status") == "cold_start_guess")
+             else "written" if absorbed.get("mastered")
+             else "failed")),
         "judge": "",
         "skipped": "",
     }
@@ -1004,7 +1020,7 @@ def _runtime_topics() -> dict[str, Any]:
     return {}
 
 
-def _runtime_topic_id(question: str) -> str:
+def _runtime_topic_id(question: str, scene_id: str = "") -> str:
     """答出来了、但归不上任何已有题 → 建一个**稳定**的能力 id。
 
     为什么必须建（用户的定义）：「我问你一句，Voyager 答完了，之后这题就到他的
@@ -1016,6 +1032,9 @@ def _runtime_topic_id(question: str) -> str:
 
     稳定 = 同一句话永远得到同一个 id（问题文本的哈希），所以问第二遍不会
     再建一个新节点把分母灌水（掌握度分母 = 图谱节点 + 这里登记的能力项）。
+
+    `scene_id`：1→n 泛化（补 ⑤ 缺口）—— 这条消费记录打上所属场景命名空间标签，
+    使「切回 A 时 A 的消费记录数不变」可被按场景隔离统计（不再混在全局池里）。
     """
     import hashlib
     h = hashlib.md5(str(question or "").strip().encode("utf-8")).hexdigest()[:8]
@@ -1023,12 +1042,22 @@ def _runtime_topic_id(question: str) -> str:
     reg = _runtime_topics()
     if tid not in reg:
         reg[tid] = {"id": tid, "name": str(question or "")[:60],
-                    "question": str(question or ""), "source": "consume"}
+                    "question": str(question or ""), "source": "consume",
+                    "root_scene": str(scene_id or "")}
         try:
             _RUNTIME_TOPICS_FILE.write_text(
                 json.dumps(reg, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as e:  # pragma: no cover
             print(f"  （登记新能力项失败：{type(e).__name__}: {e}）")
+    else:
+        # 已存在则补打场景标签（旧记录升级，不破坏既有）
+        if scene_id and not reg[tid].get("root_scene"):
+            reg[tid]["root_scene"] = str(scene_id)
+            try:
+                _RUNTIME_TOPICS_FILE.write_text(
+                    json.dumps(reg, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception:  # pragma: no cover
+                pass
     return tid
 
 
@@ -1137,7 +1166,7 @@ def _absorb(question: str, sql: str, topic_id: str) -> dict[str, Any]:
                            "cold_start": False, "root_scene": "", "node_status": ""}
     if not sql:
         return out
-    tid = topic_id or _runtime_topic_id(question)
+    tid = topic_id or _runtime_topic_id(question, _scene_id)
     out["topic_id"] = tid
     # 1→n 泛化：当前场景（冷启动节点与技能都归属它）
     try:
@@ -1159,8 +1188,16 @@ def _absorb(question: str, sql: str, topic_id: str) -> dict[str, Any]:
         # 仍然标 completed —— 但那是它**原本**的意思：「这节点规划过了，别再规划」
         # （人已经问过并且答出来的题，课程不必再练一遍）。带 source="consume"
         # 标明这次是消费侧标的，将来能审计；语义拆法见 mark_completed 的 docstring。
-        topic_graph.MasteryStore().mark_completed(tid, source="consume")
+        topic_graph.MasteryStore().mark_completed(
+            tid, source="consume", root_scene=_scene_id)
         out["mastered"] = True
+        # 刷新当前场景的 updated_at 指纹（消费是一次对该场景的活动，B 的活动只写 B，
+        # 证明切回 A 时 A 的活动时间戳没被覆盖）。
+        try:
+            import scenes as _sc
+            _sc.touch_scene(_scene_id)
+        except Exception:  # pragma: no cover
+            pass
         # 分子分母**同源**：都只从消费侧这一套集合算，不再掺练习线的账。
         # 以前分子数 MasteryStore 全部 completed（58，含练习线 29 条 runtime_*）、
         # 分母数「图谱 29 + runtime_topics 16」（含练习线 12 条 practice 项），

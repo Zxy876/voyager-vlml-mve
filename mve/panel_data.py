@@ -791,5 +791,94 @@ def as_json() -> str:
     return json.dumps(build_state(), ensure_ascii=False, indent=2)
 
 
+def scenes_view() -> dict[str, Any]:
+    """场景命名空间视图（1→n 泛化）：列出所有场景 + 当前场景 + 每场景专属节点数
+    与降级标记、状态指纹。
+
+    专属节点数 = `root_scene == 该场景` 且 `status != deleted` 且非根占位（见
+    knowledge_graph.scene_specific_node_count）—— 这就是设计 Q3 的
+    **Δ 场景专属节点数**在面板上的数据来源。插入 Scene B 之前为 0，冷启动一题
+    成功后变 1，切回 A 读数不变（证明 B 没污染 A）。
+
+    每个场景额外返回：
+      · `exclusive_nodes` —— Δ 场景专属节点数（证明量）
+      · `graph_sparsity` —— `seeding`（种子态·节点随消费增长）/`dense`
+      · `entity_catalog` —— `missing`（实体目录缺失·橙色告警）/`present`
+      · `fingerprint`    —— 状态指纹（续跑点/上次活动/消费数/状态 hash），
+                            切回 A 后可逐项核对「没被覆盖」
+    """
+    try:
+        import scenes as _sc
+        scene_list = _sc.list_scenes()
+        current = _sc.current_scene_id()
+        scene_ids = [s["id"] for s in scene_list]
+    except Exception:
+        scene_list, current, scene_ids = [], "A", []
+    exclusive: dict[str, int] = {}
+    sparsity: dict[str, str] = {}
+    catalog: dict[str, str] = {}
+    fp: dict[str, Any] = {}
+    try:
+        import knowledge_graph as kg
+        import scenes as _sc
+        g = kg.KnowledgeGraph.load()
+        for sid in scene_ids:
+            exclusive[sid] = g.scene_specific_node_count(sid)
+            sparsity[sid] = _sc.graph_sparsity(sid)
+            catalog[sid] = _sc.entity_catalog_status(sid)
+            fp[sid] = _sc.scene_state_fingerprint(sid)
+    except Exception:
+        exclusive = {sid: 0 for sid in scene_ids}
+        sparsity = {sid: "seeding" for sid in scene_ids}
+        catalog = {sid: "present" for sid in scene_ids}
+        fp = {sid: {} for sid in scene_ids}
+    return {"scenes": scene_list, "current": current,
+            "exclusive_nodes": exclusive, "graph_sparsity": sparsity,
+            "entity_catalog": catalog, "fingerprint": fp}
+
+
+def skill_traceability() -> dict[str, Any]:
+    """跨场景技能溯源（设计任务173）：每条技能归属哪个场景 + 复用健康度。
+
+    返回所有技能，按 source_scene 分组，并给每条技能判定复用状态：
+      · `ok`（🟢 正常复用）—— 被用过且正确率 ≥ 0.5，或尚未被验证（hits==0）
+      · `stale`（🔴 失效）—— 被用过 ≥2 次但正确率 < 0.5
+      · `unused`（未验证）—— 入库但从未被检索命中
+    溯源卡片据此显示「这条技能来自 Scene X」，并给出三操作（提升/失效/删除）。
+    """
+    try:
+        import skill_store as ss
+        skills = ss.all_skills()
+    except Exception:
+        skills = []
+    out: list[dict[str, Any]] = []
+    for s in skills:
+        hits = int(s.get("hits") or 0)
+        ok = int(s.get("ok") or 0)
+        ratio = (ok / hits) if hits > 0 else None
+        if hits >= 2 and ratio is not None and ratio < 0.5:
+            status = "stale"          # 🔴 失效
+        elif hits == 0:
+            status = "unused"         # 未验证
+        else:
+            status = "ok"             # 🟢 正常复用
+        out.append({
+            "key": s.get("key"),
+            "topic": s.get("topic"),
+            "name": s.get("name"),
+            "source_scene": str(s.get("source_scene", "default")),
+            "hits": hits, "ok": ok,
+            "ratio": round(ratio, 2) if ratio is not None else None,
+            "status": status,
+            "versions": int(s.get("versions") or 1),
+            "updated": s.get("updated"),
+        })
+    # 按场景分组计数（溯源视图用）
+    by_scene: dict[str, int] = {}
+    for s in out:
+        by_scene[s["source_scene"]] = by_scene.get(s["source_scene"], 0) + 1
+    return {"skills": out, "by_scene": by_scene, "total": len(out)}
+
+
 if __name__ == "__main__":
     print(as_json())

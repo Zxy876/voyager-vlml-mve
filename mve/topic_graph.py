@@ -182,7 +182,7 @@ class MasteryStore:
         return touched
 
     def mark_completed(self, topic_id: str, *, commit: bool = True,
-                       source: str = "practice") -> dict[str, Any]:
+                       source: str = "practice", root_scene: str = "") -> dict[str, Any]:
         """标 `completed`（+ `completed_source`）两个位。
 
         与 mastery（展示用）解耦：completed 是布尔「做没做过」，mastery 是
@@ -209,6 +209,9 @@ class MasteryStore:
           `:135` 学习曲线 = `len(completed_tasks)`）：**学习时不计入** ——
           练习跑通只推进课程规划，不算"能力变大了"；能力只从消费那侧长。
 
+        `root_scene`（1→n 泛化，补 ⑤ 缺口）：消费线标的记录带上场景命名空间标签，
+        使消费侧问题记录可按场景隔离统计（场景卡能单列「本场景消费数」）。
+
         升级规则：practice → consume 单向。练习先标过、后来消费答出来了 → 升级成
         consume；消费先标过、练习再跑这道题 → **不降级**（掌握的事实不能被抹掉）。
         """
@@ -220,6 +223,8 @@ class MasteryStore:
         row["completed"] = True
         if source == "consume" or not row.get("completed_source"):
             row["completed_source"] = source
+        if root_scene:
+            row["root_scene"] = str(root_scene)
         self._rows[topic_id] = row
         if commit:
             self._persist()
