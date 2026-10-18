@@ -369,6 +369,14 @@ button,textarea,select{font:inherit}
 .scopebar .lbl{font-size:12px;color:var(--muted);font-weight:700;text-transform:uppercase}
 .scopebar .hint{font-size:12px;color:var(--muted)}
 .scope-act{display:inline-flex;gap:6px;align-items:center}
+/* 场景栏（1→n 可插拔）：与练习范围条同款样式的最小入口 —— 切换/新建场景、
+   显示当前场景的 Δ 专属节点数与导入曲线摘要。不另开页面（去重，2026-10-18）。 */
+.scenebar{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin-top:8px;
+  padding:7px 10px;border:1px dashed var(--line);border-radius:var(--radius-sm);background:rgba(255,255,255,.55)}
+.scenebar .lbl{font-size:12px;color:var(--muted);font-weight:700;text-transform:uppercase}
+.scenebar .hint{font-size:12px;color:var(--muted)}
+.scenebar select{font:inherit;font-size:13px;padding:3px 8px;border:1px solid var(--line);
+  border-radius:8px;background:#fff;color:var(--ink)}
 .tbl tr.now td{background:#eef8f3}
 @keyframes pulse{50%{box-shadow:0 0 0 6px rgba(34,197,94,.06)}}
 
@@ -524,6 +532,14 @@ li{margin:3px 0}
           <span class="lbl">练习范围</span>
           <span id="scopeChip"><span class="chip grey">未设置 · 出题器自选</span></span>
           <span class="hint" id="scopeHint">去「知识图谱」页点某个维度的「练习此知识点」</span>
+        </div>
+        <!-- 场景栏（1→n）：插入场景不重启/不清库，只注册一个命名空间。
+             导入与学习曲线都按当前场景隔离；切回 A 时 A 的读数不变。 -->
+        <div class="scenebar" id="sceneBar">
+          <span class="lbl">场景</span>
+          <select id="sceneSel" onchange="switchScene(this.value)"></select>
+          <button class="btn btn-secondary" id="btnNewScene" title="插入一个新场景：注册命名空间 + 注册可执行动作，不重启不清库">＋ 新建场景</button>
+          <span class="hint" id="sceneHint">加载中…</span>
         </div>
       </div>
       <div class="hero__controls">
@@ -932,6 +948,7 @@ function pImport(s){
       <div class="imp-row">
         <select id="topic"><option value="">自动匹配（按关键词归类）</option></select>
         <button class="btn btn-primary" id="go">交给 Voyager 回答</button>
+        <button class="btn btn-secondary" id="btnRoute" title="只按双阈值判定这句话命中当前场景的哪个节点，不拉数据、不调模型">🔍 只判定命中</button>
         <button class="btn btn-secondary" id="clr">清空</button>
       </div>
       <div class="hit" id="hit">归类结果会在这里显示。</div>
@@ -944,37 +961,104 @@ function pImport(s){
   </div>`;
 }
 
+/* 只判定命中（不执行）：双阈值判定这句话命中当前场景的哪个节点。
+   未命中 → 新建图谱节点（先落待审区，解题成功才升活节点）；
+   命中 → 归入已有节点。匹配只看文本相似度，与答案对错无关。 */
+async function previewRoute(){
+  const q=document.getElementById('q');
+  const hit=document.getElementById('hit');
+  const text=(q&&q.value||'').trim();
+  if(!text){alert('先写一句想问的话');return;}
+  hit.innerHTML='<span class="muted">判定中…</span>';
+  try{
+    const r=await fetch('/api/route',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({question:text})}).then(x=>x.json());
+    if(r.error){hit.innerHTML='<span class="muted">'+ESC(r.error)+'</span>';return;}
+    const dec=r.decision==='HIGH_CONFIDENCE'?'<span class="chip ok">高置信命中</span>'
+      :r.decision==='MEDIUM_CONFIDENCE'?'<span class="chip warn">中置信命中</span>'
+      :'<span class="chip grey">未命中</span>';
+    const act=r.action==='create_new_node'
+      ? '→ <b>新建图谱节点</b>（先落待审区，解题成功才升活节点）'
+      : '→ <b>归入已有节点</b> '+ESC(r.node_id||'');
+    hit.innerHTML=`<div class="imp-row">${dec}<span class="hint">分数 ${ESC(r.max_score)} · 重复命中 ${ESC(r.chunk_hits)}（双阈值，不是人审、也不是答对）</span></div>
+      <div style="font-size:12.5px;margin-top:4px">${act}</div>`;
+  }catch(e){hit.innerHTML='<span class="muted">判定失败：'+ESC(String(e))+'</span>';}
+}
+
 /* 消费进步曲线 —— 进步与掌握度**在消费这条线上测**（用户 2026-10-13 定）。
    为什么不是练习那条：练习不判分（VLML 的尺子不能进 Voyager 反馈环），
    run_log 里的覆盖率恒为 None，画出来没有意义。消费才是交付 —— 人真的要一个答案，
-   这时用 VLML0 裁判独立跑一遍量出覆盖率，才是真实的进步。 */
+   这时用 VLML0 裁判独立跑一遍量出覆盖率，才是真实的进步。
+   1→n（2026-10-18）：曲线按场景隔离 —— 选 Scene B 只画 B 的导入历史
+   （A 的混进来会把"B 从零开始学"画成"接在 A 的尾声上"，Δ 掌握数虚高）。
+   点上标命中判定（双阈值，非人审）与判定结果，二次导入同一问题命中即可达证据。 */
 function consumeCurve(s){
   const cc=s.consume_curve||[];
   if(!cc.length) return `<h3>学习曲线 · 消费能力侧</h3>
     <div class="empty">还没有消费记录。在上面问一句话，Voyager 会用已积累的能力回答 ——
     答完了这题就进它的能力库，掌握与进步从这里开始累计。</div>`;
+  window.__consumeCurveAll=cc;   // 场景筛选回「全部」时用，不再请求一次
+  const inData=[...new Set(cc.map(c=>c.root_scene||'A'))];
+  const known=window.__sceneList||[];
+  const all=[...new Set([...inData,...known])];
+  const opts=`<option value="__all__">全部场景（${cc.length} 次）</option>`+
+    all.map(id=>`<option value="${ESC(id)}">Scene ${ESC(id)}</option>`).join('');
+  return `<h3>学习曲线 · 消费能力侧（${cc.length} 次消费）</h3>
+    <div class="legend"><b>掌握 = 能力集合的增长</b>：人问一句 → Voyager 答完了 →
+    这题进它的能力库。纵轴是<b>累计会做的题有几道</b>，照原版 Voyager
+    <span class="mono">curriculum.py:135 len(completed_tasks)</span>。
+    <b>练习不计入</b>：练习线有意不判分，跑通只推进课程规划（"这题规划过了，
+    别再规划"），不算能力变大 —— 原版也是只在成功时 append
+    （<span class="mono">:339</span>），失败不计。</div>
+    <div class="imp-row" style="margin:6px 0">
+      <select id="curveScene" onchange="switchCurveScene(this.value)">${opts}</select>
+      <span class="hint">按场景筛选：A 的导入历史不混进 B 的曲线（混了 Δ 掌握数虚高）</span>
+    </div>
+    <div id="curveBody">${consumeCurveBody(cc)}</div>`;
+}
+/* 曲线主体（图表 + 摘要 + 比对明细）。场景切换只重渲这一块，
+   不重渲整个面板 —— 与主面板其它页签同一套渲染函数复用，不另造第二份。 */
+function consumeCurveBody(cc){
+  if(!cc.length) return `<div class="empty">该场景还没有消费记录。去「人导入」问一句
+    （当前场景在顶部场景栏切换），答完了曲线就从这里开始长。</div>`;
   // 主曲线 = **累计已掌握数**（能力集合在变大）。
   //   y 轴画**绝对数**（会做的题有几道），不画百分比 —— 照原版 Voyager
   //   `curriculum.py:135 return len(self.completed_tasks)`。
   //   不画百分比是有理由的：一画百分比，读数就取决于"分母算哪几道题"
   //   （分母里该不该算练习线练过的题？）这种口径争议，而绝对数没有这个问题；
   //   且失败不计入 → 曲线单调不降，形状就是学习本身。
-  const tot=cc[cc.length-1].ability_total||0;
+  const tot=cc[cc.length-1].ability_total;
   const masMax=Math.max(1,...cc.map(c=>c.mastered_total||0));
+  // 可达证据：同一句话导入 ≥2 次且后一次高置信命中（用户要的「再导入该同一问题时，可达」）
+  const seen={};const reachIdx={};let reachN=0;
+  cc.forEach((c,i)=>{const q=(c.question||'').trim();if(!q)return;
+    seen[q]=(seen[q]||0)+1;
+    if(seen[q]>=2&&(c.route_decision||'').indexOf('HIGH')>=0){reachN++;reachIdx[i]=seen[q];}});
+  const hitTag=c=>c.route_decision==='HIGH_CONFIDENCE'?'<span class="chip ok">高置信命中</span>'
+    :c.route_decision==='MEDIUM_CONFIDENCE'?'<span class="chip warn">中置信命中</span>'
+    :c.route_decision?'<span class="chip grey">未命中</span>':'';
+  const judTag=c=>c.judgment_result==='written'?'<span class="chip ok">写入图谱</span>'
+    :c.judgment_result==='insufficient_evidence'?'<span class="chip warn">冷启动单证据</span>'
+    :c.judgment_result==='fetched_empty'?'<span class="chip grey">取到真空</span>'
+    :c.judgment_result==='failed'?'<span class="chip bad">失败</span>':'';
   const masPts=cc.map((c,i)=>({
     x:i+1,
     y: c.mastered_total||0,
-    label:`累计掌握 ${c.mastered_total||0} 道 · ${c.question}`}));
+    label:`累计掌握 ${c.mastered_total||0} 道 · ${c.question}`+
+      (reachIdx[i]?`（🔁 第 ${reachIdx[i]} 次导入同一问题 · 命中）`:'')+
+      (c.route_decision?` · ${c.route_decision}`:'')}));
   // 副线 = 覆盖率（这次答得全不全，质量分，不是掌握度）
   const covPts=cc.filter(c=>c.coverage!==null&&c.coverage!==undefined)
                  .map((c,i)=>({x:i+1, y:c.coverage, label:`覆盖率 ${Math.round(c.coverage*100)}% · ${c.question}`}));
   const last=cc[cc.length-1];
+  const first=cc[0];
   const reused=cc.filter(c=>c.reused).length;
   // 每次消费的**比对明细**：判分是"两边做法的比对"得出来的，明细必须能查，
   // 不能只给一个百分比 —— 人看不见依据就没法判断这个分可不可信。
   const cmpRows=cc.map((c,i)=>`<tr>
       <td class="num">${c.i}</td>
-      <td>${ESC(c.question)}</td>
+      <td>${ESC(c.question)}
+        <div style="margin-top:2px"><span class="chip grey">Scene ${ESC(c.root_scene||'A')}</span> ${hitTag(c)} ${judTag(c)}</div></td>
       <td class="num">${ESC(c.rows||0)}</td>
       <td class="num">${ESC(c.referee_rows||0)}</td>
       <td class="num">${c.coverage===null||c.coverage===undefined?'—'
@@ -987,17 +1071,13 @@ function consumeCurve(s){
             : (c.voyager_sound?'<span class="chip ok">站得住</span>':'<span class="chip bad">有硬伤</span>')}</td>
       <td style="font-size:12px">${ESC(c.method_reason||c.verdict||'')}${c.method_diff?'（'+ESC(c.method_diff)+'）':''}</td>
     </tr>`).join('');
-  return `<h3>学习曲线 · 消费能力侧（${cc.length} 次消费）</h3>
-    <div class="legend"><b>掌握 = 能力集合的增长</b>：人问一句 → Voyager 答完了 →
-    这题进它的能力库。纵轴是<b>累计会做的题有几道</b>，照原版 Voyager
-    <span class="mono">curriculum.py:135 len(completed_tasks)</span>。
-    <b>练习不计入</b>：练习线有意不判分，跑通只推进课程规划（"这题规划过了，
-    别再规划"），不算能力变大 —— 原版也是只在成功时 append
-    （<span class="mono">:339</span>），失败不计。
-    一致度是另一条（这次的做法跟 VLML 独立那一路差多少，只作质量参考）。</div>
+  const delta=(last.mastered_total||0)-(first.mastered_total||0);
+  return `<div class="legend"><b>曲线上升</b>（本视图首末读数）：累计掌握
+      ${first.mastered_total||0} → ${last.mastered_total||0} 道
+      ${delta>0?`<span class="chip ok">Δ +${delta}</span>`:(delta<0?'<span class="chip bad">Δ '+delta+'</span>':'<span class="chip grey">Δ 0</span>')}
+      ${reachN?`<span class="chip ok">🔁 可达证据 ${reachN} 次（同一问题二次导入后高置信命中）</span>`:''}</div>
     ${lineChart(masPts,{color:'#059669',max:masMax,fmt:v=>Math.round(v)+' 道'})}
-    <div class="legend" style="margin-top:4px">累计掌握 ${last.mastered_total||0} / ${tot||'?'} 题
-      ${tot?`（${Math.round(100*(last.mastered_total||0)/tot)}%）`:''}</div>
+    <div class="legend" style="margin-top:4px">累计掌握 ${last.mastered_total||0}${tot?` / ${tot} 题（${Math.round(100*(last.mastered_total||0)/tot)}%）`:' 道（本场景）'}</div>
     ${covPts.length?`<div class="legend" style="margin-top:8px">一致度（Voyager 与 VLML 两边做法的比对，只给人看）</div>${lineChart(covPts,{color:'#2563eb',dash:'4 3'})}`:''}
     <div class="legend" style="margin-top:6px">
       最近一次：${last.mastered?'<span class="chip ok">已掌握（进能力库）</span>':'<span class="chip bad">没答出来，未进能力库</span>'}
@@ -1008,9 +1088,75 @@ function consumeCurve(s){
     <h3 style="margin-top:10px">两边做法的比对明细</h3>
     <div class="legend">Voyager 取一路、VLML 独立取一路，把两条 SQL 和取到的东西摊开让 LLM 判
       —— 不再要求两边先把答案压成单值事实（答案是一张表也能判）。</div>
-    <table><thead><tr><th>#</th><th>问句</th><th>Voyager 行</th><th>VLML 行</th>
+    <table><thead><tr><th>#</th><th>问句 · 场景 · 命中判定</th><th>Voyager 行</th><th>VLML 行</th>
       <th>一致度</th><th>同一个量</th><th>Voyager 做法</th><th>判据 / 差别</th></tr></thead>
       <tbody>${cmpRows}</tbody></table>`;
+}
+/* 场景筛选：走各自的取数口径， curves 已在内存的回「全部」，其余按场景现取
+   （同一函数 _consume_curve 的场景参数，不新造尺子）。 */
+function switchCurveScene(sid){
+  const body=document.getElementById('curveBody');
+  if(!body) return;
+  if(sid==='__all__'){body.innerHTML=consumeCurveBody(window.__consumeCurveAll||[]);return;}
+  body.innerHTML='<span class="muted">取 Scene '+ESC(sid)+' 的曲线…</span>';
+  fetch('/api/scene-curve?scene='+encodeURIComponent(sid)).then(x=>x.json()).then(r=>{
+    if(r.error){body.innerHTML='<span class="muted">'+ESC(r.error)+'</span>';return;}
+    body.innerHTML=consumeCurveBody(r.curve||[]);
+  }).catch(e=>{body.innerHTML='<span class="muted">取曲线失败：'+ESC(String(e))+'</span>';});
+}
+
+/* ---- 场景栏（1→n 可插拔）----
+   原 /scenes 独立页撤掉后的最小入口（去重，2026-10-18）：场景切换/新建 +
+   当前场景的 Δ 专属节点数、导入次数、曲线首末读数，全走已有 API
+   （/api/scenes、/api/scene/switch、/api/scene/create），不新增后端。 */
+async function loadSceneBar(){
+  try{
+    const r=await fetch('/api/scenes').then(x=>x.json());
+    window.__sceneList=(r.scenes||[]).map(s=>s.id);
+    const sel=document.getElementById('sceneSel');
+    if(!sel) return;
+    const keep=sel.value;
+    sel.innerHTML=(r.scenes||[]).map(s=>{
+      const n=(r.exclusive_nodes||{})[s.id]||0;
+      const cs=(r.curve_summary||{})[s.id]||{};
+      return `<option value="${ESC(s.id)}"${s.id===r.current?' selected':''}>`+
+        `${ESC(s.name||s.id)}（${ESC(s.id)}）· 专属节点 ${n} · 导入 ${cs.imports||0} · 掌握 ${cs.mastered_last||0}</option>`;
+    }).join('');
+    if(keep&&[...sel.options].some(o=>o.value===keep)) sel.value=keep;
+    const cs=(r.curve_summary||{})[r.current]||{};
+    const fp=(r.fingerprint||{})[r.current]||{};
+    const gs=(r.graph_sparsity||{})[r.current], ec=(r.entity_catalog||{})[r.current];
+    document.getElementById('sceneHint').innerHTML=
+      `当前 <b>${ESC(r.current)}</b> · Δ 专属节点 <b>${(r.exclusive_nodes||{})[r.current]||0}</b> · `+
+      `导入 ${cs.imports||0} 次（高置信命中 ${cs.high||0} / 未命中 ${cs.rejected||0}）· `+
+      `曲线 ${cs.mastered_first||0}→${cs.mastered_last||0} 道`+
+      (cs.reachable?' <span class="chip ok">🔁 可达（同一问题二次导入命中）</span>':'')+
+      (gs==='seeding'?' <span class="chip warn">🌱 种子态</span>':'')+
+      (ec==='missing'?' <span class="chip bad">🟠 实体目录缺失</span>':'')+
+      (fp.state_hash?' <span class="chip grey">指纹 '+ESC(String(fp.state_hash).slice(0,8))+'</span>':'');
+  }catch(e){ /* 场景栏挂了不能拖垮主面板 */ }
+}
+function switchScene(sid){
+  fetch('/api/scene/switch',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({scene_id:sid})}).then(x=>x.json()).then(r=>{
+    alert(r.ok?('已切换到场景 '+sid+'。之后的导入与学习曲线都按这个场景隔离。')
+              :('切换失败：'+(r.error||'')));
+    loadSceneBar();
+    const cs2=document.getElementById('curveScene');
+    if(cs2&&[...cs2.options].some(o=>o.value===sid)){cs2.value=sid;switchCurveScene(sid);}
+  });
+}
+function createScene(){
+  const name=prompt('新场景名（如：我的学习场景）：');
+  if(!name) return;
+  const ds=prompt('专属数据源路径（留空 = 继承默认库）：')||'';
+  fetch('/api/scene/create',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({name:name,data_source:ds,description:''})}).then(x=>x.json()).then(r=>{
+    alert(r.ok?('已插入场景 '+r.scene_id+'：注册命名空间 + '+(r.action_count!=null?r.action_count:'?')+
+        ' 个可执行动作。不重启、不清库。')
+      :('插入被拒：'+(r.error||'')+'（可执行动作缺席的场景不许插入）'));
+    loadSceneBar();
+  });
 }
 
 /* 判据中文名。以前这一列只有 VLML0 / rubric 两种，新后端的 `db_evidence`
@@ -1085,17 +1231,32 @@ function pTrace(s){
 
 function pSkill(s){
   const st=s.skill_stats||{};
+  // 复用健康度判据（与原溯源视图同一套规则，去重后并入技能卡）：
+  //   hits>=2 且有效率 <0.5 → stale；hits==0 → unused；否则 ok。
+  const health=x=>{
+    const hits=+x.hits||0, ok=+x.ok||0;
+    if(hits>=2&&ok/hits<0.5) return '<span class="chip bad">🔴 失效（命中多、有效少）</span>';
+    if(hits===0) return '<span class="chip grey">⚪ 未验证</span>';
+    return '<span class="chip ok">🟢 正常复用</span>';};
   const cards=(s.skill_detail||[]).map(x=>`
     <div class="taskcard" style="margin-top:8px">
       <div class="th">${ESC(x.text)}</div>
       <div class="tm"><span class="chip grey">${ESC(x.topic||'—')}</span>
+        <span class="chip grey">Scene ${ESC(x.source_scene||'default')}</span>
         <span class="chip grey">命中 ${x.hits}</span>
         <span class="chip ${x.ok>0?'ok':'grey'}">有效 ${x.ok}</span>
         ${x.hits>0
           ? `<span class="chip ${x.ok>0?'ok':'bad'}">有效率 ${Math.round(100*x.ok/x.hits)}%</span>`
           : '<span class="chip dim">还没被用过</span>'}
+        ${health(x)}
         ${x.versions>1?`<span class="chip warn">已覆盖 ${x.versions} 版</span>`:''}</div>
     </div>`).join('');
+  // 按场景分组（原溯源页的分组计数，并入本页 legend）
+  const byScene={};
+  (s.skill_detail||[]).forEach(x=>{const k=x.source_scene||'default';byScene[k]=(byScene[k]||0)+1;});
+  const sceneLine=Object.keys(byScene).length
+    ? `<div class="legend">按场景归属：${Object.entries(byScene).map(([k,v])=>`<span class="chip grey">${ESC(k)} = ${v}</span>`).join(' ')}
+       <span class="hint">Scene 标签只标冷启动后新入库的技能；字段引入前入库的记 default。</span></div>` : '';
   const c=s.causal||{};
   const kc={control:'ok',attempt:'',referee:'grey',narrative:'grey'};
   const mc=s.mc_thinking||{};
@@ -1123,6 +1284,7 @@ function pSkill(s){
         （覆盖 ${st.rewrites||0} · 丢弃 ${st.skipped||0}）·
         膨胀率 <span class="chip ${(st.bloat||1)>1?'ok':'warn'}">${st.bloat||1}</span>
         · 每题最多注入 <b>${st.top_k||5}</b> 条进 prompt</div>
+      ${sceneLine}
       ${cards||'<div class="empty">空。Voyager 还没积累任何经验。</div>'}
       ${mcBlock}
     </div>
@@ -2237,6 +2399,7 @@ function render(s){
     if(il) il.innerHTML=importsList(s);
 
     const go=document.getElementById('go'); if(go) go.onclick=submitImport;
+    const br=document.getElementById('btnRoute'); if(br) br.onclick=previewRoute;
     const clr=document.getElementById('clr'); if(clr) clr.onclick=()=>{
       document.getElementById('q').value='';
       document.getElementById('result').innerHTML='';
@@ -2367,9 +2530,12 @@ document.getElementById('nav').addEventListener('click',e=>{
 document.getElementById('runStart').onclick=pilotStart;
 document.getElementById('mcLearn').onclick=mcLearnThenRun;
 document.getElementById('runStop').onclick=pilotStop;
+document.getElementById('btnNewScene').onclick=createScene;
 
 load();
 setInterval(load, 4000);
+loadSceneBar();                       // 场景栏：一次性拉齐 + 之后 8s 跟一次（与 /api/scenes 同频）
+setInterval(loadSceneBar, 8000);
 </script>
 </body>
 </html>
@@ -2377,318 +2543,10 @@ setInterval(load, 4000);
 
 
 # ---------------------------------------------------------------------------
-# 1→n 泛化 · 场景命名空间管理页（任务174 新建路由页面）
-# 复用主页面的 PREFIX 注入思路：把 window.MVE_PREFIX 写进 head，JS 用 api() 拼地址。
+# 1→n 场景管理页已撤（2026-10-18 去重）：人导入 + 学习曲线 + 场景切换/新建
+# 全部并入主面板（头部场景栏 / 学习曲线场景筛选 / 技能页场景标签），
+# 不再维护第二个页面与第二套入口。
 # ---------------------------------------------------------------------------
-def _scenes_html() -> str:
-    prefix_script = (f'<script>window.MVE_PREFIX="{PREFIX}";</script>'
-                    if PREFIX else '<script>window.MVE_PREFIX="";</script>')
-    return SCENES_HTML.replace("<head>", "<head>\n" + prefix_script, 1)
-
-
-SCENES_HTML = r"""<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MVE · 场景命名空间（1→n 可插拔）</title>
-<style>
-:root{
-  color-scheme:light;
-  font-family:"Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
-  --bg:#f3f7f1; --paper:#fff; --ink:#1f2924; --muted:#607168;
-  --line:rgba(31,41,36,.12); --brand:#2f7d57; --brand-2:#17563d;
-  --accent:#d58b2b; --seed:#e0a800; --seed-bg:#fff4cc;
-  --alert:#e8762b; --alert-bg:#fde3d2; --ok:#2f9e6b; --bad:#d9534f;
-}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink);padding:24px;line-height:1.5}
-a{color:var(--brand-2);text-decoration:none}
-.wrap{max-width:1080px;margin:0 auto}
-.topbar{display:flex;align-items:center;justify-content:space-between;
-  margin-bottom:18px;flex-wrap:wrap;gap:10px}
-h1{font-size:22px;margin:0}
-h2{font-size:17px;margin:22px 0 10px}
-.hint{color:var(--muted);font-size:13px;margin:0 0 8px}
-.back{font-size:13px;background:var(--paper);border:1px solid var(--line);
-  padding:6px 12px;border-radius:8px}
-.panel{background:var(--paper);border:1px solid var(--line);border-radius:12px;
-  padding:16px 18px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.04)}
-.switcher{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:6px}
-.chip{display:inline-flex;flex-direction:column;align-items:flex-start;
-  border:1px solid var(--line);border-radius:10px;padding:8px 12px;cursor:pointer;
-  background:var(--paper);font-size:13px;min-width:120px}
-.chip .nm{font-weight:600}
-.chip .sub{color:var(--muted);font-size:11px}
-.chip.cur{border-color:var(--brand);box-shadow:0 0 0 2px rgba(47,125,87,.18)}
-.chip.cur .nm::after{content:" ✓";color:var(--brand)}
-.create{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;align-items:center}
-.create input,.create textarea{border:1px solid var(--line);border-radius:8px;
-  padding:7px 9px;font-size:13px;font-family:inherit}
-.create input[type=text]{min-width:150px}
-button.btn{border:none;border-radius:8px;padding:8px 14px;font-size:13px;
-  cursor:pointer;background:var(--brand);color:#fff;font-weight:600}
-button.btn.alt{background:var(--paper);color:var(--brand-2);border:1px solid var(--brand)}
-button.btn.ghost{background:var(--paper);border:1px solid var(--line);color:var(--ink)}
-button.btn.sm{padding:4px 9px;font-size:12px}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
-.card{background:var(--paper);border:1px solid var(--line);border-radius:12px;
-  padding:14px 16px}
-.card.cur{border-color:var(--brand);box-shadow:0 0 0 2px rgba(47,125,87,.15)}
-.badges{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0}
-.badge{font-size:12px;border-radius:20px;padding:3px 10px;font-weight:600}
-.badge.loaded{background:#e6f5ec;color:var(--brand-2)}
-.badge.seed{background:var(--seed-bg);color:#8a6a00;border:1px dashed var(--seed)}
-.badge.alert{background:var(--alert-bg);color:#9a4711}
-.badge.act{background:#e8f0fb;color:#2f5596}
-.badge.pend{background:#f0e8fa;color:#6b4796}
-.stat{display:flex;justify-content:space-between;font-size:13px;padding:3px 0;
-  border-bottom:1px dashed var(--line)}
-.stat:last-child{border-bottom:none}
-.stat .k{color:var(--muted)}
-.stat .v{font-variant-numeric:tabular-nums;font-weight:600}
-.bignum{font-size:30px;font-weight:700;color:var(--brand);line-height:1.1}
-.bignum small{font-size:13px;color:var(--muted);font-weight:400}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--line);vertical-align:top}
-th{color:var(--muted);font-weight:600}
-.tag{display:inline-block;border-radius:6px;padding:2px 7px;font-size:11px;font-weight:600}
-.tag.ok{background:#e6f5ec;color:var(--ok)}
-.tag.stale{background:#fdeaea;color:var(--bad)}
-.tag.unused{background:#eef0ef;color:var(--muted)}
-.muted{color:var(--muted)}
-.right{text-align:right}
-.row-ops{display:flex;gap:5px;flex-wrap:wrap}
-.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);
-  background:#1f2924;color:#fff;padding:9px 16px;border-radius:10px;font-size:13px;
-  opacity:0;transition:opacity .2s;pointer-events:none}
-.toast.show{opacity:.95}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <div class="topbar">
-    <h1>场景命名空间 · 1→n 可插拔</h1>
-    <a class="back" id="backLink" href="/">← 返回主面板</a>
-  </div>
-  <p class="hint">任意用户场景作为可插拔件：插入不重启、不清库、不重训，只向共享知识图谱与技能库注册一个命名空间。切回 A 时 A 的续跑点与活动指纹不变。</p>
-
-  <div class="panel">
-    <h2 style="margin-top:0">场景切换器</h2>
-    <div class="hint">点击切换当前场景；新建场景初始只有根节点（图谱为空），随消费侧提问动态挂载。</div>
-    <div class="switcher" id="switcher"></div>
-    <div class="create">
-      <input type="text" id="newName" placeholder="场景名（如：我的学习场景）">
-      <input type="text" id="newDs" placeholder="专属数据源路径（留空继承默认库）">
-      <input type="text" id="newDesc" placeholder="描述（可选）">
-      <button class="btn" onclick="createScene()">＋ 新建场景</button>
-    </div>
-  </div>
-
-  <h2>场景卡片（降级标记 + Δ 专属节点数 + 状态指纹）</h2>
-  <div class="grid" id="cards"></div>
-
-  <h2>跨场景技能溯源（任务173）</h2>
-  <div class="panel">
-    <div class="hint" id="skillSummary"></div>
-    <table id="skillTable">
-      <thead><tr><th>技能</th><th>归属场景</th><th>命中/成功</th><th>复用状态</th><th class="right">操作</th></tr></thead>
-      <tbody id="skillBody"></tbody>
-    </table>
-  </div>
-
-  <h2>人导入题目（学习闭环起点）</h2>
-  <div class="panel">
-    <div class="hint">导入一个问题 → 系统先按<b>双阈值判定</b>（≥40 高置信 / ≥10 且重复命中≥2 中置信 / 否则未命中）。<b>命中</b>就归入已有节点；<b>未命中</b>先落待审区、解题成功才升为活节点。匹配只看文本相似度，<b>与答案对错无关</b>。</div>
-    <div class="create">
-      <input type="text" id="qInput" placeholder="导入一个问题，如：iPhone 15 销量多少">
-      <button class="btn" onclick="previewRoute()">🔍 只判定命中（不拉数据）</button>
-      <button class="btn alt" onclick="importQuestion()">🚀 导入并解题</button>
-    </div>
-    <div id="routeOut" style="margin-top:12px"></div>
-    <div id="importLog" style="margin-top:10px"></div>
-  </div>
-</div>
-<div class="toast" id="toast"></div>
-
-<script>
-const P = window.MVE_PREFIX || '';
-const api = (p) => P + p;
-const fmtTime = (t) => {
-  if(!t) return '—';
-  const d = new Date(t*1000);
-  return d.toLocaleString('zh-CN', {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
-};
-function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),1800);}
-function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
-
-/* ---- 命中判定 + 导入题目 ---- */
-function currentScene(){const chips=document.querySelectorAll('#switcher .chip.cur');return '';}
-async function previewRoute(){
-  const q=document.getElementById('qInput').value.trim();
-  if(!q){toast('先写问题');return;}
-  const out=document.getElementById('routeOut');
-  out.innerHTML='<span class="muted">判定中…</span>';
-  try{
-    const r=await fetch(api('/api/route'),{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({question:q})}).then(x=>x.json());
-    if(r.error){out.innerHTML='<span class="muted">'+esc(r.error)+'</span>';return;}
-    const badge = r.decision==='HIGH_CONFIDENCE'
-      ? '<span class="badge act">高置信命中</span>'
-      : r.decision==='MEDIUM_CONFIDENCE'
-      ? '<span class="badge pend">中置信命中</span>'
-      : '<span class="badge alert">未命中</span>';
-    const act = r.action==='create_new_node'
-      ? '→ <b>新建图谱节点</b>（先落待审区，解题成功才升活节点）'
-      : '→ <b>归入已有节点</b> '+esc(r.node_id||'');
-    out.innerHTML='<div class="stat"><span class="k">'+badge+'</span>'
-      +'<span class="v">分数 '+esc(r.max_score)+' / chunk_hits '+esc(r.chunk_hits)+'</span></div>'
-      +'<div style="font-size:13px;margin-top:6px">'+act+'</div>';
-  }catch(e){out.innerHTML='<span class="muted">判定失败：'+esc(String(e))+'</span>';}
-}
-async function importQuestion(){
-  const q=document.getElementById('qInput').value.trim();
-  if(!q){toast('先写问题');return;}
-  const log=document.getElementById('importLog');
-  log.innerHTML='<span class="muted">已受理，后台跑（约 1～5 分钟），结果会出现在下面的判定区与主面板导入历史里…</span>';
-  toast('已受理，后台执行');
-  try{
-    const r=await fetch(api('/api/coach'),{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({question:q, mode:'voyager'})}).then(x=>x.json());
-    if(r.accepted||r.busy){
-      log.innerHTML='<div class="stat"><span class="k">受理结果</span>'
-        +'<span class="v">'+(r.busy?'上一句还在回答中':'已受理，后台跑')+'</span></div>'
-        +'<div class="hint" style="margin-top:6px">跑完后回来点「只判定命中」再问一次 —— 这次应该变成<b>命中</b>（可达）。</div>';
-    }else{
-      log.innerHTML='<span class="muted">未能受理：'+esc(r.error||'未知')+'</span>';
-    }
-  }catch(e){log.innerHTML='<span class="muted">导入失败：'+esc(String(e))+'</span>';}
-}
-
-<script>
-const P = window.MVE_PREFIX || '';
-const api = (p) => P + p;
-const fmtTime = (t) => {
-  if(!t) return '—';
-  const d = new Date(t*1000);
-  return d.toLocaleString('zh-CN', {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'});
-};
-function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),1800);}
-function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
-
-async function loadScenes(){
-  const r = await fetch(api('/api/scenes')).then(x=>x.json());
-  document.getElementById('backLink').href = P || '/';
-  // 切换器
-  const sw = document.getElementById('switcher'); sw.innerHTML='';
-  (r.scenes||[]).forEach(s=>{
-    const sid = s.id, cur = sid===r.current;
-    const n = (r.exclusive_nodes||{})[sid]||0;
-    const div = document.createElement('div');
-    div.className = 'chip'+(cur?' cur':'');
-    div.innerHTML = `<span class="nm">${esc(s.name||sid)}</span>`+
-      `<span class="sub">${esc(sid)} · 专属节点 ${n}</span>`;
-    div.onclick = ()=>switchScene(sid, cur);
-    sw.appendChild(div);
-  });
-  // 卡片
-  const cards = document.getElementById('cards'); cards.innerHTML='';
-  (r.scenes||[]).forEach(s=>{
-    const sid = s.id, cur = sid===r.current;
-    const n = (r.exclusive_nodes||{})[sid]||0;
-    const gs = (r.graph_sparsity||{})[sid]||'dense';
-    const ec = (r.entity_catalog||{})[sid]||'present';
-    const fp = (r.fingerprint||{})[sid]||{};
-  const badges = `<span class="badge loaded">✓ 已加载</span>`;
-    const seedBadge = gs==='seeding' ? `<span class="badge seed">🌱 种子态·节点随消费增长</span>` : '';
-    const ecBadge = ec==='missing' ? `<span class="badge alert">🟠 实体目录缺失·需补充</span>` : '';
-    const actN = (r.action_count||{})[sid]||0;
-    const pendN = (r.pending_nodes||{})[sid]||0;
-    const actBadge = actN===0
-      ? `<span class="badge alert">⛔ 0 个可执行动作（不许插入）</span>`
-      : `<span class="badge act">⚙ ${actN} 个可执行动作</span>`;
-    const pendBadge = pendN>0 ? `<span class="badge pend">📥 待审 ${pendN}</span>` : '';
-    const card = document.createElement('div');
-    card.className = 'card'+(cur?' cur':'');
-    card.innerHTML =
-      `<div style="display:flex;justify-content:space-between;align-items:center">
-         <strong>${esc(s.name||sid)}</strong>${cur?'<span class="badge loaded">当前</span>':''}
-       </div>
-       <div class="muted" style="font-size:12px">${esc(sid)} · ${esc(s.description||'')}</div>
-       <div class="badges">${badges}${seedBadge}${ecBadge}${actBadge}${pendBadge}</div>
-       <div class="bignum">${n} <small>专属节点（Δ）</small></div>
-       <div style="margin-top:8px">
-         <div class="stat"><span class="k">续跑点 cursor</span><span class="v">${esc(fp.cursor==null?'—':fp.cursor)}</span></div>
-         <div class="stat"><span class="k">上次活动</span><span class="v">${fmtTime(fp.updated_at)}</span></div>
-         <div class="stat"><span class="k">本场景消费记录</span><span class="v">${esc(fp.consume_count==null?'—':fp.consume_count)}</span></div>
-         <div class="stat"><span class="k">可执行动作</span><span class="v">${actN} 个</span></div>
-         <div class="stat"><span class="k">待审区</span><span class="v">${pendN} 条</span></div>
-         <div class="stat"><span class="k">状态指纹 hash</span><span class="v">${esc(fp.state_hash||'—')}</span></div>
-       </div>`;
-    cards.appendChild(card);
-  });
-}
-
-function switchScene(sid, cur){
-  if(cur){toast('已在该场景');return;}
-  fetch(api('/api/scene/switch'),{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({scene_id:sid})}).then(x=>x.json()).then(r=>{
-    if(r.ok){toast('已切换到 '+sid);loadScenes();} else toast('切换失败：'+(r.error||''));
-  });
-}
-function createScene(){
-  const name=document.getElementById('newName').value.trim();
-  if(!name){toast('场景名不能为空');return;}
-  const ds=document.getElementById('newDs').value.trim();
-  const desc=document.getElementById('newDesc').value.trim();
-  fetch(api('/api/scene/create'),{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({name,description:desc,data_source:ds})}).then(x=>x.json()).then(r=>{
-    if(r.ok){toast('已新建场景 '+r.scene_id);document.getElementById('newName').value='';
-      document.getElementById('newDs').value='';document.getElementById('newDesc').value='';
-      loadScenes();} else toast('新建失败：'+(r.error||''));
-  });
-}
-
-async function loadSkills(){
-  const r = await fetch(api('/api/skill-traceability')).then(x=>x.json());
-  const byScene = r.by_scene||{};
-  document.getElementById('skillSummary').textContent =
-    `技能总数 ${r.total||0} 条；按场景归属：` +
-    Object.entries(byScene).map(([k,v])=>`${k}=${v}`).join('  ');
-  const tb = document.getElementById('skillBody'); tb.innerHTML='';
-  (r.skills||[]).forEach(s=>{
-    const tagCls = s.status==='stale'?'stale':(s.status==='unused'?'unused':'ok');
-    const tagTxt = s.status==='stale'?'🔴 失效':(s.status==='unused'?'⚪ 未验证':'🟢 正常复用');
-    const tr=document.createElement('tr');
-    tr.innerHTML =
-      `<td><div><strong>${esc(s.name||s.key)}</strong></div>
-         <div class="muted" style="font-size:11px">${esc(s.topic||'')}</div></td>
-       <td>Scene ${esc(s.source_scene)}</td>
-       <td>${s.hits}/${s.ok}`+(s.ratio!=null?` (${Math.round(s.ratio*100)}%)`:'')+`</td>
-       <td><span class="tag ${tagCls}">${tagTxt}</span></td>
-       <td class="right"><div class="row-ops">
-         <button class="btn sm alt" onclick="operate('${esc(s.key)}','boost')">提升</button>
-         <button class="btn sm ghost" onclick="operate('${esc(s.key)}','demote')">失效</button>
-         <button class="btn sm ghost" onclick="operate('${esc(s.key)}','delete')">删除</button>
-       </div></td>`;
-    tb.appendChild(tr);
-  });
-}
-function operate(key,action){
-  fetch(api('/api/skill/operate'),{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({key,action})}).then(x=>x.json()).then(r=>{
-    if(r.ok){toast(({boost:'已提升',demote:'已标记失效',delete:'已删除'})[action]||'已操作');loadSkills();}
-    else toast('操作失败：'+(r.error||''));
-  });
-}
-
-loadScenes();
-loadSkills();
-setInterval(loadScenes, 8000);
-</script>
-</body>
-</html>
-"""
 
 
 # 消费通路的后台任务状态（进程内存；面板重启即清 —— 与 pilot_state 一个思路，
@@ -2723,14 +2581,25 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/", "/index.html"):
             body = _html().encode("utf-8")
             ctype = "text/html; charset=utf-8"
-        elif path == "/scenes":
-            # 1→n 泛化：场景命名空间管理页（任务174 新建路由页面）
-            body = _scenes_html().encode("utf-8")
-            ctype = "text/html; charset=utf-8"
-        elif path == "/api/skill-traceability":
-            # 1→n 泛化：跨场景技能溯源（任务173）
-            body = json.dumps(panel_data.skill_traceability(), ensure_ascii=False).encode("utf-8")
-            ctype = "application/json; charset=utf-8"
+        elif path == "/api/scene-curve":
+            # 1→n：单场景学习曲线（主面板学习曲线的场景筛选口）。
+            # 与面板全局曲线同一个函数 _consume_curve 的场景参数，不新造尺子。
+            import urllib.parse as _up
+            qs = _up.parse_qs(_up.urlsplit(self.path).query or "")
+            sid = str((qs.get("scene") or [""])[0]).strip()
+            if not sid:
+                self._json(400, {"error": "scene 参数为空"})
+                return
+            try:
+                curve = panel_data._consume_curve(limit=40, scene_id=sid)
+                body = json.dumps(
+                    {"ok": True, "scene_id": sid, "curve": curve,
+                     "summary": panel_data.curve_summary(sid)},
+                    ensure_ascii=False, default=str).encode("utf-8")
+                ctype = "application/json; charset=utf-8"
+            except Exception as e:
+                self._json(500, {"error": f"{type(e).__name__}: {e}"[:200]})
+                return
         elif path == "/api/state":
             import time as _t
             # 消费通路在后台跑（要 1～3 分钟），前端靠 4 秒轮询看它跑没跑完。
@@ -2867,32 +2736,6 @@ class Handler(BaseHTTPRequestHandler):
                                      "current": _sc.current_scene_id(),
                                      "action_count": len(
                                          __import__("actions").entries(new_id))})
-            except Exception as e:
-                self._json(500, {"ok": False, "error": f"{type(e).__name__}: {e}"[:200]})
-            return
-
-        if path == "/api/skill/operate":
-            # 1→n 泛化：溯源卡片三操作（任务173）
-            try:
-                import skill_store as _ss
-                key = str(payload.get("key") or "").strip()
-                action = str(payload.get("action") or "").strip().lower()
-                if not key:
-                    self._json(400, {"ok": False, "error": "key 为空"})
-                    return
-                if action == "boost":
-                    ok = _ss.boost_skill(key)
-                elif action == "demote":
-                    ok = _ss.demote_skill(key)
-                elif action == "delete":
-                    ok = _ss.delete_skill(key)
-                else:
-                    self._json(400, {"ok": False, "error": f"未知操作 {action}"})
-                    return
-                if not ok:
-                    self._json(404, {"ok": False, "error": "技能不存在"})
-                    return
-                self._json(200, {"ok": True, "action": action})
             except Exception as e:
                 self._json(500, {"ok": False, "error": f"{type(e).__name__}: {e}"[:200]})
             return

@@ -319,46 +319,56 @@ def _ability_universe_size() -> int:
     return n
 
 
-def _consume_curve(limit: int = 40) -> list[dict[str, Any]]:
+def _consume_curve(limit: int = 40,
+                   scene_id: str | None = None) -> list[dict[str, Any]]:
     """**消费进步曲线** —— 用户 2026-10-13 定：「测 Voyager 的进步曲线和掌握度
     全在消费这测就好了」。
 
-    为什么是消费而不是练习：
-      练习（run_log）不判分 —— VLML 的尺子不能进 Voyager 的反馈环，所以那条线
-      只有「取没取到数」，画出来的曲线是"链路通不通"，不是"水平高不高"。
-      消费（人问一句 → Voyager 用已积累的能力答）才是**交付**：人真的要一个答案，
-      这时候用 VLML0 裁判独立跑一遍量出覆盖率，才是真实的进步曲线。
+    为什么是消费而不是练习：练习（run_log）不判分 —— VLML 的尺子不能进 Voyager
+    的反馈环，所以那条线只有「取没取到数」，画出来的曲线是"链路通不通"，
+    不是"水平高不高"。消费（人问一句 → Voyager 用已积累的能力答）才是**交付**：
+    人真的要一个答案，这时候用 VLML0 裁判独立跑一遍量出覆盖率，才是真实的进步曲线。
+
+    ⚠️ **只有消费侧算掌握度**（用户 2026-10-18 再次钉死）：本函数只读
+    `coach_log.jsonl` 里 `mode=voyager_consume` 的记录 —— 练习线（run_log /
+    MasteryStore）一条都不读。练习跑通只推进课程规划，不算能力变大
+    （照原版 Voyager `curriculum.py:339` 只在成功时 append）。
 
     曲线画的是**累计已掌握数**（`mastered_total`）—— 掌握不是覆盖率折算的分数，
     而是「答完了 → 这题进能力库 → 掌握」（用户 2026-10-13 定义）。
-    所以进步 = 能力集合在变大，y 轴是"会做的题有几道"。
+    所以进步 = 能力集合在变大，y 轴是"会做的题有几道"（原版口径
+    `curriculum.py:135 len(completed_tasks)`）。
 
-    ⚠️ **学习时不计入**（用户 2026-10-14 定，照原版 Voyager）：
-      原版 `voyager/agents/curriculum.py:135` 学习曲线 = `len(self.completed_tasks)`，
-      `:339` **只在成功时** append，且原版压根没有"考试"这回事 ——
-      学习曲线 = **能力集合的大小**，练习跑通只推进课程规划，不算能力变大。
-      MVE 的练习线（`curriculum.py:296` / `run_mve.py:463`）也在写
-      `MasteryStore` 的 `completed`，但那是**去重位**（"规划过了别再规划"），
-      不是掌握 —— 所以这条曲线**只数消费侧答出来的题**，不读 MasteryStore。
+    ⚠️ `mastered_total` **在这里重算**，不信记录里当时算的那个数：口径一改，
+    历史记录里写死的旧数不会自己更新。重算规则就是原版那句：答出来了 +1，
+    失败不计。
 
-    ⚠️ `mastered_total` **在这里重算**，不信记录里当时算的那个数：
-      口径一改，历史记录里写死的旧数不会自己更新 —— 服务器上那条老记录是
-      `58 / 45`（129%，分子比分母大），直接画出来曲线第一点就贴顶还越过 100%。
-      重算规则就是原版那句：`len(completed_tasks)` —— 答出来了 +1，失败不计。
+    ⚠️ **场景隔离**（1→n）：`scene_id` 非空时只保留该场景的记录 —— 切到
+    Scene B 时曲线必须只画 B 的导入历史，A 的历史混进来就会把"B 从零开始学"
+    画成"接在 A 的尾声上"，Δ 掌握数虚高。旧记录没有 `root_scene` 字段
+    （1→n 改造前的导入）按默认场景 `A` 计（与 consume() 的 `_scene_id="A"`
+    一致），不丢历史。
+    ⚠️ 场景模式先多读再过滤：全局取末 N 条再过滤，会因 A 的记录太多把 B 的
+    早期记录挤出末 N 条（曲线前段凭空消失）。
 
-    覆盖率另记一条（那是这次答得全不全的质量分，不是掌握度）。
-    老的人导入（纯 VLML 解释）没有这些字段，一律跳过 ——
-    不能拿 None 补 0，那会把"没测"画成"测得 0 分"。
+    覆盖率另记一条（这次答得全不全的质量分，不是掌握度）。老的人导入
+    （纯 VLML 解释）没有这些字段，一律跳过 —— 不能拿 None 补 0，那会把
+    "没测"画成"测得 0 分"。
     """
     out: list[dict[str, Any]] = []
-    # y 轴用累计掌握数（原版口径），`universe` 只作"总共多少题"的参照显示
-    universe = _ability_universe_size()
+    # y 轴用累计掌握数（原版口径），`universe` 只作"总共多少题"的参照显示。
+    # 场景模式不给 universe —— 全局分母对单场景没有意义（B 才导入 3 题，
+    # 拿 A 的 360 题当分母，掌握度恒 ≈0，读起来像"没学会"）。
+    universe = _ability_universe_size() if scene_id is None else None
+    # 场景模式多读一些再过滤，避免末 N 条被别的场景挤占
+    recs = [r for r in _human_imports(limit=limit * 10 if scene_id else limit)
+            if r.get("mode") == "voyager_consume"]
+    if scene_id is not None:
+        recs = [r for r in recs
+                if str(r.get("root_scene") or "A") == str(scene_id)]
+    recs = recs[-limit:]
     book: set[str] = set()
-    for i, rec in enumerate(
-        [r for r in _human_imports(limit=limit)
-         if r.get("mode") == "voyager_consume"],
-        start=1,
-    ):
+    for i, rec in enumerate(recs, start=1):
         # 累计：只有**答出来了**才进能力集合（失败不计入，照原版 :339）
         if rec.get("mastered") and str(rec.get("topic_id") or "").strip():
             book.add(str(rec.get("topic_id")).strip())
@@ -374,9 +384,17 @@ def _consume_curve(limit: int = 40) -> list[dict[str, Any]]:
             # 掌握（能力集合）—— 在这**重算**，不信记录里写死的旧口径数
             "mastered": bool(rec.get("mastered")),
             "mastered_total": len(book),
-            "ability_total": max(universe, len(book)),
+            "ability_total": (max(universe, len(book))
+                              if universe is not None else None),
             "skill_action": str(rec.get("skill_action") or ""),
             "reused": bool(rec.get("reused")),
+            # —— 1→n 场景归属 + 命中判定 + 判定结果（曲线点上的证据）——
+            "root_scene": str(rec.get("root_scene") or "A"),
+            "route_decision": str(rec.get("route_decision") or ""),
+            "route_score": int(rec.get("route_score") or 0),
+            "judgment_result": str(rec.get("judgment_result") or ""),
+            "node_status": str(rec.get("node_status") or ""),
+            "cold_start": bool(rec.get("cold_start")),
             # —— 方法与做法的比对结论（判分的依据，得让人看见"凭什么判这个分"）——
             "judge": str(rec.get("judge") or ""),
             "method_reason": str(rec.get("method_reason") or ""),
@@ -391,6 +409,65 @@ def _consume_curve(limit: int = 40) -> list[dict[str, Any]]:
             "rows": int(rec.get("rows") or 0),
         })
     return out
+
+
+def curve_summary(scene_id: str) -> dict[str, Any]:
+    """单场景学习曲线摘要（1→n）——给场景卡当「曲线上升」的数字证据。
+
+    只读消费侧（`_consume_curve(scene_id=…)`，口径与主面板学习曲线完全一致，
+    不另造一把尺子）：
+      · `imports`       —— 本场景导入过几次
+      · `high/medium/rejected` —— 命中判定分布（双阈值，非人审）
+      · `written/...`   —— 判定结果分布（written/insufficient_evidence/
+                          fetched_empty/failed，见《判定结果状态与写入证明规格》）
+      · `mastered_first` / `mastered_last` / `delta` —— 曲线首末读数，
+                        delta>0 即「曲线上升」
+      · `reachable`     —— 可达证据：同一问题被导入 ≥2 次且后一次高置信命中
+                        （用户要的「再导入该同一问题时，可达」）
+      · `reach_evidence`—— 人话版证据（哪句话、第几次导入后命中）
+    """
+    try:
+        cc = _consume_curve(limit=60, scene_id=scene_id)
+    except Exception:
+        cc = []
+    dec: dict[str, int] = {}
+    jud: dict[str, int] = {}
+    for c in cc:
+        if c.get("route_decision"):
+            dec[c["route_decision"]] = dec.get(c["route_decision"], 0) + 1
+        if c.get("judgment_result"):
+            jud[c["judgment_result"]] = jud.get(c["judgment_result"], 0) + 1
+    first = cc[0]["mastered_total"] if cc else 0
+    last = cc[-1]["mastered_total"] if cc else 0
+    # 可达证据：同一句话导入多次，且后一次是高置信命中
+    seen: dict[str, int] = {}
+    reach = 0
+    evidence = ""
+    for c in cc:
+        q = str(c.get("question") or "").strip()
+        if not q:
+            continue
+        seen[q] = seen.get(q, 0) + 1
+        if seen[q] >= 2 and str(c.get("route_decision") or "").startswith("HIGH"):
+            reach += 1
+            if not evidence:
+                evidence = f"「{q[:40]}」第 {seen[q]} 次导入 → 高置信命中"
+    return {
+        "imports": len(cc),
+        "high": dec.get("HIGH_CONFIDENCE", 0),
+        "medium": dec.get("MEDIUM_CONFIDENCE", 0),
+        "rejected": dec.get("REJECTED", 0),
+        "written": jud.get("written", 0),
+        "insufficient_evidence": jud.get("insufficient_evidence", 0),
+        "fetched_empty": jud.get("fetched_empty", 0),
+        "failed": jud.get("failed", 0),
+        "mastered_first": first,
+        "mastered_last": last,
+        "delta": last - first,
+        "reachable": reach > 0,
+        "reach_evidence": evidence,
+        "reused": sum(1 for c in cc if c.get("reused")),
+    }
 
 
 def _db_view() -> dict[str, Any]:
@@ -524,6 +601,9 @@ def build_state() -> dict[str, Any]:
             "text": s.get("text", ""),
             "hits": int(s.get("hits") or 0),
             "ok": int(s.get("ok") or 0),
+            # 1→n 场景归属：技能卡上直接标「来自 Scene X」（溯源并入技能页，
+            # 不再单开页面）。字段引入前入库的老技能显示 default。
+            "source_scene": str(s.get("source_scene") or "default"),
             "versions": s.get("versions", 1),
             "rate": (
                 round(int(s.get("ok") or 0) / int(s.get("hits") or 1), 3)
@@ -822,6 +902,7 @@ def scenes_view() -> dict[str, Any]:
     fp: dict[str, Any] = {}
     acts: dict[str, int] = {}
     pending: dict[str, int] = {}
+    curve: dict[str, Any] = {}
     try:
         import knowledge_graph as kg
         import scenes as _sc
@@ -845,6 +926,7 @@ def scenes_view() -> dict[str, Any]:
                 pending[sid] = len(_rt.pending_for_scene(sid))
             except Exception:
                 pending[sid] = 0
+            curve[sid] = curve_summary(sid)
     except Exception:
         exclusive = {sid: 0 for sid in scene_ids}
         sparsity = {sid: "seeding" for sid in scene_ids}
@@ -852,53 +934,18 @@ def scenes_view() -> dict[str, Any]:
         fp = {sid: {} for sid in scene_ids}
         acts = {sid: 0 for sid in scene_ids}
         pending = {sid: 0 for sid in scene_ids}
+        curve = {sid: {} for sid in scene_ids}
     return {"scenes": scene_list, "current": current,
             "exclusive_nodes": exclusive, "graph_sparsity": sparsity,
             "entity_catalog": catalog, "fingerprint": fp,
-            "action_count": acts, "pending_nodes": pending}
+            "action_count": acts, "pending_nodes": pending,
+            "curve_summary": curve}
 
 
-def skill_traceability() -> dict[str, Any]:
-    """跨场景技能溯源（设计任务173）：每条技能归属哪个场景 + 复用健康度。
-
-    返回所有技能，按 source_scene 分组，并给每条技能判定复用状态：
-      · `ok`（🟢 正常复用）—— 被用过且正确率 ≥ 0.5，或尚未被验证（hits==0）
-      · `stale`（🔴 失效）—— 被用过 ≥2 次但正确率 < 0.5
-      · `unused`（未验证）—— 入库但从未被检索命中
-    溯源卡片据此显示「这条技能来自 Scene X」，并给出三操作（提升/失效/删除）。
-    """
-    try:
-        import skill_store as ss
-        skills = ss.all_skills()
-    except Exception:
-        skills = []
-    out: list[dict[str, Any]] = []
-    for s in skills:
-        hits = int(s.get("hits") or 0)
-        ok = int(s.get("ok") or 0)
-        ratio = (ok / hits) if hits > 0 else None
-        if hits >= 2 and ratio is not None and ratio < 0.5:
-            status = "stale"          # 🔴 失效
-        elif hits == 0:
-            status = "unused"         # 未验证
-        else:
-            status = "ok"             # 🟢 正常复用
-        out.append({
-            "key": s.get("key"),
-            "topic": s.get("topic"),
-            "name": s.get("name"),
-            "source_scene": str(s.get("source_scene", "default")),
-            "hits": hits, "ok": ok,
-            "ratio": round(ratio, 2) if ratio is not None else None,
-            "status": status,
-            "versions": int(s.get("versions") or 1),
-            "updated": s.get("updated"),
-        })
-    # 按场景分组计数（溯源视图用）
-    by_scene: dict[str, int] = {}
-    for s in out:
-        by_scene[s["source_scene"]] = by_scene.get(s["source_scene"], 0) + 1
-    return {"skills": out, "by_scene": by_scene, "total": len(out)}
+# ⚠️ 跨场景技能溯源（skill_traceability）已并入技能页（2026-10-18 去重）：
+#   /scenes 独立页撤掉后，它的唯一消费方没了。归属场景 + 复用健康度改由
+#   `build_state().skill_detail` 直接供（source_scene 字段 + hits/ok 前端
+#   按同一判据算 ok/stale/unused），不再单开一个 API 和一份重复遍历。
 
 
 if __name__ == "__main__":
