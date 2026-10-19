@@ -77,7 +77,8 @@ class VLMLActionAgent:
 
     # ---------- LLM 写 SQL（用户指令：让闭环真正自己出题取数） ----------
     @staticmethod
-    def render_grabs(grabs: list[dict[str, Any]] | None) -> str:
+    def render_grabs(grabs: list[dict[str, Any]] | None,
+                     focus_tables: list[str] | None = None) -> str:
         """把当前场景的**抓手条目**渲染成「可用工具清单」（同构 MCP tools/list）。
 
         为什么要这一块（2026-10-19 服务器实测踩的）：
@@ -87,21 +88,35 @@ class VLMLActionAgent:
           join（实测写成 `rounds.round_id = ext_round_economy.game_id`，
           而那张表根本没有 round_id 列）→ Binder Error → 3 轮都没收敛 →
           闭环停在 no_data。工具可达 ≠ 注册表里有条目，得让模型**看见**它。
+
+        `focus_tables` = 本题子目标匹配出来的候选表（`task_decompose.
+        related_tables` 实查）。同一轮实测：即便给了抓手，模型仍会挑一张名字
+        最眼熟的表（问「下包之后翻盘」去查 games，还编了个 series_id 字面量），
+        所以把候选表单独点名。
         """
         items = [g for g in (grabs or []) if str(g.get("name") or "").strip()]
-        if not items:
+        ft = [t for t in (focus_tables or []) if str(t).strip()]
+        if not items and not ft:
             return ""
-        lines = []
-        for g in items[:24]:
-            desc = str(g.get("description") or "").strip().replace("\n", " ")
-            lines.append(f"  - {g['name']}: {desc[:220]}")
-        return (
-            "\n\n【本场景可用的抓手条目（注册表实查，只能按它们给的表/列取数）】\n"
-            + "\n".join(lines)
-            + "\n写 SQL 的硬规矩：join 只用上面**列名里真实出现**的键；"
-              "不确定某张表有哪些列就先 `SELECT * FROM 表 LIMIT 1` 看一行；"
-              "不要假设表里有 round_id / id 这类想当然的列。"
-        )
+        out = ""
+        if ft:
+            out += ("\n\n【本题候选表（按子目标与真实表名实查匹配）】\n  "
+                    + "、".join(ft[:10])
+                    + "\n回答本题**优先**用这些表；用别的表要能说清为什么。")
+        if items:
+            lines = []
+            for g in items[:24]:
+                desc = str(g.get("description") or "").strip().replace("\n", " ")
+                lines.append(f"  - {g['name']}: {desc[:220]}")
+            out += (
+                "\n\n【本场景可用的抓手条目（注册表实查，只能按它们给的表/列取数）】\n"
+                + "\n".join(lines)
+            )
+        out += ("\n写 SQL 的硬规矩：join 只用上面**列名里真实出现**的键；"
+                "不确定某张表有哪些列就先 `SELECT * FROM 表 LIMIT 1` 看一行；"
+                "不要假设表里有 round_id / id 这类想当然的列；"
+                "**不要编造队伍名/赛事号这类字面量**——题目没给的就不筛它。")
+        return out
 
     def write_sql(
         self,
@@ -112,6 +127,7 @@ class VLMLActionAgent:
         last_sql: str = "",
         skills: list[dict[str, Any]] | None = None,
         grabs: list[dict[str, Any]] | None = None,
+        focus_tables: list[str] | None = None,
     ) -> str:
         """让模型按题面写一条 SELECT；迭代修正时带上一轮的 critique 与 SQL 重写。
 
@@ -120,7 +136,7 @@ class VLMLActionAgent:
         from voyager_vlml.llm import chat
 
         system = self.render_system_message(skills=list(skills or []))
-        system += self.render_grabs(grabs)
+        system += self.render_grabs(grabs, focus_tables)
         if schema:
             system += (
                 "\n\n【当前库真实 schema（只能用这里的表名/列名，不要编造）】\n"
@@ -148,6 +164,7 @@ class VLMLActionAgent:
         hints: list[str] | None = None,
         skills: list[dict[str, Any]] | None = None,
         grabs: list[dict[str, Any]] | None = None,
+        focus_tables: list[str] | None = None,
     ) -> tuple[list[dict[str, Any]], str]:
         """出题之后真正取数：写 SQL → VLML MCP 执行 → 失败带 critique 重写（迭代修正）。
 
@@ -180,6 +197,7 @@ class VLMLActionAgent:
             sql = self.write_sql(
                 question, schema=schema, critique=critique, last_sql=sql,
                 skills=list(skills or []), grabs=list(grabs or []),
+                focus_tables=list(focus_tables or []),
             )
             if not sql:
                 observations.append(

@@ -76,10 +76,11 @@ class _FakeAgent:
         pass
 
     async def solve(self, question, *, max_iters=3, hints=None, skills=None,
-                    grabs=None):
+                    grabs=None, focus_tables=None):
         # 抓手清单必须真的传进来（2026-10-19 服务器实测：不传 → 执行层凭想象
         # join → Binder Error → no_data，闭环停在第五步）。这里记下来给断言看。
         _FakeAgent.last_grabs = list(grabs or [])
+        _FakeAgent.last_focus = list(focus_tables or [])
         data = ([{"n": None}] if self.vacuous
                 else [{"kills": 300}, {"kills": 180}])
         return ([{"ok": True, "rows": len(data), "data": data,

@@ -229,8 +229,21 @@ async def start_learning(
             except Exception:
                 grabs = []
             out["grabs_offered"] = len(grabs)
+            # 候选表：本题所有子目标实查匹配到的表（并集，保序）。给执行层点名，
+            # 免得它挑一张名字最眼熟但对本题无用的表（实测问「下包之后翻盘」
+            # 去查 games，还编了个 series_id 字面量）。
+            focus: list[str] = []
+            try:
+                for st in plan["subtasks"]:
+                    for t in (task_decompose.related_tables(
+                            str(st.get("need") or "")) or []):
+                        if t not in focus:
+                            focus.append(t)
+            except Exception:
+                focus = []
+            out["focus_tables"] = focus[:10]
             observations, sql = await agent.solve(
-                question, skills=skills, grabs=grabs,
+                question, skills=skills, grabs=grabs, focus_tables=focus,
                 hints=[str(s.get("need") or "") for s in plan["subtasks"]])
             real = _has_real(list(observations or []))
             out["execution"] = {
