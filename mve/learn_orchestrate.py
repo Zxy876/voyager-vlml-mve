@@ -155,6 +155,38 @@ def _has_real(obs: list[dict[str, Any]]) -> bool:
         return any(o.get("ok") and int(o.get("rows") or 0) > 0 for o in obs)
 
 
+# 单个子任务（维度）的 rollout 上限 —— **抄原版** `action_agent_task_max_retries=4`
+# （voyager_original/voyager/voyager.py:30；:277-279 `done = 迭代数 >= 上限 or
+# success`）。到上限仍不闭合就跳过这条维度（curriculum.py:342 "Skipping to
+# next task"）—— 不是"再试一次看看"，原版就没有无限重试。
+SUBTASK_MAX_RETRIES = 4
+
+
+def close_one_dimension(scene_id: str, topic_id: str, question: str,
+                        dim: dict[str, Any]) -> list[str]:
+    """闭合**一个**（维度）问题 = 落**一枚**节点 —— 最小技能单位。
+
+    用户 2026-10-19 定：最小技能单位是一个节点（也就是闭合了一个问题）。
+    所以粒度是"每闭合一条维度就记账一次"，不是"整个大问题全闭合才记账"。
+    幂等（`attach_dimensions` 同 (topic, dim_id) 只建一次，重复只加证据数）。
+    """
+    tid = str(topic_id or "").strip()
+    if not tid:
+        return []
+    # 父节点先存在（与 ⑥ `_absorb` 同一个 ensure，幂等），否则维度边会挂到
+    # 场景根上，和 ⑥ 落的那批父节点不一致。
+    try:
+        import cold_start
+        cold_start.ensure_cold_start_node(tid, question, scene_id)
+    except Exception:
+        pass
+    try:
+        import maieutic_scaffold as _ms
+        return list(_ms.attach_dimensions(scene_id, tid, [dim], verified=True))
+    except Exception:
+        return []
+
+
 async def start_learning(
     question: str,
     scene_id: str = "",
@@ -213,6 +245,11 @@ async def _start_learning_impl(
         out.update(status="failed", why="空问题，无可学")
         _record(out)
         return out
+
+    # 已逐条闭合的维度 id（最小技能单位：闭合一条就落一枚节点，见
+    # `close_one_dimension`）。定义在这是给 ⑥ 的兜底去重用的 —— 非维度模式下
+    # 它是空集，⑥ 的 `not in` 照样成立，不会 NameError。
+    closed_ids: set[str] = set()
 
     # ---- ⓪ 场景隔离：这一轮学的是**哪个后端**，先定死 ----
     # 用户 2026-10-19 两条要求：
@@ -393,6 +430,15 @@ async def _start_learning_impl(
                     learned_dims: list[dict[str, Any]] = []
                     failed_dims: list[dict[str, Any]] = []
                     answers: list[str] = []
+                    closed_nodes: list[str] = []
+                    # 父节点（这枚"问题节点"）的 id 必须与 ⑥ `_absorb` 用同一算法，
+                    # 否则循环里先落的维度节点和 ⑥ 后落的会算出两套 id → 不幂等。
+                    try:
+                        from voyager_vlml.consume import (
+                            _runtime_topic_id as _rtid)
+                        _tid = str(_rtid(question, scene) or "")
+                    except Exception:
+                        _tid = ""
                     try:
                         _prog = _ms.load_progress(scene, question)
                     except Exception:
@@ -405,10 +451,15 @@ async def _start_learning_impl(
                         if _did and _did in _prog:
                             learned_dims.append(_d)     # 断点续学：答到过的不重跑
                             continue
-                        # 单维度最多两次：第二次把闸门带回的**追问**当 critique
-                        # 灌回 prompt（原版 voyager.py:262-268 迭代提示同款）。
+                        # 原版重试机制（用户 2026-10-19 定，同 voyager.py:30
+                        # `action_agent_task_max_retries=4` + :277-279
+                        # `done = 迭代数 >= 上限 or success`）：每次把闸门带回的
+                        # **追问**当 critique 灌回 prompt（voyager.py:262-268
+                        # 迭代提示同款），**到上限仍不闭合就跳过这条维度**
+                        # （curriculum.py:342 "Skipping to next task"），
+                        # 不原地无限重试。
                         ok1, crit1, obs1, r1 = False, "", [], {}
-                        for _t in range(2):
+                        for _t in range(SUBTASK_MAX_RETRIES):
                             obs1, _ = await local_agent.solve(
                                 _q1, local_dir, llm=llm, scene_id=scene,
                                 avoid=_avoid, critique=str(crit1 or ""))
@@ -441,10 +492,19 @@ async def _start_learning_impl(
                             a1 = str(r1.get("answer") or "").strip()
                             if a1:
                                 answers.append(f"【{_q1}】{a1[:500]}")
+                            # 最小技能单位 = **一枚节点 = 闭合一个（维度）问题**
+                            # （用户 2026-10-19 定）：闭合一条就落一条，不等整个
+                            # 任务闭合 —— 否则 8/9 那种 partial 会因为 ⑤' 提前
+                            # return 而颗粒无收（2026-10-19 服务器实测）。
+                            closed_nodes.extend(
+                                close_one_dimension(scene, _tid, question, _d))
+                            if _did:
+                                closed_ids.add(_did)
                         else:
-                            failed_dims.append({"id": _did,
-                                                "question": _q1,
-                                                "critique": str(crit1)[:200]})
+                            failed_dims.append({
+                                "id": _did, "question": _q1,
+                                "attempts": SUBTASK_MAX_RETRIES,
+                                "critique": str(crit1)[:200]})
                     try:
                         _ms.save_progress(scene, question,
                                           [str(d.get("id") or "")
@@ -456,6 +516,7 @@ async def _start_learning_impl(
                         "learned": [str(d.get("id") or "") for d in learned_dims],
                         "failed": failed_dims,
                     }
+                    out["dimension_nodes"] = closed_nodes
                     observations = observations[-8:]
                     sql = ""
                     _answer_override = "\n\n".join(answers)[:2500]
@@ -590,8 +651,11 @@ async def _start_learning_impl(
             # "学会了"但其实是空的节点。
             good = ([d for d in dims if str(d.get("id") or "") in _ids]
                     if _dres else dims)
-            out["dimension_nodes"] = _ms.attach_dimensions(
-                scene, tid, good, verified=True)
+            # 逐维度闭合时已经落过的（closed_ids）不再挂一次 —— 否则同一轮
+            # 同一节点会被记两次证据。
+            good = [d for d in good if str(d.get("id") or "") not in closed_ids]
+            out["dimension_nodes"] = list(out.get("dimension_nodes") or []) + list(
+                _ms.attach_dimensions(scene, tid, good, verified=True))
         except Exception as e:
             out["dimension_nodes_error"] = f"{type(e).__name__}: {e}"
     out["milestone"] = {"topic_id": tid, "unlocked": False}

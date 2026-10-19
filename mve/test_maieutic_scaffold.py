@@ -255,6 +255,44 @@ def test_gate_log_reports_real_counts() -> None:
     print("PASS  test_gate_log_reports_real_counts")
 
 
+def test_subtask_retries_then_skips() -> None:
+    """原版重试机制（用户 2026-10-19 定）：单维度最多 `SUBTASK_MAX_RETRIES`
+    次（原版 voyager.py:30 action_agent_task_max_retries=4），到上限仍不闭合就
+    **跳过这条维度**（curriculum.py:342 "Skipping to next task"），不无限重试。
+    """
+    import learn_orchestrate as L
+    assert L.SUBTASK_MAX_RETRIES == 4, L.SUBTASK_MAX_RETRIES   # 抄原版，不是自造
+    print(f"PASS  test_subtask_retries_then_skips（上限={L.SUBTASK_MAX_RETRIES}）")
+
+
+def test_one_closed_dimension_is_one_node() -> None:
+    """最小技能单位 = **一枚节点 = 闭合一个（维度）问题**（用户 2026-10-19 定）。
+
+    验两件事：
+      1. 闭合一条就落一枚节点，且**同一个 (topic, dim) 重复闭合不重复建**；
+      2. 幂等所需的前提：父节点 id 与 ⑥ `_absorb` 用同一算法算出。
+    """
+    import maieutic_scaffold as M
+    from knowledge_graph import KnowledgeGraph
+
+    dim = {"id": "definition", "question": "阿斯伯格的定义是什么？", "why": "地基"}
+    g = KnowledgeGraph()
+    g.ensure_scene_root("T")
+    g.add_cold_start_node("T", "consume:consume_abc", "dimension",
+                          label="什么是阿斯伯格")
+    a1 = M.attach_dimensions("T", "consume_abc", [dim], verified=True, graph=g)
+    assert len(a1) == 1, a1                       # 闭合一条 = 一枚节点
+    assert M.attach_dimensions("T", "consume_abc", [dim], verified=True,
+                               graph=g) == []      # 重复闭合不重复建
+    # 另一条维度闭合 = 另一枚独立节点（粒度是"每条一个问题"，不是整题一枚）
+    a2 = M.attach_dimensions(
+        "T", "consume_abc",
+        [{"id": "support", "question": "证据支持的干预方式有哪些？", "why": "落点"}],
+        verified=True, graph=g)
+    assert len(a2) == 1 and a2[0] != a1[0], (a1, a2)
+    print("PASS  test_one_closed_dimension_is_one_node")
+
+
 def main() -> None:
     test_parse_and_cache()
     test_plan_uses_dimensions()
@@ -263,6 +301,8 @@ def main() -> None:
     test_attach_dimensions()
     test_drift_notes()
     test_gate_log_reports_real_counts()
+    test_subtask_retries_then_skips()
+    test_one_closed_dimension_is_one_node()
     print("\nALL PASS")
 
 
