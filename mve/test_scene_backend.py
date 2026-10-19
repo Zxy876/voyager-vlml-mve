@@ -761,6 +761,41 @@ def main() -> int:
     check("但依据照样列全（人还是能核）", len(nocite["sources"]) >= 1,
           str(len(nocite["sources"])))
 
+    # 反馈重试一次（同构 Voyager 的 critic → 重试）：第一次不标编号，
+    # 带着「你没标编号」再问一次，标了就采纳（只重试一次，不无限拖）。
+    calls = {"n": 0}
+    replies = [json.dumps({"answer": "最前沿的是 Genie 3。", "used": [1]},
+                          ensure_ascii=False),
+               json.dumps({"answer": "最前沿的是 Genie 3[1]。", "used": [1]},
+                          ensure_ascii=False)]
+
+    def _two_step(*a, **k):
+        i = calls["n"]
+        calls["n"] += 1
+        return replies[min(i, len(replies) - 1)]
+
+    narrator.chat = _two_step
+    try:
+        rs = narrator.narrate_answer(QUESTION, hits)
+    finally:
+        narrator.chat = real_chat
+    check("没标编号会重问一次，第二次标了就采纳（cited=True）",
+          rs.get("cited") is True and rs.get("retried") is True
+          and calls["n"] == 2, f"calls={calls['n']} cited={rs.get('cited')}")
+    check("重试后答案里真的带编号", "[1]" in rs["answer"], rs["answer"][:40])
+
+    calls["n"] = 0
+    narrator.chat = lambda *a, **k: (calls.__setitem__("n", calls["n"] + 1)
+                                     or json.dumps({"answer": "最前沿的是 Genie 3。",
+                                                    "used": [1]}, ensure_ascii=False))
+    try:
+        r2 = narrator.narrate_answer(QUESTION, hits)
+    finally:
+        narrator.chat = real_chat
+    check("重试一次还不标就收手（不会无限重问）",
+          calls["n"] == 2 and r2.get("cited") is False,
+          f"calls={calls['n']} cited={r2.get('cited')}")
+
     # ④ advisory 降级：叙事这层挂了，绝不能把「取到了数」变成「交白卷」
     narrator.chat = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("模型 500"))
     try:

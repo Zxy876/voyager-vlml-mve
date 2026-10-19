@@ -283,11 +283,10 @@ def narrate_answer(question: str, data: Any, *, note: str = "") -> dict[str, Any
               + (f"取数说明：{note}\n\n" if note else "")
               + f"{block}\n\n"
               "按铁律把上面这些讲成答案。只输出 JSON。")
+    msgs = [{"role": "system", "content": ANSWER_SYSTEM},
+            {"role": "user", "content": prompt}]
     try:
-        raw = chat(
-            [{"role": "system", "content": ANSWER_SYSTEM},
-             {"role": "user", "content": prompt}],
-            temperature=0.3, max_tokens=800)
+        raw = chat(msgs, temperature=0.3, max_tokens=800)
     except Exception as e:
         out["why"] = f"叙事模型调用失败：{type(e).__name__}: {e}"
         return out
@@ -297,6 +296,28 @@ def narrate_answer(question: str, data: Any, *, note: str = "") -> dict[str, Any
     if not answer:
         out["why"] = f"叙事模型没给出可用的 JSON（原文前 80 字：{str(raw)[:80]}）"
         return out
+
+    # 反馈重试一次（同构 Voyager 的 critic → 重试）：实测 glm-4-flash 经常给出
+    # 通顺的三句话却一个来源编号都不标 —— 而那正是「可核」的全部意义。
+    # 只重试一次：再要就是骚扰模型，也不能无限拖长导入时间（本来就 1-3 分钟）。
+    retried = False
+    if not re.findall(r"\[(\d+)\]", answer) and len(items) > 1:
+        try:
+            raw2 = chat(
+                msgs + [
+                    {"role": "assistant", "content": str(raw)[:1200]},
+                    {"role": "user",
+                     "content": (f"这段回答里一个来源编号都没有，人没法核。重写："
+                                 f"每个结论句末尾用 [编号] 标出来源，编号只能取 "
+                                 f"1..{len(items)}；其余规则不变。只输出 JSON。")},
+                ], temperature=0.3, max_tokens=800)
+            p2 = _extract_json(str(raw2 or ""))
+            a2 = str(p2.get("answer") or "").strip()
+            if a2 and re.findall(r"\[(\d+)\]", a2):
+                payload, raw, answer = p2, raw2, a2
+                retried = True
+        except Exception:
+            pass            # 重试失败不影响第一版答案（第一版已经可用，只是没标编号）
 
     caveats = [str(x).strip() for x in (payload.get("caveats") or []) if str(x).strip()]
     # 引用编号的**程序核对**（同猫娘 facts.py 的「程序恢复原路径和原文」）：
@@ -337,6 +358,8 @@ def narrate_answer(question: str, data: Any, *, note: str = "") -> dict[str, Any
         # 答案里到底有没有逐句引用：面板据此决定「依据」标题怎么写，
         # 别让人误以为是逐句可核的（诚实披露，不替模型补编号）。
         "cited": cited,
+        # 有没有为「没标编号」重问过一次（留痕，方便判断模型守不守规矩）
+        "retried": retried,
         "sources": [{"n": n, "title": valid[n].get("title") or "",
                      "url": valid[n].get("url") or ""} for n in picks],
     })
