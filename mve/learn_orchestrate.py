@@ -322,7 +322,8 @@ _LAST: list[dict[str, Any]] = []
 _LAST_MAX = 20
 
 
-def kick_learning(question: str, scene_id: str = "") -> dict[str, Any]:
+def kick_learning(question: str, scene_id: str = "", *,
+                  reason: str = "") -> dict[str, Any]:
     """后台启动一轮学习（fire-and-forget）—— 人导入未命中就自动走这里。
 
     ⚠️ **必须用独立线程 + 自己的事件循环**（2026-10-19 服务器实测踩的坑）：
@@ -333,6 +334,9 @@ def kick_learning(question: str, scene_id: str = "") -> dict[str, Any]:
     生命周期解耦：consume 线程结束、面板重启都不影响它跑完这一轮。
 
     同一问题已在跑 → 不重复起（如实回 kicked=False + why）。
+
+    `reason` 只进返回值与日志（"为什么学这一轮"）：未命中 → 陌生问题；
+    命中但没取到数 → 认识这句话但还不会回答它。两条都要学。
     """
     question = str(question or "").strip()
     if not question:
@@ -352,7 +356,8 @@ def kick_learning(question: str, scene_id: str = "") -> dict[str, Any]:
                          daemon=True)
     _BG[question] = t
     t.start()
-    return {"kicked": True, "question": question[:60], "mode": "thread"}
+    return {"kicked": True, "question": question[:60], "mode": "thread",
+            "reason": str(reason or "")}
 
 
 def _record(result: dict[str, Any]) -> None:

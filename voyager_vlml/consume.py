@@ -608,6 +608,23 @@ async def consume(
     real_rows = sum(int(o.get("rows") or 0) for o in real_calls)
     trajectory = [str(o.get("tool") or "") for o in ok_calls]
 
+    # 命中但**没取到数** = 还是没学会 —— 也要踢一轮自学。
+    # 为什么不能只靠「未命中」触发（2026-10-19 实测）：未命中会当场建一枚
+    # cold_start 节点，于是第二次问同一句就是 HIGH_CONFIDENCE「命中」了，
+    # 可节点只是记账、不会让模型突然会写这条 SQL —— 表现是「命中、但 rows=0」，
+    # 学习再也不会被触发，闭环永远停在「认识这句话」而不是「能回答这句话」。
+    # 原版铁律同构：任务做成（取到值）才固化；没做成就要继续学。
+    if not real_calls:
+        try:
+            import learn_orchestrate as _lo2
+            if not learn_kick.get("kicked"):
+                learn_kick = _lo2.kick_learning(
+                    question, _scene_id,
+                    reason="命中但没取到真数（能力还没学会）")
+        except Exception as _ke:
+            learn_kick = {"kicked": False,
+                          "why": f"{type(_ke).__name__}: {_ke}"}
+
     # ---- ④ 整理事实（**面板披露「取到了哪些数」用，不再是判分的前提**）----
     # ⚠️ 2026-10-13 改判法（用户原话）：「整理事实这个事情本来就是交给 LLM 的，
     #   如果在消费侧，直接比对 voyager 和 VLML 的方法和做法，算掌握度和曲线，
@@ -814,10 +831,12 @@ async def consume(
         "route_score": int(route_info.get("max_score") or 0),
         "route_matched_on": str(route_info.get("matched_on") or ""),
         "route_node": str(route_info.get("node_id") or ""),
-        # 未命中时是否已启动后台学习（learn_orchestrate.kick_learning）——
-        # 面板导入历史据此显示「已启动后台学习」；未命中才可能有值。
+        # 是否已启动后台学习（learn_orchestrate.kick_learning）—— 面板导入历史
+        # 据此显示「已启动后台学习」。两条触发路径都要落：未命中（陌生问题）
+        # 和命中但没取到真数（认识这句话、还不会回答它）。
         "learn_kicked": bool(learn_kick.get("kicked")),
-        "learn_kick_note": str(learn_kick.get("why") or ""),
+        "learn_kick_note": str(learn_kick.get("why")
+                               or learn_kick.get("reason") or ""),
         # 未命中时建的图谱节点（闭环第 2 步的可见证据）：node_id + 是否新建
         "miss_node": str(miss_info.get("node_id") or ""),
         "miss_node_created": bool(miss_info.get("node_created")),
