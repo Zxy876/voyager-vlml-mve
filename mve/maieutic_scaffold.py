@@ -257,11 +257,14 @@ def save_progress(scene_id: str, question: str, learned_ids: list[str]) -> None:
 
 def attach_dimensions(scene_id: str, topic_id: str,
                       dimensions: list[dict[str, Any]], *,
-                      verified: bool = False, graph: Any = None) -> list[str]:
+                      verified: bool = False, graph: Any = None,
+                      bump: bool = True) -> list[str]:
     """把追问骨架的维度**挂进知识图谱**（这是"图谱靠不停学习长大"的那一步）。
 
     每个维度 = 一枚 kind="dimension" 的节点，边 `问题节点 -has_dimension-> 维度`。
     · 幂等：同一 (topic, dim_id) 重复学不重复建，只把证据数 +1；
+      `bump=False` = 只是"补挂确认它在"（断点续学跳过重跑时用），**不重复
+      加证据** —— 没有新证据就不许把证据数刷上去（2026-10-19）。
     · 学成功才 verified（verified=True），没学成功就别冒充掌握；
     · parent 找不到时挂到场景根上（边不许悬挂，add_edge 会直接丢弃）。
 
@@ -294,7 +297,8 @@ def attach_dimensions(scene_id: str, topic_id: str,
         if old is not None:
             if verified:
                 old.status = "verified"
-                old.evidence = max(int(old.evidence or 0), 1) + 1
+                if bump:
+                    old.evidence = max(int(old.evidence or 0), 1) + 1
             continue
         g.add_node(Node(id=did, kind="dimension", label=label[:90],
                         detail={"why": str(d.get("why") or ""),

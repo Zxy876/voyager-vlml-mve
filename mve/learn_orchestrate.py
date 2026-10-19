@@ -163,7 +163,7 @@ SUBTASK_MAX_RETRIES = 4
 
 
 def close_one_dimension(scene_id: str, topic_id: str, question: str,
-                        dim: dict[str, Any]) -> list[str]:
+                        dim: dict[str, Any], *, bump: bool = True) -> list[str]:
     """闭合**一个**（维度）问题 = 落**一枚**节点 —— 最小技能单位。
 
     用户 2026-10-19 定：最小技能单位是一个节点（也就是闭合了一个问题）。
@@ -182,7 +182,8 @@ def close_one_dimension(scene_id: str, topic_id: str, question: str,
         pass
     try:
         import maieutic_scaffold as _ms
-        return list(_ms.attach_dimensions(scene_id, tid, [dim], verified=True))
+        return list(_ms.attach_dimensions(scene_id, tid, [dim], verified=True,
+                                          bump=bump))
     except Exception:
         return []
 
@@ -450,6 +451,14 @@ async def _start_learning_impl(
                             continue
                         if _did and _did in _prog:
                             learned_dims.append(_d)     # 断点续学：答到过的不重跑
+                            # 但仍要**保证节点在**（闭合过就该有那一枚技能单位）：
+                            # 旧代码里 ⑤' 判 partial 会提前 return，出现过"答到
+                            # 8 条却颗粒无收"。补挂不重跑、不加证据（bump=False）。
+                            closed_nodes.extend(
+                                close_one_dimension(scene, _tid, question, _d,
+                                                    bump=False))
+                            if _did:
+                                closed_ids.add(_did)
                             continue
                         # 原版重试机制（用户 2026-10-19 定，同 voyager.py:30
                         # `action_agent_task_max_retries=4` + :277-279
