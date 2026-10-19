@@ -191,6 +191,20 @@ def _log_learning_detail(r: dict[str, Any]) -> None:
         _log(f"  · 维度子任务：{len(_ok)}/{dres.get('total')} 个答到"
              + (f"（未闭合：{'，'.join(str(f.get('id') or '') for f in _bad)}）"
                 if _bad else "（全部闭合）"))
+    ms = r.get("milestone_scaffold") or {}
+    if ms:
+        _name = str(ms.get("name") or "")
+        _log(f"  · 里程碑：{_name}（{ms.get('closed')}/{ms.get('total')} 闭合）"
+             + ("✅ 达成" if ms.get("achieved")
+                else f"未达成（还差：{'，'.join(ms.get('missing') or []) or '？'}）"))
+    sk = r.get("skills") or {}
+    if sk:
+        _add = sk.get("added") or []
+        _skip = sk.get("skipped") or []
+        _log(f"  · 技能入库：{len(_add)} 条"
+             + (f"（{', '.join(str(a.get('dim')) for a in _add)}）" if _add else "")
+             + (f"；跳过 {len(_skip)} 条（没调取数动作，不是配方）" if _skip else "")
+             + (f" · {sk['error']}" if sk.get("error") else ""))
     gate = (r.get("critic") or {}).get("gate") or {}
     if isinstance(gate, dict) and (gate.get("addressed") or gate.get("open")):
         _open = gate.get("open") or []

@@ -162,6 +162,72 @@ def _has_real(obs: list[dict[str, Any]]) -> bool:
 SUBTASK_MAX_RETRIES = 4
 
 
+def learn_milestone_skills(scene_id: str, topic_id: str, question: str,
+                           milestone: dict[str, Any],
+                           dim_codes: list[dict[str, Any]],
+                           ) -> dict[str, Any]:
+    """里程碑**闭合**后把这一轮跑通的代码写进技能库 —— 同构原版
+    `skill.py:64-99 add_new_skill`（原版只在 rollout **成功**后写：
+    `voyager.py:230 if success: add_new_skill(info)`，存的是 program_code）。
+
+    为什么单开这条（2026-10-20 定位的致命问题）：知识型/本机场景没有 SQL，
+    走 `_absorb` 那条路会被判"无可执行配方"直接跳过 —— **学了一整轮，技能库
+    一条都不涨**。而原版学的从来不是"答案"，是**跑通的那段代码**：
+    本机场景里它就是调 `web_search / read_file / query_sql / mcp_*` 的那段脚本。
+
+    铁律不变：**没真取到数的不入**。判据复用消费侧同一个 `_looks_like_recipe`
+    （不重造），纯 `RESULT = {"answer": "…"}` 那种凭记忆写的答案照样不入库 ——
+    否则就是把记忆固化成能力（2026-10-19 已删过 3 条这种伪配方）。
+
+    粒度：一条闭合的维度 = 一次成功 rollout = 一条技能（原版就是一次 rollout
+    一条）。里程碑整体达成只加**记账**，不另外造一条"大技能"。
+    """
+    out: dict[str, Any] = {"added": [], "skipped": [], "milestone":
+                           str(milestone.get("name") or ""),
+                           "achieved": bool(milestone.get("achieved"))}
+    if not str(topic_id or "").strip() or not dim_codes:
+        return out
+    try:
+        from voyager_vlml.consume import _looks_like_recipe
+    except Exception:
+        return out
+    try:
+        import skill_store
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+        return out
+    for item in dim_codes:
+        code = str(item.get("code") or "").strip()
+        did = str(item.get("id") or "").strip()
+        if not code or not did:
+            continue
+        if not _looks_like_recipe(code):
+            out["skipped"].append(did)      # 没调取数动作 = 不是配方，如实跳过
+            continue
+        try:
+            _act, key = skill_store.add(
+                topic_id, f"{topic_id}::{did}",
+                # ⚠️ 技能描述必须够长：`add()` 对 <MIN_LESSON_LEN(12) 的 text
+                # 直接 skipped（照原版 "Deposit useless items" 特判）。
+                # 光写维度问句在短问题上会静默丢技能 —— 补一句固定后缀。
+                f"【{out['milestone'] or question[:30]}】"
+                f"{item.get('question') or question}"
+                f"：闭合这个维度时跑通的取数做法",
+                code=code,
+                source="learn",
+                blueprint={"from": "maieutic_milestone",
+                           "milestone": out["milestone"],
+                           "dimension": did,
+                           "question": str(item.get("question") or ""),
+                           "scene": scene_id},
+                source_scene=str(scene_id or "A"))
+            if key:
+                out["added"].append({"key": key, "action": _act, "dim": did})
+        except Exception as e:
+            out["error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
 def close_one_dimension(scene_id: str, topic_id: str, question: str,
                         dim: dict[str, Any], *, bump: bool = True) -> list[str]:
     """闭合**一个**（维度）问题 = 落**一枚**节点 —— 最小技能单位。
@@ -432,6 +498,7 @@ async def _start_learning_impl(
                     failed_dims: list[dict[str, Any]] = []
                     answers: list[str] = []
                     closed_nodes: list[str] = []
+                    dim_codes: list[dict[str, Any]] = []
                     # 父节点（这枚"问题节点"）的 id 必须与 ⑥ `_absorb` 用同一算法，
                     # 否则循环里先落的维度节点和 ⑥ 后落的会算出两套 id → 不幂等。
                     try:
@@ -469,7 +536,10 @@ async def _start_learning_impl(
                         # 不原地无限重试。
                         ok1, crit1, obs1, r1 = False, "", [], {}
                         for _t in range(SUBTASK_MAX_RETRIES):
-                            obs1, _ = await local_agent.solve(
+                            # ⚠️ 第二个返回值是**这一轮跑通的代码**（原版的
+                            # `program_code`）。以前写成 `obs1, _ =`，代码直接丢
+                            # 掉 → 知识型场景永远学不到技能（2026-10-20 定位）。
+                            obs1, code1 = await local_agent.solve(
                                 _q1, local_dir, llm=llm, scene_id=scene,
                                 avoid=_avoid, critique=str(crit1 or ""))
                             observations.extend(obs1)
@@ -509,6 +579,9 @@ async def _start_learning_impl(
                                 close_one_dimension(scene, _tid, question, _d))
                             if _did:
                                 closed_ids.add(_did)
+                            if str(code1 or "").strip():
+                                dim_codes.append({"id": _did, "question": _q1,
+                                                  "code": str(code1)})
                         else:
                             failed_dims.append({
                                 "id": _did, "question": _q1,
@@ -526,6 +599,22 @@ async def _start_learning_impl(
                         "failed": failed_dims,
                     }
                     out["dimension_nodes"] = closed_nodes
+                    # ---- 里程碑判定（骨架一次生成，这里只判闭合）----
+                    try:
+                        _mst = _ms.milestone_state(
+                            scene, question,
+                            [str(d.get("id") or "") for d in learned_dims],
+                            scaffold_result={"dimensions": _dims,
+                                             "milestone": plan.get("milestone") or {}})
+                        out["milestone_scaffold"] = _mst
+                        # 达成了 → 这一轮跑通的代码进技能库（同原版 add_new_skill）
+                        # 没全闭合也照样把**已闭合**那几条入库 —— 它们各自是一次
+                        # 成功 rollout，不该因为别的维度没闭合就被连坐丢掉。
+                        out["skills"] = learn_milestone_skills(
+                            scene, _tid, question, _mst, dim_codes)
+                    except Exception as e:
+                        out["milestone_scaffold"] = {
+                            "error": f"{type(e).__name__}: {e}"}
                     observations = observations[-8:]
                     sql = ""
                     _answer_override = "\n\n".join(answers)[:2500]

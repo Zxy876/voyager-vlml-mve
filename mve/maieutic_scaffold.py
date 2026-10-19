@@ -48,7 +48,15 @@ SCAFFOLD_SYSTEM = """你是一位擅长「产婆术」（Maieutic）的课程规
 （材料可能很粗糙），你的任务不是回答它，而是产出一份**追问骨架**，让一个只会取数/
 检索的助手能一个问题一个问题地把这块知识补齐。
 
-你要产出两样东西：
+你要产出三样东西：
+
+0. milestone —— 这整份骨架本身就是一个**里程碑**：一个能被命名、能被判"达成了没有"
+   的能力单元（同构课程里的一章/一个单元）。
+   · name：这句短语，像教材里的单元标题（如"阿斯伯格与孤独症谱系的边界"），
+     **不许**是"回答以下问题"这种空话，也不许把原问题原样抄一遍；
+   · why：为什么把它算一个里程碑（答清它之后，能力上多了什么）。
+   ⚠️ 里程碑**只在这里生成一次**（骨架生成时），运行时不再生成 —— 运行时做的
+   只是把下面的 dimensions 一条条闭合。所以 name 要能撑住"以后复用它"这件事。
 
 1. dimensions —— 要真正答清楚这句问题，**必须先做出承诺/必须回答**的具体问题。
    每条都是一个可以被回答、也可以被判对错的具体问题，不是一个笼统的标签。
@@ -74,6 +82,7 @@ SCAFFOLD_SYSTEM = """你是一位擅长「产婆术」（Maieutic）的课程规
 
 只输出一个 JSON 对象，不要前言、不要 markdown 代码围栏。Schema：
 {
+  "milestone": {"name": "<里程碑名，一句短语>", "why": "<为什么它是一个里程碑>"},
   "dimensions": [
     {"id": "<snake_case 短标识>", "question": "<具体问题，一句话>",
      "why": "<为什么答清这句问题必须先回答它>"}
@@ -109,6 +118,23 @@ def _parse(text: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+def _clean_milestone(data: dict[str, Any], question: str = "") -> dict[str, str]:
+    """里程碑块（骨架**生成时**产出一次，运行时只读不生成）。
+
+    老缓存 / 模型没给 → 用问题本身当名字（**不重建骨架**，去重名一样能用），
+    判据不受影响：里程碑是否达成 = 维度有没有全闭合。
+    """
+    m = data.get("milestone")
+    if isinstance(m, dict):
+        name = str(m.get("name") or "").strip()
+        if name:
+            return {"name": name[:40],
+                    "why": str(m.get("why") or "").strip()[:120]}
+    if isinstance(m, str) and m.strip():
+        return {"name": m.strip()[:40], "why": ""}
+    return {"name": str(question or "").strip()[:40], "why": ""}
 
 
 def _clean_dims(data: dict[str, Any]) -> list[dict[str, str]]:
@@ -165,7 +191,8 @@ def scaffold(question: str, scene_id: str = "A", *, llm: Callable | None = None,
     """
     q = str(question or "").strip()
     out: dict[str, Any] = {"dimensions": [], "expected_drifts": [],
-                           "material_note": "", "origin": "failed", "reason": ""}
+                           "milestone": {}, "material_note": "",
+                           "origin": "failed", "reason": ""}
     if not q:
         out["reason"] = "空问题"
         return out
@@ -177,6 +204,7 @@ def scaffold(question: str, scene_id: str = "A", *, llm: Callable | None = None,
             if dims:
                 return {"dimensions": dims,
                         "expected_drifts": list(data.get("expected_drifts") or []),
+                        "milestone": _clean_milestone(data, q),
                         "material_note": str(data.get("material_note") or ""),
                         "origin": "cache", "reason": ""}
         except Exception:
@@ -196,6 +224,7 @@ def scaffold(question: str, scene_id: str = "A", *, llm: Callable | None = None,
         return out
     drifts = [d for d in (data.get("expected_drifts") or []) if isinstance(d, dict)]
     out.update(dimensions=dims, expected_drifts=drifts,
+               milestone=_clean_milestone(data, q),
                material_note=str(data.get("material_note") or ""),
                origin="llm", reason="")
     try:
@@ -205,6 +234,38 @@ def scaffold(question: str, scene_id: str = "A", *, llm: Callable | None = None,
     except Exception:
         pass
     return out
+
+
+def milestone_state(scene_id: str, question: str,
+                    learned_ids: list[str] | set[str], *,
+                    scaffold_result: dict[str, Any] | None = None) -> dict[str, Any]:
+    """里程碑达成了没有 —— **判定只读清单，不重新生成骨架**。
+
+    口径（照 Maieutic spec-examiner 的闭合定义，`maieutic_gate` 已在用的同一条）：
+      · 达成 = `gaps_still_open` 为空 = 骨架里的维度**全部闭合**；
+      · 少一条就不算达成（不作废已闭合的部分 —— 它们各自已经是技能单位）。
+
+    用户 2026-10-20 定的语义：里程碑骨架**每次跑生成一次**，运行时拆出来的
+    子任务只是"闭合骨架的追问"。所以这里不调 LLM、不碰缓存，纯粹记账。
+    """
+    res = scaffold_result
+    if res is None or not (res.get("dimensions") or []):
+        res = scaffold(str(question or ""), str(scene_id or "A"))
+    dims = [d for d in (res.get("dimensions") or [])
+            if str(d.get("id") or "").strip()]
+    total = len(dims)
+    got = {str(x) for x in (learned_ids or [])}
+    missing = [str(d.get("id")) for d in dims if str(d.get("id")) not in got]
+    ms = res.get("milestone") or {}
+    return {
+        "name": str(ms.get("name") or "").strip() or str(question or "")[:40],
+        "why": str(ms.get("why") or "").strip(),
+        "total": total,
+        "closed": total - len(missing),
+        "missing": missing,
+        # 0 个维度的骨架不构成里程碑（没有可闭合的东西就别报"达成"）
+        "achieved": bool(total) and not missing,
+    }
 
 
 def drift_notes(scaffold_result: dict[str, Any], limit: int = 4) -> list[str]:

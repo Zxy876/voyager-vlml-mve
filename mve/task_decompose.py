@@ -379,6 +379,8 @@ def plan(task: str, scene_id: str, *, llm: Callable | None = None,
                        "origin": f"maieutic:{sc.get('origin') or 'llm'}",
                        "reason": ""}
                 extra = {"dimensions": dims,
+                         # 里程碑随骨架**一次生成**（运行时只读，不再生成）
+                         "milestone": sc.get("milestone") or {},
                          "expected_drifts": sc.get("expected_drifts") or [],
                          "material_note": str(sc.get("material_note") or "")}
         except Exception as e:

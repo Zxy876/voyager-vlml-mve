@@ -293,6 +293,95 @@ def test_one_closed_dimension_is_one_node() -> None:
     print("PASS  test_one_closed_dimension_is_one_node")
 
 
+def test_milestone_is_generated_once_and_judged_by_closure() -> None:
+    """里程碑：骨架**生成时**产出一次，运行时只判闭合（用户 2026-10-20 定）。
+
+    · 达成 = 维度全闭合（同 Maieutic spec gate 的 `gaps_still_open` 为空）；
+    · 0 个维度的骨架不算里程碑（没东西可闭合就别报达成）；
+    · 老骨架没有 milestone 字段 → 用问题当名字，**不重新生成**。
+    """
+    import maieutic_scaffold as M
+
+    tmp = Path(tempfile.mkdtemp())
+    old = M.CKPT
+    M.CKPT = tmp
+    try:
+        canned = dict(CANNED)
+        canned["milestone"] = {"name": "阿斯伯格与孤独症谱系的边界",
+                               "why": "分开之后养育建议才不会错位"}
+
+        def fake(messages):
+            return "```json\n" + json.dumps(canned, ensure_ascii=False) + "\n```"
+
+        a = M.scaffold("什么是阿斯伯格", "T", llm=fake)
+        assert a["milestone"]["name"] == "阿斯伯格与孤独症谱系的边界", a["milestone"]
+        # 再来一次是缓存命中 —— 里程碑不会在运行时反复生成
+        b = M.scaffold("什么是阿斯伯格", "T", llm=fake)
+        assert b["origin"] == "cache" and \
+            b["milestone"]["name"] == "阿斯伯格与孤独症谱系的边界", b
+
+        dims = a["dimensions"]
+        ids = [d["id"] for d in dims]
+        st = M.milestone_state("T", "什么是阿斯伯格", ids[:-1],
+                               scaffold_result=a)
+        assert st["total"] == 3 and st["closed"] == 2 and not st["achieved"], st
+        assert st["missing"] == [ids[-1]], st
+        st2 = M.milestone_state("T", "什么是阿斯伯格", ids, scaffold_result=a)
+        assert st2["achieved"] and not st2["missing"], st2
+        # 空骨架：不许报达成
+        assert not M.milestone_state("T", "x", [],
+                                     scaffold_result={"dimensions": []})["achieved"]
+        # 老骨架没有 milestone 字段 → 名字退回问题本身，不重建
+        old_sc = {"dimensions": dims}
+        st3 = M.milestone_state("T", "什么是阿斯伯格", ids, scaffold_result=old_sc)
+        assert st3["achieved"] and st3["name"] == "什么是阿斯伯格", st3
+    finally:
+        M.CKPT = old
+    print("PASS  test_milestone_is_generated_once_and_judged_by_closure")
+
+
+def test_milestone_closure_writes_skills() -> None:
+    """里程碑闭合 → 这一轮**跑通的代码**进技能库（同原版 skill.py:64-99
+    `add_new_skill`，只在成功 rollout 后写）；没调取数动作的答案**不入库**。
+    """
+    import learn_orchestrate as L
+    import skill_store as SS
+
+    tmp = Path(tempfile.mkdtemp())
+    old = SS.STORE
+    SS.STORE = tmp / "skill_store.json"
+    try:
+        mst = {"name": "里程碑X", "total": 2, "closed": 2, "missing": [],
+               "achieved": True}
+        codes = [
+            {"id": "prevalence", "question": "发病率是多少？",
+             "code": 'r = web_search("Asperger prevalence")\nRESULT = r'},
+            {"id": "definition", "question": "定义是什么？",
+             "code": 'RESULT = {"answer": "阿斯伯格是一种…"}'},   # 凭记忆 → 不是配方
+        ]
+        out = L.learn_milestone_skills("T", "consume_abc", "什么是阿斯伯格",
+                                       mst, codes)
+        assert len(out["added"]) == 1, out          # 只有真调了动作的入库
+        assert out["added"][0]["dim"] == "prevalence", out
+        assert out["skipped"] == ["definition"], out  # 伪配方如实跳过
+        raw = SS._load_raw()
+        got = list((raw.get("skills") or {}).values())
+        assert len(got) == 1, got
+        assert "web_search(" in str(got[0].get("code") or ""), got[0]
+        assert got[0].get("source") == "learn", got[0]
+        assert (got[0].get("blueprint") or {}).get("milestone") == "里程碑X", got[0]
+        # 没闭合的里程碑：已闭合的那几条照样入（各自是一次成功 rollout）
+        out2 = L.learn_milestone_skills(
+            "T", "consume_def", "另一个问题",
+            {"name": "M", "achieved": False, "closed": 1, "total": 2},
+            [{"id": "prevalence", "question": "q",
+              "code": 'read_file("a.json")\nRESULT = 1'}])
+        assert len(out2["added"]) == 1, out2
+    finally:
+        SS.STORE = old
+    print("PASS  test_milestone_closure_writes_skills")
+
+
 def main() -> None:
     test_parse_and_cache()
     test_plan_uses_dimensions()
@@ -303,6 +392,8 @@ def main() -> None:
     test_gate_log_reports_real_counts()
     test_subtask_retries_then_skips()
     test_one_closed_dimension_is_one_node()
+    test_milestone_is_generated_once_and_judged_by_closure()
+    test_milestone_closure_writes_skills()
     print("\nALL PASS")
 
 
