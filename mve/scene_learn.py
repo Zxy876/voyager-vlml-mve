@@ -107,10 +107,19 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--scene", required=True)
     ap.add_argument("--units", type=int, default=4)
+    ap.add_argument("--question", default="",
+                    help="强制重学这一句（即使账上记过 written —— 用于把"
+                         "历史误记的『成功』纠正回来，如 2026-10-19 那条把无关"
+                         "文件内容当答案的错误 written）")
     args = ap.parse_args()
     scene, units = args.scene, max(1, min(20, args.units))
 
     tasks = scene_questions(scene)[:units]
+    if args.question:
+        q = str(args.question).strip()
+        if not any(t["question"] == q for t in tasks):
+            tasks.insert(0, {"question": q})
+        tasks = [t for t in tasks if t["question"] == q] or tasks[:units]
     _log(f"\n[场景学习] Scene {scene} · 待学任务 {len(tasks)} 个"
          f"（上限 {units}）· {time.strftime('%Y-%m-%d %H:%M:%S')}")
     if not tasks:
