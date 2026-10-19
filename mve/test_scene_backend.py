@@ -453,6 +453,89 @@ def main() -> int:
           "players" in (outA.get("focus_tables") or []),
           str(outA.get("focus_tables")))
 
+    # =====================================================================
+    print("\n== 7. 猫爪总开关（同构 neko：MCP / 插件 / 开关 / 开关下面的条目）==")
+    # =====================================================================
+    scenes.switch_scene("B")
+    # 先确保本机原语已注册成条目（等于面板里的“插件已装载”）
+    import actions as _act
+    reg = _act.register_local("B", str(_scene_dir("B")))
+    check("本机原语注册成条目（origin=local / group=本机能力）",
+          reg["added"] == 4 and _act.entry_count("B") >= 4,
+          f"added={reg['added']} total={_act.entry_count('B')}")
+    grp = {g["group"]: g for g in _act.groups("B")}
+    check("总开关按能力组列出（带组下面的条目）",
+          "本机能力" in grp and grp["本机能力"]["count"] >= 4
+          and "list_files" in grp["本机能力"]["entries"],
+          json.dumps(grp.get("本机能力"), ensure_ascii=False)[:100])
+    check("默认全开（不给用户『先开开关才能用』的门槛）",
+          all(g["enabled"] for g in _act.groups("B")),
+          str([(g["group"], g["enabled"]) for g in _act.groups("B")]))
+
+    names_on = {e["name"] for e in _act.enabled_entries("B")}
+    check("开着的组：条目出现在抓手段清单里", "list_files" in names_on,
+          str(sorted(names_on))[:80])
+
+    _act.set_switch("B", "本机能力", False)
+    names_off = {e["name"] for e in _act.enabled_entries("B")}
+    check("关掉总开关：条目不再交给执行层", "list_files" not in names_off,
+          str(sorted(names_off))[:80])
+    try:
+        asyncio.run(_act.invoke("B", "list_files"))
+        blocked = False
+        why = ""
+    except RuntimeError as e:
+        blocked, why = True, str(e)
+    check("关掉总开关：调用被拒且说清是开关关的（不是删了条目）",
+          blocked and "总开关" in why, why[:60])
+    check("关掉不会丢条目（总条目数不变）",
+          "list_files" in _act.names("B") and _act.entry_count("B") >= 4,
+          str(_act.names("B"))[:60])
+
+    # 执行层拿不到原语 → 模型写 list_files 直接 NameError（同构 neko 关插件）
+    ns_off = local_agent._ns_base(str(_scene_dir("B")), "B")
+    check("关掉后模型命名空间里没有该原语", "list_files" not in ns_off,
+          str([k for k in ns_off if not k.startswith("__")]))
+
+    # 拨回来
+    _act.set_switch("B", "本机能力", True)
+    ns_on = local_agent._ns_base(str(_scene_dir("B")), "B")
+    check("拨回来即恢复（不重建、不重新学）",
+          "list_files" in ns_on and "list_files" in
+          {e["name"] for e in _act.enabled_entries("B")},
+          str(sorted(k for k in ns_on if not k.startswith("__"))))
+
+    # 顶层猫爪总开关：关掉后下面的组一律不可用（级联，同 neko「请先开启猫爪总开关」）
+    _act.set_master("B", False)
+    check("总开关关掉：所有组的条目都不交给执行层",
+          _act.enabled_entries("B") == [],
+          str(_act.enabled_entries("B"))[:60])
+    st = {g["group"]: g for g in _act.groups("B")}
+    check("总开关关掉：组状态=master_off 且给出同一句提示",
+          st["本机能力"]["state"] == "master_off"
+          and "请先开启猫爪总开关" in st["本机能力"]["why"],
+          f'{st["本机能力"]["state"]} · {st["本机能力"]["why"]}')
+    try:
+        asyncio.run(_act.invoke("B", "list_files"))
+        m_blocked = False
+    except RuntimeError:
+        m_blocked = True
+    check("总开关关掉：调用被拒（级联门控真的生效）", m_blocked)
+    check("组自己的开关状态没被总开关改掉（拨回来还是原样）",
+          st["本机能力"]["switch"] is True, str(st["本机能力"]["switch"]))
+    _act.set_master("B", True)
+    check("总开关拨回来：组恢复可用",
+          {e["name"] for e in _act.enabled_entries("B")} >= {"list_files"},
+          str(sorted(e["name"] for e in _act.enabled_entries("B")))[:60])
+
+    # 开关状态要落盘（面板重启后不能全部翻回默认开）
+    _act.set_switch("B", "本机能力", False)
+    snap = json.loads(Path(_act.SNAPSHOT).read_text(encoding="utf-8"))
+    check("开关状态进快照（重启不丢）",
+          snap.get("switches", {}).get("B", {}).get("本机能力") is False,
+          json.dumps(snap.get("switches"), ensure_ascii=False)[:80])
+    _act.set_switch("B", "本机能力", True)
+
     print(f"\n===== 结果：{len(PASS)} 过 / {len(FAIL)} 挂 =====")
     if FAIL:
         for f in FAIL:

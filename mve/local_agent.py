@@ -237,21 +237,17 @@ def _payload(value: Any) -> tuple[Any, str]:
 
 
 async def solve(question: str, scene_dir: str, *, llm=None,
-                max_iters: int = 2) -> tuple[list[dict[str, Any]], str]:
-    """写代码 → 跑 → 看结果；失败带反馈重写。返回 (观察列表, 最后一段代码)。"""
+                max_iters: int = 2, scene_id: str = ""
+                ) -> tuple[list[dict[str, Any]], str]:
+    """写代码 → 跑 → 看结果；失败带反馈重写。返回 (观察列表, 最后一段代码)。
+
+    scene_id 给了就按注册表里的**启用条目**注入原语（猫爪总开关生效）。
+    """
     from voyager_vlml.llm import chat
     call = llm or (lambda msgs: chat(msgs, temperature=0.2))
 
     def _ns() -> dict[str, Any]:
-        ns = _ns_base(scene_dir)
-        ns["__builtins__"] = {
-            "len": len, "list": list, "dict": dict,
-            "str": str, "int": int, "float": float, "sorted": sorted,
-            "sum": sum, "min": min, "max": max,
-            "any": any, "all": all, "range": range,
-            "enumerate": enumerate, "Exception": Exception,
-        }
-        return ns
+        return _ns_base(scene_dir, scene_id)
 
     # 场景目录里**现有**什么，直接告诉它（否则它会猜 *.txt 而真实文件是 .json）
     inv = inventory(scene_dir)
@@ -299,27 +295,92 @@ def _extract_code(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 条目化：本机原语是「猫爪总开关」下的一组条目（同构 neko 的插件条目）
+# ---------------------------------------------------------------------------
+# 用户 2026-10-19：「voyager 的基础抓手、能力和猫娘 neko 的 MCP、插件、猫爪
+# 总开关、以及猫爪总开关下面的内容，这块是同构的」。所以本机原语不能是藏在
+# 执行层里的几个 lambda —— 它必须**注册成条目**：
+#     origin="local" / group="本机能力"
+# 这样执行层给模型的抓手清单（actions.enabled_entries）里就有它们，面板上也
+# 能看到「本机能力」这一组的总开关；关掉 = 对模型不可见、也调不动。
+PRIMITIVES: list[dict[str, Any]] = [
+    {"name": "list_files",
+     "fn": list_files,
+     "desc": "列出场景目录/应用工作区里的文件（path 相对场景目录）",
+     "schema": {"type": "object", "properties": {
+         "path": {"type": "string"}, "pattern": {"type": "string"},
+         "limit": {"type": "integer"}}, "required": []}},
+    {"name": "read_file",
+     "fn": read_file,
+     "desc": "读一个文本文件（只读、限长）",
+     "schema": {"type": "object", "properties": {
+         "path": {"type": "string"}, "max_bytes": {"type": "integer"}},
+         "required": ["path"]}},
+    {"name": "read_json",
+     "fn": read_json,
+     "desc": "读一个 JSON 文件并解析（.json 用它，别自己解析）",
+     "schema": {"type": "object", "properties": {"path": {"type": "string"}},
+                "required": ["path"]}},
+    {"name": "query_sql",
+     "fn": query_sql,
+     "desc": "查场景目录里的 .duckdb（只读；没有库时如实报没有）",
+     "schema": {"type": "object", "properties": {"sql": {"type": "string"}},
+                "required": ["sql"]}},
+]
+LOCAL_GROUP = "本机能力"
+
+
+def bind(scene_dir: str) -> list[dict[str, Any]]:
+    """把原语绑到某个场景目录上（给 actions.register_local 用）。"""
+    from functools import partial
+    return [{"name": p["name"], "fn": partial(p["fn"], scene_dir),
+             "description": p["desc"], "schema": dict(p["schema"]),
+             "impl": f"local_agent:{p['name']}"} for p in PRIMITIVES]
+
+
+def primitive_names() -> list[str]:
+    return [p["name"] for p in PRIMITIVES]
+
+
+# ---------------------------------------------------------------------------
 # 技能结晶：把一段跑通的 Python 存成可重放的条目
 # ---------------------------------------------------------------------------
-def _ns_base(scene_dir: str) -> dict[str, Any]:
-    return {
+def _ns_base(scene_dir: str, scene_id: str = "") -> dict[str, Any]:
+    """执行命名空间。
+
+    给了 scene_id 就**按注册表里的启用条目**建（猫爪总开关关掉的组不注入 ——
+    模型连名字都拿不到，这和 neko 关掉插件后条目消失是同构的）；没给就用
+    全量原语（结晶重放/测试用）。
+    """
+    full = {
         "list_files": lambda path="", pattern="*": list_files(
             scene_dir, path, pattern),
         "read_file": lambda path, max_bytes=_MAX_BYTES: read_file(
             scene_dir, path, max_bytes),
         "read_json": lambda path: read_json(scene_dir, path),
         "query_sql": lambda sql: query_sql(scene_dir, sql),
-        "__builtins__": {"len": len, "list": list, "dict": dict, "str": str,
-                         "int": int, "sorted": sorted, "sum": sum,
-                         "min": min, "max": max, "any": any, "all": all,
-                         "range": range, "enumerate": enumerate,
-                         "Exception": Exception},
     }
+    names = set(full)
+    if scene_id:
+        try:
+            import actions
+            names = {str(e.get("name")) for e in actions.enabled_entries(scene_id)
+                     if str(e.get("origin") or "") == "local"} & set(full)
+        except Exception:
+            names = set(full)
+    ns: dict[str, Any] = {k: v for k, v in full.items() if k in names}
+    ns["__builtins__"] = {"len": len, "list": list, "dict": dict, "str": str,
+                          "int": int, "float": float, "sorted": sorted,
+                          "sum": sum, "min": min, "max": max, "any": any,
+                          "all": all, "range": range, "enumerate": enumerate,
+                          "Exception": Exception}
+    return ns
 
 
-def run_saved(code: str, scene_dir: str, timeout: float = 30.0) -> Any:
+def run_saved(code: str, scene_dir: str, timeout: float = 30.0,
+              scene_id: str = "") -> Any:
     """跑一段已存下来的本机技能代码，返回它的 RESULT（失败抛异常，由调用方如实报）。"""
-    ns = _ns_base(scene_dir)
+    ns = _ns_base(scene_dir, scene_id)
     box = _run_restricted(code, ns, timeout=timeout)
     if not box.get("ok"):
         raise RuntimeError(box.get("error") or "本机技能执行失败")

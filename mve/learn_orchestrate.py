@@ -277,7 +277,7 @@ async def start_learning(
                 import actions as _act
                 grabs = [{"name": e.get("name", ""),
                           "description": str(e.get("description") or "")}
-                         for e in _act.entries(scene)]
+                         for e in _act.enabled_entries(scene)]
             except Exception:
                 grabs = []
             out["grabs_offered"] = len(grabs)
@@ -296,8 +296,14 @@ async def start_learning(
             out["focus_tables"] = focus[:10]
             if is_local:
                 import local_agent
+                # 本机原语先注册成条目（origin=local / group=本机能力），
+                # 才谈得上被 `enabled_entries` 当抓手段交给执行层。
+                try:
+                    _act.register_local(scene, local_dir)
+                except Exception:
+                    pass
                 observations, sql = await local_agent.solve(
-                    question, local_dir, llm=llm)
+                    question, local_dir, llm=llm, scene_id=scene)
             else:
                 observations, sql = await agent.solve(
                     question, skills=skills, grabs=grabs, focus_tables=focus,

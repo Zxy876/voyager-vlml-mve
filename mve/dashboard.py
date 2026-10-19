@@ -578,6 +578,13 @@ li{margin:3px 0}
           <button class="btn btn-secondary" id="btnNewScene" title="插入一个新场景：注册命名空间 + 注册可执行动作，不重启不清库">＋ 新建场景</button>
           <span class="hint" id="sceneHint">加载中…</span>
         </div>
+        <!-- 猫爪总开关（同构 neko）：一组能力一个开关，关掉该组「对模型不可见、
+             也调不动」，拨回来即恢复（不删条目）。开关下面就是该组的条目，
+             鼠标悬停可看。 -->
+        <div class="scenebar" id="clawBar" style="gap:6px;flex-wrap:wrap">
+          <span class="lbl">能力开关</span>
+          <span id="clawBox" class="hint">加载中…</span>
+        </div>
       </div>
       <div class="hero__controls">
         <div class="summary-pills" id="pills"></div>
@@ -1210,7 +1217,46 @@ async function loadSceneBar(){
       (gs==='seeding'?' <span class="chip warn">🌱 种子态</span>':'')+
       (ec==='missing'?' <span class="chip bad">🟠 实体目录缺失</span>':'')+
       (fp.state_hash?' <span class="chip grey">指纹 '+ESC(String(fp.state_hash).slice(0,8))+'</span>':'');
+    // 猫爪总开关（同构 neko 的 NekoClaw Master Switch）：
+    //   顶层总开关 → 关掉后下面所有能力组一律不可用（级联，同 masterRequired）
+    //   组开关     → 组内条目对模型不可见、也调不动（不删条目）
+    //   条目       → 悬停可见（组下有什么）
+    const gs2=(r.groups||{})[r.current]||[];
+    const back=(r.scene_backend||{})[r.current]||'';
+    const box=document.getElementById('clawBox');
+    if(box){
+      const bchip = back==='vlml' ? '<span class="chip grey">数据源 VLML 库</span>'
+                  : back==='local' ? '<span class="chip grey">数据源 本机</span>'
+                  : back==='scene' ? '<span class="chip grey">数据源 场景自带库</span>'
+                  : back==='missing' ? '<span class="chip bad">数据源路径不存在</span>' : '';
+      const mOn = gs2.length ? !!gs2[0].master : true;
+      const mchip = `<button class="chip ${mOn?'ok':'bad'}" style="cursor:pointer"
+          title="猫爪总开关（NekoClaw Master Switch）&#10;关掉后下面的能力组全部不可用；拨回来即恢复"
+          onclick="toggleGroup('${ESC(r.current)}','*',${mOn?'false':'true'})"
+          >${mOn?'🐾 猫爪总开关 开':'🐾 猫爪总开关 关'}</button>`;
+      const gchips = gs2.map(g=>{
+        const cls = g.state==='ready' ? 'ok' : (g.state==='master_off'||g.state==='off') ? 'grey' : 'warn';
+        const mark = g.state==='ready' ? '🟢' : (g.state==='master_off'?'🔒':'⚪');
+        const tip = `能力组：${g.group}（${g.count} 条）&#10;`+
+                    (g.why?g.why+'&#10;':'')+
+                    `条目：${(g.entries||[]).join(' / ')}`;
+        return `<button class="chip ${cls}" style="cursor:pointer"
+           title="${tip}"
+           onclick="toggleGroup('${ESC(r.current)}','${ESC(g.group)}',${g.switch?'false':'true'})"
+           >${mark} ${ESC(g.group)} · ${g.count}</button>`;
+      }).join(' ');
+      box.innerHTML = bchip + mchip + (gs2.length?gchips
+        : '<span class="hint">这个场景还没有可执行动作条目</span>');
+    }
   }catch(e){ /* 场景栏挂了不能拖垮主面板 */ }
+}
+/* 拨猫爪总开关：关掉整组 = 对模型不可见、也调不动（不删条目，拨回来即恢复）。 */
+function toggleGroup(sid,group,on){
+  fetch('/api/actions/switch',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({scene:sid,group:group,enabled:on})}).then(x=>x.json()).then(r=>{
+    if(!r.ok){ alert('拨开关失败：'+(r.error||'')); return; }
+    loadSceneBar();
+  });
 }
 function switchScene(sid){
   fetch('/api/scene/switch',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -2050,6 +2096,8 @@ function consumeBlock(im){
         ? `<span class="chip grey">硬尺子 ${pct(im.coverage_referee)}</span>`:''}
       <span class="chip grey">工具 ${ESC(im.ok_tool_calls||0)} 次 · ${ESC(im.rows||0)} 行</span>
       ${im.root_scene?`<span class="chip grey">Scene ${ESC(im.root_scene)}</span>`:''}
+      ${im.scene_kind==='local'?'<span class="chip grey">本机数据源</span>'
+        :im.scene_kind==='scene'?'<span class="chip grey">场景自带库</span>':''}
       ${im.route_decision==='HIGH_CONFIDENCE'?'<span class="chip ok">高置信命中</span>'
         :im.route_decision==='MEDIUM_CONFIDENCE'?'<span class="chip warn">中置信命中</span>'
         :im.route_decision==='REJECTED'?'<span class="chip grey">未命中 → 新建节点</span>':''}
@@ -2999,6 +3047,22 @@ class Handler(BaseHTTPRequestHandler):
                                      "current": _sc.current_scene_id(),
                                      "action_count": len(
                                          __import__("actions").entries(new_id))})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": f"{type(e).__name__}: {e}"[:200]})
+            return
+
+        if path == "/api/actions/switch":
+            # 猫爪总开关（同构 neko 的插件 toggle）：按能力组拨开/关。
+            # 关掉不是删条目 —— 执行层拿不到、调用被拒，拨回来即恢复。
+            try:
+                import actions as _acts
+                sid = str(payload.get("scene") or payload.get("scene_id") or "").strip()
+                grp = str(payload.get("group") or "").strip()
+                if not sid or not grp:
+                    self._json(400, {"ok": False, "error": "scene/group 不能为空"})
+                    return
+                on = bool(payload.get("enabled", True))
+                self._json(200, {"ok": True, **_acts.set_switch(sid, grp, on)})
             except Exception as e:
                 self._json(500, {"ok": False, "error": f"{type(e).__name__}: {e}"[:200]})
             return

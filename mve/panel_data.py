@@ -961,18 +961,28 @@ def scenes_view() -> dict[str, Any]:
     acts: dict[str, int] = {}
     pending: dict[str, int] = {}
     curve: dict[str, Any] = {}
+    groups: dict[str, list[dict[str, Any]]] = {}
+    backend: dict[str, str] = {}
     try:
         import knowledge_graph as kg
         import scenes as _sc
         import actions as _acts
         import routing as _rt
+        import scene_profile as _sp
         # 热路径兜底：注册表是进程内存态，重启后就丢（实测 action_count 全 0）。
         # 这里在取数前先 restore + 反射补齐，与面板启动自检同一套逻辑，
         # 避免「明明能跑的场景显示 0 个可执行动作」的假告警。
         _acts.restore()
         for sid in [s["id"] for s in scene_list]:
+            prof = _sp.profile(sid)
+            backend[sid] = str(prof.get("kind") or "")
             if _acts.entry_count(sid) == 0:
-                _acts.register_builtin_actions(sid)
+                # 按后端补：VLML 场景走反射；本机场景注册本机原语条目
+                # （否则普通用户建的新场景永远是 0 条 → 被硬拒绝项拦住）。
+                if prof.get("kind") == _sp.LOCAL:
+                    _acts.register_local(sid, str(prof.get("scene_dir") or ""))
+                else:
+                    _acts.register_builtin_actions(sid)
         g = kg.KnowledgeGraph.load()
         for sid in scene_ids:
             exclusive[sid] = g.scene_specific_node_count(sid)
@@ -980,6 +990,8 @@ def scenes_view() -> dict[str, Any]:
             catalog[sid] = _sc.entity_catalog_status(sid)
             fp[sid] = _sc.scene_state_fingerprint(sid)
             acts[sid] = _acts.entry_count(sid)
+            # 猫爪总开关：每组一个开关 + 组下面的条目（同构 neko 插件 toggle）
+            groups[sid] = _acts.groups(sid)
             try:
                 pending[sid] = len(_rt.pending_for_scene(sid))
             except Exception:
@@ -993,11 +1005,16 @@ def scenes_view() -> dict[str, Any]:
         acts = {sid: 0 for sid in scene_ids}
         pending = {sid: 0 for sid in scene_ids}
         curve = {sid: {} for sid in scene_ids}
+        groups = {sid: [] for sid in scene_ids}
+        backend = {sid: "" for sid in scene_ids}
     return {"scenes": scene_list, "current": current,
             "exclusive_nodes": exclusive, "graph_sparsity": sparsity,
             "entity_catalog": catalog, "fingerprint": fp,
             "action_count": acts, "pending_nodes": pending,
-            "curve_summary": curve}
+            "curve_summary": curve,
+            # 猫爪总开关（同构 neko）：每场景的能力组 + 组内条目 + 开关状态；
+            # scene_backend 说明这场景的数据源是哪一档（vlml / local / scene）。
+            "groups": groups, "scene_backend": backend}
 
 
 # ⚠️ 跨场景技能溯源（skill_traceability）已并入技能页（2026-10-18 去重）：

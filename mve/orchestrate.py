@@ -176,6 +176,23 @@ def init_scene(scene_id: str, *, data_source: str = "") -> dict[str, Any]:
     added = int(reg.get("added") or 0)
     reason = str(reg.get("reason") or "")
 
+    # 非 VLML 场景（普通用户下载下来放本机跑的那一档）：可执行动作 = **本机原语**
+    # （list_files / read_file / read_json / query_sql），注册成 origin=local /
+    # group=本机能力的一组条目。不注册的话新场景就是「0 个可执行动作」→ 面板按
+    # 硬拒绝项拒插 → 普通用户连场景都建不出来（本机没有 vlml 反射）。
+    try:
+        import scene_profile as _sp
+        prof = _sp.profile(scene_id)
+        if prof.get("kind") == _sp.LOCAL:
+            loc = actions.register_local(scene_id, str(prof.get("scene_dir") or ""))
+            added += int(loc.get("added") or 0)
+            if loc.get("added"):
+                reason = ""
+            elif loc.get("reason"):
+                reason = str(loc.get("reason"))
+    except Exception as e:
+        reason = reason or f"本机原语注册失败：{type(e).__name__}: {e}"
+
     # 场景自带数据源时，额外注册「只针对它」的原语（条目文本由数据源派生，不手写）
     if data_source:
         try:

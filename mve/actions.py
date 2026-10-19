@@ -85,7 +85,11 @@ class ActionSpec:
     kind: str = ACTION
     input_schema: dict[str, Any] = field(default_factory=dict)
     # 来源可追溯：builtin（通用 MCP 自带）/ learned（学到的技能）/ plugin（场景插件）
+    # / mcp（远端 MCP server 暴露的）/ local（本机原语）
     origin: str = "builtin"
+    # 能力组 = 猫爪总开关下面的那一层（同构 neko 的「插件」分组）：
+    # 一组条目共用一个开关，关掉整组对模型不可见、也调不动。
+    group: str = ""
     # impl 描述（可序列化）："module:qualified_name" —— 快照里只存这个，
     # 靠它恢复可调用实现，而不是把函数对象写进 json（那不可能）。
     impl: str = ""
@@ -99,6 +103,7 @@ class ActionSpec:
             "input_schema": self.input_schema,
             "scene_id": self.scene_id,
             "origin": self.origin,
+            "group": self.group,
             "impl": self.impl,
         }
 
@@ -222,12 +227,13 @@ def _resolve_impl(ref: str) -> Callable[..., Any] | None:
 
 
 def _save_snapshot() -> None:
-    """把注册表快照落盘（只存可序列化字段 + impl 引用）。"""
+    """把注册表快照落盘（只存可序列化字段 + impl 引用 + 总开关状态）。"""
     try:
-        data = {"version": 1, "scenes": {
+        data = {"version": 2, "scenes": {
             sid: [s.to_entry() for s in specs.values()]
             for sid, specs in _REGISTRY.items()
-        }}
+        }, "switches": {sid: dict(v) for sid, v in _SWITCHES.items() if v},
+            "master": {sid: bool(v) for sid, v in _MASTER.items()}}
         SNAPSHOT.write_text(json.dumps(data, ensure_ascii=False, indent=1),
                             encoding="utf-8")
     except Exception:
@@ -247,6 +253,12 @@ def restore() -> dict[str, int]:
     except Exception:
         return {}
     out: dict[str, int] = {}
+    for sid, mv in (data.get("master") or {}).items():
+        _MASTER[str(sid)] = bool(mv)
+    for sid, sw in (data.get("switches") or {}).items():
+        if isinstance(sw, dict):
+            _SWITCHES.setdefault(sid, {}).update(
+                {str(k): bool(v) for k, v in sw.items()})
     for sid, entries in (data.get("scenes") or {}).items():
         n = 0
         for e in entries or []:
@@ -255,11 +267,17 @@ def restore() -> dict[str, int]:
             fn = _resolve_impl(str(e.get("impl") or ""))
             if fn is None:
                 continue
+            if str(e.get("origin") or "") == "local":
+                # 本机原语的 impl 是**绑定过场景目录**的 partial，json 里存不下来
+                # → 恢复无意义（会把未绑定版本调错）。面板启动时由
+                # register_local() 按当前场景目录重新绑一次，这里跳过不硬凑。
+                continue
             _REGISTRY.setdefault(sid, {})[e["name"]] = ActionSpec(
                 name=e["name"], description=str(e.get("description") or ""),
                 fn=fn, scene_id=sid, kind=str(e.get("kind") or ACTION),
                 input_schema=dict(e.get("input_schema") or {}),
                 origin=str(e.get("origin") or "builtin"),
+                group=str(e.get("group") or ""),
                 impl=str(e.get("impl") or ""),
             )
             n += 1
@@ -330,6 +348,34 @@ def register_builtin_actions(scene_id: str) -> dict[str, Any]:
     return {"added": n, "tools": tools, "reason": ""}
 
 
+def register_local(scene_id: str, scene_dir: str) -> dict[str, Any]:
+    """把**本机原语**注册成场景里的一组条目（origin=local / group=本机能力）。
+
+    同构 neko：插件（能力来源）+ 猫爪总开关（这一组的开关）+ 开关下面的条目。
+    幂等：重复调用只是按当前场景目录重绑一次（场景目录变了也不会指错地方）。
+    """
+    try:
+        import local_agent
+        prims = local_agent.bind(scene_dir)
+    except Exception as e:
+        return {"added": 0, "names": [],
+                "reason": f"本机原语不可用：{type(e).__name__}: {e}"}
+    n = 0
+    for p in prims:
+        spec = ActionSpec(
+            name=str(p["name"]), description=str(p.get("description") or ""),
+            fn=p["fn"], scene_id=str(scene_id),
+            input_schema=dict(p.get("schema") or {}),
+            origin="local", group=local_agent.LOCAL_GROUP,
+            impl=str(p.get("impl") or ""),
+        )
+        _REGISTRY.setdefault(str(scene_id), {})[spec.name] = spec
+        n += 1
+    if n:
+        _save_snapshot()
+    return {"added": n, "names": [str(p["name"]) for p in prims], "reason": ""}
+
+
 def unregister(scene_id: str, name: str) -> bool:
     bucket = _REGISTRY.get(str(scene_id))
     if not bucket or name not in bucket:
@@ -339,10 +385,134 @@ def unregister(scene_id: str, name: str) -> bool:
     return True
 
 
-def entries(scene_id: str) -> list[dict[str, Any]]:
-    """某场景注册的全部可执行动作条目（UI 用）。"""
-    return [s.to_entry() for s in
-            _REGISTRY.get(str(scene_id), {}).values()]
+# ---------------------------------------------------------------------------
+# 猫爪总开关（用户 2026-10-19：「voyager 的基础抓手、能力和猫娘 neko 的
+# MCP、插件、猫爪总开关、以及猫爪总开关下面的内容，这块是同构的」）
+#
+#   neko                                  MVE
+#   ─────────────────────────────────────────────────────────────
+#   mcp_adapter（传输层）                 通用 MCP 传输层（run_query / list_tables）
+#   插件 plugin/plugins/*                 一条能力来源：builtin / local / mcp / learned
+#   猫爪总开关（插件级 toggle）            group 开关 —— 关掉整组「对模型不可见、也调不动」
+#   总开关下面的 entries                  group 下面的条目（ActionSpec.to_entry）
+#
+# 关键：开关关掉不是"删条目"，而是**不暴露 + 拒绝调用**（同 neko：插件还在，
+# 只是不启用）。这样切回来不用重建，也不会悄悄把学到的东西丢掉。
+# ---------------------------------------------------------------------------
+_ORIGIN_GROUP = {
+    "builtin": "VLML 工具集",
+    "local": "本机能力",
+    "learned": "学到的技能",
+    "mcp": "MCP 远端工具",
+    "plugin": "场景插件",
+}
+_SWITCHES: dict[str, dict[str, bool]] = {}
+# 顶层总开关（猫爪总开关 / NekoClaw Master Switch）。默认开。
+# 关掉 = 下面的所有组一律不可用（级联门控），与 neko 的 masterRequired 同义。
+_MASTER: dict[str, bool] = {}
+MASTER_KEY = "*"
+
+
+def set_master(scene_id: str, enabled: bool = True) -> dict[str, Any]:
+    """拨猫爪总开关（顶层）。关掉后所有能力组一律不可用。"""
+    sid = str(scene_id)
+    _MASTER[sid] = bool(enabled)
+    _save_snapshot()
+    return {"scene_id": sid, "master": bool(enabled),
+            "groups": len(groups(sid))}
+
+
+def master_enabled(scene_id: str) -> bool:
+    return bool(_MASTER.get(str(scene_id), True))
+
+
+def group_of(spec: ActionSpec) -> str:
+    """条目属于哪个能力组（= 猫爪总开关管的那一层）。"""
+    return str(spec.group or _ORIGIN_GROUP.get(spec.origin, "其它"))
+
+
+def set_switch(scene_id: str, group: str, enabled: bool = True) -> dict[str, Any]:
+    """拨某个场景的能力开关。`group="*"` = 顶层猫爪总开关。
+
+    返回该组现状（含 master / available，面板据此显示"请先开总开关"）。
+    """
+    sid, g = str(scene_id), str(group)
+    if g == MASTER_KEY:
+        return set_master(sid, enabled)
+    _SWITCHES.setdefault(sid, {})[g] = bool(enabled)
+    _save_snapshot()
+    return {"scene_id": sid, "group": g, "enabled": bool(enabled),
+            "master": master_enabled(sid),
+            "count": len([s for s in _REGISTRY.get(sid, {}).values()
+                          if group_of(s) == g])}
+
+
+def switches(scene_id: str) -> dict[str, bool]:
+    out = dict(_SWITCHES.get(str(scene_id), {}))
+    out[MASTER_KEY] = master_enabled(scene_id)
+    return out
+
+
+def group_enabled(scene_id: str, group: str) -> bool:
+    """总开关 + 组开关都开才可用。
+
+    默认开：没有记录过的组一律启用（不给用户"先开开关才能用"的门槛）；
+    但**顶层总开关关掉时，组开关无论如何都不生效**（级联，同 neko
+    的「请先开启猫爪总开关」）。
+    """
+    if not master_enabled(scene_id):
+        return False
+    return bool(_SWITCHES.get(str(scene_id), {}).get(str(group), True))
+
+
+def group_state(scene_id: str, group: str, count: int) -> tuple[str, str]:
+    """(state, why) —— 同构 neko 的 ready / masterRequired / unavailable / checking。"""
+    if count == 0:
+        return "empty", "这一组还没有条目"
+    if not master_enabled(scene_id):
+        return "master_off", "请先开启猫爪总开关"
+    if not bool(_SWITCHES.get(str(scene_id), {}).get(str(group), True)):
+        return "off", "这一组的能力开关是关的"
+    return "ready", ""
+
+
+def groups(scene_id: str) -> list[dict[str, Any]]:
+    """某场景的全部能力组 + 开关状态 + 组内条目（面板照这个渲染总开关）。"""
+    sid = str(scene_id)
+    buckets: dict[str, list[ActionSpec]] = {}
+    for s in _REGISTRY.get(sid, {}).values():
+        buckets.setdefault(group_of(s), []).append(s)
+    out = []
+    for g, specs in sorted(buckets.items()):
+        state, why = group_state(sid, g, len(specs))
+        out.append({"group": g,
+                    "enabled": group_enabled(sid, g),
+                    "switch": bool(_SWITCHES.get(sid, {}).get(g, True)),
+                    "master": master_enabled(sid),
+                    "state": state, "why": why,
+                    "count": len(specs),
+                    "origins": sorted({s.origin for s in specs}),
+                    "entries": sorted(s.name for s in specs)})
+    return out
+
+
+def entries(scene_id: str, *, only_enabled: bool = False) -> list[dict[str, Any]]:
+    """某场景注册的全部可执行动作条目（UI 用）。
+
+    `only_enabled=True` = 只给**启用的组**（执行层/抓手段清单要用这个，
+    否则关掉的总开关等于没关）。
+    """
+    sid = str(scene_id)
+    out = []
+    for s in _REGISTRY.get(sid, {}).values():
+        if only_enabled and not group_enabled(sid, group_of(s)):
+            continue
+        out.append(s.to_entry())
+    return out
+
+
+def enabled_entries(scene_id: str) -> list[dict[str, Any]]:
+    return entries(scene_id, only_enabled=True)
 
 
 def entry_count(scene_id: str) -> int:
@@ -359,6 +529,10 @@ async def invoke(scene_id: str, name: str, **kwargs: Any) -> Any:
     spec = _REGISTRY.get(str(scene_id), {}).get(name)
     if spec is None:
         raise KeyError(f"场景 {scene_id} 没有可执行动作 {name}")
+    if not group_enabled(str(scene_id), group_of(spec)):
+        raise RuntimeError(
+            f"能力组「{group_of(spec)}」的总开关是关的（场景 {scene_id}）"
+            "—— 关掉不是删条目，拨回来就能用")
     res = spec.fn(**kwargs)
     if inspect.isawaitable(res):
         res = await res

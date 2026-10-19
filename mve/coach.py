@@ -168,6 +168,9 @@ def _log_import(result: dict[str, Any]) -> None:
         "route_decision": result.get("route_decision") or "",
         "route_score": result.get("route_score") or 0,
         "judgment_result": result.get("judgment_result") or "",
+        # 这一条是哪个后端答的（vlml / local / scene）—— 面板要能看出"本机数据源"
+        # 与"场景自带库"的区别，不然人分不清是没数据还是没连对库。
+        "scene_kind": result.get("scene_kind") or "",
         "node_status": result.get("node_status") or "",
         "cold_start": bool(result.get("cold_start")),
         # 学习闭环（2026-10-19 用户验收线）：未命中时 on_miss 建的那个点 +

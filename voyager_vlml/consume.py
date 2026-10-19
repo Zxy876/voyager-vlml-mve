@@ -586,6 +586,14 @@ async def consume(
     # 「本机」场景（普通用户的默认形态）：用本机只读原语作答；取不到就如实说。
     if _non_vlml_why and _scene_kind == "local":
         import local_agent as _la
+        # 本机原语注册成条目（origin=local / group=本机能力）——同构猫娘：
+        # 插件（能力来源）+ 猫爪总开关（这一组的开关）+ 开关下面的条目。
+        # 注册了才在执行层的抓手清单里出现；开关关掉就注入不到命名空间里。
+        try:
+            import actions as _act
+            _act.register_local(_scene_id, _scene_dir)
+        except Exception:
+            pass
         # ③a 复用优先（同构 Voyager：retrieve → 重放 → 取不到才写新代码）。
         # 只认「本机形态」的配方（代码里有 RESULT、能 run_saved 重放）；
         # VLML 的 SQL 配方在本机场景重放不了 —— 那是另一个数据源的东西，
@@ -599,7 +607,7 @@ async def consume(
             if "RESULT" not in sc:
                 continue
             try:
-                val = _la.run_saved(sc, _scene_dir)
+                val = _la.run_saved(sc, _scene_dir, scene_id=_scene_id)
             except Exception:
                 val = None
             if val in (None, [], {}):
@@ -609,7 +617,7 @@ async def consume(
             break
         # ③b 没有可复用的配方 → 现场写
         if reused_skill is None:
-            obs, code = await _la.solve(question, _scene_dir)
+            obs, code = await _la.solve(question, _scene_dir, scene_id=_scene_id)
             real = [o for o in obs if o.get("ok") and o.get("data") is not None]
             data = (real[-1].get("data") if real else None)
         # 没取到 → 还是没学会 → 踢一轮自学（与 VLML 路径同一条铁律：
