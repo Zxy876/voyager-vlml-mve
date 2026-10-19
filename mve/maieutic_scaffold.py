@@ -222,6 +222,39 @@ def drift_notes(scaffold_result: dict[str, Any], limit: int = 4) -> list[str]:
     return out
 
 
+def load_progress(scene_id: str, question: str) -> set[str]:
+    """读这道题的维度学习进度（已答到的维度 id 集）。
+
+    为什么需要：原版子目标制（voyager.py:403-421）里 `while progress <
+    len(sub_goals)` 是**断点续学** —— 重试时已完成的子目标不重跑。
+    进度就存在骨架缓存同一个文件里（同一把钥匙），不另开存储。
+    """
+    path = _cache_path(scene_id, question)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        pr = data.get("progress") or {}
+        return {str(x) for x in (pr.get("learned") or [])}
+    except Exception:
+        return set()
+
+
+def save_progress(scene_id: str, question: str, learned_ids: list[str]) -> None:
+    """写维度学习进度（断点续学用；失败静默 —— 进度丢了顶多重学）。"""
+    path = _cache_path(scene_id, question)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    data["progress"] = {"learned": [str(x) for x in learned_ids],
+                        "updated": __import__("time").time()}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=1),
+                        encoding="utf-8")
+    except Exception:
+        pass
+
+
 def attach_dimensions(scene_id: str, topic_id: str,
                       dimensions: list[dict[str, Any]], *,
                       verified: bool = False, graph: Any = None) -> list[str]:

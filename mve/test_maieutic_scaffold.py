@@ -105,36 +105,82 @@ def test_dimensions_reach_prompts() -> None:
     import task_critic
     seen: list[str] = []
 
-    def fake(messages):
+    def fake_closed(messages):
         seen.append(messages[-1]["content"])
-        return json.dumps({"reasoning": "ok", "success": True, "critique": ""})
+        return json.dumps({"gaps_addressed": [], "gaps_still_open": [],
+                           "emergent_gaps": [], "questions": [],
+                           "passed": True}, ensure_ascii=False)
 
     dims = CANNED["dimensions"]
     result = {"execution": {"real_calls": 1, "calls": 1, "rows": 1,
                             "data_sources": ["read_file"], "sql": "read_json()"},
               "answer": "……", "status": "learned"}
     ok, _ = task_critic.check_task_success("什么是阿斯伯格", "", result,
-                                           llm=fake, dimensions=dims)
+                                           llm=fake_closed, dimensions=dims)
     assert ok
+    # 维度清单真的进了判定提示词（否则只是存了一份 JSON）
+    assert "必须回答的维度清单" in seen[-1], seen[-1][:200]
     assert all(d["question"] in seen[-1] for d in dims), seen[-1][:400]
-    assert "drift" in seen[-1], seen[-1][:300]
+    assert all(d["id"] in seen[-1] for d in dims), seen[-1][:400]
 
-    # ---- 闸门：LLM 说「有一条没答到」→ 就算它 success=true 也必须判否 ----
-    def fake_drift(messages):
-        return json.dumps({"reasoning": "定义答了，干预没答", "success": True,
-                           "critique": "干预方式缺",
-                           "dimensions": [
-                               {"id": "definition", "answered": True, "why": ""},
-                               {"id": "support", "answered": False,
-                                "why": "只说'要支持'，没给具体干预方式"}]},
-                          ensure_ascii=False)
+    print("PASS  test_dimensions_reach_prompts")
 
-    ok2, crit2 = task_critic.check_task_success(
-        "什么是阿斯伯格", "", result, llm=fake_drift, dimensions=dims)
+
+def test_gate_closes_only_when_list_satisfied() -> None:
+    """Maieutic 闭合口径（spec-examiner.ts:136-147）：
+    passed 当且仅当 gaps_still_open 为空；emergent_gaps 不阻塞；追问 ≤3 条。
+    """
+    import maieutic_gate as G
+    import task_critic
+
+    dims = [{"id": "def_x", "question": "X 是什么？", "why": ""},
+            {"id": "how_x", "question": "X 怎么做？", "why": ""}]
+    result = {"execution": {"real_calls": 0, "calls": 1, "rows": 1,
+                            "data_sources": []}, "answer": "X 是……"}
+
+    def closed(messages):
+        return json.dumps({"gaps_addressed": ["def_x", "how_x"],
+                           "gaps_still_open": [], "emergent_gaps": [],
+                           "questions": [], "passed": True}, ensure_ascii=False)
+
+    ok, crit = task_critic.check_task_success("X", "", result, llm=closed,
+                                              dimensions=dims)
+    assert ok is True and crit == "", (ok, crit)
+
+    def open_gap(messages):
+        return json.dumps({
+            "gaps_addressed": ["def_x"], "gaps_still_open": ["how_x"],
+            "emergent_gaps": [{"description": "没给依据", "question": "依据来自哪？"}],
+            "questions": ["X 具体怎么做？分几步？", "第二步之后呢？"],
+            "passed": False}, ensure_ascii=False)
+
+    ok2, crit2 = task_critic.check_task_success("X", "", result, llm=open_gap,
+                                                dimensions=dims)
     assert ok2 is False, (ok2, crit2)
-    assert "闸门未过" in crit2 and "support" in crit2, crit2
-    assert result.get("critic_gate"), result
-    print("PASS  test_dimensions_reach_prompts（含闸门判否）")
+    assert crit2 == "X 具体怎么做？分几步？ 第二步之后呢？", crit2   # 追问原样带回
+    gate = result.get("critic_gate") or {}
+    assert gate.get("open") == ["how_x"] and gate.get("addressed") == ["def_x"], gate
+
+    # 模型自相矛盾（说 passed 但清单没清）→ 按清单为准（原版 :146-147）
+    def liar(messages):
+        return json.dumps({"gaps_addressed": [], "gaps_still_open": ["how_x"],
+                           "emergent_gaps": [], "questions": ["补上怎么做"],
+                           "passed": True}, ensure_ascii=False)
+
+    ok3, _ = task_critic.check_task_success("X", "", result, llm=liar,
+                                            dimensions=dims)
+    assert ok3 is False, "passed 必须严格等于 gaps_still_open 为空"
+
+    # 空答案 → 清单全部未闭合，不叫 LLM
+    ok4, crit4 = task_critic.check_task_success(
+        "X", "", {"execution": {"real_calls": 0}, "answer": ""},
+        llm=lambda m: "{}", dimensions=dims)
+    assert ok4 is False and crit4, (ok4, crit4)
+
+    # 闸门自身不可用 → 如实报 failed，不假装判过
+    bad = G.check("X", "答", dims, llm=lambda m: "我不会")
+    assert bad["origin"] == "failed", bad
+    print("PASS  test_gate_closes_only_when_list_satisfied")
 
 
 def test_attach_dimensions() -> None:
@@ -177,6 +223,7 @@ def main() -> None:
     test_parse_and_cache()
     test_plan_uses_dimensions()
     test_dimensions_reach_prompts()
+    test_gate_closes_only_when_list_satisfied()
     test_attach_dimensions()
     test_drift_notes()
     print("\nALL PASS")

@@ -366,6 +366,7 @@ async def _start_learning_impl(
             except Exception:
                 focus = []
             out["focus_tables"] = focus[:10]
+            _answer_override = ""
             if is_local:
                 import local_agent
                 # 本机原语先注册成条目（origin=local / group=本机能力），
@@ -375,18 +376,95 @@ async def _start_learning_impl(
                     _act.register_net(scene)
                 except Exception:
                     pass
-                # Maieutic 骨架 → 执行层提示词：必须答到的维度 + 别出现的偏差。
-                # 没有骨架（数据场景/骨架失败）就传空，不编造维度。
                 try:
                     import maieutic_scaffold as _ms
                     _dims = plan.get("dimensions") or []
                     _avoid = _ms.drift_notes(plan)
                 except Exception:
                     _dims, _avoid = [], []
-                observations, sql = await local_agent.solve(
-                    question, local_dir, llm=llm, scene_id=scene,
-                    critique=str(critique or ""),
-                    dimensions=_dims, avoid=_avoid)
+                if _dims:
+                    # ---- 原版子目标制：逐维度 rollout + critic ----
+                    # 原版 voyager.py:403-421：拆出的 sub_goals 是**按序逐个
+                    # 完成**的，每个子目标一次完整的 rollout。2026-10-19 实测
+                    # （Scene D，9 个维度塞一次 prompt 让它一口气答）：闸门
+                    # 只能 1/9，两轮连挂。维度即子任务才是原版语义，也是
+                    # "闸门评估任务完成没有"的正确粒度。
+                    observations: list[dict[str, Any]] = []
+                    learned_dims: list[dict[str, Any]] = []
+                    failed_dims: list[dict[str, Any]] = []
+                    answers: list[str] = []
+                    try:
+                        _prog = _ms.load_progress(scene, question)
+                    except Exception:
+                        _prog = set()
+                    for _d in _dims:
+                        _did = str(_d.get("id") or "")
+                        _q1 = str(_d.get("question") or "").strip()
+                        if not _q1:
+                            continue
+                        if _did and _did in _prog:
+                            learned_dims.append(_d)     # 断点续学：答到过的不重跑
+                            continue
+                        # 单维度最多两次：第二次把闸门带回的**追问**当 critique
+                        # 灌回 prompt（原版 voyager.py:262-268 迭代提示同款）。
+                        ok1, crit1, obs1, r1 = False, "", [], {}
+                        for _t in range(2):
+                            obs1, _ = await local_agent.solve(
+                                _q1, local_dir, llm=llm, scene_id=scene,
+                                avoid=_avoid, critique=str(crit1 or ""))
+                            observations.extend(obs1)
+                            r1: dict[str, Any] = {
+                                "execution": {
+                                    "calls": len(obs1),
+                                    "real_calls": sum(
+                                        1 for o in obs1 if _has_real([o])
+                                        and (o.get("data_sources") or [])),
+                                    "rows": sum(int(o.get("rows") or 0)
+                                                for o in obs1 if o.get("ok")),
+                                    "data_sources": sorted(
+                                        {s for o in obs1
+                                         for s in (o.get("data_sources") or [])}),
+                                    "sql": "", "ok": _has_real(obs1)},
+                                "answer": _answer_text(obs1),
+                                "status": "learned"}
+                            try:
+                                import task_critic as _tc1
+                                # dimensions=[一个维度] → 走 maieutic_gate 闭合判定
+                                ok1, crit1 = _tc1.check_task_success(
+                                    _q1, str(crit1 or ""), r1, dimensions=[_d])
+                            except Exception as e1:
+                                ok1, crit1 = False, f"critic 异常：{type(e1).__name__}: {e1}"
+                            if ok1:
+                                break
+                        if ok1:
+                            learned_dims.append(_d)
+                            a1 = str(r1.get("answer") or "").strip()
+                            if a1:
+                                answers.append(f"【{_q1}】{a1[:500]}")
+                        else:
+                            failed_dims.append({"id": _did,
+                                                "question": _q1,
+                                                "critique": str(crit1)[:200]})
+                    try:
+                        _ms.save_progress(scene, question,
+                                          [str(d.get("id") or "")
+                                           for d in learned_dims])
+                    except Exception:
+                        pass
+                    out["dimension_results"] = {
+                        "total": len(_dims),
+                        "learned": [str(d.get("id") or "") for d in learned_dims],
+                        "failed": failed_dims,
+                    }
+                    observations = observations[-8:]
+                    sql = ""
+                    _answer_override = "\n\n".join(answers)[:2500]
+                else:
+                    observations, sql = await local_agent.solve(
+                        question, local_dir, llm=llm, scene_id=scene,
+                        critique=str(critique or ""),
+                        dimensions=_dims, avoid=_avoid)
+                    _answer_override = ""
             else:
                 observations, sql = await agent.solve(
                     question, skills=skills, grabs=grabs, focus_tables=focus,
@@ -410,7 +488,8 @@ async def _start_learning_impl(
                              else "knowledge"),
             }
             # 答案与逐轮观察留给 critic / 面板（知识型任务没有数据源，critic 靠答案判）
-            out["answer"] = _answer_text(observations)
+            out["answer"] = (str(_answer_override or "").strip()
+                             or _answer_text(observations))
             out["observations"] = [
                 {"ok": bool(o.get("ok")), "rows": int(o.get("rows") or 0),
                  "data_sources": list(o.get("data_sources") or []),
@@ -450,20 +529,32 @@ async def _start_learning_impl(
     # 放在入库**之前**：判定结果决定这一轮算不算学到（原版 voyager.py:230 在
     # step 里判，判过才 add_new_skill、update_exploration_progress）。
     if judge:
-        try:
-            import task_critic
-            _ok, _crit = task_critic.check_task_success(
-                question, str(context or ""), out,
-                dimensions=(plan.get("dimensions") or None))
-        except Exception as e:
-            _ok, _crit = bool(real), f"critic 异常：{type(e).__name__}: {e}"
-        out["critic"] = {"success": bool(_ok), "critique": str(_crit or ""),
-                         # 闸门逐维度结论（Maieutic spec gate）：面板/日志能看
-                         # 「这道题哪几个维度答到了、哪条被判 drift」
-                         "gate": list(out.get("critic_gate") or [])}
+        _dres = out.get("dimension_results")
+        if _dres is not None:
+            # 维度模式：判定已经在**每个维度各自的 rollout 后**做过了
+            # （maieutic_gate 的闭合口径）。这里只汇总，不再让 critic 判一遍。
+            _failed = _dres.get("failed") or []
+            _ok = not _failed
+            _crit = " ".join(str(f.get("critique") or "") for f in _failed)[:300]
+            out["critic"] = {"success": bool(_ok), "critique": _crit,
+                             "gate": {"addressed": _dres.get("learned") or [],
+                                      "open": [f.get("id") for f in _failed],
+                                      "questions": [str(f.get("critique") or "")
+                                                    for f in _failed]}}
+        else:
+            try:
+                import task_critic
+                _ok, _crit = task_critic.check_task_success(
+                    question, str(context or ""), out)
+            except Exception as e:
+                _ok, _crit = bool(real), f"critic 异常：{type(e).__name__}: {e}"
+            out["critic"] = {"success": bool(_ok), "critique": str(_crit or ""),
+                             "gate": out.get("critic_gate") or {}}
         if not _ok:
-            out.update(status=("no_data" if not real else "failed"),
-                       why=(str(_crit or "") or "critic 判未完成")[:300])
+            out.update(status=(("partial" if (_dres or {}).get("learned")
+                                else "failed") if _dres is not None
+                               else ("no_data" if not real else "failed")),
+                       why=(str(_crit or "") or "闸门/critic 判未完成")[:300])
             _record(out)
             return out
 
@@ -492,8 +583,14 @@ async def _start_learning_impl(
     if dims:
         try:
             import maieutic_scaffold as _ms
+            _dres = out.get("dimension_results") or {}
+            _ids = set(_dres.get("learned") or [])
+            # 只把**真的答到**的维度上图（没答到的等补齐），避免图谱上出现
+            # "学会了"但其实是空的节点。
+            good = ([d for d in dims if str(d.get("id") or "") in _ids]
+                    if _dres else dims)
             out["dimension_nodes"] = _ms.attach_dimensions(
-                scene, tid, dims, verified=True)
+                scene, tid, good, verified=True)
         except Exception as e:
             out["dimension_nodes_error"] = f"{type(e).__name__}: {e}"
     out["milestone"] = {"topic_id": tid, "unlocked": False}
