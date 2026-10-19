@@ -264,11 +264,17 @@ async def solve(question: str, scene_dir: str, *, llm=None,
     obs: list[dict[str, Any]] = []
     code = ""
     fb = ""
+    # 经 MCP 接入的远端工具（名字/签名）动态拼进 system —— server 连上了才出现，
+    # 没连上不误导模型去调一个不存在的函数。
+    system = PROMPT_SYSTEM
+    mcp_sec = _mcp_prompt_section(scene_id)
+    if mcp_sec:
+        system = PROMPT_SYSTEM + mcp_sec
     for _ in range(max(1, max_iters)):
         user = (f"问题：{question}\n\n{inv_txt}\n"
                 + (f"\n上一次的代码：\n{code}\n执行反馈：{fb}\n请修正后重写。"
                    if fb else ""))
-        text = call([{"role": "system", "content": PROMPT_SYSTEM},
+        text = call([{"role": "system", "content": system},
                      {"role": "user", "content": user}]) or ""
         code = _extract_code(text)
         if not code:
@@ -295,6 +301,95 @@ def _extract_code(text: str) -> str:
     import re
     m = re.search(r"```(?:python)?\s*(.+?)```", str(text or ""), re.S)
     return (m.group(1) if m else "").strip()
+
+
+# ---------------------------------------------------------------------------
+# MCP 远端工具 → 模型可调用（打通「死通道」）
+# ---------------------------------------------------------------------------
+def _first_mcp_text(inner: dict) -> str:
+    for c in (inner.get("content") or []):
+        if isinstance(c, dict) and c.get("type") == "text":
+            return str(c.get("text") or "")
+    return ""
+
+
+def _unwrap_mcp(payload: Any) -> Any:
+    """把 mcp_gateway.call_remote 的返回（`{result:{...}}` 或 `{error:...}`）
+    翻回模型能用的 Python 对象。错误如实抛 RuntimeError —— 执行层会把它记成
+    「取不到真数」，绝不冒充成功（同 critic 真空判据）。"""
+    if not isinstance(payload, dict):
+        return payload
+    if "error" in payload:
+        raise RuntimeError(f"MCP 远端调用失败：{payload.get('error')}")
+    inner = payload.get("result", payload)
+    if not isinstance(inner, dict):
+        return inner
+    if inner.get("isError"):
+        sc = inner.get("structuredContent") or {}
+        raise RuntimeError(
+            f"MCP 工具报错：{sc.get('error') or _first_mcp_text(inner) or '未知错误'}")
+    sc = inner.get("structuredContent")
+    if sc is not None:
+        return sc
+    # 兜底：解析 content[0].text 的 JSON
+    for c in (inner.get("content") or []):
+        if isinstance(c, dict) and c.get("type") == "text":
+            try:
+                return json.loads(c["text"])
+            except Exception:
+                return c["text"]
+    return inner
+
+
+def _make_mcp_callable(gw: Any, tool_id: str, loop: Any):
+    """造一个**同步**包装器：模型在受限 exec 里只能调同步函数，而 MCP 调用是
+    异步的。用 `run_coroutine_threadsafe` 把调用桥回主事件循环（网关的 MCP 客户端
+    子进程与读循环都绑在那个循环上），worker 线程阻塞等结果。
+
+    ⚠️ 跨线程桥接是必须的：网关的 `_request` 在**主循环**里 `await` 读循环解析
+    出来的 future，若在执行线程里另起一个事件循环跑它，future 跨循环不唤醒 → 死锁。
+    run_coroutine_threadsafe 是标准正确路径。
+    """
+    def _sync(**kwargs: Any) -> Any:
+        cfut = asyncio.run_coroutine_threadsafe(
+            gw.call_remote(tool_id, **kwargs), loop)
+        return _unwrap_mcp(cfut.result(timeout=60))
+    _sync.__name__ = str(tool_id)
+    return _sync
+
+
+def _mcp_prompt_section(scene_id: str) -> str:
+    """把经 MCP 接入的远端工具（名字/签名）写进 prompt，让模型知道能调它。
+
+    只在真有 mcp 条目（server 连上、expose_as_actions 注册了）时才返回非空 ——
+    server 没连上就不误导模型去调一个不存在的函数。
+    """
+    if not scene_id:
+        return ""
+    try:
+        import actions
+        items: list[str] = []
+        for e in actions.enabled_entries(scene_id):
+            if str(e.get("origin") or "") != "mcp":
+                continue
+            name = str(e.get("name"))
+            schema = e.get("input_schema") or {}
+            props = schema.get("properties") or {}
+            required = set(schema.get("required") or [])
+            parts = []
+            for pname, pinfo in props.items():
+                ptype = (pinfo or {}).get("type", "str")
+                parts.append(f"{pname}: {ptype}" if pname in required
+                             else f"{pname}: {ptype}=...")
+            sig = ", ".join(parts) if parts else ""
+            desc = str(e.get("description") or "")[:48].replace("\n", " ")
+            items.append(f"  {name}({sig})  → {desc}")
+        if items:
+            return ("\n此外，以下**经 MCP 接入的远端工具（猫娘计划 mcp 同构）**可直接调用"
+                    "（名字就是函数名，联网优先用它们）：\n" + "\n".join(items))
+    except Exception:
+        pass
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -375,6 +470,7 @@ def _ns_base(scene_dir: str, scene_id: str = "") -> dict[str, Any]:
     if scene_id:
         try:
             import actions
+            import mcp_gateway
             # 条目必须先注册，`enabled_entries()` 才看得到 —— 注册是幂等的，
             # 但**不能省**：实测（2026-10-19 服务器）在独立进程里直接重放一条
             # 学到的联网配方，报 `NameError: name 'web_search' is not defined`，
@@ -387,6 +483,26 @@ def _ns_base(scene_dir: str, scene_id: str = "") -> dict[str, Any]:
         except Exception:
             names = set(full)
     ns: dict[str, Any] = {k: v for k, v in full.items() if k in names}
+    # ---- MCP 远端工具经 stdio 接入，喂给模型（打通「死通道」）----
+    # expose_as_actions 早已把 mcp_* 注册进 registry，但执行层只注入了 local/net，
+    # 模型写代码调不到它们 → 整条「猫娘能力经 MCP」是断的。这里把 origin=mcp 的
+    # 条目按名字注入执行命名空间（同步包装器桥接主循环），prompt 由 _mcp_prompt_section 提供。
+    if scene_id:
+        try:
+            import actions
+            import mcp_gateway
+            loop = asyncio.get_running_loop()
+            gw = mcp_gateway.get_gateway()
+            for e in actions.enabled_entries(scene_id):
+                if str(e.get("origin") or "") != "mcp":
+                    continue
+                tid = str(e.get("name"))
+                if tid in ns:        # 不覆盖本机/联网同名（理论上不会重名）
+                    continue
+                ns[tid] = _make_mcp_callable(gw, tid, loop)
+        except RuntimeError:
+            # 没有运行中的事件循环（技能重放 run_saved 等）→ 不注入 mcp 远端工具
+            pass
     ns["__builtins__"] = {"len": len, "list": list, "dict": dict, "str": str,
                           "int": int, "float": float, "sorted": sorted,
                           "sum": sum, "min": min, "max": max, "any": any,

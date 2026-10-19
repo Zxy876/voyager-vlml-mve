@@ -48,6 +48,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -58,6 +59,35 @@ CONFIG = HERE / "mcp_servers.json"
 # 照猫娘 initialize 的协议版本与 clientInfo 形状
 PROTOCOL_VERSION = "2024-11-05"
 CLIENT_INFO = {"name": "mve-mcp-gateway", "version": "1.0"}
+
+
+# ---------------------------------------------------------------------------
+# 配置路径/命令的可移植解析（本地与服务器共用同一份 mcp_servers.json）
+# ---------------------------------------------------------------------------
+def _is_abs(path: str) -> bool:
+    return bool(path) and (path.startswith("/") or (len(path) > 1 and path[1] == ":"))
+
+
+def _resolve_command(cmd: str) -> str:
+    """命令解析：
+      · 绝对路径 → 原样；
+      · 哨兵 auto / python / python3 → 当前解释器（面板进程的解释器：服务器上是
+        `/root/mve/.venv/bin/python`，本地是管理虚拟环境 python），**跨机器通用**；
+      · 其它相对值 → 也退回当前解释器（避免歧义，反正 server 脚本由 python 拉起）。
+    """
+    cmd = str(cmd or "").strip()
+    if _is_abs(cmd):
+        return cmd
+    return sys.executable
+
+
+def _resolve_arg(arg: str) -> str:
+    """参数里的相对路径解析到配置文件所在目录（mve/）：脚本无论被哪个工作目录
+    的面板进程拉起，都能找到。绝对路径原样。"""
+    arg = str(arg or "")
+    if _is_abs(arg):
+        return arg
+    return str((CONFIG.parent / arg).resolve())
 
 # 路由三态（同构 neko RouteMode；PLUGIN 在 MVE 的语义是「本地注册表优先」）
 SELF = "self"        # 本地动作注册表已有该条目（学过的/锻造的优先于远端通用工具）
@@ -366,11 +396,11 @@ class MCPGateway:
             if not isinstance(cfg, dict):
                 continue
             env = cfg.get("env") if isinstance(cfg.get("env"), dict) else {}
-            args = cfg.get("args") if isinstance(cfg.get("args"), list) else []
+            raw_args = cfg.get("args") if isinstance(cfg.get("args"), list) else []
             servers[str(name)] = MCPServerConfig(
                 name=str(name),
-                command=str(cfg.get("command") or ""),
-                args=[str(a) for a in args],
+                command=_resolve_command(cfg.get("command")),
+                args=[_resolve_arg(str(a)) for a in raw_args],
                 env={str(k): str(v) for k, v in env.items()},
                 enabled=bool(cfg.get("enabled", True)),
             )

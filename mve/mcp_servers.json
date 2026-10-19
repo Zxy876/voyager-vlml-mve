@@ -1,0 +1,10 @@
+{
+  "servers": {
+    "neko": {
+      "command": "auto",
+      "args": ["mcp_neko_server.py"],
+      "env": {},
+      "enabled": true
+    }
+  }
+}
