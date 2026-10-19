@@ -143,7 +143,36 @@ async def start_learning(
     execute: bool = True,
     use_mcp: bool = True,
 ) -> dict[str, Any]:
-    """启动一轮学习（同构 learn() 单圈）。返回全量过程记录，失败如实带 why。"""
+    """启动一轮学习（同构 learn() 单圈）。返回全量过程记录，失败如实带 why。
+
+    薄壳：跑完把 MCP 网关干净断开。**必须在这里断且趁事件循环还没关**——
+    否则 stdio 子进程的 transport 会在解释器退出、loop 关闭后才 __del__，
+    实测在 scene_learn 里刷一条 `RuntimeError: Event loop is closed` 噪声
+    （子进程能靠 stdin EOF 兜底退出，但不干净）。
+    """
+    try:
+        return await _start_learning_impl(
+            question, scene_id, llm=llm, db_path=db_path,
+            execute=execute, use_mcp=use_mcp)
+    finally:
+        if use_mcp:
+            try:
+                import mcp_gateway
+                await mcp_gateway.get_gateway().disconnect_all()
+            except Exception:
+                pass
+
+
+async def _start_learning_impl(
+    question: str,
+    scene_id: str = "",
+    *,
+    llm: Callable | None = None,
+    db_path: str = "",
+    execute: bool = True,
+    use_mcp: bool = True,
+) -> dict[str, Any]:
+    """启动一轮学习（同构 learn() 单圈）的实现体（断开逻辑见外层 start_learning）。"""
     question = str(question or "").strip()
     scene = _resolve_scene(scene_id)
     out: dict[str, Any] = {

@@ -182,10 +182,16 @@ PROMPT_SYSTEM = """你是本机数据助手。你能用的是**这个应用工�
 
 要求：
 1. 只输出一个 ```python 代码块；
-2. 把最终答案赋给 `RESULT`（列表或字典），**联网拿到的答案要带来源 URL**；
+2. 把最终答案赋给 `RESULT`（列表或字典），**答案必须来自你调用上面函数取回的真实数据**；
+   联网拿到的答案要带来源 URL；
 3. 不要 print，不要 import，不要写文件；
-4. 本机问题按下面的文件清单直接读，不要猜文件名/扩展名（猜错就取不到数）；
-5. **清单里的文件和问题无关时，不要拿它凑答案** —— 本机没有就联网查；
+4. **必须调用至少一个数据源函数**（list_files/read_file/read_json/query_sql/
+   web_search/web_fetch/mcp_*）。⛔ 绝对不许把训练记忆里的事实直接写成
+   `RESULT = [...]` 交上来 —— 那是编造、不算取到数，会被判失败让你重写。问
+   「热门的/最新的/2026 的/排行/推荐」这类时效性问题，**一定**先 web_search
+   （或 mcp_* 联网工具），再据检索到的真实结果作答；
+5. 本机问题按下面的文件清单直接读，不要猜文件名/扩展名（猜错就取不到数）；
+   **清单里的文件和问题无关时，不要拿它凑答案** —— 本机没有就联网查；
    联网也取不到（没网/被限流）才 `RESULT = {"error": "..."}` 如实说。
    拿无关文件的内容当答案是比"没有答案"更糟的错（2026-10-19 服务器实测：
    问世界模型，它把 subjects.json 整份当成答案交了上来）；
@@ -249,8 +255,8 @@ async def solve(question: str, scene_dir: str, *, llm=None,
     from voyager_vlml.llm import chat
     call = llm or (lambda msgs: chat(msgs, temperature=0.2))
 
-    def _ns() -> dict[str, Any]:
-        return _ns_base(scene_dir, scene_id)
+    def _ns(tracer: list[str]) -> dict[str, Any]:
+        return _ns_base(scene_dir, scene_id, tracer=tracer)
 
     # 场景目录里**现有**什么，直接告诉它（否则它会猜 *.txt 而真实文件是 .json）
     inv = inventory(scene_dir)
@@ -282,14 +288,24 @@ async def solve(question: str, scene_dir: str, *, llm=None,
             obs.append({"ok": False, "tool": "local_python", "rows": 0,
                         "error": fb})
             continue
-        ns = _ns()
+        tracer: list[str] = []
+        ns = _ns(tracer)
         res = await asyncio.to_thread(_run_restricted, code, ns)
         data, why_empty = _payload(ns.get("RESULT"))
         rows = len(data) if isinstance(data, list) else (1 if data else 0)
-        o = {"ok": bool(res.get("ok")) and data is not None,
+        err = str(res.get("error") or "")
+        # ⚠️ 真空成功的新形态：代码跑通、RESULT 非空，却一次数据源都没调 ——
+        # 这正是服务器实测踩到的（问热门 AI 开源项目，模型直接把训练记忆里的
+        # Transformers/PyTorch 列表写进 RESULT，一次都没 web_search）。不算取到数，
+        # 把原因喂回去让它改（:20 的「学到」判据 `_has_real` 也靠这个 ok=False）。
+        if not err and res.get("ok") and data is not None and not tracer:
+            err = ("没调用任何数据源（web_search/web_fetch/read_json/query_sql/"
+                   "mcp_* 等）——答案疑似凭训练记忆编造，不算取到数；"
+                   "请调用联网/本机原语去取真实数据再作答")
+        o = {"ok": bool(res.get("ok")) and data is not None and not err,
              "tool": "local_python", "rows": rows, "data": data,
-             "error": str(res.get("error") or ("" if data is not None
-                                               else why_empty))}
+             "data_sources": list(tracer),
+             "error": err or ("" if data is not None else why_empty)}
         obs.append(o)
         if o["ok"]:
             break
@@ -356,6 +372,22 @@ def _make_mcp_callable(gw: Any, tool_id: str, loop: Any):
         return _unwrap_mcp(cfut.result(timeout=60))
     _sync.__name__ = str(tool_id)
     return _sync
+
+
+def _recorder(tracer: list[str] | None, name: str):
+    """给一个可调用套一层：**被调用时**把 name 记进 tracer（先记后调，调用失败也留痕）。
+
+    这是堵「真空成功」新形态的关键：代码跑通、RESULT 非空，但如果一次数据源都没
+    真正调用，答案八成是拿训练记忆编的 —— tracer 空就是证据。
+    """
+    def deco(fn: Any) -> Any:
+        def _w(*a: Any, **k: Any) -> Any:
+            if tracer is not None:
+                tracer.append(name)
+            return fn(*a, **k)
+        _w.__name__ = str(name)
+        return _w
+    return deco
 
 
 def _mcp_prompt_section(scene_id: str) -> str:
@@ -443,13 +475,17 @@ def primitive_names() -> list[str]:
 # ---------------------------------------------------------------------------
 # 技能结晶：把一段跑通的 Python 存成可重放的条目
 # ---------------------------------------------------------------------------
-def _ns_base(scene_dir: str, scene_id: str = "") -> dict[str, Any]:
+def _ns_base(scene_dir: str, scene_id: str = "",
+             tracer: list[str] | None = None) -> dict[str, Any]:
     """执行命名空间。
 
     给了 scene_id 就**按注册表里的启用条目**建（猫爪总开关关掉的组不注入 ——
     模型连名字都拿不到，这和 neko 关掉插件后条目消失是同构的）；没给就用
     全量原语（结晶重放/测试用）。本机原语（origin=local）+ 联网原语
-    （origin=net）都从这里出。
+    （origin=net）+ MCP 远端工具（origin=mcp）都从这里出。
+
+    `tracer`：给了就记录**哪些数据源被真正调用**（先记后调，失败也留痕）——
+    solve 用它堵「代码跑通、RESULT 非空却一次都没取数」的真空成功新形态。
     """
     full: dict[str, Any] = {
         "list_files": lambda path="", pattern="*": list_files(
@@ -465,6 +501,12 @@ def _ns_base(scene_dir: str, scene_id: str = "") -> dict[str, Any]:
         full["web_fetch"] = net_tools.web_fetch
     except Exception:
         pass
+    # 套调用记录：每个原语被调用时往 tracer 记一笔（可读性让位于「真的取了数吗」）。
+    # tracer 为空（技能重放 run_saved / 测试直连）时**不套**，保持函数原样 ——
+    # 免得 repr 变成 <function _w> 而不是 <function web_search>（test_scene_backend
+    # 靠 str(web_search) 认名，实测被这个包装破坏过一次）。
+    if tracer is not None:
+        full = {k: _recorder(tracer, k)(v) for k, v in full.items()}
     allowed_origins = {"local", "net"}
     names = set(full)
     if scene_id:
@@ -499,7 +541,9 @@ def _ns_base(scene_dir: str, scene_id: str = "") -> dict[str, Any]:
                 tid = str(e.get("name"))
                 if tid in ns:        # 不覆盖本机/联网同名（理论上不会重名）
                     continue
-                ns[tid] = _make_mcp_callable(gw, tid, loop)
+                _entry = _make_mcp_callable(gw, tid, loop)
+                ns[tid] = (_recorder(tracer, tid)(_entry)
+                           if tracer is not None else _entry)
         except RuntimeError:
             # 没有运行中的事件循环（技能重放 run_saved 等）→ 不注入 mcp 远端工具
             pass

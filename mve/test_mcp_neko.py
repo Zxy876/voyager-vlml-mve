@@ -13,7 +13,9 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+REPO = HERE.parent
 sys.path.insert(0, str(HERE))
+sys.path.insert(1, str(REPO))
 
 
 def test_unwrap_unit() -> None:
@@ -94,9 +96,48 @@ async def test_gateway_connect() -> None:
     print("PASS  test_gateway_connect")
 
 
+def test_vacuum_enforcement() -> None:
+    """闭环真空-success 新形态：代码跑通、RESULT 非空却一次数据源都没调
+    （模型把训练记忆写死成 RESULT）→ 判失败；真调数据源才放行。"""
+    import tempfile
+    d = Path(tempfile.mkdtemp())
+    (d / "metrics.json").write_text(
+        '{"latest":"真正来自文件的世界模型"}', encoding="utf-8")
+    import local_agent as L
+
+    class _Fake:
+        def __init__(self):
+            self.queue: list[str] = []
+
+        def push(self, s: str):
+            self.queue.append(s)
+
+        def __call__(self, messages, **_kw):
+            return self.queue.pop(0) if self.queue else "无"
+
+    # 1) 凭记忆编造（服务器实测踩的那种）：RESULT 是写死的列表，没有取数 → 不算取到数
+    f1 = _Fake()
+    f1.push('```python\nRESULT = [{"title": "PyTorch", "url": "x"}]\n```')
+    obs1, _ = asyncio.run(L.solve("热门AI开源项目", str(d), llm=f1, max_iters=1))
+    assert obs1 and obs1[0]["ok"] is False, "凭记忆编造应判失败"
+    assert "数据源" in str(obs1[0]["error"]), obs1[0]["error"]
+    assert obs1[0].get("data_sources") == [], obs1[0].get("data_sources")
+    print("PASS  test_vacuum_enforcement：凭记忆编造被拦下（ok=False + 反馈带回）")
+
+    # 2) 真调数据源：read_file 取到 → ok=True，data_sources 记到 read_file
+    f2 = _Fake()
+    f2.push('```python\nf = read_file("metrics.json")\nRESULT = {"v": f["text"]}\n```')
+    obs2, _ = asyncio.run(L.solve("读 metrics", str(d), llm=f2, max_iters=1))
+    assert obs2 and obs2[0]["ok"] is True, json.dumps(obs2, ensure_ascii=False)
+    assert "read_file" in obs2[0].get("data_sources", []), obs2[0].get("data_sources")
+    print("PASS  test_vacuum_enforcement：真调数据源放行（ok=True, data_sources=",
+          obs2[0]["data_sources"], "）")
+
+
 def main() -> None:
     test_unwrap_unit()
     asyncio.run(test_gateway_connect())
+    test_vacuum_enforcement()
     print("\nALL PASS")
 
 
