@@ -219,6 +219,42 @@ def test_drift_notes() -> None:
     print("PASS  test_drift_notes")
 
 
+def test_gate_log_reports_real_counts() -> None:
+    """日志必须打出**真实**的维度答到数，不能把 dict 当 list 数（2026-10-19 踩过：
+    服务器日志打出「闸门：0/3 个维度答到」，实际是 8/9 —— len(dict)=3 个 key，
+    ok_n 迭代到 str key 全被 `isinstance(g, dict)` 挡掉 → 恒 0。」
+    """
+    import scene_learn as SL
+
+    captured: list[str] = []
+    _ORIG_LOG = SL._log
+    SL._log = lambda t: captured.append(str(t))        # type: ignore[assignment]
+    try:
+        SL._log_learning_detail({
+            "dimension_results": {
+                "total": 9,
+                "learned": ["asd_definition", "asberg_definition",
+                            "diagnosis_criteria"],
+                "failed": [{"id": "motor_difficulties", "critique": "请具体说明"}],
+            },
+            "critic": {"success": False,
+                       "critique": "[motor_difficulties] 请具体说明",
+                       "gate": {"addressed": ["asd_definition",
+                                              "asberg_definition",
+                                              "diagnosis_criteria"],
+                                "open": ["motor_difficulties"],
+                                "questions": ["请具体说明"]}},
+        })
+    finally:
+        SL._log = _ORIG_LOG                            # type: ignore[assignment]
+    txt = "\n".join(captured)
+    assert "3/9" in txt, txt                           # 维度子任务：3/9
+    assert "motor_difficulties" in txt, txt
+    assert "闭合 3 条 / 未闭合 1 条" in txt, txt
+    assert "0/3" not in txt, txt
+    print("PASS  test_gate_log_reports_real_counts")
+
+
 def main() -> None:
     test_parse_and_cache()
     test_plan_uses_dimensions()
@@ -226,6 +262,7 @@ def main() -> None:
     test_gate_closes_only_when_list_satisfied()
     test_attach_dimensions()
     test_drift_notes()
+    test_gate_log_reports_real_counts()
     print("\nALL PASS")
 
 

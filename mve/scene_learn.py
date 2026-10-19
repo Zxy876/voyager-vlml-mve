@@ -182,12 +182,22 @@ def _log_learning_detail(r: dict[str, Any]) -> None:
     if isinstance(cry, dict) and cry.get("ok"):
         _log("  · 技能结晶：" + str(cry.get("entry") or cry.get("name") or "ok"))
     # 闸门（Maieutic spec gate）：逐维度答到没答到 —— 这是"任务完成没有"的硬判据
-    gate = (r.get("critic") or {}).get("gate") or []
-    if gate:
-        ok_n = sum(1 for g in gate if isinstance(g, dict)
-                   and g.get("answered") is not False)
-        _log(f"  · 闸门：{ok_n}/{len(gate)} 个维度答到"
-             + ("（缺的那条判 drift = 这轮不算完成）" if ok_n < len(gate) else ""))
+    # 2026-10-19 修：维度即子任务后 critic.gate 是 {addressed/open/questions}，
+    # 旧打印按 list 数（len = 3 个 key）→ 打出"0/3"这种假数字。
+    dres = r.get("dimension_results")
+    if dres:
+        _ok = dres.get("learned") or []
+        _bad = dres.get("failed") or []
+        _log(f"  · 维度子任务：{len(_ok)}/{dres.get('total')} 个答到"
+             + (f"（未闭合：{'，'.join(str(f.get('id') or '') for f in _bad)}）"
+                if _bad else "（全部闭合）"))
+    gate = (r.get("critic") or {}).get("gate") or {}
+    if isinstance(gate, dict) and (gate.get("addressed") or gate.get("open")):
+        _open = gate.get("open") or []
+        _log(f"  · 闸门：闭合 {len(gate.get('addressed') or [])} 条"
+             f" / 未闭合 {len(_open)} 条"
+             + ("（未闭合 = 这轮不算完成，维度 id 留在进度里下轮补）"
+                if _open else "（闭合 → 判完成）"))
 
 
 def _run_one(q: str, scene: str, *, context: str = "",

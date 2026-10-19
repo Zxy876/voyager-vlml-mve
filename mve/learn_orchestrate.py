@@ -535,7 +535,8 @@ async def _start_learning_impl(
             # （maieutic_gate 的闭合口径）。这里只汇总，不再让 critic 判一遍。
             _failed = _dres.get("failed") or []
             _ok = not _failed
-            _crit = " ".join(str(f.get("critique") or "") for f in _failed)[:300]
+            _crit = " ".join(f"[{f.get('id')}] {str(f.get('critique') or '')}"
+                             for f in _failed).strip()[:300]
             out["critic"] = {"success": bool(_ok), "critique": _crit,
                              "gate": {"addressed": _dres.get("learned") or [],
                                       "open": [f.get("id") for f in _failed],
