@@ -658,8 +658,10 @@ async def consume(
             "reused": bool(reused_skill), "graph_link": {},
             "judgment_result": "written" if data is not None else "fetched_empty",
             "skipped": ("" if data is not None else
-                        ("本机原语没取到结果（" + _scene_why + "）"
-                         "—— 场景目录里放数据文件，或把问题问成本机能查到的东西")),
+                        ("本机工作区里没有能回答它的数据（" + _scene_why + "）"
+                         "——「本机」= 应用跑在用户自己电脑上的那一档：只读应用"
+                         "工作区/场景目录，不联网、也不翻操作者的私人文件；"
+                         "这类问题需要外部数据源")),
         }
         if not reused_skill:          # 复用已有配方时不必再记一遍账
             try:

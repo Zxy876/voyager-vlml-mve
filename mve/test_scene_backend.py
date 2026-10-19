@@ -229,7 +229,21 @@ def main() -> int:
         blocked = False
     except PermissionError:
         blocked = True
-    check("越界路径被拒（只许场景目录 / 家目录）", blocked)
+    check("越界路径被拒（只许应用工作区 / 场景目录）", blocked)
+
+    # 用户 2026-10-19：「一般用户下载下来放本机用啊，不需要我的本机数据的」
+    # → 家目录**不在**允许的根里（程序不该去翻操作者的私人文件）。
+    roots = [str(r) for r in local_agent._roots(d)]
+    check("家目录不在可读根里（不翻操作者私人文件）",
+          str(Path.home().resolve()) not in roots, str(roots)[:90])
+    probe = Path.home() / ".zshrc"
+    if probe.exists():
+        try:
+            local_agent.read_file(d, str(probe))
+            home_blocked = False
+        except PermissionError:
+            home_blocked = True
+        check("读家目录里的文件被拒", home_blocked, str(probe))
 
     try:
         local_agent.query_sql(d, "SELECT 1")
@@ -250,6 +264,14 @@ def main() -> int:
           LOCAL_ANSWER in json.dumps(obs[0].get("data"), ensure_ascii=False),
           json.dumps(obs[0].get("data"), ensure_ascii=False)[:70])
     check("用的是本机原语（trajectory=local_python）", obs[0]["tool"] == "local_python")
+    check("prompt 里给了现有文件清单（不让模型猜扩展名）",
+          "metrics.json" in json.dumps(FAKE.prompts[-1], ensure_ascii=False),
+          json.dumps(FAKE.prompts[-1], ensure_ascii=False)[-120:])
+
+    # read_json：普通用户的数据大多是 json，不该逼模型自己解析
+    parsed = local_agent.read_json(d, "metrics.json")
+    check("read_json 直接读出解析好的对象",
+          parsed.get("latest") == LOCAL_ANSWER, str(parsed)[:60])
 
     # 模型自报取不到：必须当失败（真空成功的老毛病），且把反馈喂回去重写
     FAKE.queue.clear()
@@ -352,9 +374,11 @@ def main() -> int:
     check("本机取不到 → judgment_result=fetched_empty",
           empty.get("judgment_result") == "fetched_empty",
           str(empty.get("judgment_result")))
-    check("如实告诉人怎么办（放数据文件 / 换个问法）",
-          "本机" in str(empty.get("skipped")) and empty.get("answer") == "",
-          str(empty.get("skipped"))[:70])
+    check("如实说「本机工作区里没有」+ 这类问题需要外部数据源",
+          "本机工作区里没有" in str(empty.get("skipped"))
+          and "外部数据源" in str(empty.get("skipped"))
+          and empty.get("answer") == "",
+          str(empty.get("skipped"))[:80])
     check("本机没取到也要踢一轮自学（不把闭环停在『认识这句话』）",
           any(k["scene"] == "F" and "本机" in k["reason"] for k in KICKS),
           str([(k["scene"], k["reason"]) for k in KICKS])[:110])
