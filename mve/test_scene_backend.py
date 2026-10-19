@@ -650,54 +650,57 @@ def main() -> int:
     print("\n== 9. 场景学习循环：驾驶舱在 B 下学的是 B 自己的任务（不是 VLML）==")
     # =====================================================================
     import scene_learn
+    import run_log
+    # 隔离 run_log：scene_questions 现在也会读 run_log 的「已学成功」记录来剔除
+    # 已学会的问题，测试不能让本地真实历史（含 learned 的 QUESTION）混入判据。
     fake_log = tmp / "coach_log.jsonl"
-    rows = [
-        {"mode": "voyager_consume", "root_scene": "B",
-         "question": QUESTION, "judgment_result": "fetched_empty"},
-        {"mode": "voyager_consume", "root_scene": "B",
-         "question": "另一个没答出来的问题", "judgment_result": "failed"},
-        {"mode": "voyager_consume", "root_scene": "B",
-         "question": "已经答出来的问题", "judgment_result": "written"},
-        {"mode": "voyager_consume", "root_scene": "A",
-         "question": "A 场景的问题不该混进来", "judgment_result": "fetched_empty"},
-    ]
-    fake_log.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows),
-                        encoding="utf-8")
     old_cl = scene_learn.COACH_LOG
+    old_rl = run_log.LOG
+    run_log.LOG = tmp / "run_log_isolated.jsonl"
+    run_log.LOG.write_text("")
     scene_learn.COACH_LOG = fake_log
     try:
+        rows = [
+            {"mode": "voyager_consume", "root_scene": "B",
+             "question": QUESTION, "judgment_result": "fetched_empty"},
+            {"mode": "voyager_consume", "root_scene": "B",
+             "question": "另一个没答出来的问题", "judgment_result": "failed"},
+            {"mode": "voyager_consume", "root_scene": "B",
+             "question": "已经答出来的问题", "judgment_result": "written"},
+            {"mode": "voyager_consume", "root_scene": "A",
+             "question": "A 场景的问题不该混进来", "judgment_result": "fetched_empty"},
+        ]
+        fake_log.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows),
+                            encoding="utf-8")
         tasks_b = scene_learn.scene_questions("B")
-    finally:
-        scene_learn.COACH_LOG = old_cl
-    got = [t["question"] for t in tasks_b]
-    check("任务清单 = 本场景没答出来的导入问题（新→旧）",
-          got == ["另一个没答出来的问题", QUESTION], str(got))
-    check("已答出的不重学（不再重复出题）", "已经答出来的问题" not in got)
-    check("别的场景的问题不混进来", all("A 场景" not in g for g in got))
+        got = [t["question"] for t in tasks_b]
+        check("任务清单 = 本场景没答出来的导入问题（新→旧）",
+              got == ["另一个没答出来的问题", QUESTION], str(got))
+        check("已答出的不重学（不再重复出题）", "已经答出来的问题" not in got)
+        check("别的场景的问题不混进来", all("A 场景" not in g for g in got))
 
-    # 「答出来过」看**最近一次**判读（实测坑）：同一句先被联网答出来（written），
-    # 之后关掉联网再导入 → fetched_empty。旧写法因为历史上那条 written 就永久
-    # 判「已掌握」，驾驶舱显示「待学任务 0 个」—— 明明刚刚才答不出来。
-    rows2 = rows + [
-        {"mode": "voyager_consume", "root_scene": "B",
-         "question": "曾经答出来、现在答不出来", "judgment_result": "written"},
-        {"mode": "voyager_consume", "root_scene": "B",
-         "question": "曾经答出来、现在答不出来", "judgment_result": "fetched_empty"},
-        {"mode": "voyager_consume", "root_scene": "B",
-         "question": "先失败后答出来", "judgment_result": "fetched_empty"},
-        {"mode": "voyager_consume", "root_scene": "B",
-         "question": "先失败后答出来", "judgment_result": "written"},
-    ]
-    fake_log.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows2),
-                        encoding="utf-8")
-    scene_learn.COACH_LOG = fake_log
-    try:
+        # 「答出来过」看**最近一次**判读（实测坑）：同一句先被联网答出来（written），
+        # 之后关掉联网再导入 → fetched_empty。旧写法因为历史上那条 written 就永久
+        # 判「已掌握」，驾驶舱显示「待学任务 0 个」—— 明明刚刚才答不出来。
+        rows2 = rows + [
+            {"mode": "voyager_consume", "root_scene": "B",
+             "question": "曾经答出来、现在答不出来", "judgment_result": "written"},
+            {"mode": "voyager_consume", "root_scene": "B",
+             "question": "曾经答出来、现在答不出来", "judgment_result": "fetched_empty"},
+            {"mode": "voyager_consume", "root_scene": "B",
+             "question": "先失败后答出来", "judgment_result": "fetched_empty"},
+            {"mode": "voyager_consume", "root_scene": "B",
+             "question": "先失败后答出来", "judgment_result": "written"},
+        ]
+        fake_log.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows2),
+                            encoding="utf-8")
         got2 = [t["question"] for t in scene_learn.scene_questions("B")]
+        check("最近一次没答出来 → 重新进学习清单（旧账的 written 不能抵消）",
+              "曾经答出来、现在答不出来" in got2, str(got2))
+        check("最近一次答出来了 → 不再重学", "先失败后答出来" not in got2, str(got2))
     finally:
         scene_learn.COACH_LOG = old_cl
-    check("最近一次没答出来 → 重新进学习清单（旧账的 written 不能抵消）",
-          "曾经答出来、现在答不出来" in got2, str(got2))
-    check("最近一次答出来了 → 不再重学", "先失败后答出来" not in got2, str(got2))
+        run_log.LOG = old_rl
 
     # =====================================================================
     print("\n== 10. 叙事层：取到的东西 → 给人看的答案（同构猫娘）==")

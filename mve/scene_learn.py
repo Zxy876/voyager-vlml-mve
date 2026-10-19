@@ -98,29 +98,86 @@ def scene_questions(scene_id: str) -> list[dict[str, Any]]:
             continue
         latest[q] = str(r.get("judgment_result") or "")   # 后写的覆盖先写的
     done = {q for q, v in latest.items() if v == "written"}
+    # 已经被 Voyager 学成功（落 run_log 的 scene_learn 且 learned/partial）的，
+    # 不再当待学 —— 否则同题会无限重学：队列依据的是 coach_log 的**人工消费**
+    # 判读，学习成功没回写它，于是学完又学（实测：第 1 次 no_data、之后连 learned，
+    # 但队列不认，12 轮都在学同一句）。
+    learned_done: set[str] = set()
+    try:
+        import run_log as _rl
+        for l in _rl.load_all():
+            if str(l.get("mode")) != "scene_learn":
+                continue
+            if str(l.get("scene") or "A") != scene_id:
+                continue
+            if str(l.get("learn_status") or "") in ("learned", "partial"):
+                learned_done.add(str(l.get("question") or "").strip())
+    except Exception:
+        pass
     for r in reversed(rows):                         # 新→旧排任务
         if str(r.get("root_scene") or "") != scene_id:
             continue
         if str(r.get("mode") or "") != "voyager_consume":
             continue
         q = str(r.get("question") or "").strip()
-        if q and q not in done and q not in todo:
+        if q and q not in done and q not in learned_done and q not in todo:
             todo.append(q)
     # 待审区（人导入了、还没解出来的另一本账）
     try:
         import routing
         for item in routing.pending_for_scene(scene_id) or []:
             q = str((item or {}).get("question") or "").strip()
-            if q and q not in done and q not in todo:
+            if q and q not in done and q not in learned_done and q not in todo:
                 todo.append(q)
     except Exception:
         pass
     return [{"question": q} for q in todo]
 
 
+def _log_learning_detail(r: dict[str, Any]) -> None:
+    """把一轮学习的「拆解 / 暴露能力 / 取数 / 入库」打到日志 —— 面板运行日志
+    才看得见学习主循环（用户 2026-10-19：原来只打 status，看不到课程规划/
+    任务拆解/用了什么能力）。失败也照打，方便定位。"""
+    if not isinstance(r, dict):
+        return
+    plan = r.get("plan") or {}
+    subs = plan.get("subtasks") or plan.get("subgoals") or []
+    if subs:
+        needs = [str(s.get("need") or s.get("goal") or "") for s in subs]
+        _log("  · 拆解子目标(" + str(len(needs)) + ")：" +
+             "；".join(n[:42] for n in needs if n))
+    exposed = r.get("exposed") or {}
+    if exposed.get("exposed"):
+        _log("  · 暴露的远端/MCP·猫娘能力：" +
+             "，".join(str(x) for x in exposed["exposed"][:12]))
+    elif exposed.get("connected"):
+        _log("  · 已连 MCP server：" +
+             "，".join(str(c.get("server")) for c in exposed["connected"]))
+    elif exposed.get("reason"):
+        _log("  · MCP：" + str(exposed["reason"])[:80])
+    execu = r.get("execution") or {}
+    if execu:
+        _log(f"  · 取数：calls={execu.get('calls')} 真取到={execu.get('real_calls')} "
+             f"行数={execu.get('rows')} ok={execu.get('ok')}")
+        sql = str(execu.get("sql") or "")
+        if sql:
+            _log("  · 脚本/SQL(head)：" + sql[:160].replace("\n", " "))
+    absorbed = r.get("absorbed") or {}
+    if absorbed:
+        _log(f"  · 入库：topic={absorbed.get('topic_id')} 掌握={absorbed.get('mastered')} "
+             f"动作={absorbed.get('skill_action')}")
+    ms = r.get("milestone") or {}
+    if ms.get("topic_id"):
+        _log("  · 里程碑解锁：" + ("是" if ms.get("unlocked") else "否") +
+             f"（{ms.get('topic_id')}）")
+    cry = r.get("crystallized") or {}
+    if isinstance(cry, dict) and cry.get("ok"):
+        _log("  · 技能结晶：" + str(cry.get("entry") or cry.get("name") or "ok"))
+
+
 def _run_one(q: str, scene: str) -> None:
     """学一道（同构原版 voyager.py:326 那圈 rollout：取任务 → 写代码/取数 → 成功加技能）。
-    结果自身会落 run_log（轨迹页可见），不在这里另记。"""
+    结果自身会落 run_log（轨迹页可见），这里再打一份可读的过程摘要到运行日志。"""
     _log(f"\n----- 场景学习 · Scene {scene} · {q} -----")
     t0 = time.time()
     try:
@@ -132,6 +189,7 @@ def _run_one(q: str, scene: str) -> None:
     _log(f"[场景学习] → status={status}（{time.time() - t0:.0f}s）"
          + (f" · {why[:160]}" if why else "")
          + (f" · 后端={((r.get('backend') or {}).get('kind'))}" if r.get("backend") else ""))
+    _log_learning_detail(r)
 
 
 def main() -> int:
