@@ -66,13 +66,26 @@
   想一次归零就两个都点，或命令行各跑一次。
 
 用法：
-    python mve/reset_all.py            # 先备份再清
+    python mve/reset_all.py            # 先备份再清（**全库**：所有场景一起清）
     python mve/reset_all.py --dry-run  # 只看会清什么
     python mve/reset_all.py --no-backup
     python mve/reset_all.py --force    # 循环还在跑也硬清（不推荐）
     python mve/reset_all.py --db-switch  # 换库清档：额外清旧库派生缓存
                                          # （entity_catalog / tool_schemas ——
                                          #   旧库的队名/图名在新库查不到）
+
+    # **只清一个场景**（2026-10-19 加）：其它场景的学习成果、数据源、场景注册
+    # 全保留；课程账 / 骨架缓存本来按场景分目录，日志与图谱按 root_scene 过滤。
+    python mve/reset_all.py --scene D
+    python mve/reset_all.py --scene D --dry-run
+
+⚠️ 按场景清**不动**这些（不是学习成果，或本来就不带场景字段）：
+    scene_data/<场景>/       人的本机文件 —— 那是**数据源**（同 .duckdb）
+    scenes.json              场景注册（清了场景就没了）
+    action_registry.json     猫爪总开关 / 组开关
+    skill_store.json         技能是**跨场景复用**资产，且不带场景字段
+    exam_log.jsonl           裸考记录，不带场景字段
+    想连这些一起清 → 用不带 --scene 的全清。
 """
 
 from __future__ import annotations
@@ -303,11 +316,238 @@ def _running() -> list[str]:
     return out
 
 
+def _scene_ids() -> list[str]:
+    """已注册的场景 id（给 `--scene` 做校验，防止打错字清了个寂寞）。"""
+    try:
+        import scenes
+        return [str(s.get("id") or "") for s in scenes.list_scenes()]
+    except Exception:
+        try:
+            d = json.loads((ROOT / "scenes.json").read_text(encoding="utf-8"))
+            return [str(k) for k in (d.get("scenes") or d)]
+        except Exception:
+            return []
+
+
+# 按场景清：**目录**直接删（天然按场景分目录）
+SCENE_DIRS = [
+    ("ckpt_curriculum/{s}", "课程两本账（completed / failed / failed_why）"),
+    ("ckpt_maieutic/{s}", "Maieutic 追问骨架缓存 + 维度进度（断点续学）"),
+]
+
+# 按场景清：**逐条过滤重写**（只删这个场景的行/条目，其它场景原样留着）
+#   (文件名, 场景字段名, 说明)
+SCENE_ROWS = [
+    ("run_log.jsonl", "scene", "每轮作答（练习线）"),
+    ("causal_timeline.jsonl", "scene", "行动因果时间线"),
+    ("coach_log.jsonl", "root_scene", "人导入历史 + 消费记录"),
+    ("topic_mastery.jsonl", "root_scene", "掌握库（每个节点的进度 / 完成情况）"),
+    ("runtime_topics.json", "root_scene", "运行期生成的图谱节点"),
+    ("pending_dimensions.json", "root_scene", "待审维度候选"),
+]
+
+
+def _scene_matches(rec: dict, key: str, scene: str) -> bool:
+    """这条记录属于该场景吗？
+
+    ⚠️ 口径与 `build_state` 一致（2026-10-19 定的全页签场景化）：**旧记录没有
+    场景字段 → 一律归默认场景 A**。所以清 A 会连"没标场景的历史记录"一起清，
+    清其它场景不会误伤它们。
+    """
+    val = str(rec.get(key) or "").strip()
+    if not val:
+        return scene == "A"
+    return val == scene
+
+
+def _clear_scene(scene: str, *, dry: bool, backup: bool) -> int:
+    """只清**一个场景**的学习成果，其它场景 / 数据源 / 场景注册原样保留。
+
+    为什么单开这条路径（用户 2026-10-19 问「能清掉对应场景的库吗」）：
+    `TARGETS` 那套是**整文件删**，做不到"只清 D 不碰 A"。而课程账
+    （`ckpt_curriculum/<scene>/`）和骨架缓存（`ckpt_maieutic/<scene>/`）
+    本来就按场景分目录，图谱/日志里每条也带 `root_scene` / `scene` ——
+    按场景清是能做到的，只是要换成"过滤重写"而不是"删文件"。
+
+    **有意不动**（打印出来让人看见）：
+      · `scene_data/<scene>/` —— 人的本机文件，那是**数据源**（同 .duckdb，
+        不在清库范围），清了等于删人东西；
+      · `scenes.json` / `action_registry.json` —— 场景注册与猫爪开关，是配置；
+      · `skill_store.json` / `exam_log.jsonl` —— **不带场景字段**，技能还是
+        跨场景复用资产（`source_scene` 只说明它从哪来，别的场景照样用）。
+        按场景清不会动它们，需要清就走全清。
+    """
+    print("=" * 68)
+    print(f"  MVE 清档 · 只清场景 {scene}"
+          + ("（DRY RUN，不会真的删）" if dry else ""))
+    print("=" * 68)
+
+    # 1. 目录类
+    dirs = [(ROOT / p.format(s=scene), d) for p, d in SCENE_DIRS
+            if (ROOT / p.format(s=scene)).exists()]
+    # 2. 条目类：先算清楚会删多少条
+    row_stats: list[tuple[Path, str, str, int, int]] = []
+    for name, key, desc in SCENE_ROWS:
+        p = ROOT / name
+        if not p.exists():
+            continue
+        try:
+            if name.endswith(".jsonl"):
+                recs = [json.loads(l) for l in p.read_text(
+                    encoding="utf-8").splitlines() if l.strip()]
+            else:
+                d = json.loads(p.read_text(encoding="utf-8"))
+                recs = list(d.values()) if isinstance(d, dict) else list(d)
+        except Exception as e:
+            print(f"  ⚠️ 读不了 {name}（跳过）：{type(e).__name__}: {e}")
+            continue
+        hit = sum(1 for r in recs if isinstance(r, dict)
+                  and _scene_matches(r, key, scene))
+        row_stats.append((p, key, desc, len(recs), hit))
+    # 3. 图谱：这个场景的节点 + 挂在它们上的边
+    gpath = ROOT / "knowledge_graph.json"
+    drop_nodes, drop_edges = 0, 0
+    if gpath.exists():
+        try:
+            g = json.loads(gpath.read_text(encoding="utf-8"))
+            ns = g.get("nodes") or []
+            es = g.get("edges") or []
+            ids = {str(n.get("id")) for n in ns
+                   if isinstance(n, dict)
+                   and _scene_matches(n, "root_scene", scene)}
+            drop_nodes = len(ids)
+            drop_edges = sum(1 for e in es if isinstance(e, dict)
+                             and (str(e.get("from") or "") in ids
+                                  or str(e.get("to") or "") in ids))
+        except Exception as e:
+            print(f"  ⚠️ 读不了图谱（跳过）：{type(e).__name__}: {e}")
+
+    print("\n  会清掉：")
+    for d, desc in dirs:
+        print(f"    目录 {d.relative_to(ROOT)}/  {desc}")
+    for p, _k, desc, total, hit in row_stats:
+        if hit:
+            print(f"    {p.name:26s} {hit}/{total} 条   {desc}")
+    if drop_nodes:
+        print(f"    {'knowledge_graph.json':26s} {drop_nodes} 个节点 + "
+              f"{drop_edges} 条边（root_scene={scene}）")
+    if not dirs and not any(h for *_x, h in row_stats) and not drop_nodes:
+        print("    （这个场景没有可清的东西）")
+        return 0
+    print("\n  有意不动：scene_data/<场景>/（人的本机数据 = 数据源）、"
+          "scenes.json（场景注册）、")
+    print("            action_registry.json（猫爪开关）、skill_store.json / "
+          "exam_log.jsonl（不带场景字段，跨场景共享）")
+
+    if dry:
+        return 0
+
+    if backup:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        dest = ROOT / f"_backup_{stamp}_scene{scene}"
+        dest.mkdir(parents=True, exist_ok=True)
+        for d, _ in dirs:
+            shutil.copytree(d, dest / d.name)
+        for p, *_ in row_stats:
+            shutil.copy2(p, dest / p.name)
+        if gpath.exists():
+            shutil.copy2(gpath, dest / gpath.name)
+        print(f"\n  已备份到：{dest}")
+
+    # 目录：整删
+    for d, _ in dirs:
+        shutil.rmtree(d)
+    # 条目：过滤重写（清干净了就删文件，不留空壳）
+    for p, key, _desc, total, hit in row_stats:
+        if not hit:
+            continue
+        if p.name.endswith(".jsonl"):
+            keep = []
+            for l in p.read_text(encoding="utf-8").splitlines():
+                if not l.strip():
+                    continue
+                try:
+                    r = json.loads(l)
+                except Exception:
+                    keep.append(l)          # 坏行原样留着，别顺手吞掉
+                    continue
+                if isinstance(r, dict) and _scene_matches(r, key, scene):
+                    continue
+                keep.append(l)
+            if keep:
+                p.write_text("\n".join(keep) + "\n", encoding="utf-8")
+            else:
+                p.unlink()
+        else:
+            d = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(d, dict):
+                d = {k: v for k, v in d.items()
+                     if not (isinstance(v, dict)
+                             and _scene_matches(v, key, scene))}
+            else:
+                d = [v for v in d if not (isinstance(v, dict)
+                                          and _scene_matches(v, key, scene))]
+            if d:
+                p.write_text(json.dumps(d, ensure_ascii=False, indent=1),
+                             encoding="utf-8")
+            else:
+                p.unlink()
+    # 图谱：用模块自己的 API 重写（save() 带残图防呆，不会把 A 的图写坏）
+    if drop_nodes:
+        try:
+            sys.path.insert(0, str(ROOT))
+            from knowledge_graph import KnowledgeGraph
+            g = KnowledgeGraph.load(gpath)
+            keep_ids = {i for i, n in g.nodes.items()
+                        if (str(getattr(n, "root_scene", "") or "").strip()
+                            or "A") != scene}
+            if not keep_ids:
+                # 清的是默认场景（A）：整图都归它 → 删文件交给面板自愈重建，
+                # 否则 save() 的"残图不许覆盖真图"防呆会拒绝写。
+                gpath.unlink()
+                print("  · 图谱：节点全部属于该场景 → 整份删除"
+                      "（面板下次启动用种子题重建）")
+            else:
+                ng = KnowledgeGraph()
+                for i in keep_ids:
+                    ng.add_node(g.nodes[i])
+                for e in g.edges:
+                    if e.src in keep_ids and e.dst in keep_ids:
+                        ng.add_edge(e)
+                ng.save(gpath)
+                print(f"  · 图谱：剩 {len(ng.nodes)} 节点 / {len(ng.edges)} 边")
+        except Exception as e:
+            print(f"  ⚠️ 图谱按场景清理失败（未改动）：{type(e).__name__}: {e}")
+    print(f"\n  已清场景 {scene}。其它场景的学习成果、数据源、场景注册都原样保留。")
+    print("  下一步：面板切到该场景点「练题」，或 "
+          f"`python mve/scene_learn.py --scene {scene} --max-iterations N`")
+    return 0
+
+
 def main() -> int:
     argv = sys.argv[1:]
     dry = "--dry-run" in argv
     backup = "--no-backup" not in argv
     force = "--force" in argv
+    # 只清某一个场景（其余场景 / 数据源 / 场景注册都保留）
+    scene = ""
+    for a in argv:
+        if a.startswith("--scene="):
+            scene = a.split("=", 1)[1].strip()
+        elif a == "--scene" and argv.index(a) + 1 < len(argv):
+            scene = argv[argv.index(a) + 1].strip()
+    if scene:
+        known = _scene_ids()
+        if known and scene not in known:
+            print(f"  ⚠️ 场景 {scene!r} 不存在（已注册：{', '.join(known)}）"
+                  " —— 不猜、不自动创建，防止打错字清了别的地方。")
+            return 1
+        busy = _running()
+        if busy and "--force" not in argv:
+            print("  ⚠️ 拒绝清档：还有东西在跑 —— " + "、".join(busy))
+            print("     先停（面板「■ 停止」），或加 --force 硬清。")
+            return 1
+        return _clear_scene(scene, dry=dry, backup=backup)
     # 换库清档：额外清掉从旧库派生的缓存（entity_catalog / tool_schemas）
     db_switch = "--db-switch" in argv
     targets = list(TARGETS) + (DB_DERIVED if db_switch else [])
