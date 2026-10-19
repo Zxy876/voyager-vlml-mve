@@ -97,11 +97,16 @@ def scene_questions(scene_id: str) -> list[dict[str, Any]]:
         if not q:
             continue
         latest[q] = str(r.get("judgment_result") or "")   # 后写的覆盖先写的
-    done = {q for q, v in latest.items() if v == "written"}
-    # 已经被 Voyager 学成功（落 run_log 的 scene_learn 且 learned/partial）的，
-    # 不再当待学 —— 否则同题会无限重学：队列依据的是 coach_log 的**人工消费**
-    # 判读，学习成功没回写它，于是学完又学（实测：第 1 次 no_data、之后连 learned，
-    # 但队列不认，12 轮都在学同一句）。
+    # ⚠️ **不能**拿 coach_log 的 judgment_result=="written" 当"课程已完成"。
+    # 那是**消费侧**的判读（人问一句、当场答出来），原版里对应的是"这次答复成功"，
+    # 不是 curriculum 的两本账。原版课程账只由 curriculum 自己记
+    # （completed_tasks / failed_tasks，curriculum.py:330-365）。
+    # 2026-10-19 实测踩过：Scene D 导入「什么是阿斯伯格（孤独症）」→ 消费层
+    # 用模型记忆写了段 RESULT={"answer": …} 就判 written → 这句话立刻被踢出
+    # 待学队列 → 队列空 → 自动课程围着空目录编出 room_data.txt，用户看到的
+    # 就是「课程完全没按我导入的问题来」。
+    # 现在课程完成只认下面这本账（学习链路自己落盘的 learned/partial），
+    # 与消费侧判读解耦 —— 这就是原版「课程账 vs 执行结果」的分工。
     learned_done: set[str] = set()
     try:
         import run_log as _rl
@@ -120,14 +125,14 @@ def scene_questions(scene_id: str) -> list[dict[str, Any]]:
         if str(r.get("mode") or "") != "voyager_consume":
             continue
         q = str(r.get("question") or "").strip()
-        if q and q not in done and q not in learned_done and q not in todo:
+        if q and q not in learned_done and q not in todo:
             todo.append(q)
     # 待审区（人导入了、还没解出来的另一本账）
     try:
         import routing
         for item in routing.pending_for_scene(scene_id) or []:
             q = str((item or {}).get("question") or "").strip()
-            if q and q not in done and q not in learned_done and q not in todo:
+            if q and q not in learned_done and q not in todo:
                 todo.append(q)
     except Exception:
         pass
@@ -302,8 +307,10 @@ def main() -> int:
                 _log(f"[场景学习] 课程规划失败：{type(e).__name__}: {e} —— 退出。")
             break
         if not task:
-            _log("[场景学习] 课程提不出下一个任务（工作区没数据 / LLM 不可用 / "
-                 "连续 5 次解析失败）—— 如实退出，不硬凑。")
+            _log("[场景学习] 课程提不出下一个任务"
+                 + (f"：{context}" if context else
+                    "（工作区没数据 / LLM 不可用 / 连续 5 次解析失败）")
+                 + " —— 如实退出，不硬凑。")
             break
         iteration += 1
         info = _run_one(task, scene, context=context, max_retries=max_retries)

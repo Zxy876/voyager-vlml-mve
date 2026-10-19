@@ -674,9 +674,14 @@ def main() -> int:
                             encoding="utf-8")
         tasks_b = scene_learn.scene_questions("B")
         got = [t["question"] for t in tasks_b]
-        check("任务清单 = 本场景没答出来的导入问题（新→旧）",
-              got == ["另一个没答出来的问题", QUESTION], str(got))
-        check("已答出的不重学（不再重复出题）", "已经答出来的问题" not in got)
+        # 课程账 = 原版 curriculum 的两本账；coach_log 的 written 是**消费侧判读**
+        # （人问一句、当场答出来），不是"这门课学完了"。实测教训：拿它当课程完成，
+        # 导入题会被立刻踢出队列 → 课程只围着空目录编题（用户 2026-10-19 报的
+        # 「导入阿斯伯格问题，课程完全没按它来」）。
+        check("任务清单 = 本场景导入过的题，新→旧（含消费层答过的）",
+              got == ["已经答出来的问题", "另一个没答出来的问题", QUESTION], str(got))
+        check("消费层答过 ≠ 课程学完（不再用它剔除课程任务）",
+              "已经答出来的问题" in got)
         check("别的场景的问题不混进来", all("A 场景" not in g for g in got))
 
         # 「答出来过」看**最近一次**判读（实测坑）：同一句先被联网答出来（written），
@@ -695,9 +700,10 @@ def main() -> int:
         fake_log.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows2),
                             encoding="utf-8")
         got2 = [t["question"] for t in scene_learn.scene_questions("B")]
-        check("最近一次没答出来 → 重新进学习清单（旧账的 written 不能抵消）",
+        check("曾经答出来、现在答不出来 → 仍在课程清单",
               "曾经答出来、现在答不出来" in got2, str(got2))
-        check("最近一次答出来了 → 不再重学", "先失败后答出来" not in got2, str(got2))
+        check("消费层先失败后答出来的题 → 仍在课程清单（课程账独立）",
+              "先失败后答出来" in got2, str(got2))
     finally:
         scene_learn.COACH_LOG = old_cl
         run_log.LOG = old_rl

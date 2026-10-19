@@ -134,9 +134,27 @@ class CurriculumAgent:
         return len(self.completed_tasks)
 
     # ---------- 观察（原版 :150-224） ----------
+    def local_enabled(self) -> bool:
+        """本机取数能力这一组还开着吗（= 猫爪总开关 ∧ 本机组开关）。
+
+        原版没有那么细的开关，对应物是「环境里有没有可用的 control primitive」：
+        原版 observation 里能看到 chests / nearby_blocks，是因为 agent 确实能
+        采集它们。MVE 里能力关掉后模型根本调不到本机原语，再围绕本机文件出题
+        就是出一道**必然失败**的题（用户 2026-10-19 实测）。
+        所以「能不能读本机」必须体现在环境观察里，而不是只体现在执行层。
+        """
+        try:
+            import actions
+            actions.restore_switches()          # 子进程：读面板拨过的开关
+            return bool(actions.group_enabled(self.scene_id, "本机能力"))
+        except Exception:
+            return True                          # 读不到就按默认开（不假装关）
+
     def render_observation(self) -> dict[str, str]:
         import local_agent
-        inv = local_agent.inventory(self.scene_dir, limit=12) if self.scene_dir else []
+        local_ok = self.local_enabled()
+        inv = (local_agent.inventory(self.scene_dir, limit=12)
+               if (self.scene_dir and local_ok) else [])
         if inv:
             lines = []
             for r in inv:
@@ -148,19 +166,33 @@ class CurriculumAgent:
                     pv = str(r["preview"]).replace("\n", " ")
                     lines.append(f"    开头内容（结构预览）：{pv[:300]}")
             files = "\n".join(lines)
+        elif not local_ok:
+            files = ("None（本机能力已被关掉，读不到任何文件 —— 不要出需要读本机"
+                     "文件的题）")
         else:
-            files = "None"
+            files = ("None（这个场景的工作区里没有任何文件 —— **绝对不要编造"
+                     "文件名**；没有文件就没有能从这里取数的任务）")
         done = "；".join(self.completed_tasks[-20:]) if self.completed_tasks else "None"
         failed = "；".join(self.failed_tasks[-20:]) if self.failed_tasks else "None"
         wo = "；".join(f"{k}（{v[:60]}）" for k, v in list(self._failed_why.items())[-8:])
         return {
-            "biome": f"数据源: 本机工作区 {self.scene_dir}\n\n",
+            # 原版 biome 只说「这是什么地形」（plains / forest），**不报路径**。
+            # 我上一版写成 "数据源: 本机工作区 /root/mve/scene_data/D"，
+            # 实测模型据此编出 room_data.txt（空目录里根本没这个文件），
+            # 连出 3 道必失败的题。环境描述只给类别，不给可被脑补成文件名的路径。
+            "biome": self._biome_text(local_ok) + "\n\n",
             "nearby_blocks": f"工作区文件:\n{files}\n\n",
             "chests": f"已学会的技能（可复用配方）: {self._skill_count()} 条\n\n",
             "completed_tasks": f"Completed tasks so far: {done}\n\n",
             "failed_tasks": (f"Failed tasks that are too hard: {failed}\n\n"
                              + (f"为什么失败: {wo}\n\n" if wo else "")),
         }
+
+    def _biome_text(self, local_ok: bool) -> str:
+        if not local_ok:
+            return ("数据源: 本机取数能力已被关掉。不要去读本机文件，"
+                    "也不要把本机文件当成数据来源。")
+        return "数据源: 本机工作区（应用工作区 + 场景目录），只读"
 
     def _skill_count(self) -> int:
         try:
@@ -187,7 +219,26 @@ class CurriculumAgent:
             q = str(q or "").strip()
             if q and q not in self.completed_tasks and q not in self.failed_tasks:
                 return q, "人导入的待学问题（原版 manual 模式对应物）"
+        # 原版 :264-291 在交给 LLM 之前先走硬编码分支（inventory 满 → 固定任务）。
+        # MVE 的对应物就是这条：先看**环境里有没有可学的抓手**。
+        # 工作区空 + 本机能力关着时，模型只能凭"场景目录"这个路径编文件名
+        # （2026-10-19 实测：Scene D 空目录 → 连出 3 道 room_data.txt 的题，
+        # 全部 no_data）。那不是探索，是幻觉 —— 如实返回空，别让模型编。
+        if not self.has_environment():
+            return "", ("这个场景没有可学的环境：工作区里没有任何文件"
+                        + ("，本机取数能力也被关掉了" if not self.local_enabled() else "")
+                        + "。放数据或导入要学的问题后再启动。")
         return self.propose_next_ai_task(max_retries=max_retries)
+
+    def has_environment(self) -> bool:
+        """工作区里有没有东西可探索（原版：nearby_blocks 非空才谈得上出任务）。"""
+        if not self.scene_dir or not self.local_enabled():
+            return False
+        try:
+            import local_agent
+            return bool(local_agent.inventory(self.scene_dir, limit=1))
+        except Exception:
+            return True          # 探不动就按有环境（不因探测失败而假装没得学）
 
     def propose_next_ai_task(self, *, max_retries: int = 5,
                              _feedback: str = "") -> tuple[str, str]:

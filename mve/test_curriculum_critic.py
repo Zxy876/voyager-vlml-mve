@@ -104,6 +104,86 @@ def test_retry_raise_with_reason() -> None:
     print("PASS  test_retry_raise_with_reason")
 
 
+def test_empty_env_no_invented_files() -> None:
+    """空工作区 → 不出题，也不把场景路径写进环境描述（防模型脑补文件名）。
+
+    2026-10-19 实测：Scene D 工作区是空的，可我上一版 biome 里报了绝对路径
+    `/root/mve/scene_data/D` → 模型连出 3 道「计算 room_data.txt 房间面积」的题，
+    全部 no_data。原版 biome 只说地形（plains），不报路径。
+    """
+    import curriculum_auto as C
+    d = Path(tempfile.mkdtemp())
+    # ckpt 放**另一个**目录：放在场景目录里会让"工作区为空"这个前提失效
+    a = C.CurriculumAgent("T", scene_dir=str(d),
+                          state_dir=Path(tempfile.mkdtemp()) / "ckpt",
+                          llm=lambda m: "Task: 编一个\nContext: 瞎编")
+    task, why = a.propose_next_task()
+    assert task == "", task
+    assert "没有任何文件" in why, why
+    obs = a.render_observation()
+    assert str(d) not in obs["biome"], obs["biome"]
+    assert "没有任何文件" in obs["nearby_blocks"], obs["nearby_blocks"]
+    print("PASS  test_empty_env_no_invented_files")
+
+
+def test_local_off_hides_files() -> None:
+    """本机能力关掉 → 环境里不列文件、并明说关了，也不再自动出题。
+
+    用户 2026-10-19：「我把本机能力关了也没用」—— 开关以前只管执行层，
+    课程层照样围着本机文件出题。原版语义：调不到的 primitive 不算环境。
+    """
+    import curriculum_auto as C
+    d = Path(tempfile.mkdtemp())
+    (d / "room_data.txt").write_text("1,2,3", encoding="utf-8")
+    a = C.CurriculumAgent("T", scene_dir=str(d),
+                          state_dir=Path(tempfile.mkdtemp()) / "ckpt",
+                          llm=lambda m: "Task: x\nContext: y")
+    a.local_enabled = lambda: False            # 模拟猫爪总开关/本机组关掉
+    obs = a.render_observation()
+    assert "room_data" not in obs["nearby_blocks"], obs["nearby_blocks"]
+    assert "关掉" in obs["biome"], obs["biome"]
+    assert a.propose_next_task()[0] == "", "本机关了不该再有可学环境"
+    print("PASS  test_local_off_hides_files")
+
+
+def test_import_question_not_done_by_written() -> None:
+    """导入题即使消费层判了 written，也仍在**课程**待学队列里。
+
+    课程账（原版 curriculum 两本账）与消费判读是两本账。实测：Scene D 导入
+    「什么是阿斯伯格（孤独症）」→ 消费层用模型记忆写了段 RESULT 就判 written
+    → 被踢出队列 → 队列空 → 自动课程围着空目录编题。这就是用户看到的
+    「课程完全没按我导入的问题来」。
+    """
+    import json
+    import scene_learn as S
+    d = Path(tempfile.mkdtemp())
+    p = d / "coach.jsonl"
+    p.write_text(json.dumps({"root_scene": "T", "mode": "voyager_consume",
+                             "question": "什么是阿斯伯格（孤独症）",
+                             "judgment_result": "written"},
+                            ensure_ascii=False) + "\n", encoding="utf-8")
+    old = S.COACH_LOG
+    S.COACH_LOG = p
+    try:
+        qs = [x["question"] for x in S.scene_questions("T")]
+    finally:
+        S.COACH_LOG = old
+    assert "什么是阿斯伯格（孤独症）" in qs, qs
+    print("PASS  test_import_question_not_done_by_written")
+
+
+def test_recipe_requires_real_fetch() -> None:
+    """纯答案不是配方：`RESULT = {"answer": …}` 不许进技能库（原版技能=调 primitive 的代码）。"""
+    from voyager_vlml.consume import _looks_like_recipe as ok
+    assert not ok('RESULT = {"answer": "阿斯伯格是一种广泛性发育障碍……"}')
+    assert not ok('answer = "阿斯伯格是……"')
+    assert ok('projects = read_json("projects.json")')
+    assert ok('RESULT = web_search("阿斯伯格", max_results=3)')
+    assert ok('SELECT count(*) FROM games')
+    assert ok('r = mcp_ddg_search("x")')
+    print("PASS  test_recipe_requires_real_fetch")
+
+
 def test_needs_data() -> None:
     """题面分型：数据型 vs 知识型（决定要不要把"没取数"判死）。"""
     import task_critic as T
@@ -192,6 +272,10 @@ def main() -> None:
     test_queue_priority_and_retry()
     test_dedupe_exact_only()
     test_retry_raise_with_reason()
+    test_empty_env_no_invented_files()
+    test_local_off_hides_files()
+    test_import_question_not_done_by_written()
+    test_recipe_requires_real_fetch()
     test_needs_data()
     test_knowledge_vs_data_judge()
     test_critic_shortcut()

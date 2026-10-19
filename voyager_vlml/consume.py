@@ -54,6 +54,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -1434,6 +1435,25 @@ def _ability_universe() -> set[str]:
     return ids
 
 
+# 配方 = **真的去取数**的代码（原版 skill 就是一次成功 rollout 的 program_code，
+# 里面调的是 control primitive）。认这几种取数动作：本机只读原语 / 联网原语 /
+# MCP 工具 / SQL 查询。纯赋值（RESULT = 一段文字）不算 —— 那是模型记忆，
+# 不是可复用方法。
+_RECIPE_CALL = re.compile(
+    r"\b(list_files|read_file|read_json|read_csv|query_sql"
+    r"|web_search|web_fetch|http_get|fetch_url)\s*\("
+    r"|\bmcp_[A-Za-z0-9_]+\s*\("
+    r"|\bSELECT\b[\s\S]{0,200}?\bFROM\b"
+    r"|\bduckdb\b",
+    re.I,
+)
+
+
+def _looks_like_recipe(code: str) -> bool:
+    """这段代码是不是「可执行取数配方」，而不是模型写的一段答案。"""
+    return bool(_RECIPE_CALL.search(str(code or "")))
+
+
 def _absorb(question: str, sql: str, topic_id: str,
             *, scene_id: str = "", answer: str = "") -> dict[str, Any]:
     """答完了 → **这题就到他的能力里了 → 这就是掌握**（用户 2026-10-13 定）。
@@ -1519,6 +1539,16 @@ def _absorb(question: str, sql: str, topic_id: str,
 
     if not str(sql or "").strip():
         out["skill_action"] = "知识型答案（无可执行配方，不写技能库）"
+        return out
+    if not _looks_like_recipe(sql):
+        # 原版技能 = 一次**成功 rollout 的 program_code**，那是真的调了
+        # control primitive 的代码（voyager.py:250-283 成功才 add_new_skill）。
+        # 纯 `RESULT = {"answer": "…"}` 是模型凭训练记忆写的答案，不是配方：
+        # 存进去下次就会被当"可复用配方"重放，等于把记忆固化成能力。
+        # 2026-10-19 实测：Scene D 问「什么是阿斯伯格」，消费层写的正是这种代码，
+        # 被存成 consume_e81eea3e 技能 —— 假配方就这么进了库。
+        out["skill_action"] = ("知识型答案（代码里没有任何取数动作，不是配方，"
+                               "不写技能库）")
         return out
     try:
         import skill_store

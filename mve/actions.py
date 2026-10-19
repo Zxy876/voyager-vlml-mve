@@ -240,6 +240,32 @@ def _save_snapshot() -> None:
         pass
 
 
+def restore_switches() -> dict[str, dict[str, bool]]:
+    """**只**从快照恢复开关（总开关 + 组开关），不碰注册表。
+
+    为什么需要：开关状态活在进程内存里（`_MASTER` / `_SWITCHES`），而学习循环
+    是 pilot 拉起的**另一个进程**。人在面板上关掉「本机能力」后再启动学习，
+    子进程里 `master_enabled()` 永远返回默认 True —— 于是课程照样围着本机
+    文件出题（用户 2026-10-19 实测：「我把本机能力关了也没用」）。
+    快照 `action_registry.json` 里本来就有 master/switches 两份状态，
+    这里就是那条读法的唯一入口，不另造存储格式。
+    """
+    if not SNAPSHOT.exists():
+        return {}
+    try:
+        data = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    for sid, mv in (data.get("master") or {}).items():
+        _MASTER[str(sid)] = bool(mv)
+    for sid, sw in (data.get("switches") or {}).items():
+        if isinstance(sw, dict):
+            _SWITCHES.setdefault(str(sid), {}).update(
+                {str(k): bool(v) for k, v in sw.items()})
+    return {sid: switches(sid) for sid in
+            set(_MASTER) | set(_SWITCHES)}
+
+
 def restore() -> dict[str, int]:
     """从快照恢复注册表（面板启动时调，避免重启后「0 个可执行动作」误报）。
 
