@@ -637,6 +637,30 @@ def main() -> int:
     check("已答出的不重学（不再重复出题）", "已经答出来的问题" not in got)
     check("别的场景的问题不混进来", all("A 场景" not in g for g in got))
 
+    # 「答出来过」看**最近一次**判读（实测坑）：同一句先被联网答出来（written），
+    # 之后关掉联网再导入 → fetched_empty。旧写法因为历史上那条 written 就永久
+    # 判「已掌握」，驾驶舱显示「待学任务 0 个」—— 明明刚刚才答不出来。
+    rows2 = rows + [
+        {"mode": "voyager_consume", "root_scene": "B",
+         "question": "曾经答出来、现在答不出来", "judgment_result": "written"},
+        {"mode": "voyager_consume", "root_scene": "B",
+         "question": "曾经答出来、现在答不出来", "judgment_result": "fetched_empty"},
+        {"mode": "voyager_consume", "root_scene": "B",
+         "question": "先失败后答出来", "judgment_result": "fetched_empty"},
+        {"mode": "voyager_consume", "root_scene": "B",
+         "question": "先失败后答出来", "judgment_result": "written"},
+    ]
+    fake_log.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows2),
+                        encoding="utf-8")
+    scene_learn.COACH_LOG = fake_log
+    try:
+        got2 = [t["question"] for t in scene_learn.scene_questions("B")]
+    finally:
+        scene_learn.COACH_LOG = old_cl
+    check("最近一次没答出来 → 重新进学习清单（旧账的 written 不能抵消）",
+          "曾经答出来、现在答不出来" in got2, str(got2))
+    check("最近一次答出来了 → 不再重学", "先失败后答出来" not in got2, str(got2))
+
     print(f"\n===== 结果：{len(PASS)} 过 / {len(FAIL)} 挂 =====")
     if FAIL:
         for f in FAIL:

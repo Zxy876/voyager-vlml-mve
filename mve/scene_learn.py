@@ -61,8 +61,15 @@ def scene_questions(scene_id: str) -> list[dict[str, Any]]:
     · 没答出来的（fetched_empty / failed）→ 要学；
     · 已经答出来的（written）→ 不重学（同「不再重复出题」）；
     · 待审区条目（人导入了但还没建到活图谱的）也排进来。
+
+    ⚠️ 「答出来过」看**最近一次**的判读，不是「历史上曾经答出来过」。
+    实测（2026-10-19 服务器）：同一句先被联网答出来（written），
+    之后关掉联网能力再导入 → fetched_empty（真空、需外部数据源）。
+    旧写法因为历史上那条 written 就把它永久判「已掌握」，
+    驾驶舱于是显示「待学任务 0 个」—— 明明刚刚才答不出来。
+    当前答不出来 = 要学；历史上答出来过不能抵消这一点。
     """
-    done: set[str] = set()
+    latest: dict[str, str] = {}
     todo: list[str] = []
     try:
         if COACH_LOG.exists():
@@ -73,7 +80,7 @@ def scene_questions(scene_id: str) -> list[dict[str, Any]]:
             rows = []
     except Exception:
         rows = []
-    for r in rows:                                   # 旧→新扫一遍
+    for r in rows:                                   # 旧→新扫一遍：留最后一次判读
         if str(r.get("root_scene") or "") != scene_id:
             continue
         if str(r.get("mode") or "") != "voyager_consume":
@@ -81,8 +88,8 @@ def scene_questions(scene_id: str) -> list[dict[str, Any]]:
         q = str(r.get("question") or "").strip()
         if not q:
             continue
-        if str(r.get("judgment_result") or "") == "written":
-            done.add(q)                              # 答出来过 = 已掌握
+        latest[q] = str(r.get("judgment_result") or "")   # 后写的覆盖先写的
+    done = {q for q, v in latest.items() if v == "written"}
     for r in reversed(rows):                         # 新→旧排任务
         if str(r.get("root_scene") or "") != scene_id:
             continue
