@@ -385,6 +385,62 @@ def test_milestone_closure_writes_skills() -> None:
     print("PASS  test_milestone_closure_writes_skills")
 
 
+def test_observed_tools_are_written_back() -> None:
+    """回写"由谁产出"（用户 2026-10-20 截图纠偏）：闭合维度时把**实测调用过**
+    的动作建成 tool 节点 + produced_by（origin=observed）边 —— 不然图谱的
+    「工具（MCP）」列永远空、来源永远是"无来源"，违背原版"维度由哪个工具
+    产出"的设计哲学（knowledge_graph.py:1556 声明式的 observed 同构）。
+    """
+    import maieutic_scaffold as M
+    from knowledge_graph import KnowledgeGraph
+
+    g = KnowledgeGraph()
+    g.ensure_scene_root("T")
+    g.add_cold_start_node("T", "consume:consume_abc", "dimension",
+                          label="什么是阿斯伯格")
+    dim = {"id": "prevalence", "question": "发病率是多少？", "why": "要有数"}
+    added = M.attach_dimensions(
+        "T", "consume_abc", [dim], verified=True, graph=g,
+        tools={"prevalence": ["web_search", "web_search", "mcp_ddg_search"]})
+    assert len(added) == 1, added
+    # 工具节点建出来了（重复的 web_search 只算一个）
+    assert "tool:web_search" in g.nodes and "tool:mcp_ddg_search" in g.nodes
+    assert g.nodes["tool:web_search"].kind == "tool"
+    # produced_by 边：tool → 维度，origin=observed
+    rels = [(e.src, e.dst, e.relation, e.origin) for e in g.edges
+            if e.dst == "dim:consume_abc:prevalence"
+            and e.relation == "produced_by"]
+    assert {r[0] for r in rels} == {"tool:web_search", "tool:mcp_ddg_search"}, rels
+    assert all(r[3] == "observed" for r in rels), rels
+    # 幂等：同一批再挂一次不重复建边
+    n_edges = len(g.edges)
+    M.attach_dimensions("T", "consume_abc", [dim], verified=True, graph=g,
+                        tools={"prevalence": ["web_search"]})
+    assert len([e for e in g.edges if e.relation == "produced_by"]) * 2 \
+        <= n_edges + 2, "produced_by 边不该翻倍"
+    # 没给 tools → 不建工具节点（老路径不破坏）
+    g2 = KnowledgeGraph()
+    g2.ensure_scene_root("T")
+    M.attach_dimensions("T", "consume_x", [{"id": "d", "question": "q？"}],
+                        verified=True, graph=g2)
+    assert not [n for n in g2.nodes.values() if n.kind == "tool"], \
+        "没实测就别造工具节点"
+    print("PASS  test_observed_tools_are_written_back")
+
+
+def test_called_tools_parses_code() -> None:
+    """从跑通的代码解析动作名（续学补挂 produced_by 时没有新 observations）。"""
+    import learn_orchestrate as L
+    code = ('r1 = web_search("阿斯伯格 发病率")\n'
+            'f = read_json("data.json")\n'
+            'x = mcp_ddg_fetch_content(url="...")\n'
+            'RESULT = {"answer": "…"}')          # 纯答案不产生动作名
+    assert L._called_tools(code) == ["mcp_ddg_fetch_content", "read_json",
+                                     "web_search"], L._called_tools(code)
+    assert L._called_tools('RESULT = {"answer": "纯记忆"}') == []
+    print("PASS  test_called_tools_parses_code")
+
+
 def main() -> None:
     test_parse_and_cache()
     test_plan_uses_dimensions()
@@ -397,6 +453,8 @@ def main() -> None:
     test_one_closed_dimension_is_one_node()
     test_milestone_is_generated_once_and_judged_by_closure()
     test_milestone_closure_writes_skills()
+    test_observed_tools_are_written_back()
+    test_called_tools_parses_code()
     print("\nALL PASS")
 
 

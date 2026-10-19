@@ -333,7 +333,8 @@ def load_progress_codes(scene_id: str, question: str) -> dict[str, dict[str, str
             if isinstance(c, dict) and str(c.get("id") or ""):
                 out[str(c["id"])] = {"question": str(c.get("question") or ""),
                                      "code": str(c.get("code") or ""),
-                                     "answer": str(c.get("answer") or "")}
+                                     "answer": str(c.get("answer") or ""),
+                                     "tools": list(c.get("tools") or [])}
         return out
     except Exception:
         return {}
@@ -355,16 +356,20 @@ def save_progress_codes(scene_id: str, question: str,
         if isinstance(c, dict) and str(c.get("id") or ""):
             merged[str(c["id"])] = {"question": str(c.get("question") or ""),
                                     "code": str(c.get("code") or ""),
-                                    "answer": str(c.get("answer") or "")}
+                                    "answer": str(c.get("answer") or ""),
+                                    "tools": list(c.get("tools") or [])}
     for c in codes:                       # 本轮新跑的覆盖旧的
         cid = str(c.get("id") or "").strip()
         if cid and (str(c.get("code") or "").strip()
                     or str(c.get("answer") or "").strip()):
             merged[cid] = {"question": str(c.get("question") or "")[:200],
                            "code": str(c.get("code") or ""),
-                           "answer": str(c.get("answer") or "")[:800]}
+                           "answer": str(c.get("answer") or "")[:800],
+                           "tools": [str(x) for x in (c.get("tools") or [])
+                                     if str(x).strip()]}
     pr["codes"] = [{"id": k, "question": v["question"], "code": v["code"],
-                    "answer": v["answer"]} for k, v in merged.items()]
+                    "answer": v["answer"], "tools": v["tools"]}
+                   for k, v in merged.items()]
     data["progress"] = pr
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -377,7 +382,8 @@ def save_progress_codes(scene_id: str, question: str,
 def attach_dimensions(scene_id: str, topic_id: str,
                       dimensions: list[dict[str, Any]], *,
                       verified: bool = False, graph: Any = None,
-                      bump: bool = True) -> list[str]:
+                      bump: bool = True,
+                      tools: dict[str, list[str]] | None = None) -> list[str]:
     """把追问骨架的维度**挂进知识图谱**（这是"图谱靠不停学习长大"的那一步）。
 
     每个维度 = 一枚 kind="dimension" 的节点，边 `问题节点 -has_dimension-> 维度`。
@@ -387,6 +393,15 @@ def attach_dimensions(scene_id: str, topic_id: str,
     · 学成功才 verified（verified=True），没学成功就别冒充掌握；
     · parent 找不到时挂到场景根上（边不许悬挂，add_edge 会直接丢弃）。
 
+    `tools` = {维度id: [这一维**实测调用过**的动作名]}（执行层 tracer 记的，
+    不是模型说的）。给了就为每个动作建/复用 `tool:<名>` 节点并连
+    `tool:<名> -produced_by-> 维度`，**origin="observed"** —— 这是 VLML 之外
+    场景的"由谁产出"来源（那边是 rubric 的 answer_spec.tool 声明式
+    `knowledge_graph.py:1556`，origin="declared"；本机/知识型没有 rubric，
+    只能靠实测，与 `knowledge_graph.py:2831` 裁判实测编排的 observed 同款）。
+    ⚠️ 只连**这个维度自己真的调过**的动作 —— 题级/骨架级的"可用工具"不许
+    连 produced_by，否则 who_produces 就废了（knowledge_graph.py:1423 的警告）。
+
     返回新建的节点 id 列表（面板/日志据此显示 Δ 节点数）。
     """
     dims = [d for d in (dimensions or []) if isinstance(d, dict)
@@ -394,7 +409,7 @@ def attach_dimensions(scene_id: str, topic_id: str,
     if not dims:
         return []
     try:
-        from knowledge_graph import KnowledgeGraph, Node, Edge
+        from knowledge_graph import KnowledgeGraph, Node, Edge, PRODUCED_BY
     except Exception:
         return []
     g = graph if graph is not None else KnowledgeGraph.load()
@@ -418,19 +433,31 @@ def attach_dimensions(scene_id: str, topic_id: str,
                 old.status = "verified"
                 if bump:
                     old.evidence = max(int(old.evidence or 0), 1) + 1
-            continue
-        g.add_node(Node(id=did, kind="dimension", label=label[:90],
-                        detail={"why": str(d.get("why") or ""),
-                                "from": "maieutic_spec_gate",
-                                "topic": tid},
-                        root_scene=str(scene_id),
-                        status=("verified" if verified else "unverified"),
-                        evidence=1))
-        if parent in g.nodes:
-            g.add_edge(Edge(src=parent, dst=did, relation="has_dimension",
-                            origin="observed", reason="Maieutic 追问骨架"))
-        added.append(did)
-    if graph is None and added:
+        else:
+            g.add_node(Node(id=did, kind="dimension", label=label[:90],
+                            detail={"why": str(d.get("why") or ""),
+                                    "from": "maieutic_spec_gate",
+                                    "topic": tid},
+                            root_scene=str(scene_id),
+                            status=("verified" if verified else "unverified"),
+                            evidence=1))
+            if parent in g.nodes:
+                g.add_edge(Edge(src=parent, dst=did, relation="has_dimension",
+                                origin="observed", reason="Maieutic 追问骨架"))
+            added.append(did)
+        # 实测"由谁产出"：这一维闭合时真的调用过的动作（不是猜的）。
+        for t in sorted({str(x).strip() for x in (tools or {}).get(
+                str(d.get("id") or ""), []) if str(x).strip()}):
+            tn = f"tool:{t}"
+            if tn not in g.nodes:
+                g.add_node(Node(id=tn, kind="tool", label=t,
+                                root_scene=str(scene_id),
+                                detail={"origin": "learn_loop"}))
+            g.add_edge(Edge(src=tn, dst=did, relation=PRODUCED_BY,
+                            origin="observed",
+                            reason=f"实测：闭合「{label[:36]}」时真的调用过",
+                            confidence=0.95))
+    if graph is None and (added or tools):
         try:
             g.save()
         except Exception:

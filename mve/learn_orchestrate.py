@@ -221,7 +221,8 @@ def learn_milestone_skills(scene_id: str, topic_id: str, question: str,
                            "milestone": out["milestone"],
                            "dimension": did,
                            "question": str(item.get("question") or ""),
-                           "scene": scene_id},
+                           "scene": scene_id,
+                           "tools": list(item.get("tools") or [])},
                 source_scene=str(scene_id or "A"))
             if key:
                 out["added"].append({"key": key, "action": _act, "dim": did})
@@ -230,8 +231,23 @@ def learn_milestone_skills(scene_id: str, topic_id: str, question: str,
     return out
 
 
+def _called_tools(code: str) -> list[str]:
+    """从跑通的代码里解析**调用了哪些动作**（与 consume._RECIPE_CALL 同一族，
+    但这里是提取名字不是判真假 —— 真假判据仍走 `_looks_like_recipe`）。
+
+    为什么需要：执行层 tracer 只在**真的跑起来**时记录（observations 的
+    data_sources）；断点续学补挂时不重跑，只能从**上次跑通的代码**里解析。
+    """
+    import re as _re
+    return sorted({m.group(1) for m in _re.finditer(
+        r"\b(list_files|read_file|read_json|read_csv|query_sql"
+        r"|web_search|web_fetch|http_get|fetch_url"
+        r"|mcp_[A-Za-z0-9_]+)\s*\(", str(code or ""))})
+
+
 def close_one_dimension(scene_id: str, topic_id: str, question: str,
-                        dim: dict[str, Any], *, bump: bool = True) -> list[str]:
+                        dim: dict[str, Any], *, bump: bool = True,
+                        tools: list[str] | None = None) -> list[str]:
     """闭合**一个**（维度）问题 = 落**一枚**节点 —— 最小技能单位。
 
     用户 2026-10-19 定：最小技能单位是一个节点（也就是闭合了一个问题）。
@@ -250,8 +266,10 @@ def close_one_dimension(scene_id: str, topic_id: str, question: str,
         pass
     try:
         import maieutic_scaffold as _ms
-        return list(_ms.attach_dimensions(scene_id, tid, [dim], verified=True,
-                                          bump=bump))
+        did = str(dim.get("id") or "").strip()
+        return list(_ms.attach_dimensions(
+            scene_id, tid, [dim], verified=True, bump=bump,
+            tools=({did: list(tools or [])} if did and tools else None)))
     except Exception:
         return []
 
@@ -501,6 +519,9 @@ async def _start_learning_impl(
                     answers: list[str] = []
                     closed_nodes: list[str] = []
                     dim_codes: list[dict[str, Any]] = []
+                    # {维度id: [实测调用过的动作]} —— 回写图谱 produced_by
+                    # （origin=observed）用的，"工具（MCP）"列的数据源
+                    tools_map: dict[str, list[str]] = {}
                     # 父节点（这枚"问题节点"）的 id 必须与 ⑥ `_absorb` 用同一算法，
                     # 否则循环里先落的维度节点和 ⑥ 后落的会算出两套 id → 不幂等。
                     try:
@@ -529,8 +550,12 @@ async def _start_learning_impl(
                             # 旧代码里 ⑤' 判 partial 会提前 return，出现过"答到
                             # 8 条却颗粒无收"。补挂不重跑、不加证据（bump=False）。
                             closed_nodes.extend(
-                                close_one_dimension(scene, _tid, question, _d,
-                                                    bump=False))
+                                close_one_dimension(
+                                    scene, _tid, question, _d, bump=False,
+                                    tools=list(_old_codes.get(_did, {}).get(
+                                        "tools") or [])
+                                    or _called_tools(
+                                        _old_codes.get(_did, {}).get("code"))))
                             if _did:
                                 closed_ids.add(_did)
                             # 这一轮没重跑，但**上次跑通的代码**还在 —— 那次
@@ -545,6 +570,12 @@ async def _start_learning_impl(
                             _a0 = str(_c0.get("answer") or "").strip()
                             if _a0:
                                 answers.append(f"【{_q1}】{_a0[:500]}")
+                            # 上次跑通的代码里解析调用过的动作 —— 续学不重跑，
+                            # produced_by 的实测证据只能从代码里来
+                            _t0 = (list(_c0.get("tools") or [])
+                                   or _called_tools(_c0.get("code")))
+                            if _t0:
+                                tools_map[_did] = _t0
                             continue
                         # 原版重试机制（用户 2026-10-19 定，同 voyager.py:30
                         # `action_agent_task_max_retries=4` + :277-279
@@ -590,17 +621,29 @@ async def _start_learning_impl(
                             a1 = str(r1.get("answer") or "").strip()
                             if a1:
                                 answers.append(f"【{_q1}】{a1[:500]}")
+                            # 这条维度**实测**调用过的动作（执行层 tracer 记的；
+                            # tracer 空就从代码解析兜底）——回写图谱的工具来源
+                            _t1 = sorted({s for o in obs1
+                                          for s in (o.get("data_sources") or [])
+                                          if str(s).strip()}) \
+                                or _called_tools(code1)
+                            if _did and _t1:
+                                tools_map[_did] = _t1
+                            dim_codes.append({"id": _did, "question": _q1,
+                                              "code": str(code1 or ""),
+                                              "answer": str(a1 or ""),
+                                              "tools": list(tools_map.get(_did)
+                                                            or [])})
                             # 最小技能单位 = **一枚节点 = 闭合一个（维度）问题**
                             # （用户 2026-10-19 定）：闭合一条就落一条，不等整个
                             # 任务闭合 —— 否则 8/9 那种 partial 会因为 ⑤' 提前
                             # return 而颗粒无收（2026-10-19 服务器实测）。
                             closed_nodes.extend(
-                                close_one_dimension(scene, _tid, question, _d))
+                                close_one_dimension(
+                                    scene, _tid, question, _d,
+                                    tools=tools_map.get(_did)))
                             if _did:
                                 closed_ids.add(_did)
-                            dim_codes.append({"id": _did, "question": _q1,
-                                              "code": str(code1 or ""),
-                                              "answer": str(a1 or "")})
                         else:
                             failed_dims.append({
                                 "id": _did, "question": _q1,
@@ -773,7 +816,11 @@ async def _start_learning_impl(
             # 同一节点会被记两次证据。
             good = [d for d in good if str(d.get("id") or "") not in closed_ids]
             out["dimension_nodes"] = list(out.get("dimension_nodes") or []) + list(
-                _ms.attach_dimensions(scene, tid, good, verified=True))
+                _ms.attach_dimensions(
+                    scene, tid, good, verified=True,
+                    tools={str(d.get("id") or ""): tools_map.get(
+                        str(d.get("id") or ""), [])
+                        for d in good if tools_map.get(str(d.get("id") or ""))}))
         except Exception as e:
             out["dimension_nodes_error"] = f"{type(e).__name__}: {e}"
     out["milestone"] = {"topic_id": tid, "unlocked": False}

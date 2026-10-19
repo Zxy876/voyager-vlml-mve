@@ -1723,13 +1723,18 @@ ${ESC(REL[e.relation]&&REL[e.relation][1]||e.relation)}${e.origin==='observed'?'
 
   // 下方位清单：照伴学 relation_groups —— 图看结构，清单看内容
   const dims=cols.dimension.map(n=>n.label);
-  const rows=dims.map(d=>{
-    const prod=[...new Set(edges.filter(e=>e.to==='dim:'+d&&e.relation==='produced_by')
+  const rows=cols.dimension.map(n=>{
+    const d=n.label;
+    // ⚠️ 按节点 id 匹配，不拼 'dim:'+label：VLML 种子维度 id 恰好是
+    // `dim:<维度名>`，但学习闭环落的维度 id 是 `dim:<topic>:<slug>`，label 是
+    // 整句问题 —— 拼 label 永远匹配不上，「由谁产出/来源」就全是"无来源"
+    // （2026-10-20 用户截图纠偏）。
+    const prod=[...new Set(edges.filter(e=>e.to===n.id&&e.relation==='produced_by')
       .map(e=>(byId[e.from]||{}).label||e.from))];
-    const tbl=[...new Set(edges.filter(e=>e.to==='dim:'+d&&e.relation==='derived_from')
+    const tbl=[...new Set(edges.filter(e=>e.to===n.id&&e.relation==='derived_from')
       .map(e=>(byId[e.from]||{}).label||e.from))];
-    const conf=[...new Set(edges.filter(e=>e.relation==='confusable'&&(e.to==='dim:'+d||e.from==='dim:'+d))
-      .map(e=>(e.to==='dim:'+d?(byId[e.from]||{}):(byId[e.to]||{})).label||''))].filter(Boolean);
+    const conf=[...new Set(edges.filter(e=>e.relation==='confusable'&&(e.to===n.id||e.from===n.id))
+      .map(e=>(e.to===n.id?(byId[e.from]||{}):(byId[e.to]||{})).label||''))].filter(Boolean);
     const src=prod.length?`<span class="chip ok">${prod.map(ESC).join('、')}</span>`
                          :(tbl.length?`<span class="chip grey">表 ${tbl.map(ESC).join('、')}</span>`
                                      :`<span class="chip warn">无来源</span>`);
@@ -1754,7 +1759,11 @@ ${ESC(REL[e.relation]&&REL[e.relation][1]||e.relation)}${e.origin==='observed'?'
       ${colTitle}${es}${ns}
     </svg>
     <div class="note info" style="margin-top:10px">判错时反馈里的「这个维度由哪个工具产出」
-      就来自这张图 —— 它是 <span class="mono">answer_spec.tool</span> 声明出来的，不是模型猜的。
+      就来自这张图。来源有两种，都不是模型猜的：
+      VLML 是 <span class="mono">answer_spec.tool</span> <b>声明</b>出来的
+      （origin=declared）；本机/知识型场景没有 rubric，来源是<b>实测</b> ——
+      闭合这个维度时执行层<span class="mono">tracer</span> 真的调用过的动作
+      （origin=observed，学习回写时落的 produced_by 边）。
       冷启动期新建的维度（淡黄虚线框）即使还没连边也会画出来 —— 它是问题"插进场景"的
       可见证明（证据数=1、待验证）；VLML 那些没被任何题用到的工具仍不画（避免图变乱）。
       <br><b>点任意维度</b>（或下表按钮）把它设成练习范围，出题器就只在这范围里出题。</div>
