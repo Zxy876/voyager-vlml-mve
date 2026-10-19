@@ -78,6 +78,46 @@ def test_queue_priority_and_retry() -> None:
     print("PASS  test_queue_priority_and_retry")
 
 
+def test_needs_data() -> None:
+    """题面分型：数据型 vs 知识型（决定要不要把"没取数"判死）。"""
+    import task_critic as T
+    assert T.needs_data("projects.json 中哪些项目的 2026 年 stars 比 2025 年多？")
+    assert T.needs_data("库里有多少行记录？")
+    assert T.needs_data("2026 年最热门的 AI 开源项目有哪些？")
+    assert not T.needs_data("阿斯伯格孩子怎么养育？")
+    assert not T.needs_data("如何理解孩子的情绪崩溃？")
+    print("PASS  test_needs_data")
+
+
+def test_knowledge_vs_data_judge() -> None:
+    """知识型：没取数也交 LLM 判（原版就是 LLM 判）；数据型：没取数直接失败。"""
+    import task_critic as T
+    calls: list[int] = []
+
+    def llm_ok(msgs):
+        calls.append(1)
+        return '{"reasoning":"答案切题且有依据","success":true,"critique":""}'
+
+    # 知识型 + 有答案 + 没数据源 → 叫 LLM，判成功
+    ok, crit = T.check_task_success(
+        "阿斯伯格孩子怎么养育？", "知识型问题",
+        {"execution": {"ok": False, "real_calls": 0, "calls": 1, "rows": 0},
+         "answer": "结构化养育建议：明确规则、视觉化日程、情绪共情……"},
+        llm=llm_ok)
+    assert ok is True and len(calls) == 1, (ok, calls)
+
+    # 数据型 + 有答案 + 没数据源 → 直接失败，不叫 LLM（真空防线保持）
+    calls.clear()
+    ok2, crit2 = T.check_task_success(
+        "projects.json 里 star 增长最多的是哪个？", "数据型",
+        {"execution": {"ok": False, "real_calls": 0, "calls": 1, "rows": 0},
+         "answer": "Ollama（凭记忆）"},
+        llm=llm_ok)
+    assert ok2 is False and calls == [], (ok2, calls)
+    assert "数据" in crit2
+    print("PASS  test_knowledge_vs_data_judge")
+
+
 def test_critic_shortcut() -> None:
     """critic 真空短路：没取到真数直接 False，不叫 LLM（原版 messages[1] is None）。"""
     import task_critic
@@ -124,6 +164,8 @@ def main() -> None:
     test_parse_ai_message()
     test_two_books()
     test_queue_priority_and_retry()
+    test_needs_data()
+    test_knowledge_vs_data_judge()
     test_critic_shortcut()
     test_critic_parse_retry()
     print("\nALL PASS")

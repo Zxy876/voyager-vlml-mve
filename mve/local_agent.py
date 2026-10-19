@@ -204,11 +204,14 @@ PROMPT_SYSTEM = """你是本机数据助手。你能用的是**这个应用工�
 2. 把最终答案赋给 `RESULT`（列表或字典），**答案必须来自你调用上面函数取回的真实数据**；
    联网拿到的答案要带来源 URL；
 3. 不要 print，不要 import，不要写文件；
-4. **必须调用至少一个数据源函数**（list_files/read_file/read_json/query_sql/
-   web_search/web_fetch/mcp_*）。⛔ 绝对不许把训练记忆里的事实直接写成
-   `RESULT = [...]` 交上来 —— 那是编造、不算取到数，会被判失败让你重写。问
-   「热门的/最新的/2026 的/排行/推荐」这类时效性问题，**一定**先 web_search
-   （或 mcp_* 联网工具），再据检索到的真实结果作答；
+4. **先判断这题要不要数据**：
+   · 要数据（文件/库/表/统计/排名/多少/最新/热门/推荐…）→ **必须调用至少一个
+     数据源函数**（list_files/read_file/read_json/query_sql/web_search/
+     web_fetch/mcp_*），不许把训练记忆里的东西写成 `RESULT` 交上来；时效性问题
+     一定先 web_search（或 mcp_* 联网工具），再据检索到的真实结果作答；
+   · 不要数据（方法/建议/解释类，例如「阿斯伯格孩子怎么养育」）→ 可以**直接
+     写答案**（`RESULT = {"answer": "..."}`），但要写清楚依据来自哪里（公认方法/
+     权威指南/检索到的来源），不要编具体数字和人名；有网就 web_search 补依据；
 5. 本机问题按下面的文件清单直接读，不要猜文件名/扩展名（猜错就取不到数）；
    **read_json 返回的是整个对象**：数据列表通常在某一个键下面（清单里给了
    结构预览，按预览里的真实键名取值，别直接 `for x in read_json(...)` 遍历
@@ -328,17 +331,24 @@ async def solve(question: str, scene_dir: str, *, llm=None,
         data, why_empty = _payload(ns.get("RESULT"))
         rows = len(data) if isinstance(data, list) else (1 if data else 0)
         err = str(res.get("error") or "")
-        # ⚠️ 真空成功的新形态：代码跑通、RESULT 非空，却一次数据源都没调 ——
-        # 这正是服务器实测踩到的（问热门 AI 开源项目，模型直接把训练记忆里的
-        # Transformers/PyTorch 列表写进 RESULT，一次都没 web_search）。不算取到数，
-        # 把原因喂回去让它改（:20 的「学到」判据 `_has_real` 也靠这个 ok=False）。
-        if not err and res.get("ok") and data is not None and not tracer:
-            err = ("没调用任何数据源（web_search/web_fetch/read_json/query_sql/"
-                   "mcp_* 等）——答案疑似凭训练记忆编造，不算取到数；"
-                   "请调用联网/本机原语去取真实数据再作答")
+        # 真空成功：代码跑通、RESULT 非空，却一次数据源都没调。**只对数据型任务
+        # 判失败**（题面要文件/库/统计/时效）——「阿斯伯格孩子怎么养育」这类知识
+        # 型问题本来就没有数据可取，一刀切会把它们全部判死（2026-10-19 实测连判
+        # 4 次 no_data）。知识型交 critic 用 LLM 判（照原版 critic.py 的口径）。
+        try:
+            import task_critic as _tc
+            _needs_data = _tc.needs_data(question)
+        except Exception:
+            _needs_data = True
+        if not err and res.get("ok") and data is not None and not tracer and _needs_data:
+            err = ("这题要具体数据（文件/库/统计/时效），但没调用任何数据源"
+                   "（list_files/read_file/read_json/query_sql/web_search/"
+                   "web_fetch/mcp_*）——答案疑似凭训练记忆编造，不算完成；"
+                   "请调用数据源取真实数据再作答")
         o = {"ok": bool(res.get("ok")) and data is not None and not err,
              "tool": "local_python", "rows": rows, "data": data,
              "data_sources": list(tracer),
+             "evidence": ("data" if tracer else "knowledge"),
              "error": err or ("" if data is not None else why_empty)}
         obs.append(o)
         if o["ok"]:

@@ -194,7 +194,7 @@ def _run_one(q: str, scene: str, *, context: str = "",
         t0 = time.time()
         try:
             r = asyncio.run(learn_orchestrate.start_learning(
-                q, scene, critique=critique))
+                q, scene, critique=critique, judge=True, context=context))
         except Exception as e:
             r = {"status": "failed", "why": f"{type(e).__name__}: {e}"}
         status = str(r.get("status") or "")
@@ -205,13 +205,18 @@ def _run_one(q: str, scene: str, *, context: str = "",
              + (f" · 后端={((r.get('backend') or {}).get('kind'))}"
                 if r.get("backend") else ""))
         _log_learning_detail(r)
-        # 完成判定（原版 critic.check_task_success 的同构：LLM 判任务达成与否，
-        # 没取到真数直接 False 不叫 LLM —— 见 task_critic.py）
-        try:
-            import task_critic
-            success, critique2 = task_critic.check_task_success(q, context, r)
-        except Exception as e:
-            success, critique2 = False, f"critic 失败：{type(e).__name__}: {e}"
+        # 完成判定：learn_orchestrate 里已经调过 critic（judge=True，原版在
+        # rollout 判、判过才入库）。这里只取结论；没判过（prepared/unreachable）
+        # 才自己再判一次。
+        c = r.get("critic") or {}
+        if "success" in c:
+            success, critique2 = bool(c.get("success")), str(c.get("critique") or "")
+        else:
+            try:
+                import task_critic
+                success, critique2 = task_critic.check_task_success(q, context, r)
+            except Exception as e:
+                success, critique2 = False, f"critic 失败：{type(e).__name__}: {e}"
         info.update(task=q, success=bool(success),
                     critique=str(critique2 or ""), attempts=i + 1, result=r)
         _log("  · critic 判完成：" + ("是" if success else "否")

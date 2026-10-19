@@ -3017,6 +3017,14 @@ class Handler(BaseHTTPRequestHandler):
                                     for n in sn[:8]]
                 except Exception:
                     pass
+                # 知识型问题（怎么养育/如何理解…）本来就没有"库域"可命中 ——
+                # 别把它当"归错场景"劝人换场景（2026-10-19 用户实测踩过）。
+                _needs_data = True
+                try:
+                    import task_critic as _tc2
+                    _needs_data = bool(_tc2.needs_data(q))
+                except Exception:
+                    pass
                 self._json(200, {
                     "scene_id": sid,
                     "decision": m["decision"],
@@ -3034,7 +3042,8 @@ class Handler(BaseHTTPRequestHandler):
                     "out_of_domain": bool(
                         m["decision"] == "REJECTED"
                         and int(m["max_score"]) < 10
-                        and scene_nodes > 0),
+                        and scene_nodes > 0
+                        and _needs_data),
                 })
             except Exception as e:
                 self._json(500, {"error": f"{type(e).__name__}: {e}"[:200]})

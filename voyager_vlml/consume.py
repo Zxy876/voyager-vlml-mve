@@ -1435,7 +1435,7 @@ def _ability_universe() -> set[str]:
 
 
 def _absorb(question: str, sql: str, topic_id: str,
-            *, scene_id: str = "") -> dict[str, Any]:
+            *, scene_id: str = "", answer: str = "") -> dict[str, Any]:
     """答完了 → **这题就到他的能力里了 → 这就是掌握**（用户 2026-10-13 定）。
 
     掌握不是覆盖率折算出来的一个分数，而是**能力集合的增长**：
@@ -1457,7 +1457,9 @@ def _absorb(question: str, sql: str, topic_id: str,
     out: dict[str, Any] = {"mastered": False, "skill_action": "",
                            "mastered_total": 0, "ability_total": 0, "topic_id": "",
                            "cold_start": False, "root_scene": "", "node_status": ""}
-    if not sql:
+    # 知识型任务（怎么养育/如何理解…）没有取数 SQL，但有答案 —— 照样算"答出来了"，
+    # 建节点 + 标掌握；只是不写技能库（技能存的是**可执行配方**，答案本身不是配方）。
+    if not sql and not str(answer or "").strip():
         return out
     # 1→n 泛化：当前场景（冷启动节点与技能都归属它）。
     # ⚠️ 必须先解析再使用：`_scene_id` 在下面有赋值，Python 把它当本函数局部
@@ -1515,6 +1517,9 @@ def _absorb(question: str, sql: str, topic_id: str,
         print(f"  （标记掌握失败：{type(e).__name__}: {e}）")
         return out
 
+    if not str(sql or "").strip():
+        out["skill_action"] = "知识型答案（无可执行配方，不写技能库）"
+        return out
     try:
         import skill_store
         have = [k for k in (skill_store._load_raw().get("skills") or {})

@@ -16,13 +16,18 @@
 MVE 同构
 --------
   events/观察      → 执行层的 observations（local_agent / VLMLActionAgent 产出：
-                     data / data_sources / rows / sql / error）
-  onError → None   → 没有取到真数（data_sources 为空 或 ok=False）→ 直接判 False，
-                     不叫 LLM（比原版更严：真空成功在 MVE 是硬性失败）
+                     data / data_sources / rows / sql / error）+ answer 文本
+  onError → None   → 执行层报错（没有答案）→ 直接判 False，不叫 LLM
+  数据型任务        → 题面本身要求具体数据（文件/表/多少/排名/统计/最新…）却
+                     一次数据源都没调 → 直接判 False（真空防线；见 needs_data）
+  知识型任务        → 「怎么养育」「如何理解」这类不需要取数的问题 → **交给 LLM
+                     critic 判**（原版本来就是 LLM 判，不要求环境里有"数据"）
   Task/Context     → 同一句任务与 context
   输出契约不变      → {"reasoning","success","critique"}，解析失败重试 5 次
 
-⚠️ 只判「任务目标在观察里是否达成」，**不拿 VLML 判分当完成判据**（用户硬约束）。
+⚠️ 为什么不能一刀切「必须取数」：2026-10-19 实测，人导入「阿斯伯格孩子怎么
+养育」，本机没有数据也不该有 —— 旧判据连判 4 次 no_data，还把问题当"域外"引导
+换场景。原版 Voyager 的 critic 判的是**任务目标有没有达成**，不是"有没有查库"。
 """
 
 from __future__ import annotations
@@ -31,17 +36,37 @@ import json
 import re
 from typing import Any
 
-_SYSTEM = """你是 Voyager 的 critic：评估一个「只读本机工作区」的助手有没有完成给定任务。
+# 题面里出现这些词 = 这题要的是**具体数据**（文件/库/统计/时效），
+# 没取到真数就是没完成。反之（养育/方法/解释类）= 知识型，交给 LLM 判。
+_DATA_HINTS = re.compile(
+    r"(\.json|\.csv|\.db|\.duckdb|\.xlsx|\.parquet|\.txt|文件|目录|表|库|"
+    r"多少|几个|几次|几成|排名|排行|统计|平均|总和|合计|最高|最低|最大|最小|"
+    r"增长|下降|比例|占比|行数|记录|条目|字段|列名|"
+    r"sql|SQL|查询|检索|数据库|"
+    r"最新|最近|今年|今天|现在|当前|实时|热门|推荐|榜单|star|stars)"
+)
+
+
+def needs_data(question: str) -> bool:
+    """这题是不是「必须取数才算完成」的数据型任务（原版没有这一档，MVE 的
+    真空防线需要它：不区分题型就要求取数 = 把知识型问答全判死）。"""
+    return bool(_DATA_HINTS.search(str(question or "")))
+
+_SYSTEM = """你是 Voyager 的 critic：评估一个助手有没有完成给定的任务。
 
 我会给你：
 - 任务 Task 与上下文 Context（完成标准写在里面）
-- 执行观察：它写/跑了什么、调了哪些数据源、取回了什么数据、有没有报错
+- 执行观察：它写了什么代码、调了哪些数据源、取回了什么数据、最终答案是什么、有没有报错
 
-判定口径（照原版）：
+判定口径（照原版：只看任务目标有没有达成）：
 - 任务要求达到或超过 → success=true；没达到 → success=false，并且必须给 critique
   告诉它差在哪、下一步怎么改（critique 会被拼进它的下一次尝试，别写空话）。
-- 观察里的数据是**真实取回的**才能算成功；只说了结论、没取数、数据与任务无关、
-  或取回的是空表/错误 → success=false。
+- 两类任务要分开看：
+  · **数据型**任务（题面要求具体文件/库/统计/排名/时效事实）：必须有**真实取回
+    的数据**支撑。只给结论、没取数、取回空表或与任务无关 → success=false。
+  · **知识型**任务（怎么养育/如何理解/为什么、方法或解释类）：不要求取数。
+    答案切题、有依据、不自相矛盾、不编造具体数字/来源 → success=true；
+    空话套话、答非所问、编造事实 → success=false 并指出缺什么。
 - 只看任务目标，不看代码写得漂不漂亮。
 
 只输出 JSON（能被 json.loads 解析，不许注释/单引号）：
@@ -50,7 +75,7 @@ _SYSTEM = """你是 Voyager 的 critic：评估一个「只读本机工作区」
 
 
 def _evidence_text(result: dict[str, Any], limit: int = 1600) -> str:
-    """把一轮学习结果渲染成原版那种"观察"文本。"""
+    """把一轮学习结果渲染成原版那种"观察"文本（含答案，知识型任务靠它判）。"""
     ex = result.get("execution") or {}
     lines: list[str] = []
     lines.append(f"执行后端: {result.get('execution_backend') or (result.get('backend') or {}).get('kind') or '未知'}")
@@ -61,8 +86,14 @@ def _evidence_text(result: dict[str, Any], limit: int = 1600) -> str:
     sql = str(ex.get("sql") or "").strip()
     if sql:
         lines.append("执行内容（前 800 字）:\n" + sql[:800])
-    # 观察明细（data）——local_agent 的 observations 没直接进 result，但有 execution 汇总；
-    # 若有 absorbed/结晶，说明取到过真值。
+    ans = str(result.get("answer") or "").strip()
+    if ans:
+        lines.append("最终答案（RESULT）:\n" + ans[:800])
+    # 观察明细（每轮返回什么、调了哪个数据源）—— 知识型任务没有数据源，
+    # 但也要让 critic 看见模型到底交了什么。
+    obs = result.get("observations") or []
+    if obs:
+        lines.append("各轮观察: " + json.dumps(obs[-3:], ensure_ascii=False)[:600])
     ab = result.get("absorbed") or {}
     if ab:
         lines.append(f"入库: topic={ab.get('topic_id')} mastered={ab.get('mastered')}")
@@ -72,14 +103,21 @@ def _evidence_text(result: dict[str, Any], limit: int = 1600) -> str:
 
 def check_task_success(task: str, context: str, result: dict[str, Any], *,
                        llm=None, max_retries: int = 5) -> tuple[bool, str]:
-    """返回 (success, critique)。原版语义：出错/没取到数 → (False, ""), 不叫 LLM。"""
+    """返回 (success, critique)。照原版：出错 → (False, "")；其余交 LLM 判。
+
+    唯一的硬门槛是**数据型任务的真空**（题面要数据、却一个数据源都没调），
+    知识型任务不再要求取数 —— 否则「阿斯伯格孩子怎么养育」这种问题永远判死。
+    """
     ex = result.get("execution") or {}
     real = int(ex.get("real_calls") or 0)
-    ok = bool(ex.get("ok"))
+    answer = str(result.get("answer") or "").strip()
     # 原版 critic.py:137-... `messages[1] is None → (False, "")` 的同构：
-    # 没有真取到数（真空/报错）就不必叫 LLM 判，直接失败。
-    if not ok or real <= 0:
-        return False, str(result.get("why") or "没取到真数（执行层失败/空结果）")[:300]
+    # 执行层连答案都没产出（报错/空结果）才直接失败，不叫 LLM。
+    if not answer and not real:
+        return False, str(result.get("why") or "执行层没有产出答案（报错/空结果）")[:300]
+    if needs_data(task) and real <= 0:
+        return False, ("这题要具体数据（文件/库/统计/时效），但一次数据源都没调、"
+                       "没有真实取数 —— 不算完成")[:300]
     return ai_check_task_success(task, context, result, llm=llm,
                                 max_retries=max_retries)
 

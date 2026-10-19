@@ -40,6 +40,7 @@ update_exploration_progress → 下一轮。本模块的 `start_learning()` 就�
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import threading
 import time
@@ -122,6 +123,26 @@ def on_miss(question: str, scene_id: str = "", *,
     return out
 
 
+def _answer_text(obs: list[dict[str, Any]]) -> str:
+    """取最后一轮观察里的 RESULT 当"答案"（critic 判知识型任务靠它）。
+
+    原版 critic 看的是环境观察（inventory 等）；MVE 的知识型任务没有环境数据，
+    模型交的 RESULT 就是全部证据 —— 不把它交给 critic，critic 只能看执行汇总，
+    等于让它猜。截断到 1200 字，够判切不切题。
+    """
+    for o in reversed(obs or []):
+        d = (o or {}).get("data")
+        if d in (None, "", [], {}):
+            continue
+        try:
+            if isinstance(d, str):
+                return d[:1200]
+            return json.dumps(d, ensure_ascii=False)[:1200]
+        except Exception:
+            return str(d)[:1200]
+    return ""
+
+
 def _has_real(obs: list[dict[str, Any]]) -> bool:
     """至少一次观察取到了**真数**（批判据复用 critic.has_real_data，不重造）。"""
     if not obs:
@@ -143,6 +164,8 @@ async def start_learning(
     execute: bool = True,
     use_mcp: bool = True,
     critique: str = "",
+    judge: bool = False,
+    context: str = "",
 ) -> dict[str, Any]:
     """启动一轮学习（同构 learn() 单圈）。返回全量过程记录，失败如实带 why。
 
@@ -154,7 +177,8 @@ async def start_learning(
     try:
         return await _start_learning_impl(
             question, scene_id, llm=llm, db_path=db_path,
-            execute=execute, use_mcp=use_mcp, critique=critique)
+            execute=execute, use_mcp=use_mcp, critique=critique,
+            judge=judge, context=context)
     finally:
         if use_mcp:
             try:
@@ -173,6 +197,8 @@ async def _start_learning_impl(
     execute: bool = True,
     use_mcp: bool = True,
     critique: str = "",
+    judge: bool = False,
+    context: str = "",
 ) -> dict[str, Any]:
     """启动一轮学习（同构 learn() 单圈）的实现体（断开逻辑见外层 start_learning）。"""
     question = str(question or "").strip()
@@ -349,13 +375,35 @@ async def _start_learning_impl(
                                   if _has_real([o])),
                 "rows": sum(int(o.get("rows") or 0)
                             for o in (observations or []) if o.get("ok")),
+                "data_sources": sorted({s for o in (observations or [])
+                                        for s in (o.get("data_sources") or [])}),
             }
+            # 答案与逐轮观察留给 critic / 面板（知识型任务没有数据源，critic 靠答案判）
+            out["answer"] = _answer_text(observations)
+            out["observations"] = [
+                {"ok": bool(o.get("ok")), "rows": int(o.get("rows") or 0),
+                 "data_sources": list(o.get("data_sources") or []),
+                 "evidence": str(o.get("evidence") or ""),
+                 "error": str(o.get("error") or "")[:200],
+                 "data": (json.dumps(o.get("data"), ensure_ascii=False)[:600]
+                          if not isinstance(o.get("data"), str)
+                          else str(o.get("data"))[:600])}
+                for o in (observations or [])][-4:]
             if not real:
-                out.update(status="no_data",
-                           why="执行层跑通了但没取到真数（空表/真空值）——"
-                               "原版铁律：失败不写技能库，不结晶不建点")
-                _record(out)
-                return out
+                # 数据型任务：没取到真数 = 没完成（真空防线，保持）。
+                # 知识型任务（怎么养育/如何理解…）：本来就没有数据可取 —— 交给下面
+                # 的 critic 用 LLM 判，别一刀切判死（2026-10-19 用户实测踩过）。
+                try:
+                    import task_critic as _tc
+                    _needs = _tc.needs_data(question)
+                except Exception:
+                    _needs = True
+                if _needs:
+                    out.update(status="no_data",
+                               why="执行层跑通了但没取到真数（空表/真空值）——"
+                                   "原版铁律：失败不写技能库，不结晶不建点")
+                    _record(out)
+                    return out
         except Exception as e:
             out.update(status="failed",
                        why=f"执行层失败：{type(e).__name__}: {e}")
@@ -367,11 +415,29 @@ async def _start_learning_impl(
         _record(out)
         return out
 
-    # ---- ⑥ 取到值 → 图谱建点 + 掌握 + 配方入库（复用消费侧同一套账）----
+    # ---- ⑤' 完成判定（原版 critic.check_task_success 的同构）----
+    # 放在入库**之前**：判定结果决定这一轮算不算学到（原版 voyager.py:230 在
+    # step 里判，判过才 add_new_skill、update_exploration_progress）。
+    if judge:
+        try:
+            import task_critic
+            _ok, _crit = task_critic.check_task_success(
+                question, str(context or ""), out)
+        except Exception as e:
+            _ok, _crit = bool(real), f"critic 异常：{type(e).__name__}: {e}"
+        out["critic"] = {"success": bool(_ok), "critique": str(_crit or "")}
+        if not _ok:
+            out.update(status=("no_data" if not real else "failed"),
+                       why=(str(_crit or "") or "critic 判未完成")[:300])
+            _record(out)
+            return out
+
+    # ---- ⑥ 判过 → 图谱建点 + 掌握 + 配方入库（复用消费侧同一套账）----
     try:
         import voyager_vlml.consume as _consume
         out["absorbed"] = _consume._absorb(question, sql, "",
-                                          scene_id=scene)
+                                          scene_id=scene,
+                                          answer=out.get("answer", ""))
     except Exception as e:
         out.update(status="failed",
                    why=f"入库失败（_absorb）：{type(e).__name__}: {e}")
@@ -395,8 +461,8 @@ async def _start_learning_impl(
     try:
         import skill_store
         import plugin_forge
-        fresh = [s for s in skill_store.all_skills()
-                 if str(s.get("code") or "") == str(sql)]
+        fresh = ([s for s in skill_store.all_skills()
+                  if str(s.get("code") or "") == str(sql)] if str(sql).strip() else [])
         if fresh:
             out["crystallized"] = plugin_forge.crystallize_skill(
                 fresh[-1], into_scene=scene,
