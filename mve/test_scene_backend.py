@@ -386,6 +386,34 @@ def main() -> int:
           not any(k["scene"] == "B" and "本机" in k["reason"] for k in KICKS),
           str([(k["scene"], k["reason"]) for k in KICKS])[:110])
 
+    # 「没取到数不记账」——上面那次自报 error 的代码，绝不能变成配方入库。
+    # 否则闭环永远停在「命中但不回答」：下一问命中它、重放出 RESULT=error，
+    # 账面命中率很好看，就是一个字都没答（2026-10-19 截图「命中 1 · 有效率 0%」）。
+    bad_in_store = [s for s in skill_store.all_skills()
+                    if "本机找不到需要的数据" in str(s.get("code") or "")]
+    check("取不到数的代码没被结晶进技能库（没取到就不记账）",
+          not bad_in_store, str([s.get("name") for s in bad_in_store]))
+    check("那次 reused 必须是 False（没配方可复用就别假装命中）",
+          empty.get("reused") is False, f"reused={empty.get('reused')}")
+
+    # 反向验证：就算库里**历史上已经**躺了一条坏配方（旧版本误写的），
+    # 命中时也必须被真空判据挡下 —— 不能把 error 当答案交上去。
+    skill_store.add("坏配方", "bad_recipe", "量子计算机现在的纠错水平",
+                    code='RESULT = {"error": "本机工作区里没有能回答这个问题的数据"}',
+                    source="consume", source_scene="F")
+    FAKE.queue.clear()          # 不给模型任何改写机会：它若不挡下就只能交 error
+    stale = asyncio.run(consume_mod.consume("量子计算机现在的纠错水平"))
+    check("库里有坏配方也不会把 RESULT=error 当答案交上去",
+          stale.get("answer") == "" and stale.get("reused") is False,
+          f"reused={stale.get('reused')} answer={str(stale.get('answer'))[:40]}")
+    check("而是照旧判 fetched_empty + 如实说没取到",
+          stale.get("judgment_result") == "fetched_empty"
+          and "本机工作区里没有" in str(stale.get("skipped")),
+          str(stale.get("judgment_result")))
+    check("挡下的每一条都留了证据（不静默跳过）",
+          any("没取到数" in str(x) for x in (stale.get("reuse_errors") or [])),
+          str(stale.get("reuse_errors"))[:110])
+
     # =====================================================================
     print("\n== 6. 学习侧同样按后端分流（A 走 VLML，B 走本机）==")
     # =====================================================================
@@ -413,7 +441,9 @@ def main() -> int:
           str(outB["crystallized"].get("entry")))
     check("B 学到的技能归属 B（不记到 A 头上）",
           all(s.get("source_scene") in ("B", "default")
-              for s in skill_store.all_skills()),
+              for s in skill_store.all_skills()
+              # bad_recipe 是上一段故意塞进 F 的诱饵，不算学习产物
+              if s.get("name") != "bad_recipe"),
           str([(s.get("name"), s.get("source_scene"))
                for s in skill_store.all_skills()])[:80])
 

@@ -603,18 +603,28 @@ async def consume(
         code = ""
         obs: list[dict[str, Any]] = []
         reused_skill: dict[str, Any] | None = None
+        reuse_errors: list[str] = []
         for s in skills:
             sc = str(s.get("code") or "")
             if "RESULT" not in sc:
                 continue
             try:
                 val = _la.run_saved(sc, _scene_dir, scene_id=_scene_id)
-            except Exception:
-                val = None
-            if val in (None, [], {}):
+            except Exception as e:
+                reuse_errors.append(f"重放 {s.get('name')} 抛错：{e}")
                 continue
-            data, code, reused_skill = val, sc, dict(s)
-            obs = [{"ok": True, "tool": "local_python", "rows": 1, "data": val}]
+            # ⚠️ 重放结果必须过真空判据：`{"error": ...}` / 空值**不算答出来**。
+            # 实测（2026-10-19 截图「命中 1 · 有效率 0%」）：命中后复用一条
+            # 历史错误配方，它把 RESULT=error 当答案交了上去 —— 命中了、
+            # 掌握度也有了、就是没回答问题。所以这里与 critic 同一口径：
+            # error/空 → 这条配方当失败，换下一条；全失败就现场重写。
+            data_try, err_try = _la._payload(val)
+            if data_try is None:
+                reuse_errors.append(f"重放 {s.get('name')} 没取到数：{err_try}")
+                continue
+            data, code, reused_skill = data_try, sc, dict(s)
+            obs = [{"ok": True, "tool": "local_python", "rows": 1,
+                    "data": data_try}]
             break
         # ③b 没有可复用的配方 → 现场写
         if reused_skill is None:
@@ -665,6 +675,8 @@ async def consume(
                               "key": reused_skill.get("key")}]
                             if reused_skill else []),
             "reused": bool(reused_skill), "graph_link": {},
+            # 复用阶段被真空判据挡下的每一条，都留下证据（不静默跳过）
+            "reuse_errors": reuse_errors,
             "judgment_result": "written" if data is not None else "fetched_empty",
             "skipped": ("" if data is not None else
                         ("本机工作区里没有能回答它的数据（" + _scene_why + "）"
@@ -672,7 +684,12 @@ async def consume(
                          "工作区/场景目录，不联网、也不翻操作者的私人文件；"
                          "这类问题需要外部数据源")),
         }
-        if not reused_skill:          # 复用已有配方时不必再记一遍账
+        # ⑤ 结晶进技能库的闸门：**只有真取到数才记账**。
+        # 复用已有配方时不必再记一遍账；没取到数（data is None）时绝不能
+        # 把这段代码写进技能库 —— 否则下一问命中它、重放出 RESULT=error，
+        # 闭环就永远停在「命中但不回答」。这是原版 Voyager 的铁律
+        # （learn_orchestrate / 执行层 critic 同一个判据），本机分支照抄。
+        if data is not None and not reused_skill:
             try:
                 _absorb(question, code, "", scene_id=_scene_id)
             except Exception:
