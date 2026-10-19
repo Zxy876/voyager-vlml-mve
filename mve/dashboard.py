@@ -2072,6 +2072,21 @@ function importsList(s){
    ⚠️ 必须显示在**历史里**，不能只放在提交回执：消费走后台执行（全链路 1～3 分钟），
    提交回执只说一句"已受理"，结果全靠 4 秒轮询刷进导入历史 ——
    历史里不显示 = 人永远看不到 Voyager 的回答和判分依据。 */
+/* 叙事层的依据列表：编号 → 真实 title/url 是**程序**映射回来的
+   （narrator.narrate_answer 校验 used 里的编号，越界的剔除并写进 caveats），
+   所以这里可以直接当链接标出来。见 docs/叙事层同构-猫娘对照.md */
+function sourcesBlock(im){
+  const src = im.sources || [];
+  if(!src.length) return '';
+  const rows = src.map(s=>{
+    const label = `[${s.n}] ${ESC(s.title || ('来源 ' + s.n))}`;
+    return s.url
+      ? `<li>${label} · <a href="${ESC(s.url)}" target="_blank" rel="noreferrer noopener">${ESC(s.url)}</a></li>`
+      : `<li>${label}</li>`;
+  }).join('');
+  return `<div class="nocmp-sub" style="margin-top:5px"><b>依据：</b><ul style="margin:4px 0 0 18px">${rows}</ul></div>`;
+}
+
 function consumeBlock(im){
   if(im.mode!=='voyager_consume') return '';
   const pct=v=>(v===null||v===undefined)?'—':Math.round(v*100)+'%';
@@ -2106,6 +2121,9 @@ function consumeBlock(im){
     ${outOfDomainNote(im)}
     ${im.answer?`<div style="margin-top:6px"><b>Voyager 的回答：</b>
       <div class="nocmp-body" style="margin-top:4px">${ESC(im.answer)}</div></div>`:''}
+    ${sourcesBlock(im)}
+    ${im.narrative_skipped?`<div style="margin-top:5px;font-size:12px;color:var(--muted)">
+      <b>叙事层没产出</b>（答案退回原始取数结果）：${ESC(im.narrative_skipped)}</div>`:''}
     ${im.method_reason?`<div style="margin-top:5px;font-size:12px;color:var(--muted)">
       <b>两边做法的比对：</b>${ESC(im.method_reason)}${im.method_diff?'；差别：'+ESC(im.method_diff):''}
       <br>Voyager 取到 ${ESC(im.rows||0)} 行，VLML 独立那一路取到 ${ESC(im.referee_rows||0)} 行 ——
@@ -2335,6 +2353,9 @@ function renderImportResult(res){
     ${(res.errors||[]).length?`<div style="margin-top:5px"><b>工具报错：</b>${(res.errors||[]).map(e=>ESC(e)).join('；')}</div>`:''}
     ${isConsume&&res.answer?`<div style="margin-top:9px"><b>Voyager 的回答：</b>
       <div class="nocmp-body" style="margin-top:4px">${ESC(res.answer)}</div></div>`:''}
+    ${isConsume?sourcesBlock(res):''}
+    ${isConsume&&res.narrative_skipped?`<div style="margin-top:5px;font-size:12px;color:var(--muted)">
+      <b>叙事层没产出</b>（答案退回原始取数结果）：${ESC(res.narrative_skipped)}</div>`:''}
     ${facts?`<div style="margin-top:9px"><b>VLML 的解析 · 取到的事实（${(res.facts||[]).length} 条）：</b>${facts}
       <div style="font-size:12px;color:var(--muted);margin-top:5px">
         ${isConsume

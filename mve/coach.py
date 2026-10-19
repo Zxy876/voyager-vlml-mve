@@ -113,6 +113,12 @@ def _log_import(result: dict[str, Any]) -> None:
         "narrative": result.get("narrative", ""),
         "insights": result.get("insights") or [],
         "caveats": result.get("caveats") or [],
+        # 叙事层的依据（编号 → 真实 title/url，由 narrator 程序化映射回来）。
+        # 必须进白名单：面板要在「Voyager 的回答」下面把依据列出来给人核，
+        # 不然答案是一句话、依据全丢了，等于又变成了"信我"。
+        "sources": result.get("sources") or [],
+        "narrative_ok": result.get("narrative_ok"),
+        "narrative_skipped": result.get("narrative_skipped", ""),
         "comparable": result.get("comparable", False),
         "skipped": result.get("skipped", ""),
         "errors": (result.get("errors") or [])[:2],
