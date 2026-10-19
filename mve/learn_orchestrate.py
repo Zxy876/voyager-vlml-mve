@@ -511,6 +511,11 @@ async def _start_learning_impl(
                         _prog = _ms.load_progress(scene, question)
                     except Exception:
                         _prog = set()
+                    try:
+                        # 上次跑通的代码：续学跳过 rollout 时靠它补回技能
+                        _old_codes = _ms.load_progress_codes(scene, question)
+                    except Exception:
+                        _old_codes = {}
                     for _d in _dims:
                         _did = str(_d.get("id") or "")
                         _q1 = str(_d.get("question") or "").strip()
@@ -526,6 +531,18 @@ async def _start_learning_impl(
                                                     bump=False))
                             if _did:
                                 closed_ids.add(_did)
+                            # 这一轮没重跑，但**上次跑通的代码**还在 —— 那次
+                            # rollout 的成果不该因为续学被丢掉（原版 program_code）
+                            _c0 = _old_codes.get(_did) or {}
+                            if str(_c0.get("code") or "").strip():
+                                dim_codes.append({"id": _did,
+                                                  "question": _c0.get("question")
+                                                  or _q1,
+                                                  "code": _c0.get("code"),
+                                                  "answer": _c0.get("answer")})
+                            _a0 = str(_c0.get("answer") or "").strip()
+                            if _a0:
+                                answers.append(f"【{_q1}】{_a0[:500]}")
                             continue
                         # 原版重试机制（用户 2026-10-19 定，同 voyager.py:30
                         # `action_agent_task_max_retries=4` + :277-279
@@ -579,9 +596,9 @@ async def _start_learning_impl(
                                 close_one_dimension(scene, _tid, question, _d))
                             if _did:
                                 closed_ids.add(_did)
-                            if str(code1 or "").strip():
-                                dim_codes.append({"id": _did, "question": _q1,
-                                                  "code": str(code1)})
+                            dim_codes.append({"id": _did, "question": _q1,
+                                              "code": str(code1 or ""),
+                                              "answer": str(a1 or "")})
                         else:
                             failed_dims.append({
                                 "id": _did, "question": _q1,
@@ -591,6 +608,7 @@ async def _start_learning_impl(
                         _ms.save_progress(scene, question,
                                           [str(d.get("id") or "")
                                            for d in learned_dims])
+                        _ms.save_progress_codes(scene, question, dim_codes)
                     except Exception:
                         pass
                     out["dimension_results"] = {

@@ -316,6 +316,64 @@ def save_progress(scene_id: str, question: str, learned_ids: list[str]) -> None:
         pass
 
 
+def load_progress_codes(scene_id: str, question: str) -> dict[str, dict[str, str]]:
+    """读断点续学里**上次跑通的代码**（维度 id → {"question","code"}）。
+
+    为什么必须存代码：原版技能 = 一次成功 rollout 的 `program_code`。
+    续学时这一轮**不重跑**（断点续学的本意），于是没有任何新代码 ——
+    2026-10-20 实测：7/7 全闭合、里程碑达成，技能却入库 0 条。
+    把上次跑通的代码留下来，续学时才复用得回那次 rollout 的成果。
+    """
+    path = _cache_path(scene_id, question)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        pr = data.get("progress") or {}
+        out: dict[str, dict[str, str]] = {}
+        for c in (pr.get("codes") or []):
+            if isinstance(c, dict) and str(c.get("id") or ""):
+                out[str(c["id"])] = {"question": str(c.get("question") or ""),
+                                     "code": str(c.get("code") or ""),
+                                     "answer": str(c.get("answer") or "")}
+        return out
+    except Exception:
+        return {}
+
+
+def save_progress_codes(scene_id: str, question: str,
+                        codes: list[dict[str, Any]]) -> None:
+    """把这一轮跑通的代码写进进度（与已闭合维度 id 同存一份）。"""
+    if not codes:
+        return
+    path = _cache_path(scene_id, question)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    pr = data.get("progress") or {}
+    merged: dict[str, dict[str, str]] = {}
+    for c in (pr.get("codes") or []):
+        if isinstance(c, dict) and str(c.get("id") or ""):
+            merged[str(c["id"])] = {"question": str(c.get("question") or ""),
+                                    "code": str(c.get("code") or ""),
+                                    "answer": str(c.get("answer") or "")}
+    for c in codes:                       # 本轮新跑的覆盖旧的
+        cid = str(c.get("id") or "").strip()
+        if cid and (str(c.get("code") or "").strip()
+                    or str(c.get("answer") or "").strip()):
+            merged[cid] = {"question": str(c.get("question") or "")[:200],
+                           "code": str(c.get("code") or ""),
+                           "answer": str(c.get("answer") or "")[:800]}
+    pr["codes"] = [{"id": k, "question": v["question"], "code": v["code"],
+                    "answer": v["answer"]} for k, v in merged.items()]
+    data["progress"] = pr
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=1),
+                        encoding="utf-8")
+    except Exception:
+        pass
+
+
 def attach_dimensions(scene_id: str, topic_id: str,
                       dimensions: list[dict[str, Any]], *,
                       verified: bool = False, graph: Any = None,
