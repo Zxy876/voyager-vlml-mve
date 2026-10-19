@@ -81,6 +81,8 @@ _SYSTEM = """你是 Voyager 的 critic：评估一个助手有没有完成给定
 `dimensions` 只在给了维度清单时才需要；**闸门口径**（这是判完成的硬条件，
 同 Maieutic 的 spec gate）：只要有一条维度 answered=false，
 就 success=false —— 哪怕其它部分答得不错。漏答是 drift，不是小瑕疵。
+维度清单里每条前面方括号里是它的 id，`dimensions[].id` 必须**原样回填那个 id**。
+reasoning / critique / why 一律用中文写。
 """
 
 
@@ -150,7 +152,8 @@ def ai_check_task_success(task: str, context: str, result: dict[str, Any], *,
         for i, d in enumerate(dimensions, start=1):
             q = str((d or {}).get("question") or (d or {}).get("need") or "").strip()
             if q:
-                rows.append(f"{i}. {q}")
+                did = str((d or {}).get("id") or i)
+                rows.append(f"{i}. [{did}] {q}")
         if rows:
             dim_block = ("\n必须回答的维度（每条都要有实质回答，缺一条就是 drift）：\n"
                          + "\n".join(rows) + "\n")
