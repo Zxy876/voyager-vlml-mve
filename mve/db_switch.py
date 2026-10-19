@@ -53,6 +53,61 @@ def current_path() -> str:
     return _abs(p) if p else str(DEFAULT_DB)
 
 
+def list_tables(path: str = "") -> list[str]:
+    """实查某个库里的表名（information_schema，不手写清单）。
+
+    为什么要这个函数：`orchestrate.init_scene` 早就调 `db_switch.list_tables`
+    —— 但这个函数**之前不存在**，调用点包在 try/except 里，表发现一直静默
+    失败（tables 恒 []）→ 「场景自带数据源时注册针对性原语」这条路从来没
+    生效过。表名是**问库问出来的**，换库自动跟着换。
+
+    失败（库不存在/打不开）返回 []，由调用方决定怎么如实报。
+    """
+    p = str(path or "").strip() or current_path()
+    f = Path(p)
+    if not f.exists() or f.suffix.lower() not in (".duckdb", ".db", ".ddb"):
+        return []
+    try:
+        import duckdb
+        con = duckdb.connect(str(f), read_only=True)
+    except Exception:
+        return []
+    try:
+        return [r[0] for r in con.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema='main' ORDER BY table_name").fetchall()]
+    except Exception:
+        return []
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
+def table_columns(path: str, table: str) -> list[str]:
+    """实查某张表的列名（information_schema.columns）。"""
+    f = Path(str(path or "").strip() or current_path())
+    if not f.exists() or f.suffix.lower() not in (".duckdb", ".db", ".ddb"):
+        return []
+    try:
+        import duckdb
+        con = duckdb.connect(str(f), read_only=True)
+    except Exception:
+        return []
+    try:
+        return [r[0] for r in con.execute(
+            "SELECT column_name FROM information_schema.columns "
+            f"WHERE table_name='{str(table)}' ORDER BY ordinal_position").fetchall()]
+    except Exception:
+        return []
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
 def is_default() -> bool:
     try:
         return Path(current_path()).resolve() == DEFAULT_DB.resolve()

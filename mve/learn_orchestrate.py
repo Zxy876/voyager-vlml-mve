@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""启动学习闭环 —— 同构原版 Voyager.learn() 的 MVE 单轮（编排器）。
+
+用户闭环（2026-10-19 指令原文，本模块一层层对应）
+------------------------------------------------
+「人消费能力（无法命中）→ 图谱建点 → 启动学习（图谱任务拆分，拆到任务有抓手可达）
+→ 用猫娘计划的 mcp 去写插件，编排插件使用两个层面来完成任务 → 任务达成（取到值）
+→ 写入技能库 → 人再消费同一个问题（命中且有答案，掌握度上升）」
+
+    环节                    本模块的落地
+    图谱任务拆分            task_decompose.plan()（同构 decompose_task）
+    拆到任务有抓手可达      task_decompose.reachability() 逐个子目标判；
+                           判 gap → forge、判 unreachable → 如实停
+    用 mcp 写插件           plugin_forge.forge_gaps()（缺口→插件文件+动态注册）
+    编排插件使用            plugin_forge.crystallize_skill()（技能→条目）+
+                           mcp_gateway.expose_as_actions()（远端工具→条目）+
+                           orchestrate.plan()（条目组合成步骤序列）
+    任务达成（取到值）      VLMLActionAgent.solve()（写 SQL 真取数，带技能注入）
+    写入技能库              consume._absorb()（图谱建点+掌握+配方入库，
+                           与消费侧同一套账，不另造一本）
+    人再消费同一问题命中    routing.match 打的是图谱节点 —— _absorb 里的
+                           cold_start.ensure_cold_start_node 已建点
+
+和原版 learn() 的对应（voyager.py:306-391）
+------------------------------------------
+learn() 一圈 = propose_next_task → rollout → 成功则 add_new_skill +
+update_exploration_progress → 下一轮。本模块的 `start_learning()` 就是
+一圈：拆分 → 补缺口 → 执行 → **取到值才固化**。原版铁律「失败不写技能库」
+照搬：没取到真数 → status=no_data，不结晶、不入库、不建点。
+
+诚实地界（不装全能）
+------------------
+· 执行层（写 SQL）复用 VLMLActionAgent —— 编排出来的条目描述/schema 进它的
+  system 消息（技能注入），条目本身是**命名的抓手与记账**，不重复实现一个
+  并行执行器。
+· LLM 不可用（无 key/超时）→ 拆分降级 rule_fallback，origin 如实标；
+  执行层失败 → status=failed + why，绝不编造取数结果。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import sys
+import time
+from pathlib import Path
+from typing import Any, Callable
+
+HERE = Path(__file__).resolve().parent
+REPO_ROOT = HERE.parent
+for _p in (str(HERE), str(REPO_ROOT)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+
+def _resolve_scene(scene_id: str) -> str:
+    sid = str(scene_id or "").strip()
+    if sid:
+        return sid
+    try:
+        import scenes
+        return str(scenes.current_scene_id() or "A")
+    except Exception:
+        return "A"
+
+
+def on_miss(question: str, scene_id: str = "", *,
+            reason: str = "") -> dict[str, Any]:
+    """人导入**未命中** → ① 待审区登记 ② **建图谱节点**（用户闭环第 2 步）。
+
+    为什么要建点（用户 2026-10-19 澄清的验收线）：
+        「人导入（未命中）---- 建图谱节点 ---- voyager 规划课程自主学习 …」
+    只进待审区（pending_dimensions.json）的话，图谱上什么都没有 ——
+    「图谱任务拆分」就没有可拆的对象，人也看不见这条问题落在哪。
+    所以未命中当场建一枚 `status="cold_start_guess"` / `evidence=1` 的猜测
+    节点（同构 neko candidate_knowledge_items：先建猜测项，解题成功才升级）。
+
+    ⚠️ 只建不升：重复导入同一未命中问题**不涨证据**（没解出来就不算证据）。
+    升级只发生在 `_absorb`（真的取到值并入能力库）那一侧。
+
+    返回 {"pending_id", "node_id", "node_created", "node_status", "reason"}。
+    """
+    question = str(question or "").strip()
+    scene = _resolve_scene(scene_id)
+    out: dict[str, Any] = {"question": question, "scene_id": scene,
+                           "pending_id": "", "node_id": "",
+                           "node_created": False, "node_status": "",
+                           "reason": ""}
+    if not question:
+        out["reason"] = "空问题"
+        return out
+    # ① 待审区（同构 neko candidate_knowledge_items，被拒项留审计不删）
+    tid = ""
+    try:
+        import routing
+        item = routing.add_pending(
+            question, scene, reason=reason or "检索图谱未命中（相似度低于双阈值）")
+        tid = str(item.get("topic_id") or "")
+        out["pending_id"] = tid
+    except Exception as e:
+        out["reason"] = f"待审区登记失败：{type(e).__name__}: {e}"
+    if not tid:
+        return out
+    # ② 图谱建点：只建不升（见 docstring）
+    try:
+        from knowledge_graph import KnowledgeGraph
+        g = KnowledgeGraph.load()
+        nid = f"consume:{tid}"
+        node = g.nodes.get(nid)
+        if node is None:
+            g.add_cold_start_node(scene, nid, "dimension",
+                                  label=question[:60],
+                                  detail={"source": "human_import_miss"})
+            g.save()
+            out.update(node_id=nid, node_created=True,
+                       node_status="cold_start_guess")
+        else:
+            out.update(node_id=nid, node_status=str(node.status))
+    except Exception as e:
+        out["reason"] = (out["reason"] + "；" if out["reason"] else "") + \
+            f"建图谱节点失败：{type(e).__name__}: {e}"
+    return out
+
+
+def _has_real(obs: list[dict[str, Any]]) -> bool:
+    """至少一次观察取到了**真数**（批判据复用 critic.has_real_data，不重造）。"""
+    if not obs:
+        return False
+    try:
+        from voyager_vlml.agents.critic import has_real_data
+        return any(has_real_data(o) for o in obs)
+    except Exception:
+        # 判据取不到时退回最保守口径：ok 且有行
+        return any(o.get("ok") and int(o.get("rows") or 0) > 0 for o in obs)
+
+
+async def start_learning(
+    question: str,
+    scene_id: str = "",
+    *,
+    llm: Callable | None = None,
+    db_path: str = "",
+    execute: bool = True,
+    use_mcp: bool = True,
+) -> dict[str, Any]:
+    """启动一轮学习（同构 learn() 单圈）。返回全量过程记录，失败如实带 why。"""
+    question = str(question or "").strip()
+    scene = _resolve_scene(scene_id)
+    out: dict[str, Any] = {
+        "question": question, "scene_id": scene, "status": "", "why": "",
+        "plan": {}, "forged": {}, "exposed": {}, "stuck": [],
+        "execution": {}, "absorbed": {}, "crystallized": {}, "milestone": {},
+        "started_at": round(time.time(), 1),
+    }
+    if not question:
+        out.update(status="failed", why="空问题，无可学")
+        _record(out)
+        return out
+
+    # ---- ① 图谱任务拆分（同构 decompose_task；LLM 失败降级会如实标 origin）----
+    import task_decompose
+    plan = task_decompose.plan(question, scene, llm=llm)
+    out["plan"] = plan
+    if not plan.get("subgoals"):
+        out.update(status="failed", why="拆分不出子目标（LLM 不可用且规则兜底也空）")
+        _record(out)
+        return out
+    if plan["counts"]["unreachable"] == len(plan["subgoals"]):
+        # 硬不可达：既无抓手也无相关表。学不出来不是循环的失败，是数据源
+        # 缺席 —— 如实报给人（装数据源/换场景），不硬编一个"学过了"。
+        out.update(status="unreachable",
+                   why="注册表无抓手且库中无相关表 —— 硬不可达（装数据源/换场景）")
+        _record(out)
+        return out
+
+    # ---- ② 缺口 → 写插件（第一层：写插件）----
+    if plan["counts"]["gap"]:
+        import plugin_forge
+        out["forged"] = plugin_forge.forge_gaps(plan, scene, db_path=db_path)
+
+    # ---- ③ 远端 MCP 工具 → 暴露为抓手段（编排的接入点；失败不拦学习）----
+    if use_mcp:
+        try:
+            import mcp_gateway
+            gw = mcp_gateway.get_gateway()
+            conn = await gw.connect_all()
+            exposed = gw.expose_as_actions(scene)
+            out["exposed"] = {"connected": conn.get("connected", []),
+                              "failed": conn.get("failed", []),
+                              "exposed": exposed.get("exposed", []),
+                              "reason": str(exposed.get("reason") or "")}
+        except Exception as e:
+            out["exposed"] = {"error": f"{type(e).__name__}: {e}"}
+
+    # ---- ④ 重判：forge/expose 之后还有没有抓不到的子目标（照实，不宣称全通）----
+    stuck: list[dict[str, Any]] = []
+    for st in plan["subtasks"]:
+        if st.get("status") == "reachable":
+            continue
+        r = task_decompose.reachability(str(st.get("need") or ""), scene)
+        if r.get("status") != "reachable":
+            stuck.append({"seq": st.get("seq"), "need": st.get("need"),
+                          "status": r.get("status"), "why": r.get("why")})
+    out["stuck"] = stuck
+    if stuck and len(stuck) == len(plan["subtasks"]):
+        out.update(status="unreachable",
+                   why="forge/expose 后所有子目标仍无抓手：" +
+                       "；".join(str(s["need"])[:30] for s in stuck))
+        _record(out)
+        return out
+
+    # ---- ⑤ 执行层：写 SQL 真取数（带已学配方注入，同构 retrieve→rollout）----
+    sql = ""
+    if execute:
+        try:
+            import skill_store
+            skills = skill_store.retrieve("", question)
+            from voyager_vlml.agents.action import VLMLActionAgent
+            agent = VLMLActionAgent()
+            observations, sql = await agent.solve(question, skills=skills)
+            real = _has_real(list(observations or []))
+            out["execution"] = {
+                "ok": real, "sql": sql,
+                "calls": len(observations or []),
+                "real_calls": sum(1 for o in (observations or [])
+                                  if _has_real([o])),
+                "rows": sum(int(o.get("rows") or 0)
+                            for o in (observations or []) if o.get("ok")),
+            }
+            if not real:
+                out.update(status="no_data",
+                           why="执行层跑通了但没取到真数（空表/真空值）——"
+                               "原版铁律：失败不写技能库，不结晶不建点")
+                _record(out)
+                return out
+        except Exception as e:
+            out.update(status="failed",
+                       why=f"执行层失败：{type(e).__name__}: {e}")
+            _record(out)
+            return out
+    else:
+        out.update(status="prepared",
+                   why="只完成拆分+补缺口（execute=False），未取数")
+        _record(out)
+        return out
+
+    # ---- ⑥ 取到值 → 图谱建点 + 掌握 + 配方入库（复用消费侧同一套账）----
+    try:
+        import voyager_vlml.consume as _consume
+        out["absorbed"] = _consume._absorb(question, sql, "")
+    except Exception as e:
+        out.update(status="failed",
+                   why=f"入库失败（_absorb）：{type(e).__name__}: {e}")
+        _record(out)
+        return out
+
+    # 里程碑解锁（用户闭环第 4 步的「不再重复出题」）：
+    # **复用原 MVE 已有披露**（scene_context.unlocked_milestones = MasteryStore
+    # 里 completed 的知识点 = 已解锁的图谱节点，进运行时上下文；规划/出题器按
+    # is_completed 门控不再重复推，见 topic_graph.py:582）。这里不另造读法，
+    # 只回答一个问题：**这一轮学到的能力项，现在是不是已解锁里程碑**。
+    tid = str(out["absorbed"].get("topic_id") or "")
+    out["milestone"] = {"topic_id": tid, "unlocked": False}
+    try:
+        import scene_context
+        out["milestone"]["unlocked"] = tid in scene_context.unlocked_milestones()
+    except Exception as e:
+        out["milestone"]["why"] = f"{type(e).__name__}: {e}"
+
+    # ---- ⑦ 写入技能库 → 结晶成条目（闭环最后一环：下次抓得到）----
+    try:
+        import skill_store
+        import plugin_forge
+        fresh = [s for s in skill_store.all_skills()
+                 if str(s.get("code") or "") == str(sql)]
+        if fresh:
+            out["crystallized"] = plugin_forge.crystallize_skill(
+                fresh[-1], into_scene=scene)
+    except Exception as e:
+        out["crystallized"] = {"ok": False, "why": f"{type(e).__name__}: {e}"}
+
+    out["status"] = "learned" if out["absorbed"].get("mastered") else "partial"
+    if out["status"] == "partial":
+        out["why"] = ("取到值并执行了，但图谱标记掌握这步没成"
+                      f"（{out['absorbed'].get('skill_action') or '无说明'}）")
+    _record(out)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 后台触发（consume 未命中时接线用）+ 结果留痕（面板 API 读）
+# ---------------------------------------------------------------------------
+_BG: dict[str, asyncio.Task] = {}
+_LAST: list[dict[str, Any]] = []
+_LAST_MAX = 20
+
+
+def kick_learning(question: str, scene_id: str = "") -> dict[str, Any]:
+    """在**运行中的事件循环**里后台启动学习（fire-and-forget）。
+
+    consume() 是 async，未命中分支直接调它 —— 学习要分钟级，不能堵住本次
+    回答。没有运行中的循环（同步上下文）就如实返回 kicked=False，调用方
+    自行决定怎么办；绝不起一个立刻被回收的协程假装启动了。
+    """
+    question = str(question or "").strip()
+    if not question:
+        return {"kicked": False, "why": "空问题"}
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return {"kicked": False, "why": "没有运行中的事件循环"}
+    if question in _BG and not _BG[question].done():
+        return {"kicked": False, "why": "同一问题的学习已在后台跑"}
+
+    async def _run() -> None:
+        try:
+            await start_learning(question, scene_id)
+        except Exception as e:  # 后台任务自己兜住，绝不无声死掉
+            _record({"question": question, "scene_id": scene_id,
+                     "status": "failed", "why": f"{type(e).__name__}: {e}"})
+
+    task = loop.create_task(_run())
+    _BG[question] = task
+    return {"kicked": True, "question": question[:60]}
+
+
+def _record(result: dict[str, Any]) -> None:
+    """留痕：内存里给面板 API，因果时间线给复盘（面板时间线页签可见）。"""
+    result = dict(result)
+    result["finished_at"] = round(time.time(), 1)
+    _LAST.append(result)
+    del _LAST[:-_LAST_MAX]
+    try:
+        import causal_timeline
+        causal_timeline.append(
+            "learn",
+            topic_id=str(result.get("absorbed", {}).get("topic_id") or ""),
+            summary=(f"学习[{result.get('status')}] "
+                     f"{str(result.get('question') or '')[:40]}"
+                     + (f" —— {result['why'][:60]}" if result.get("why") else "")),
+            detail={"status": result.get("status"),
+                    "origin": (result.get("plan") or {}).get("origin", ""),
+                    "forged": (result.get("forged") or {}).get("counts", {}),
+                    "exposed": len((result.get("exposed") or {}).get("exposed")
+                                   or []),
+                    "stuck": len(result.get("stuck") or []),
+                    "execution_ok": (result.get("execution") or {}).get("ok"),
+                    "crystallized": bool((result.get("crystallized") or {}).get("ok")),
+                    "why": str(result.get("why") or "")[:200]},
+            scene=str(result.get("scene_id") or ""),
+        )
+    except Exception:
+        pass                                # 留痕失败不拦学习本身
+
+
+def last_learn_results(limit: int = 10) -> list[dict[str, Any]]:
+    """面板 API 用：最近几轮学习的结果（新的在前）。"""
+    return list(reversed(_LAST))[:max(1, int(limit))]
+
+
+def learn_running() -> list[str]:
+    """后台还在跑的问题（面板显示「学着呢」）。"""
+    return [q for q, t in _BG.items() if not t.done()]

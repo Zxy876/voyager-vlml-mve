@@ -501,13 +501,31 @@ async def consume(
     # 不挂活图谱、不丢弃，冷启动解题成功才升活节点；被拒项留审计、不删。
     # ⚠️ 之前这条没接线 —— 面板场景卡的「待审 N」徽章因此恒为 0，人导入了
     # 域外问题却在任何地方都看不到痕迹（2026-10-18 实测特斯拉问题踩中）。
+    # 学习触发结果（未命中才有）：面板导入历史据此显示「已启动后台学习」。
+    learn_kick: dict[str, Any] = {"kicked": False, "why": ""}
+    miss_info: dict[str, Any] = {}
     try:
         if str(route_info.get("decision") or "") == "REJECTED":
-            import routing as _rt2
-            _rt2.add_pending(
-                question, _scene_id,
-                reason=(f"双阈值未命中（score={route_info.get('max_score', 0)}，"
-                        f"matched_on={route_info.get('matched_on') or '—'}）"))
+            # 用户闭环前两步（2026-10-19 澄清）：
+            #   人导入（未命中）→ **待审区登记 + 建图谱节点** → 启动学习
+            # on_miss 一次做完前两步（同一套账，消费侧与学习侧不各写一份）。
+            try:
+                import learn_orchestrate as _lo
+                miss_info = _lo.on_miss(
+                    question, _scene_id,
+                    reason=(f"双阈值未命中（score={route_info.get('max_score', 0)}，"
+                            f"matched_on={route_info.get('matched_on') or '—'}）"))
+            except Exception as _me:
+                miss_info = {"reason": f"{type(_me).__name__}: {_me}"}
+            # 第三步：启动 voyager 自主学习（拆分→补缺口→取数→入库→结晶）。
+            # 后台任务（分钟级），失败绝不影响本次回答 —— try/except 整个包住，
+            # 退回原行为（只有待审区登记 + 建点）。
+            try:
+                import learn_orchestrate as _lo
+                learn_kick = _lo.kick_learning(question, _scene_id)
+            except Exception as _le:
+                learn_kick = {"kicked": False,
+                              "why": f"{type(_le).__name__}: {_le}"}
     except Exception:
         pass                                     # 待审区写不进去不能拦消费
     if topic_hint:
@@ -784,6 +802,13 @@ async def consume(
         "route_score": int(route_info.get("max_score") or 0),
         "route_matched_on": str(route_info.get("matched_on") or ""),
         "route_node": str(route_info.get("node_id") or ""),
+        # 未命中时是否已启动后台学习（learn_orchestrate.kick_learning）——
+        # 面板导入历史据此显示「已启动后台学习」；未命中才可能有值。
+        "learn_kicked": bool(learn_kick.get("kicked")),
+        "learn_kick_note": str(learn_kick.get("why") or ""),
+        # 未命中时建的图谱节点（闭环第 2 步的可见证据）：node_id + 是否新建
+        "miss_node": str(miss_info.get("node_id") or ""),
+        "miss_node_created": bool(miss_info.get("node_created")),
         # 判定结果枚举（设计《判定结果状态与写入证明规格》）：写入图谱的充分条件。
         #   written              —— 成功写入图谱（节点已存在/已验证，已提交终态）
         #   insufficient_evidence —— 冷启动单次证据（节点 cold_start_guess，待巩固）
@@ -1208,14 +1233,19 @@ def _absorb(question: str, sql: str, topic_id: str) -> dict[str, Any]:
                            "cold_start": False, "root_scene": "", "node_status": ""}
     if not sql:
         return out
-    tid = topic_id or _runtime_topic_id(question, _scene_id)
-    out["topic_id"] = tid
-    # 1→n 泛化：当前场景（冷启动节点与技能都归属它）
+    # 1→n 泛化：当前场景（冷启动节点与技能都归属它）。
+    # ⚠️ 必须先解析再使用：`_scene_id` 在下面有赋值，Python 把它当本函数局部
+    # 变量 —— 若先读后写（旧代码顺序），topic_id 为空（归不上题，恰好是
+    # 学习闭环 learn_orchestrate 每次的走法）时读局部变量会直接
+    # UnboundLocalError。2026-10-19 修：消费侧一直没炸只因历史上的成功消费
+    # 都归上了有 rubric 的题（or 短路，根本读不到这行）。
     try:
         from scenes import current_scene_id as _cur
         _scene_id = _cur()
     except Exception:
         _scene_id = "A"
+    tid = topic_id or _runtime_topic_id(question, _scene_id)
+    out["topic_id"] = tid
     out["root_scene"] = _scene_id
     # 冷启动登记：在图谱上建/升级一枚带场景归属的节点，并标记 cold_start
     try:

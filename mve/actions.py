@@ -52,7 +52,7 @@ import inspect
 import json
 import os
 import typing
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -196,10 +196,22 @@ def _resolve_impl(ref: str) -> Callable[..., Any] | None:
     if not ref or ":" not in ref:
         return None
     mod_name, _, qual = ref.partition(":")
+    mod = None
     try:
         import importlib
         mod = importlib.import_module(mod_name)
     except Exception:
+        mod = None
+    if mod is None:
+        # 锻造/结晶插件兜底：插件文件在 mve/plugins/ 下，不在 sys.path 上，
+        # import_module 找不到 —— 走 plugin_forge 的文件加载器（同一条 impl
+        # 引用，重启后照样能恢复条目）。
+        try:
+            import plugin_forge
+            mod = plugin_forge.load_forged_module(mod_name)
+        except Exception:
+            mod = None
+    if mod is None:
         return None
     obj: Any = mod
     for part in qual.split("."):
@@ -257,16 +269,24 @@ def restore() -> dict[str, int]:
 
 def register(scene_id: str, fn: Callable[..., Any], *,
              origin: str = "plugin") -> ActionSpec | None:
-    """把一个带 `@action` 标记的函数注册进某场景的命名空间。"""
+    """把一个带 `@action` 标记的函数注册进某场景的命名空间。
+
+    ⚠️ 用 `replace()` 复制一份 spec 而不是原地改：原实现直接 `spec.scene_id =
+    str(scene_id)`，同一个 fn 注册进两个场景时两个命名空间会**共享同一个
+    spec 对象**，后注册的场景把先注册的 scene_id 覆盖掉（快照落盘时两个
+    场景的条目都显示成后一个场景）。插件锻造的「同一技能注册进来源场景+
+    当前场景」正好踩这条，所以这里改成每场景一份独立 spec。
+    """
     spec = getattr(fn, _SPEC_ATTR, None)
     if spec is None:
         return None
-    spec.scene_id = str(scene_id)
-    spec.origin = origin
-    spec.impl = _impl_ref(spec.fn)
-    _REGISTRY.setdefault(str(scene_id), {})[spec.name] = spec
+    # impl 在这里重算：装饰器当时不知道该 fn 会注册进哪个模块上下文，
+    # 而 fn.__module__ 对插件文件是加载时定的，注册时取才准。
+    reg = replace(spec, scene_id=str(scene_id), origin=origin,
+                  impl=_impl_ref(spec.fn))
+    _REGISTRY.setdefault(str(scene_id), {})[reg.name] = reg
     _save_snapshot()
-    return spec
+    return reg
 
 
 def register_builtin_actions(scene_id: str) -> dict[str, Any]:

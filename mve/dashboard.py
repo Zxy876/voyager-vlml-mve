@@ -2715,6 +2715,12 @@ setInterval(loadSceneBar, 8000);
 # 只是它轻到不值得落盘）。
 COACH_JOB: dict = {"running": False, "question": "", "started_at": 0.0, "error": ""}
 
+# 学习闭环的后台任务状态（learn_orchestrate.start_learning，分钟级）。
+# 和 COACH_JOB 同一个模式：立即受理 → 后台线程 → 结果进 learn_orchestrate
+# 的 _LAST + causal_timeline（面板时间线页签可见），前端轮询本状态。
+LEARN_JOB: dict = {"running": False, "question": "", "started_at": 0.0,
+                   "error": "", "last_status": ""}
+
 
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code: int, body: bytes, ctype: str) -> None:
@@ -2771,6 +2777,23 @@ class Handler(BaseHTTPRequestHandler):
             st["coach_elapsed"] = (int(_t.time() - COACH_JOB["started_at"])
                                    if COACH_JOB["running"] else 0)
             st["coach_error"] = str(COACH_JOB["error"] or "")
+            # 学习闭环（learn_orchestrate）：后台学的状态 + 最近结果摘要。
+            st["learn_running"] = bool(LEARN_JOB["running"])
+            st["learn_question"] = str(LEARN_JOB["question"] or "")[:80]
+            st["learn_elapsed"] = (int(_t.time() - LEARN_JOB["started_at"])
+                                   if LEARN_JOB["running"] else 0)
+            st["learn_error"] = str(LEARN_JOB["error"] or "")
+            st["learn_last_status"] = str(LEARN_JOB["last_status"] or "")
+            try:
+                import learn_orchestrate as _lo
+                st["learn_recent"] = [
+                    {"question": str(r.get("question") or "")[:60],
+                     "status": str(r.get("status") or ""),
+                     "scene_id": str(r.get("scene_id") or ""),
+                     "why": str(r.get("why") or "")[:80]}
+                    for r in _lo.last_learn_results(5)]
+            except Exception:
+                st["learn_recent"] = []
             body = json.dumps(st, ensure_ascii=False, default=str).encode("utf-8")
             ctype = "application/json; charset=utf-8"
         elif path == "/api/graph":
@@ -3002,6 +3025,43 @@ class Handler(BaseHTTPRequestHandler):
                              "message": "已受理，Voyager 正在回答（要串十几次模型调用，"
                                         "约 1～3 分钟）。结果会自动出现在下方导入历史里，"
                                         "不用盯着等。"})
+            return
+
+        if path == "/api/learn/start":
+            # 启动学习闭环（用户 2026-10-19 指令的环）：拆分 → 补缺口 →
+            # 写插件 → 执行取数 → 入库 → 结晶。分钟级 → 后台线程，立即受理。
+            q = str(payload.get("question") or "").strip()
+            if not q:
+                self._json(400, {"ok": False, "error": "问题是空的"})
+                return
+            if LEARN_JOB["running"]:
+                self._json(200, {"ok": False, "busy": True,
+                                 "error": (f"上一轮学习还在跑（{LEARN_JOB['question'][:40]}…，"
+                                           "等它出结果再启动下一轮）。")})
+                return
+            import threading
+            import time as _lt
+
+            def _run_learn_bg() -> None:
+                LEARN_JOB.update({"running": True, "question": q,
+                                  "started_at": _lt.time(), "error": ""})
+                try:
+                    import asyncio
+                    import learn_orchestrate as _lo
+                    r = asyncio.run(_lo.start_learning(q))
+                    LEARN_JOB["last_status"] = str(r.get("status") or "")
+                    if r.get("status") in ("failed",):
+                        LEARN_JOB["error"] = str(r.get("why") or "")[:300]
+                except Exception as e:
+                    LEARN_JOB["error"] = f"{type(e).__name__}: {e}"[:300]
+                finally:
+                    LEARN_JOB["running"] = False
+
+            threading.Thread(target=_run_learn_bg, daemon=True).start()
+            self._json(200, {"ok": True, "accepted": True, "running": True,
+                             "message": "已受理，学习闭环正在后台跑（拆分→补缺口→"
+                                        "取数→入库→结晶，约 1～3 分钟）。"
+                                        "进度看下方学习状态，结果进技能库与因果时间线。"})
             return
 
         if path == "/api/db/probe":
