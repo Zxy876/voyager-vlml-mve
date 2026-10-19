@@ -158,7 +158,10 @@ def _log_learning_detail(r: dict[str, Any]) -> None:
     execu = r.get("execution") or {}
     if execu:
         _log(f"  · 取数：calls={execu.get('calls')} 真取到={execu.get('real_calls')} "
-             f"行数={execu.get('rows')} ok={execu.get('ok')}")
+             f"行数={execu.get('rows')} ok={execu.get('ok')} "
+             f"证据={execu.get('evidence') or 'unknown'}"
+             + ("（知识型：无数据源，成败交 critic 判）"
+                if execu.get("evidence") == "knowledge" else ""))
         sql = str(execu.get("sql") or "")
         if sql:
             _log("  · 脚本/SQL(head)：" + sql[:160].replace("\n", " "))

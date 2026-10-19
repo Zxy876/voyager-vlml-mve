@@ -371,12 +371,19 @@ async def _start_learning_impl(
             out["execution"] = {
                 "ok": real, "sql": sql,
                 "calls": len(observations or []),
+                # 「真取到」只数**真的有数据源支撑**的观察：知识型答案（RESULT 是一段
+                # 回答、没有任何数据源调用）不该记成"取到数"——否则日志会自欺
+                # （2026-10-19 实测：养育问题打出了"真取到=1"）。
                 "real_calls": sum(1 for o in (observations or [])
-                                  if _has_real([o])),
+                                  if _has_real([o])
+                                  and (o.get("data_sources") or [])),
                 "rows": sum(int(o.get("rows") or 0)
                             for o in (observations or []) if o.get("ok")),
                 "data_sources": sorted({s for o in (observations or [])
                                         for s in (o.get("data_sources") or [])}),
+                "evidence": ("data" if any(o.get("data_sources")
+                                           for o in (observations or []))
+                             else "knowledge"),
             }
             # 答案与逐轮观察留给 critic / 面板（知识型任务没有数据源，critic 靠答案判）
             out["answer"] = _answer_text(observations)
