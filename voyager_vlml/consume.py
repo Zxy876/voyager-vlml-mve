@@ -684,16 +684,30 @@ async def consume(
                          "工作区/场景目录，不联网、也不翻操作者的私人文件；"
                          "这类问题需要外部数据源")),
         }
-        # ⑤ 结晶进技能库的闸门：**只有真取到数才记账**。
-        # 复用已有配方时不必再记一遍账；没取到数（data is None）时绝不能
-        # 把这段代码写进技能库 —— 否则下一问命中它、重放出 RESULT=error，
-        # 闭环就永远停在「命中但不回答」。这是原版 Voyager 的铁律
-        # （learn_orchestrate / 执行层 critic 同一个判据），本机分支照抄。
-        if data is not None and not reused_skill:
+        # ⑤ 记进能力库的闸门：**只有真取到数才记账**。
+        # 没取到数（data is None）时绝不能把这段代码写进技能库 —— 否则下一问
+        # 命中它、重放出 RESULT=error，闭环就永远停在「命中但不回答」。
+        # 这是原版 Voyager 的铁律（learn_orchestrate / 执行层 critic 同一判据）。
+        #
+        # 复用已有配方也要记 —— 但记的不是「再存一条技能」（`_absorb` 自己
+        # 判重：已有配方就 mark_result 用过且有效），而是**这题到能力里了**
+        # （用户 2026-10-13 的定义：问一句、答完了，这题就进能力库）。
+        # 实测（2026-10-19）：只在「现场新写」时调 `_absorb`，命中复用那条
+        # 路径的 mastered 永远是 False —— 面板上「掌握度」怎么答都不涨。
+        abs_info: dict[str, Any] = {}
+        if data is not None:
             try:
-                _absorb(question, code, "", scene_id=_scene_id)
+                abs_info = _absorb(question, code, "", scene_id=_scene_id)
             except Exception:
-                pass
+                abs_info = {}
+        base.update({
+            "mastered": bool(abs_info.get("mastered")),
+            "skill_action": str(abs_info.get("skill_action") or ""),
+            "node_status": str(abs_info.get("node_status") or ""),
+            "cold_start": bool(abs_info.get("cold_start")),
+            "mastered_total": int(abs_info.get("mastered_total") or 0),
+            "ability_total": abs_info.get("ability_total"),
+        })
         _log(base)
         return base
 

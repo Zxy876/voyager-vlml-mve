@@ -364,6 +364,15 @@ def main() -> int:
     check("复用不需要再问模型（没现场重写代码）",
           "REUSED" not in "".join(FAKE.queue) and again.get("sql") == res.get("sql"),
           f"sql相同={again.get('sql') == res.get('sql')}")
+    # 掌握度：答出来就进能力库（复用同一条配方也算，用户 2026-10-13 的定义）
+    check("现场写取到数 → mastered=True（这题进能力库）",
+          res.get("mastered") is True, str(res.get("mastered")))
+    check("命中复用取到数 → 也算掌握（不然掌握度怎么答都不涨）",
+          again.get("mastered") is True, str(again.get("mastered")))
+    check("掌握度分子分母同源（mastered ≤ ability）",
+          int(again.get("mastered_total") or 0)
+          <= int(again.get("ability_total") or 0),
+          f"{again.get('mastered_total')}/{again.get('ability_total')}")
 
     # 本机没数据时：如实说「没取到」，不编、也不偷偷去读 rib
     scenes.create_scene("空场景", scene_id="F")
