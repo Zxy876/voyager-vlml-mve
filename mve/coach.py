@@ -170,6 +170,14 @@ def _log_import(result: dict[str, Any]) -> None:
         "judgment_result": result.get("judgment_result") or "",
         "node_status": result.get("node_status") or "",
         "cold_start": bool(result.get("cold_start")),
+        # 学习闭环（2026-10-19 用户验收线）：未命中时 on_miss 建的那个点 +
+        # 有没有真的把后台学习踢起来。**必须进白名单**——2026-10-19 实测：
+        # consume 里明明写了这三个字段，_log_import 白名单重建记录时把它们
+        # 丢了，面板导入历史看不出「已建点/已启动学习」，闭环的第一跳无法取证。
+        "miss_node": result.get("miss_node") or "",
+        "miss_node_created": bool(result.get("miss_node_created")),
+        "learn_kicked": bool(result.get("learn_kicked")),
+        "learn_kick_note": str(result.get("learn_kick_note") or "")[:200],
     }
     with COACH_LOG.open("a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")

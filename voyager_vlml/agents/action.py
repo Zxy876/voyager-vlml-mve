@@ -76,6 +76,33 @@ class VLMLActionAgent:
         return out
 
     # ---------- LLM 写 SQL（用户指令：让闭环真正自己出题取数） ----------
+    @staticmethod
+    def render_grabs(grabs: list[dict[str, Any]] | None) -> str:
+        """把当前场景的**抓手条目**渲染成「可用工具清单」（同构 MCP tools/list）。
+
+        为什么要这一块（2026-10-19 服务器实测踩的）：
+          学习环第 ② 步 forge 出来的条目，描述里嵌着**实查到的真实表名与列名**
+          （见 `mve/plugin_forge.py` 的条目 description）。但执行层只拿到了
+          schema 和技能库 —— 抓手条目对写 SQL 的模型**不可见**，于是它凭想象
+          join（实测写成 `rounds.round_id = ext_round_economy.game_id`，
+          而那张表根本没有 round_id 列）→ Binder Error → 3 轮都没收敛 →
+          闭环停在 no_data。工具可达 ≠ 注册表里有条目，得让模型**看见**它。
+        """
+        items = [g for g in (grabs or []) if str(g.get("name") or "").strip()]
+        if not items:
+            return ""
+        lines = []
+        for g in items[:24]:
+            desc = str(g.get("description") or "").strip().replace("\n", " ")
+            lines.append(f"  - {g['name']}: {desc[:220]}")
+        return (
+            "\n\n【本场景可用的抓手条目（注册表实查，只能按它们给的表/列取数）】\n"
+            + "\n".join(lines)
+            + "\n写 SQL 的硬规矩：join 只用上面**列名里真实出现**的键；"
+              "不确定某张表有哪些列就先 `SELECT * FROM 表 LIMIT 1` 看一行；"
+              "不要假设表里有 round_id / id 这类想当然的列。"
+        )
+
     def write_sql(
         self,
         question: str,
@@ -84,6 +111,7 @@ class VLMLActionAgent:
         critique: str = "",
         last_sql: str = "",
         skills: list[dict[str, Any]] | None = None,
+        grabs: list[dict[str, Any]] | None = None,
     ) -> str:
         """让模型按题面写一条 SELECT；迭代修正时带上一轮的 critique 与 SQL 重写。
 
@@ -92,6 +120,7 @@ class VLMLActionAgent:
         from voyager_vlml.llm import chat
 
         system = self.render_system_message(skills=list(skills or []))
+        system += self.render_grabs(grabs)
         if schema:
             system += (
                 "\n\n【当前库真实 schema（只能用这里的表名/列名，不要编造）】\n"
@@ -118,11 +147,16 @@ class VLMLActionAgent:
         max_iters: int = 3,
         hints: list[str] | None = None,
         skills: list[dict[str, Any]] | None = None,
+        grabs: list[dict[str, Any]] | None = None,
     ) -> tuple[list[dict[str, Any]], str]:
         """出题之后真正取数：写 SQL → VLML MCP 执行 → 失败带 critique 重写（迭代修正）。
 
         `skills` = 检索到的已学会配方（照原版 voyager.py:195 先 retrieve 再跑）。
         它进 system 区块，所以**迭代的每一轮都带着**，不是只在第一轮给。
+
+        `grabs` = 当前场景的抓手条目（`actions.entries(scene)`）。同构 MCP 的
+        tools/list：不把工具清单交给模型，模型就只能凭 schema 瞎猜 join 键
+        （2026-10-19 服务器实测，见 `render_grabs` 注释）。
 
         返回 (观察列表, 最后一条 SQL)。观察是**可枚举的**：工具成败 + 取到几行。
         """
@@ -145,7 +179,7 @@ class VLMLActionAgent:
         for i in range(max_iters):
             sql = self.write_sql(
                 question, schema=schema, critique=critique, last_sql=sql,
-                skills=list(skills or []),
+                skills=list(skills or []), grabs=list(grabs or []),
             )
             if not sql:
                 observations.append(

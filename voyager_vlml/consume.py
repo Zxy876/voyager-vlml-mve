@@ -586,7 +586,19 @@ async def consume(
             print(f"  （配方回填后没取到真数，降级为现场写 SQL：{note[:60]}）")
         reused, sql = False, ""
         act = VLMLActionAgent(env=env)
-        observations, sql = await act.solve(question, max_iters=3)
+        # 抓手条目同构 MCP tools/list 一并交给模型（含 forge 出来的锻造条目，
+        # 其描述里带着实查到的真实列名）。不给它，模型就凭 schema 瞎猜 join 键：
+        # 2026-10-19 服务器实测写成 `rounds.round_id = ext_round_economy.game_id`
+        # （那张表没有 round_id 列）→ Binder Error → 3 轮不收敛 → 报"没取到数"。
+        grabs: list[dict[str, Any]] = []
+        try:
+            import actions as _act2
+            grabs = [{"name": e.get("name", ""),
+                      "description": str(e.get("description") or "")}
+                     for e in _act2.entries(_scene_id)]
+        except Exception:
+            grabs = []
+        observations, sql = await act.solve(question, max_iters=3, grabs=grabs)
 
     ok_calls = [o for o in observations if o.get("ok")]
     # 真的取到了数（ok 且非真空）—— 判分 / 回答 / 沉淀都只认这个，

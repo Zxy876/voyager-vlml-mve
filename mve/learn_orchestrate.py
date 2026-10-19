@@ -216,7 +216,21 @@ async def start_learning(
             skills = skill_store.retrieve("", question)
             from voyager_vlml.agents.action import VLMLActionAgent
             agent = VLMLActionAgent()
-            observations, sql = await agent.solve(question, skills=skills)
+            # 抓手条目 = 注册表里本场景的**全部**条目（builtin + forged），
+            # 同构 MCP tools/list 交给模型。forge 出来的条目描述里带着实查到的
+            # 真实列名 —— 不交给它，它就凭 schema 瞎猜 join 键（实测踩过）。
+            grabs: list[dict[str, Any]] = []
+            try:
+                import actions as _act
+                grabs = [{"name": e.get("name", ""),
+                          "description": str(e.get("description") or "")}
+                         for e in _act.entries(scene)]
+            except Exception:
+                grabs = []
+            out["grabs_offered"] = len(grabs)
+            observations, sql = await agent.solve(
+                question, skills=skills, grabs=grabs,
+                hints=[str(s.get("need") or "") for s in plan["subtasks"]])
             real = _has_real(list(observations or []))
             out["execution"] = {
                 "ok": real, "sql": sql,
