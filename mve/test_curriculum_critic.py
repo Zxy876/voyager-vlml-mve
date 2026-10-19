@@ -105,29 +105,47 @@ def test_retry_raise_with_reason() -> None:
 
 
 def test_empty_env_no_invented_files() -> None:
-    """空工作区 → 不出题，也不把场景路径写进环境描述（防模型脑补文件名）。
+    """空工作区：出题必须切到知识型拓展模式，且环境描述不含场景路径。
 
     2026-10-19 实测：Scene D 工作区是空的，可我上一版 biome 里报了绝对路径
     `/root/mve/scene_data/D` → 模型连出 3 道「计算 room_data.txt 房间面积」的题，
     全部 no_data。原版 biome 只说地形（plains），不报路径。
+    用户进一步纠偏：空环境 + 联网开着 → 课程要**继续**出知识型拓展题
+    （不停是原版 while True 的本义），而不是退出。
     """
     import curriculum_auto as C
     d = Path(tempfile.mkdtemp())
-    # ckpt 放**另一个**目录：放在场景目录里会让"工作区为空"这个前提失效
     a = C.CurriculumAgent("T", scene_dir=str(d),
                           state_dir=Path(tempfile.mkdtemp()) / "ckpt",
-                          llm=lambda m: "Task: 编一个\nContext: 瞎编")
-    task, why = a.propose_next_task()
-    assert task == "", task
-    assert "没有任何文件" in why, why
+                          llm=lambda m: "Task: 阿斯伯格的诊断标准是什么？\n"
+                                        "Context: 联网检索权威诊断标准")
+    a.local_enabled = lambda: False            # 本机关（用户实测场景）
+    a.net_enabled = lambda: True               # 联网开
+    task, ctx = a.propose_next_task()
+    assert task == "阿斯伯格的诊断标准是什么？", task
     obs = a.render_observation()
     assert str(d) not in obs["biome"], obs["biome"]
     assert "没有任何文件" in obs["nearby_blocks"], obs["nearby_blocks"]
+    assert "联网检索可用" in obs["biome"], obs["biome"]
     print("PASS  test_empty_env_no_invented_files")
 
 
+def test_all_capabilities_off_is_the_only_stop() -> None:
+    """本机 + 联网**都关**才停；只关本机不停（用户 2026-10-19 截图纠偏）。"""
+    import curriculum_auto as C
+    d = Path(tempfile.mkdtemp())
+    a = C.CurriculumAgent("T", scene_dir=str(d),
+                          state_dir=Path(tempfile.mkdtemp()) / "ckpt",
+                          llm=lambda m: "Task: x\nContext: y")
+    a.local_enabled = lambda: False
+    a.net_enabled = lambda: False
+    task, why = a.propose_next_task()
+    assert task == "" and "都处于关闭" in why, (task, why)
+    print("PASS  test_all_capabilities_off_is_the_only_stop")
+
+
 def test_local_off_hides_files() -> None:
-    """本机能力关掉 → 环境里不列文件、并明说关了，也不再自动出题。
+    """本机能力关掉 → 环境里不列文件、并明说关了；有文件也不再当数据来源。
 
     用户 2026-10-19：「我把本机能力关了也没用」—— 开关以前只管执行层，
     课程层照样围着本机文件出题。原版语义：调不到的 primitive 不算环境。
@@ -137,12 +155,11 @@ def test_local_off_hides_files() -> None:
     (d / "room_data.txt").write_text("1,2,3", encoding="utf-8")
     a = C.CurriculumAgent("T", scene_dir=str(d),
                           state_dir=Path(tempfile.mkdtemp()) / "ckpt",
-                          llm=lambda m: "Task: x\nContext: y")
+                          llm=lambda m: "Task: 阿斯伯格有哪些干预方法？\nContext: 检索")
     a.local_enabled = lambda: False            # 模拟猫爪总开关/本机组关掉
     obs = a.render_observation()
     assert "room_data" not in obs["nearby_blocks"], obs["nearby_blocks"]
-    assert "关掉" in obs["biome"], obs["biome"]
-    assert a.propose_next_task()[0] == "", "本机关了不该再有可学环境"
+    assert "已被关掉" in obs["biome"], obs["biome"]
     print("PASS  test_local_off_hides_files")
 
 
@@ -273,6 +290,7 @@ def main() -> None:
     test_dedupe_exact_only()
     test_retry_raise_with_reason()
     test_empty_env_no_invented_files()
+    test_all_capabilities_off_is_the_only_stop()
     test_local_off_hides_files()
     test_import_question_not_done_by_written()
     test_recipe_requires_real_fetch()

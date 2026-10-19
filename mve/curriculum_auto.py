@@ -150,9 +150,26 @@ class CurriculumAgent:
         except Exception:
             return True                          # 读不到就按默认开（不假装关）
 
+    def net_enabled(self) -> bool:
+        """联网检索能力这组还开着吗（组名与 actions.register_net 一致）。
+
+        为什么课程层要关心它：**知识型学习不依赖本机文件**。工作区空 +
+        本机关，只要联网还开着，Voyager 就该继续围绕人问过的主题出更深的
+        子问题（Maieutic 追问式拓展）—— 用户 2026-10-19 实测纠偏：
+        「本机能力关了之后课程直接退出」是错的，不停（while True）才是原版语义；
+        只有**所有取数手段都关了**才谈得上"没得学"。
+        """
+        try:
+            import actions
+            actions.restore_switches()
+            return bool(actions.group_enabled(self.scene_id, "联网能力"))
+        except Exception:
+            return True
+
     def render_observation(self) -> dict[str, str]:
         import local_agent
         local_ok = self.local_enabled()
+        net_ok = self.net_enabled()
         inv = (local_agent.inventory(self.scene_dir, limit=12)
                if (self.scene_dir and local_ok) else [])
         if inv:
@@ -167,11 +184,12 @@ class CurriculumAgent:
                     lines.append(f"    开头内容（结构预览）：{pv[:300]}")
             files = "\n".join(lines)
         elif not local_ok:
-            files = ("None（本机能力已被关掉，读不到任何文件 —— 不要出需要读本机"
-                     "文件的题）")
+            files = ("None（本机能力已被关掉读不到文件，而且工作区里本来也没有"
+                     "任何文件 —— 不要出需要读本机文件的题，也**绝对不要编造"
+                     "文件名**）")
         else:
             files = ("None（这个场景的工作区里没有任何文件 —— **绝对不要编造"
-                     "文件名**；没有文件就没有能从这里取数的任务）")
+                     "文件名**）")
         done = "；".join(self.completed_tasks[-20:]) if self.completed_tasks else "None"
         failed = "；".join(self.failed_tasks[-20:]) if self.failed_tasks else "None"
         wo = "；".join(f"{k}（{v[:60]}）" for k, v in list(self._failed_why.items())[-8:])
@@ -180,7 +198,7 @@ class CurriculumAgent:
             # 我上一版写成 "数据源: 本机工作区 /root/mve/scene_data/D"，
             # 实测模型据此编出 room_data.txt（空目录里根本没这个文件），
             # 连出 3 道必失败的题。环境描述只给类别，不给可被脑补成文件名的路径。
-            "biome": self._biome_text(local_ok) + "\n\n",
+            "biome": self._biome_text(local_ok, net_ok) + "\n\n",
             "nearby_blocks": f"工作区文件:\n{files}\n\n",
             "chests": f"已学会的技能（可复用配方）: {self._skill_count()} 条\n\n",
             "completed_tasks": f"Completed tasks so far: {done}\n\n",
@@ -188,11 +206,13 @@ class CurriculumAgent:
                              + (f"为什么失败: {wo}\n\n" if wo else "")),
         }
 
-    def _biome_text(self, local_ok: bool) -> str:
+    def _biome_text(self, local_ok: bool, net_ok: bool = True) -> str:
+        if not local_ok and not net_ok:
+            return "数据源: 本机取数能力与联网能力**都已被关掉** —— 这个场景现在没有任何可用的取数手段。"
         if not local_ok:
-            return ("数据源: 本机取数能力已被关掉。不要去读本机文件，"
-                    "也不要把本机文件当成数据来源。")
-        return "数据源: 本机工作区（应用工作区 + 场景目录），只读"
+            return ("数据源: 本机取数能力已被关掉；联网检索可用。"
+                    "只能出由联网检索回答的知识型问题，不要碰本机文件。")
+        return "数据源: 本机工作区（应用工作区 + 场景目录），只读；联网检索也可用"
 
     def _skill_count(self) -> int:
         try:
@@ -214,20 +234,28 @@ class CurriculumAgent:
                           queue: list[str] | None = None
                           ) -> tuple[str, str]:
         """返回 (task, context)。队列里有人导入的题 → 直接取（原版 manual 的人给题）；
-        队列空 → LLM 出题（原版 auto），解析失败重试 max_retries 次。"""
+        队列空 → LLM 出题（原版 auto），解析失败重试 max_retries 次。
+
+        环境三态（2026-10-19 用户纠偏后定）：
+          · 有文件 → 原版模式：围绕工作区数据出题；
+          · 没文件/本机关，但联网开 → **知识型拓展模式**：围绕 Completed tasks
+            里人问过的主题出更深的子问题（Maieutic 追问式），由联网检索回答
+            ——「不停」是原版 while True 的本义，本机关不等于没得学；
+          · 本机 + 联网**都关** → 才是"没有可学的环境"，如实返回空。
+        """
         for q in (queue or []):
             q = str(q or "").strip()
             if q and q not in self.completed_tasks and q not in self.failed_tasks:
                 return q, "人导入的待学问题（原版 manual 模式对应物）"
         # 原版 :264-291 在交给 LLM 之前先走硬编码分支（inventory 满 → 固定任务）。
-        # MVE 的对应物就是这条：先看**环境里有没有可学的抓手**。
-        # 工作区空 + 本机能力关着时，模型只能凭"场景目录"这个路径编文件名
-        # （2026-10-19 实测：Scene D 空目录 → 连出 3 道 room_data.txt 的题，
-        # 全部 no_data）。那不是探索，是幻觉 —— 如实返回空，别让模型编。
-        if not self.has_environment():
-            return "", ("这个场景没有可学的环境：工作区里没有任何文件"
-                        + ("，本机取数能力也被关掉了" if not self.local_enabled() else "")
-                        + "。放数据或导入要学的问题后再启动。")
+        # MVE 的对应物就是这条：先看**有没有任何可用的取数手段**。
+        # 2026-10-19 第一版这里把"工作区没文件"也当成没得学，用户实测纠偏：
+        # Scene D（阿斯伯格）本机关、联网开着，点「练题」课程直接退 ——
+        # 但知识型拓展根本不需要本机文件。
+        if not self.local_enabled() and not self.net_enabled():
+            return "", ("可学的抓手全被关掉了：本机取数能力和联网能力都处于关闭"
+                        "状态。把至少一组能力打开（面板「能力开关」），或导入要学"
+                        "的问题后再启动。")
         return self.propose_next_ai_task(max_retries=max_retries)
 
     def has_environment(self) -> bool:
@@ -254,7 +282,25 @@ class CurriculumAgent:
             raise RuntimeError(
                 "Max retries reached, failed to propose ai task."
                 + (f"（最后原因：{_feedback}）" if _feedback else ""))
-        user = self.render_human_message() + "\n请按系统要求输出 Task: 与 Context: 两行。"
+        # 环境模式：没文件（或本机关）时切换到知识型拓展 —— 不然模型只能对着
+        # "工作区"这个词编文件名（2026-10-19 实测连出 3 道 room_data.txt）。
+        mode = ""
+        if not self.has_environment():
+            local_ok, net_ok = self.local_enabled(), self.net_enabled()
+            mode = ("\n\n本次环境模式（重要）：\n"
+                    f"- 本机取数能力：{'开' if local_ok else '关'}；"
+                    f"联网检索能力：{'开' if net_ok else '关'}。\n"
+                    "- 工作区里**没有任何文件**。所以**禁止**出「读/计算某个文件"
+                    "里的数据」这类题 —— 那种文件名都是编出来的，必然失败。\n"
+                    "- 你要出的是**知识型问题**：定义/区别/机制/标准/方法/常见"
+                    "误解这类，执行层会用联网检索来回答。\n")
+            if self.completed_tasks:
+                mode += ("- 优先围绕上面 Completed tasks 里已经回答过的主题，出"
+                         "**同一主题更深入的子问题**（更细的维度，比如从「是什么」"
+                         "深入到「怎么判断/怎么做/有什么争议」），不要漂到不相关"
+                         "的领域。\n")
+        user = (self.render_human_message() + mode
+                + "\n请按系统要求输出 Task: 与 Context: 两行。")
         if _feedback:
             user += f"\n\n上一次不行：{_feedback}。请务必换一个**不同**的任务。"
         msgs = [{"role": "system", "content": _SYSTEM},
