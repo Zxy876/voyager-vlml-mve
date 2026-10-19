@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from llm_client import chat  # noqa: E402
@@ -298,8 +299,12 @@ def narrate_answer(question: str, data: Any, *, note: str = "") -> dict[str, Any
         return out
 
     caveats = [str(x).strip() for x in (payload.get("caveats") or []) if str(x).strip()]
-    # 来源编号**由程序校验并映射回真实 url**（同猫娘 facts.py 的「程序恢复原路径
-    # 和原文」）：模型写了个不存在的 [9]，就剔除并留一句实话，不能让它凭空造来源。
+    # 引用编号的**程序核对**（同猫娘 facts.py 的「程序恢复原路径和原文」）：
+    # ① 模型写了个不存在的 [9] → 剔除并留一句实话；
+    # ② 模型一个编号都没标 → 不能假装它标了，如实说「依据见下面列的表」。
+    # 实测（2026-10-19 服务器 glm-4-flash）：答案是通顺的三句话，但一个 [n]
+    # 都没标 —— 这时候把 sources 列在下面才是诚实的做法，而不是替它补编号。
+    cited_nums = re.findall(r"\[(\d+)\]", answer)
     valid = {it["n"]: it for it in items}
     used_raw = payload.get("used") or []
     used: list[int] = []
@@ -320,12 +325,18 @@ def narrate_answer(question: str, data: Any, *, note: str = "") -> dict[str, Any
                        + "、".join(f"[{b}]" for b in bogus[:4]) + "，已剔除")
     # 模型没给 used（或全被剔除）时，把条目全列上：人是来看依据的，多给不算错
     picks = used if used else list(valid)
+    cited = bool(cited_nums)
+    if not cited:
+        caveats.append("答案没有逐句标注来源编号 —— 依据见下面列出的清单")
     out.update({
         "ok": True,
         "answer": answer,
         "insights": [str(x).strip() for x in (payload.get("insights") or [])
                      if str(x).strip()][:3],
         "caveats": caveats,
+        # 答案里到底有没有逐句引用：面板据此决定「依据」标题怎么写，
+        # 别让人误以为是逐句可核的（诚实披露，不替模型补编号）。
+        "cited": cited,
         "sources": [{"n": n, "title": valid[n].get("title") or "",
                      "url": valid[n].get("url") or ""} for n in picks],
     })

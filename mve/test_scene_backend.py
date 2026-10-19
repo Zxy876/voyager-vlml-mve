@@ -742,6 +742,24 @@ def main() -> int:
     check("模型编造的 [9] 被剔除并如实记一条 caveat",
           any("[9]" in c for c in nar["caveats"]),
           json.dumps(nar["caveats"], ensure_ascii=False))
+    check("答案里真标了编号 → cited=True（面板标题照实写）",
+          nar.get("cited") is True, str(nar.get("cited")))
+
+    # 实测坑（服务器 glm-4-flash）：答案是通顺的三句，但一个 [n] 都没标。
+    # 这时不许替它补编号——如实标 cited=False 并写进 caveats，让面板标题说实话。
+    narrator.chat = lambda *a, **k: json.dumps({
+        "answer": "最前沿的是 Genie 3。", "insights": [], "caveats": [],
+        "used": [1]}, ensure_ascii=False)
+    try:
+        nocite = narrator.narrate_answer(QUESTION, hits)
+    finally:
+        narrator.chat = real_chat
+    check("答案没标编号 → cited=False 且如实记 caveat",
+          nocite.get("cited") is False
+          and any("没有逐句标注" in c for c in nocite["caveats"]),
+          json.dumps(nocite["caveats"], ensure_ascii=False)[:70])
+    check("但依据照样列全（人还是能核）", len(nocite["sources"]) >= 1,
+          str(len(nocite["sources"])))
 
     # ④ advisory 降级：叙事这层挂了，绝不能把「取到了数」变成「交白卷」
     narrator.chat = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("模型 500"))

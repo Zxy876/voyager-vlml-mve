@@ -2084,7 +2084,10 @@ function sourcesBlock(im){
       ? `<li>${label} · <a href="${ESC(s.url)}" target="_blank" rel="noreferrer noopener">${ESC(s.url)}</a></li>`
       : `<li>${label}</li>`;
   }).join('');
-  return `<div class="nocmp-sub" style="margin-top:5px"><b>依据：</b><ul style="margin:4px 0 0 18px">${rows}</ul></div>`;
+  // 答案没逐句标编号时，标题必须说实话（narrator 会置 cited=false 并写进 caveats）
+  const head = im.narrative_cited === false
+    ? '依据（答案未逐句标编号，逐条可点）：' : '依据：';
+  return `<div class="nocmp-sub" style="margin-top:5px"><b>${head}</b><ul style="margin:4px 0 0 18px">${rows}</ul></div>`;
 }
 
 function consumeBlock(im){

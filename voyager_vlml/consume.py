@@ -686,6 +686,7 @@ async def consume(
             "caveats": list(nar.get("caveats") or []),
             "sources": list(nar.get("sources") or []),
             "narrative_ok": bool(nar.get("ok")),
+            "narrative_cited": nar.get("cited"),
             "narrative_skipped": ("" if nar.get("ok")
                                   else str(nar.get("why") or "")[:200]),
             "errors": [str(o.get("error") or "") for o in obs if not o.get("ok")],

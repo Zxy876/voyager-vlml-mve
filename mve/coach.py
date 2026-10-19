@@ -118,6 +118,7 @@ def _log_import(result: dict[str, Any]) -> None:
         # 不然答案是一句话、依据全丢了，等于又变成了"信我"。
         "sources": result.get("sources") or [],
         "narrative_ok": result.get("narrative_ok"),
+        "narrative_cited": result.get("narrative_cited"),
         "narrative_skipped": result.get("narrative_skipped", ""),
         "comparable": result.get("comparable", False),
         "skipped": result.get("skipped", ""),
