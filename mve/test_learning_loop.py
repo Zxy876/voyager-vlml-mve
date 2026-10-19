@@ -50,14 +50,25 @@ def main() -> int:
     print(f"[A 注册] 可执行动作条目 = {actions.entry_count('A')}："
           f"{actions.names('A')}")
 
-    # ---- 场景 B：插入时若 0 条目 → 硬拒绝（设计案硬拒绝项）----
+    # ---- 场景 B：硬拒绝判据 = entry_count == 0（设计案硬拒绝项）----
+    # 注意：这里断言的是**契约本身**（0 条目 ⇒ 不许插入，且给出理由），
+    # 不是「B 一定被拒」。B 能否注册到内置原语取决于 action_code 能否反射
+    # （服务器上有 vlml 包 → 10 条；本机缺 vlml → 0 条）。实测踩过：
+    # 原来写成 b_blocked = not insert_allowed，本机因缺 vlml 假过、服务器上真挂。
     scenes.create_scene("我的学习场景 B", description="新数据域")
     vB = orchestrate.init_scene("B")
     print(f"[B 插入] 条目数 = {vB['entry_count']}  "
           f"allowed={vB['insert_allowed']}  reason={vB['blocking_reason']!r}")
-    b_blocked = not vB["insert_allowed"]
-    if b_blocked:
+    b_policy_ok = vB["insert_allowed"] == (vB["entry_count"] > 0)
+    if not vB["insert_allowed"]:
         print("         → 已按硬拒绝拒绝插入（动作本身缺席，取不到数）")
+    else:
+        print(f"         → 放行（该场景有 {vB['entry_count']} 条可执行原语，"
+              f"不构成「动作缺席」）")
+    if vB["insert_allowed"]:
+        assert vB["blocking_reason"] == "", "放行时不该带 blocking_reason"
+    else:
+        assert vB["blocking_reason"], "硬拒绝必须给出理由，不许静默"
 
     # ---- 第 1 次导入：未命中 → 编排 → 写入 ----
     q = "iPhone 15 的销量是多少"
@@ -97,7 +108,7 @@ def main() -> int:
     print(f"  可达 = {reachable}（命中已有节点 → 归入，复用已固化技能）")
 
     # ---- 证据链自检 ----
-    ok = (first_unmatched and b_blocked and reachable
+    ok = (first_unmatched and b_policy_ok and reachable
           and actions.entry_count("A") > 0
           and status_after in ("verified", "cold_start_guess"))
     print("\n=== 结论 ===")
