@@ -240,9 +240,24 @@ async def _start_learning_impl(
     out["backend"]["vlml"] = use_vlml
 
     # ---- ① 图谱任务拆分（同构 decompose_task；LLM 失败降级会如实标 origin）----
+    # 本机/知识型场景走 Maieutic 追问骨架（maieutic_scaffold，移植自
+    # ~/ maieutic_fork 的 scaffolding.ts）：出的不是"Get X"动宾空壳，而是
+    # 「要答清这句必须先回答的维度」——知识型问题没有表可撞，动宾格式只能拆出
+    # 1 条空壳（实测）。数据/库场景仍走原版 decompose（reachability 靠词面撞表名）。
     import task_decompose
-    plan = task_decompose.plan(question, scene, llm=llm, db_path=db_path)
+    # 什么时候用 Maieutic 骨架：**本机场景 + 知识型问题**。
+    # 数据型问题（文件/库/统计/排名/时效）仍走原版 decompose —— 它出的动宾子目标
+    # 才能被 reachability 拿去撞表名/条目名；知识型问题没有表可撞，动宾格式只会
+    # 拆出 "Get definition of X" 这种空壳（实测就 1 条）。
+    try:
+        import task_critic as _tc0
+        _use_scaffold = bool(is_local) and not _tc0.needs_data(question)
+    except Exception:
+        _use_scaffold = bool(is_local)
+    plan = task_decompose.plan(question, scene, llm=llm, db_path=db_path,
+                               scaffold=_use_scaffold)
     out["plan"] = plan
+    out["plan_origin"] = str(plan.get("origin") or "")
     if not plan.get("subgoals"):
         out.update(status="failed", why="拆分不出子目标（LLM 不可用且规则兜底也空）")
         _record(out)
@@ -360,9 +375,18 @@ async def _start_learning_impl(
                     _act.register_net(scene)
                 except Exception:
                     pass
+                # Maieutic 骨架 → 执行层提示词：必须答到的维度 + 别出现的偏差。
+                # 没有骨架（数据场景/骨架失败）就传空，不编造维度。
+                try:
+                    import maieutic_scaffold as _ms
+                    _dims = plan.get("dimensions") or []
+                    _avoid = _ms.drift_notes(plan)
+                except Exception:
+                    _dims, _avoid = [], []
                 observations, sql = await local_agent.solve(
                     question, local_dir, llm=llm, scene_id=scene,
-                    critique=str(critique or ""))
+                    critique=str(critique or ""),
+                    dimensions=_dims, avoid=_avoid)
             else:
                 observations, sql = await agent.solve(
                     question, skills=skills, grabs=grabs, focus_tables=focus,
@@ -429,10 +453,14 @@ async def _start_learning_impl(
         try:
             import task_critic
             _ok, _crit = task_critic.check_task_success(
-                question, str(context or ""), out)
+                question, str(context or ""), out,
+                dimensions=(plan.get("dimensions") or None))
         except Exception as e:
             _ok, _crit = bool(real), f"critic 异常：{type(e).__name__}: {e}"
-        out["critic"] = {"success": bool(_ok), "critique": str(_crit or "")}
+        out["critic"] = {"success": bool(_ok), "critique": str(_crit or ""),
+                         # 闸门逐维度结论（Maieutic spec gate）：面板/日志能看
+                         # 「这道题哪几个维度答到了、哪条被判 drift」
+                         "gate": list(out.get("critic_gate") or [])}
         if not _ok:
             out.update(status=("no_data" if not real else "failed"),
                        why=(str(_crit or "") or "critic 判未完成")[:300])
@@ -457,6 +485,17 @@ async def _start_learning_impl(
     # is_completed 门控不再重复推，见 topic_graph.py:582）。这里不另造读法，
     # 只回答一个问题：**这一轮学到的能力项，现在是不是已解锁里程碑**。
     tid = str(out["absorbed"].get("topic_id") or "")
+    # 维度节点：Maieutic 骨架出的每条维度都挂到图谱上（问题 -has_dimension-> 维度）。
+    # 这是「不停学习 → 图谱长大」的机制层：学一个问题 = 长 N 个维度节点，
+    # 而不是只多一枚 consume_* 大字节点。幂等，重复学只加证据数。
+    dims = plan.get("dimensions") or []
+    if dims:
+        try:
+            import maieutic_scaffold as _ms
+            out["dimension_nodes"] = _ms.attach_dimensions(
+                scene, tid, dims, verified=True)
+        except Exception as e:
+            out["dimension_nodes_error"] = f"{type(e).__name__}: {e}"
     out["milestone"] = {"topic_id": tid, "unlocked": False}
     try:
         import scene_context

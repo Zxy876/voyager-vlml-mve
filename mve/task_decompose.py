@@ -339,25 +339,56 @@ def _content_query(need: str) -> str:
 # 汇总：一次拆分 + 逐个子目标过可达性（学习循环的入口视图）
 # ---------------------------------------------------------------------------
 def plan(task: str, scene_id: str, *, llm: Callable | None = None,
-         db_path: str = "") -> dict[str, Any]:
+         db_path: str = "", scaffold: bool = False) -> dict[str, Any]:
     """拆分一次任务并给每个子目标标注抓手状态。
+
+    `scaffold=True`（本机/知识型场景用）：**先**走 Maieutic 的追问骨架
+    （maieutic_scaffold，移植自 ~/ maieutic_fork 的 scaffolding.ts）——
+    它出的是「要答清这句必须先回答的维度」，比原版动宾子目标更适合没有表
+    可撞的知识型问题（实测：动宾格式只拆出 1 条 "Get definition of X" 空壳）。
+    骨架拿不到（LLM 失败/解析失败）→ 退回原版 decompose，如实标 origin。
+    数据/库场景**不要**开：`reachability()` 靠动宾词面撞表名/条目名，
+    维度问句撞不上，会把可达的表判成不可达。
 
     返回：
         {
           "task", "scene_id",
           "subgoals": [...],              # 原版口径的有序子目标
-          "origin", "reason",             # 拆分来源（llm / rule_fallback）
+          "origin", "reason",             # 拆分来源（llm / rule_fallback / maieutic:*）
           "subtasks": [                   # 带可达性的执行视图
               {"seq", "need", "status": reachable|gap|unreachable,
                "grab": entry|None, "gap_hint": [tables]|None, "why"}],
           "counts": {"reachable": n, "gap": n, "unreachable": n},
+          # 仅 scaffold=True 且成功时：
+          "dimensions": [{"id","question","why"}],
+          "expected_drifts": [{"category","pattern"}],
+          "material_note": str,
         }
     """
-    dec = decompose(task, scene_id, llm=llm)
+    dec: dict[str, Any] = {}
+    extra: dict[str, Any] = {}
+    if scaffold:
+        try:
+            import maieutic_scaffold
+            sc = maieutic_scaffold.scaffold(task, scene_id, llm=llm)
+            dims = sc.get("dimensions") or []
+            if dims:
+                dec = {"task": task, "scene_id": str(scene_id),
+                       "subgoals": [d["question"] for d in dims],
+                       # origin 记清来源：maieutic:llm / maieutic:cache
+                       "origin": f"maieutic:{sc.get('origin') or 'llm'}",
+                       "reason": ""}
+                extra = {"dimensions": dims,
+                         "expected_drifts": sc.get("expected_drifts") or [],
+                         "material_note": str(sc.get("material_note") or "")}
+        except Exception as e:
+            extra = {"scaffold_error": f"{type(e).__name__}: {e}"}
+    if not dec:
+        dec = decompose(task, scene_id, llm=llm)
     subtasks: list[dict[str, Any]] = []
     counts = {"reachable": 0, "gap": 0, "unreachable": 0}
     for i, need in enumerate(dec["subgoals"], start=1):
         r = reachability(need, scene_id, db_path=db_path)
         counts[r["status"]] = counts.get(r["status"], 0) + 1
         subtasks.append({"seq": i, "need": need, **r})
-    return {**dec, "subtasks": subtasks, "counts": counts}
+    return {**dec, "subtasks": subtasks, "counts": counts, **extra}

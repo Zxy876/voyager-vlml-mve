@@ -41,7 +41,7 @@ from typing import Any
 _DATA_HINTS = re.compile(
     r"(\.json|\.csv|\.db|\.duckdb|\.xlsx|\.parquet|\.txt|文件|目录|表|库|"
     r"多少|几个|几次|几成|排名|排行|统计|平均|总和|合计|最高|最低|最大|最小|"
-    r"增长|下降|比例|占比|行数|记录|条目|字段|列名|"
+    r"增长|下降|比例|占比|分布|趋势|频率|行数|记录|条目|字段|列名|"
     r"sql|SQL|查询|检索|数据库|"
     r"最新|最近|今年|今天|现在|当前|实时|热门|推荐|榜单|star|stars)"
 )
@@ -68,9 +68,19 @@ _SYSTEM = """你是 Voyager 的 critic：评估一个助手有没有完成给定
     答案切题、有依据、不自相矛盾、不编造具体数字/来源 → success=true；
     空话套话、答非所问、编造事实 → success=false 并指出缺什么。
 - 只看任务目标，不看代码写得漂不漂亮。
+- 如果下面给了「必须回答的维度」（来自 Maieutic 的 spec gate），就**按维度核**：
+  · 每个维度都要在答案里有实质回答，全齐才算 success=true；
+  · 漏答某个维度、或答得像标语不像回答 = **drift**（做的比承诺少）→
+    success=false，critique 里点名缺哪一条（下一次它会拿到这条评语重做）；
+  · 换了组织方式但每个维度都答到了 = 仍然 success=true（那是 revision，不是错）。
 
 只输出 JSON（能被 json.loads 解析，不许注释/单引号）：
-{"reasoning": "...", "success": true/false, "critique": "..."}
+{"reasoning": "...", "success": true/false, "critique": "...",
+ "dimensions": [{"id": "<维度 id>", "answered": true/false, "why": "<没答到差在哪>"}]}
+
+`dimensions` 只在给了维度清单时才需要；**闸门口径**（这是判完成的硬条件，
+同 Maieutic 的 spec gate）：只要有一条维度 answered=false，
+就 success=false —— 哪怕其它部分答得不错。漏答是 drift，不是小瑕疵。
 """
 
 
@@ -102,11 +112,16 @@ def _evidence_text(result: dict[str, Any], limit: int = 1600) -> str:
 
 
 def check_task_success(task: str, context: str, result: dict[str, Any], *,
-                       llm=None, max_retries: int = 5) -> tuple[bool, str]:
+                       llm=None, max_retries: int = 5,
+                       dimensions: list[dict[str, Any]] | None = None
+                       ) -> tuple[bool, str]:
     """返回 (success, critique)。照原版：出错 → (False, "")；其余交 LLM 判。
 
     唯一的硬门槛是**数据型任务的真空**（题面要数据、却一个数据源都没调），
     知识型任务不再要求取数 —— 否则「阿斯伯格孩子怎么养育」这种问题永远判死。
+
+    `dimensions` = Maieutic 追问骨架出的维度清单（{"question","why"}）。
+    给了就按维度核：漏答 = drift = 不完成（这条定义照抄 intent-diff.ts:19-22）。
     """
     ex = result.get("execution") or {}
     real = int(ex.get("real_calls") or 0)
@@ -119,16 +134,29 @@ def check_task_success(task: str, context: str, result: dict[str, Any], *,
         return False, ("这题要具体数据（文件/库/统计/时效），但一次数据源都没调、"
                        "没有真实取数 —— 不算完成")[:300]
     return ai_check_task_success(task, context, result, llm=llm,
-                                max_retries=max_retries)
+                                max_retries=max_retries, dimensions=dimensions)
 
 
 def ai_check_task_success(task: str, context: str, result: dict[str, Any], *,
-                          llm=None, max_retries: int = 5) -> tuple[bool, str]:
+                          llm=None, max_retries: int = 5,
+                          dimensions: list[dict[str, Any]] | None = None
+                          ) -> tuple[bool, str]:
     """原版 critic.py:112-135 的同构：解析失败递归重试，5 次都失败 → (False, "")。"""
     if max_retries <= 0:
         return False, ""
-    user = (f"Task: {task}\n\nContext: {context or 'None'}\n\n"
-            f"执行观察：\n{_evidence_text(result)}\n\n请按系统要求输出 JSON。")
+    dim_block = ""
+    if dimensions:
+        rows = []
+        for i, d in enumerate(dimensions, start=1):
+            q = str((d or {}).get("question") or (d or {}).get("need") or "").strip()
+            if q:
+                rows.append(f"{i}. {q}")
+        if rows:
+            dim_block = ("\n必须回答的维度（每条都要有实质回答，缺一条就是 drift）：\n"
+                         + "\n".join(rows) + "\n")
+    user = (f"Task: {task}\n\nContext: {context or 'None'}\n"
+            + dim_block
+            + f"\n执行观察：\n{_evidence_text(result)}\n\n请按系统要求输出 JSON。")
     msgs = [{"role": "system", "content": _SYSTEM},
             {"role": "user", "content": user}]
     try:
@@ -142,7 +170,8 @@ def ai_check_task_success(task: str, context: str, result: dict[str, Any], *,
     m = re.search(r"\{.*\}", text, re.S)
     if not m:
         return ai_check_task_success(task, context, result, llm=llm,
-                                     max_retries=max_retries - 1)
+                                     max_retries=max_retries - 1,
+                                     dimensions=dimensions)
     try:
         obj = json.loads(m.group(0))
         success = obj.get("success")
@@ -150,5 +179,21 @@ def ai_check_task_success(task: str, context: str, result: dict[str, Any], *,
             raise ValueError("success 不是 bool")
     except Exception:
         return ai_check_task_success(task, context, result, llm=llm,
-                                     max_retries=max_retries - 1)
-    return bool(success), str(obj.get("critique") or "")
+                                     max_retries=max_retries - 1,
+                                     dimensions=dimensions)
+    success = bool(obj.get("success"))
+    critique = str(obj.get("critique") or "")
+    # ---- 闸门（Maieutic spec gate）：逐维度核，缺一条就算没完成 ----
+    gate = obj.get("dimensions")
+    if isinstance(gate, list):
+        result["critic_gate"] = [g for g in gate if isinstance(g, dict)]
+        if dimensions and result["critic_gate"]:
+            missing = [g for g in result["critic_gate"]
+                       if g.get("answered") is False]
+            if missing:
+                names = "；".join(
+                    str(g.get("id") or g.get("question") or "维度")
+                    + (f"（{g.get('why')}）" if g.get("why") else "")
+                    for g in missing)
+                return False, (critique + " ｜ 闸门未过，缺：" + names).strip(" ｜")[:300]
+    return success, critique

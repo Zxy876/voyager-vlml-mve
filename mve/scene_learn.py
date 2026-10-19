@@ -181,6 +181,13 @@ def _log_learning_detail(r: dict[str, Any]) -> None:
     cry = r.get("crystallized") or {}
     if isinstance(cry, dict) and cry.get("ok"):
         _log("  · 技能结晶：" + str(cry.get("entry") or cry.get("name") or "ok"))
+    # 闸门（Maieutic spec gate）：逐维度答到没答到 —— 这是"任务完成没有"的硬判据
+    gate = (r.get("critic") or {}).get("gate") or []
+    if gate:
+        ok_n = sum(1 for g in gate if isinstance(g, dict)
+                   and g.get("answered") is not False)
+        _log(f"  · 闸门：{ok_n}/{len(gate)} 个维度答到"
+             + ("（缺的那条判 drift = 这轮不算完成）" if ok_n < len(gate) else ""))
 
 
 def _run_one(q: str, scene: str, *, context: str = "",

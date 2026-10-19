@@ -271,7 +271,9 @@ def _payload(value: Any) -> tuple[Any, str]:
 
 
 async def solve(question: str, scene_dir: str, *, llm=None,
-                max_iters: int = 2, scene_id: str = "", critique: str = ""
+                max_iters: int = 2, scene_id: str = "", critique: str = "",
+                dimensions: list[dict[str, Any]] | None = None,
+                avoid: list[str] | None = None
                 ) -> tuple[list[dict[str, Any]], str]:
     """写代码 → 跑 → 看结果；失败带反馈重写。返回 (观察列表, 最后一段代码)。
 
@@ -279,6 +281,12 @@ async def solve(question: str, scene_dir: str, *, llm=None,
     critique 是上一轮 **critic 的评语**（原版 voyager.py:262-268 把 critic 的
     critique 拼进下一次 human message —— 迭代提示的来源）。给了就放在首轮
     user 消息里，别让它重犯同一个坑。
+
+    dimensions / avoid 来自 Maieutic 的追问骨架（maieutic_scaffold）：
+      · dimensions —— 必须回答的维度（spec gate）。答案要逐条答到，
+        执行层就会按维度组织，而不是糊一段话；
+      · avoid —— 预判的偏差（drift/bug），直接告诉它别这么答。
+    两者都可能为空（骨架没产出来），为空就不出现那两段，不编。
     """
     from voyager_vlml.llm import chat
     call = llm or (lambda msgs: chat(msgs, temperature=0.2))
@@ -312,7 +320,20 @@ async def solve(question: str, scene_dir: str, *, llm=None,
     if mcp_sec:
         system = PROMPT_SYSTEM + mcp_sec
     for _ in range(max(1, max_iters)):
-        user = (f"问题：{question}\n\n{inv_txt}\n"
+        dim_txt = ""
+        if dimensions:
+            rows = [f"{i}. {str((d or {}).get('question') or '').strip()}"
+                    for i, d in enumerate(dimensions, start=1)
+                    if str((d or {}).get("question") or "").strip()]
+            if rows:
+                dim_txt = ("\n必须回答的维度（逐条答到；漏一条这轮就算没完成）：\n"
+                           + "\n".join(rows) + "\n")
+        avoid_txt = ""
+        if avoid:
+            avoid_txt = ("\n常见答偏方式（明确别这么答）：\n"
+                         + "\n".join(f"- {str(a)}" for a in avoid if str(a).strip())
+                         + "\n")
+        user = (f"问题：{question}\n\n{inv_txt}\n" + dim_txt + avoid_txt
                 + (f"\n上一轮没通过 critic 检查，它的评语（务必针对它改）：{critique}\n"
                    if critique else "")
                 + (f"\n上一次的代码：\n{code}\n执行反馈：{fb}\n请修正后重写。"
