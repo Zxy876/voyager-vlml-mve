@@ -983,6 +983,8 @@ def scenes_view() -> dict[str, Any]:
                 if not any(e.get("origin") == "local"
                            for e in _acts.entries(sid)):
                     _acts.register_local(sid, str(prof.get("scene_dir") or ""))
+                if not any(e.get("origin") == "net" for e in _acts.entries(sid)):
+                    _acts.register_net(sid)
             elif _acts.entry_count(sid) == 0:
                 # VLML 场景走反射补齐（浅克隆没有 vlml/ 时如实 0 条，不编清单）
                 _acts.register_builtin_actions(sid)

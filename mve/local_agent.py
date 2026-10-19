@@ -164,26 +164,29 @@ def inventory(scene_dir: str, limit: int = 50) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # 执行：模型写一段 Python（只许调上面三个原语），在受限命名空间里跑
 # ---------------------------------------------------------------------------
-PROMPT_SYSTEM = """你是本机数据助手。用户问的是**这个应用工作区里**的数据（它就跑在
-用户自己的电脑上：工作区里的文件、目录、本地 duckdb），不是任何在线数据库。
+PROMPT_SYSTEM = """你是本机数据助手。你能用的是**这个应用工作区里**的数据（它就跑在
+用户自己的电脑上：工作区里的文件、目录、本地 duckdb），加上**联网**（搜索/抓网页）。
+你连的不是任何在线数据库。
 
-你只能使用下面这些已注入的函数（不要导入任何模块，不要读写除它们以外的路径）：
+你只能使用下面这些已注入的函数（不要导入任何模块）：
 
   list_files(path="", pattern="*")  → 文件列表 [{"path","name","is_dir","size","mtime"}]
   read_file(path, max_bytes=200000) → {"path","bytes","text"}（只读）
   read_json(path)                   → 直接读出解析好的 JSON 对象（.json 用它，别自己解析）
-  query_sql(sql)                    → 本机场景目录里 .duckdb 的只读查询（有库时）
+  query_sql(sql)                    → 场景目录里 .duckdb 的只读查询（有库时）
+  web_search(query, max_results=5)  → 联网搜索，返回 [{"title","url","snippet"}]
+  web_fetch(url)                    → 抓一个公网页面的正文文本（只读、限长）
 
 ⚠️ 这个环境里**没有 import**：`os` / `json` / `pandas` 都用不了，写 `os.path`
 就是 ImportError。要文件名用 `list_files` 结果里的 name，要 JSON 用 `read_json`。
 
 要求：
 1. 只输出一个 ```python 代码块；
-2. 把最终答案赋给 `RESULT`（列表或字典）；
+2. 把最终答案赋给 `RESULT`（列表或字典），**联网拿到的答案要带来源 URL**；
 3. 不要 print，不要 import，不要写文件；
-4. **按下面给你的文件清单直接读**，不要猜文件名/扩展名（猜错就取不到数）；
-5. **清单里的文件和问题无关时，不要拿它凑答案** —— 直接
-   `RESULT = {"error": "本机工作区里没有能回答这个问题的数据"}`。
+4. 本机问题按下面的文件清单直接读，不要猜文件名/扩展名（猜错就取不到数）；
+5. **清单里的文件和问题无关时，不要拿它凑答案** —— 本机没有就联网查；
+   联网也取不到（没网/被限流）才 `RESULT = {"error": "..."}` 如实说。
    拿无关文件的内容当答案是比"没有答案"更糟的错（2026-10-19 服务器实测：
    问世界模型，它把 subjects.json 整份当成答案交了上来）；
 6. 取不到就如实说，不要编造。"""
@@ -350,9 +353,10 @@ def _ns_base(scene_dir: str, scene_id: str = "") -> dict[str, Any]:
 
     给了 scene_id 就**按注册表里的启用条目**建（猫爪总开关关掉的组不注入 ——
     模型连名字都拿不到，这和 neko 关掉插件后条目消失是同构的）；没给就用
-    全量原语（结晶重放/测试用）。
+    全量原语（结晶重放/测试用）。本机原语（origin=local）+ 联网原语
+    （origin=net）都从这里出。
     """
-    full = {
+    full: dict[str, Any] = {
         "list_files": lambda path="", pattern="*": list_files(
             scene_dir, path, pattern),
         "read_file": lambda path, max_bytes=_MAX_BYTES: read_file(
@@ -360,12 +364,19 @@ def _ns_base(scene_dir: str, scene_id: str = "") -> dict[str, Any]:
         "read_json": lambda path: read_json(scene_dir, path),
         "query_sql": lambda sql: query_sql(scene_dir, sql),
     }
+    try:
+        import net_tools
+        full["web_search"] = net_tools.web_search
+        full["web_fetch"] = net_tools.web_fetch
+    except Exception:
+        pass
+    allowed_origins = {"local", "net"}
     names = set(full)
     if scene_id:
         try:
             import actions
             names = {str(e.get("name")) for e in actions.enabled_entries(scene_id)
-                     if str(e.get("origin") or "") == "local"} & set(full)
+                     if str(e.get("origin") or "") in allowed_origins} & set(full)
         except Exception:
             names = set(full)
     ns: dict[str, Any] = {k: v for k, v in full.items() if k in names}

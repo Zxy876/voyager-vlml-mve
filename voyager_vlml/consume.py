@@ -592,6 +592,7 @@ async def consume(
         try:
             import actions as _act
             _act.register_local(_scene_id, _scene_dir)
+            _act.register_net(_scene_id)
         except Exception:
             pass
         # ③a 复用优先（同构 Voyager：retrieve → 重放 → 取不到才写新代码）。

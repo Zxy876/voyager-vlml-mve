@@ -300,6 +300,7 @@ async def start_learning(
                 # 才谈得上被 `enabled_entries` 当抓手段交给执行层。
                 try:
                     _act.register_local(scene, local_dir)
+                    _act.register_net(scene)
                 except Exception:
                     pass
                 observations, sql = await local_agent.solve(

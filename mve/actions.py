@@ -376,6 +376,35 @@ def register_local(scene_id: str, scene_dir: str) -> dict[str, Any]:
     return {"added": n, "names": [str(p["name"]) for p in prims], "reason": ""}
 
 
+def register_net(scene_id: str) -> dict[str, Any]:
+    """把**联网原语**注册成场景里的一组条目（origin=net / group=联网能力）。
+
+    用户 2026-10-19 的设计：「用编排使用从猫娘搬来的那些 mcp、插件、**联网能力**
+    去达到任务（成功依据是取没取到内容）」。与「本机能力」并排挂在猫爪总开关
+    下面；impl 是模块级函数 → 快照可直接恢复，不需要重绑。
+    """
+    try:
+        import net_tools
+        prims = net_tools.bind()
+    except Exception as e:
+        return {"added": 0, "names": [],
+                "reason": f"联网原语不可用：{type(e).__name__}: {e}"}
+    n = 0
+    for p in prims:
+        spec = ActionSpec(
+            name=str(p["name"]), description=str(p.get("description") or ""),
+            fn=p["fn"], scene_id=str(scene_id),
+            input_schema=dict(p.get("schema") or {}),
+            origin="net", group=net_tools.NET_GROUP,
+            impl=str(p.get("impl") or ""),
+        )
+        _REGISTRY.setdefault(str(scene_id), {})[spec.name] = spec
+        n += 1
+    if n:
+        _save_snapshot()
+    return {"added": n, "names": [str(p["name"]) for p in prims], "reason": ""}
+
+
 def unregister(scene_id: str, name: str) -> bool:
     bucket = _REGISTRY.get(str(scene_id))
     if not bucket or name not in bucket:

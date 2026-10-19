@@ -536,6 +536,77 @@ def main() -> int:
           json.dumps(snap.get("switches"), ensure_ascii=False)[:80])
     _act.set_switch("B", "本机能力", True)
 
+    # =====================================================================
+    print("\n== 8. 联网能力（编排要能用「猫娘搬来的 MCP、插件、联网」达成任务）==")
+    # =====================================================================
+    reg_net = _act.register_net("B")
+    check("联网原语注册成条目（origin=net / group=联网能力）",
+          reg_net["added"] == 2 and "web_search" in _act.names("B"),
+          f"added={reg_net['added']}")
+    grp_net = {g["group"]: g for g in _act.groups("B")}.get("联网能力")
+    check("联网能力挂在猫爪总开关下面（带条目清单）",
+          bool(grp_net) and grp_net["count"] == 2
+          and set(grp_net["entries"]) == {"web_search", "web_fetch"},
+          json.dumps(grp_net, ensure_ascii=False)[:90] if grp_net else "无")
+    ns_net = local_agent._ns_base(str(_scene_dir("B")), "B")
+    check("执行层命名空间里有联网原语", "web_search" in ns_net and "web_fetch" in ns_net,
+          str(sorted(k for k in ns_net if not k.startswith("__"))))
+    _act.set_switch("B", "联网能力", False)
+    ns_nonet = local_agent._ns_base(str(_scene_dir("B")), "B")
+    check("关掉联网组的开关：模型就拿不到 web_search",
+          "web_search" not in ns_nonet and "web_fetch" not in ns_nonet)
+    _act.set_switch("B", "联网能力", True)
+
+    # 安全边界（离线可断言）：只许公网 http(s)，拒绝私网/回环/非 http
+    import net_tools
+    try:
+        net_tools.web_fetch("http://127.0.0.1:8777/")
+        ssrf = False
+    except (PermissionError, ValueError):
+        ssrf = True
+    check("web_fetch 拒绝回环地址（SSRF 防护）", ssrf)
+    try:
+        net_tools.web_fetch("file:///etc/passwd")
+        scheme = False
+    except ValueError:
+        scheme = True
+    check("web_fetch 只许 http(s)", scheme)
+    try:
+        net_tools.web_search("")
+        empty = False
+    except ValueError:
+        empty = True
+    check("空搜索词如实报错（不编结果）", empty)
+
+    # =====================================================================
+    print("\n== 9. 场景学习循环：驾驶舱在 B 下学的是 B 自己的任务（不是 VLML）==")
+    # =====================================================================
+    import scene_learn
+    fake_log = tmp / "coach_log.jsonl"
+    rows = [
+        {"mode": "voyager_consume", "root_scene": "B",
+         "question": QUESTION, "judgment_result": "fetched_empty"},
+        {"mode": "voyager_consume", "root_scene": "B",
+         "question": "另一个没答出来的问题", "judgment_result": "failed"},
+        {"mode": "voyager_consume", "root_scene": "B",
+         "question": "已经答出来的问题", "judgment_result": "written"},
+        {"mode": "voyager_consume", "root_scene": "A",
+         "question": "A 场景的问题不该混进来", "judgment_result": "fetched_empty"},
+    ]
+    fake_log.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows),
+                        encoding="utf-8")
+    old_cl = scene_learn.COACH_LOG
+    scene_learn.COACH_LOG = fake_log
+    try:
+        tasks_b = scene_learn.scene_questions("B")
+    finally:
+        scene_learn.COACH_LOG = old_cl
+    got = [t["question"] for t in tasks_b]
+    check("任务清单 = 本场景没答出来的导入问题（新→旧）",
+          got == ["另一个没答出来的问题", QUESTION], str(got))
+    check("已答出的不重学（不再重复出题）", "已经答出来的问题" not in got)
+    check("别的场景的问题不混进来", all("A 场景" not in g for g in got))
+
     print(f"\n===== 结果：{len(PASS)} 过 / {len(FAIL)} 挂 =====")
     if FAIL:
         for f in FAIL:

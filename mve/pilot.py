@@ -189,6 +189,18 @@ def tail(lines: int = 60) -> str:
     return "\n".join(content[-lines:])
 
 
+def _scene_backend(scene_id: str) -> str:
+    """这个场景的数据源是哪一档（vlml / local / scene / missing）。
+
+    判定唯一入口在 scene_profile —— 这里只读，不另立一套标准。
+    """
+    try:
+        import scene_profile
+        return str(scene_profile.profile(scene_id).get("kind") or "")
+    except Exception:
+        return ""
+
+
 def _log(text: str) -> None:
     with LOG.open("a", encoding="utf-8") as f:
         f.write(text)
@@ -244,6 +256,14 @@ def start(*, mode: str = "once", topic: str = "", rounds: int = 0,
     units = max(1, min(20, int(units or 1)))
     transfer = max(0, min(10, int(transfer or 0)))
 
+    # 场景隔离（用户 2026-10-19）：点击那一刻在哪个场景，学习就只学那个场景。
+    # 显式传给子进程 —— 后台跑着的时候人切了场景，跑的仍是点击时的那个。
+    try:
+        import scenes as _scn0
+        scene_id = str(_scn0.current_scene_id() or "A")
+    except Exception:
+        scene_id = "A"
+
     scope_label = ""
     if job == "practice" and use_scope and not topic:
         try:
@@ -264,6 +284,8 @@ def start(*, mode: str = "once", topic: str = "", rounds: int = 0,
         cmd += ["--curriculum"]
     if topic:
         cmd += ["--topic", str(topic)]
+    if scene_id and job in ("learn", "practice"):
+        cmd += ["--scene", scene_id]
 
     # start_new_session：脱离面板进程组，面板退出也不带走它
     proc = subprocess.Popen(
@@ -277,7 +299,7 @@ def start(*, mode: str = "once", topic: str = "", rounds: int = 0,
         "rounds": rounds, "pid": proc.pid, "started_at": _now(),
         "stopped_at": "", "iterations": 0, "last_exit": None,
         "stop_requested": False, "why": "运行中",
-        "scope": scope_label,
+        "scope": scope_label, "scene": scene_id,
     }
     _write(st)
     _log(f"\n===== 启动 {_now()} · 任务 {JOB_LABEL[job]} · 模式 {mode} · "
@@ -368,7 +390,8 @@ def _install_signal_handlers() -> None:
 
 
 def _run(mode: str, topic: str, rounds: int, job: str = "practice",
-         units: int = 1, transfer: int = 0, curriculum: bool = False) -> int:
+         units: int = 1, transfer: int = 0, curriculum: bool = False,
+         scene_id: str = "") -> int:
     _install_signal_handlers()
 
     # 日志文件句柄必须**全程持有**：用 `with` 包住 Popen 会在它返回后立刻关掉 fd，
@@ -376,7 +399,8 @@ def _run(mode: str, topic: str, rounds: int, job: str = "practice",
     #   Fatal Python error: init_sys_streams: ... OSError: [Errno 9] Bad file descriptor
     logf = LOG.open("a", encoding="utf-8")
     try:
-        code = _loop(mode, topic, rounds, logf, job, units, transfer, curriculum)
+        code = _loop(mode, topic, rounds, logf, job, units, transfer,
+                     curriculum, scene_id)
     finally:
         try:
             logf.close()
@@ -386,7 +410,8 @@ def _run(mode: str, topic: str, rounds: int, job: str = "practice",
 
 
 def _loop(mode: str, topic: str, rounds: int, logf, job: str = "practice",
-          units: int = 1, transfer: int = 0, curriculum: bool = False) -> int:
+          units: int = 1, transfer: int = 0, curriculum: bool = False,
+          scene_id: str = "") -> int:
     pid = os.getpid()
 
     def mark(text: str) -> None:
@@ -450,6 +475,16 @@ def _loop(mode: str, topic: str, rounds: int, logf, job: str = "practice",
             # （摸底要空库，结业考要有库），落盘 kind="final" 不覆盖摸底基线。
             cmd = [PY, str(ROOT / "exam.py"), "--final"]
             what = f"结业考（带技能库全库撤图谱再考）· {_now()}"
+        elif job in ("learn", "practice") and scene_id and _scene_backend(scene_id) != "vlml":
+            # 场景隔离（用户 2026-10-19 截图质问「为什么在场景 b 下会跑 VLML 的
+            # 学习」）：这个场景的数据源根本不是 VLML，学习单元就必须学**这个
+            # 场景自己**的任务 —— 拆分本场景图谱任务、用本机/联网原语取数
+            # （成功判据 = 取没取到内容），不再跑 vlml_grain_* 那套课程。
+            units_eff = units if job == "learn" else 1
+            cmd = [PY, str(ROOT / "scene_learn.py"),
+                   "--scene", scene_id, "--units", str(units_eff)]
+            what = (f"场景学习单元 · Scene {scene_id}（数据源非 VLML，只学本场景"
+                    f"没答出来的导入问题）· {units_eff} 单元 · {_now()}")
         elif job == "learn":
             # learn 的 --rounds 是"每个学习单元里练几轮"，语义与"不停"无关，
             # 传 0 会让它一轮都不跑 → 兜回 1
@@ -585,7 +620,8 @@ if __name__ == "__main__":
         job = _flag("--job", "practice")
         units = int(_flag("--units", "1"))
         transfer = int(_flag("--transfer", "0"))
-        sys.exit(_run(m, t, r, job, units, transfer, curriculum))
+        sys.exit(_run(m, t, r, job, units, transfer, curriculum,
+                      scene_id=_flag("--scene", "")))
 
     if argv and argv[0] == "status":
         st = read()

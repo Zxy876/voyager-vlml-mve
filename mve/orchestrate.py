@@ -186,6 +186,9 @@ def init_scene(scene_id: str, *, data_source: str = "") -> dict[str, Any]:
         if prof.get("kind") == _sp.LOCAL:
             loc = actions.register_local(scene_id, str(prof.get("scene_dir") or ""))
             added += int(loc.get("added") or 0)
+            # 联网能力（用户 2026-10-19：编排要能用「从猫娘搬来的 mcp、插件、
+            # 联网能力」去达成任务）—— 与本机能力并排挂猫爪总开关下面。
+            added += int(actions.register_net(scene_id).get("added") or 0)
             if loc.get("added"):
                 reason = ""
             elif loc.get("reason"):
