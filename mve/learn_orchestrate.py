@@ -206,7 +206,9 @@ def learn_milestone_skills(scene_id: str, topic_id: str, question: str,
             continue
         try:
             _act, key = skill_store.add(
-                topic_id, f"{topic_id}::{did}",
+                # key = f"{topic}::{name}"（skill_store._key），所以 name 直接用
+                # 维度 id —— 写成 f"{topic}::{did}" 会出现 topic::topic::dim 双前缀。
+                topic_id, did,
                 # ⚠️ 技能描述必须够长：`add()` 对 <MIN_LESSON_LEN(12) 的 text
                 # 直接 skipped（照原版 "Deposit useless items" 特判）。
                 # 光写维度问句在短问题上会静默丢技能 —— 补一句固定后缀。

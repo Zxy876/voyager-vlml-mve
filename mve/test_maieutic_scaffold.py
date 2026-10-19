@@ -368,6 +368,9 @@ def test_milestone_closure_writes_skills() -> None:
         got = list((raw.get("skills") or {}).values())
         assert len(got) == 1, got
         assert "web_search(" in str(got[0].get("code") or ""), got[0]
+        # key 不能出现 topic::topic::dim 的双前缀
+        assert list((raw.get("skills") or {}))[0] == "consume_abc::prevalence", \
+            list((raw.get("skills") or {}))
         assert got[0].get("source") == "learn", got[0]
         assert (got[0].get("blueprint") or {}).get("milestone") == "里程碑X", got[0]
         # 没闭合的里程碑：已闭合的那几条照样入（各自是一次成功 rollout）
