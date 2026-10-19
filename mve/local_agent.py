@@ -375,6 +375,13 @@ def _ns_base(scene_dir: str, scene_id: str = "") -> dict[str, Any]:
     if scene_id:
         try:
             import actions
+            # 条目必须先注册，`enabled_entries()` 才看得到 —— 注册是幂等的，
+            # 但**不能省**：实测（2026-10-19 服务器）在独立进程里直接重放一条
+            # 学到的联网配方，报 `NameError: name 'web_search' is not defined`，
+            # 只因为那个进程没走过 consume 的注册那一步。技能是跨入口复用的资产，
+            # 重放不能依赖「调用方刚好注册过」。
+            actions.register_local(scene_id, str(scene_dir))
+            actions.register_net(scene_id)
             names = {str(e.get("name")) for e in actions.enabled_entries(scene_id)
                      if str(e.get("origin") or "") in allowed_origins} & set(full)
         except Exception:

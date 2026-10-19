@@ -587,6 +587,22 @@ def main() -> int:
           "web_search" not in ns_nonet and "web_fetch" not in ns_nonet)
     _act.set_switch("B", "联网能力", True)
 
+    # 冷进程重放（2026-10-19 服务器实测）：一条学到的联网配方，在没走过
+    # consume 注册那一步的进程里直接重放，曾报 NameError: web_search 未定义。
+    # 注册表被清空后重放必须还能跑起来 —— 技能是跨入口复用的资产。
+    _act._REGISTRY.pop("B", None)
+    try:
+        _v = local_agent.run_saved(
+            'RESULT = {"probe": str(web_search)[:40], "net": str(web_fetch)[:40]}',
+            str(_scene_dir("B")), scene_id="B")
+        cold_ok = "web_search" in str(_v.get("probe")) \
+            and "web_fetch" in str(_v.get("net"))
+        cold_err = ""
+    except Exception as _e:
+        cold_ok, cold_err = False, f"{type(_e).__name__}: {_e}"
+    check("清空注册表后仍能重放学到的联网配方（run_saved 自己补注册）",
+          cold_ok, cold_err or "ok")
+
     # 安全边界（离线可断言）：只许公网 http(s)，拒绝私网/回环/非 http
     import net_tools
     try:
