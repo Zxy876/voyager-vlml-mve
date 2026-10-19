@@ -976,13 +976,16 @@ def scenes_view() -> dict[str, Any]:
         for sid in [s["id"] for s in scene_list]:
             prof = _sp.profile(sid)
             backend[sid] = str(prof.get("kind") or "")
-            if _acts.entry_count(sid) == 0:
-                # 按后端补：VLML 场景走反射；本机场景注册本机原语条目
-                # （否则普通用户建的新场景永远是 0 条 → 被硬拒绝项拦住）。
-                if prof.get("kind") == _sp.LOCAL:
+            if prof.get("kind") == _sp.LOCAL:
+                # 本机场景：本机原语**始终**作为一组条目在（不是"没条目才补"）——
+                # 否则一个已经学过技能的场景只显示「学到的技能」组，人在面板上
+                # 看不到「本机能力」这组开关，等于总开关下面少了一格。
+                if not any(e.get("origin") == "local"
+                           for e in _acts.entries(sid)):
                     _acts.register_local(sid, str(prof.get("scene_dir") or ""))
-                else:
-                    _acts.register_builtin_actions(sid)
+            elif _acts.entry_count(sid) == 0:
+                # VLML 场景走反射补齐（浅克隆没有 vlml/ 时如实 0 条，不编清单）
+                _acts.register_builtin_actions(sid)
         g = kg.KnowledgeGraph.load()
         for sid in scene_ids:
             exclusive[sid] = g.scene_specific_node_count(sid)
