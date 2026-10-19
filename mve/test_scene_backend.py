@@ -150,7 +150,7 @@ def _isolate(tmp: Path) -> None:
     _consume._RUNTIME_TOPICS_FILE = tmp / "runtime_topics.json"
     _consume.chat_json = lambda *_a, **_k: {"points": []}
     _llm.chat = FAKE
-    # 后台学习线程不在这里起（本文件单独测学习链路），但要记下有没有被踢
+    # 消费侧是否调 kick_learning（新设计：不再调，学习改人工触发，这里只验证没被调）
     def _fake_kick(question, scene_id="", *, reason=""):
         KICKS.append({"question": question, "scene": scene_id, "reason": reason})
         return {"kicked": False, "why": "测试内不起后台线程"}
@@ -393,11 +393,19 @@ def main() -> int:
           and "外部数据源" in str(empty.get("skipped"))
           and empty.get("answer") == "",
           str(empty.get("skipped"))[:80])
-    check("本机没取到也要踢一轮自学（不把闭环停在『认识这句话』）",
-          any(k["scene"] == "F" and "本机" in k["reason"] for k in KICKS),
+    # 2026-10-19 用户改设计：未命中 / 没取到数 **不再自动后台学**，学习改由人
+    # 在驾驶舱点「▶ 启动 Voyager」触发（每轮落 run_log，轨迹页可见）。这里验证
+    # 消费侧**不再调用** kick_learning（KICKS 空），而是把「等人工触发」写进
+    # learn_kick_note，让导入历史如实说明。
+    check("本机没取到 → 不自动后台学（kick_learning 没被调用，KICKS 空）",
+          not any(k["scene"] == "F" for k in KICKS),
           str([(k["scene"], k["reason"]) for k in KICKS])[:110])
-    check("取到数的那次不踢『本机没取到』（已解决就不用再学）",
-          not any(k["scene"] == "B" and "本机" in k["reason"] for k in KICKS),
+    check("本机没取到 → 导入历史带回『等人工触发』说明（learn_kicked=False）",
+          empty.get("learn_kicked") is False
+          and "驾驶舱" in str(empty.get("learn_kick_note") or ""),
+          str(empty.get("learn_kick_note"))[:120])
+    check("取到数的那次同样不自动踢（统一人工触发，不抢跑）",
+          not any(k["scene"] == "B" for k in KICKS),
           str([(k["scene"], k["reason"]) for k in KICKS])[:110])
 
     # 「没取到数不记账」——上面那次自报 error 的代码，绝不能变成配方入库。

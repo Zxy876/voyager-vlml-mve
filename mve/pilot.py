@@ -480,11 +480,17 @@ def _loop(mode: str, topic: str, rounds: int, logf, job: str = "practice",
             # 学习」）：这个场景的数据源根本不是 VLML，学习单元就必须学**这个
             # 场景自己**的任务 —— 拆分本场景图谱任务、用本机/联网原语取数
             # （成功判据 = 取没取到内容），不再跑 vlml_grain_* 那套课程。
+            # 循环是 Voyager 式 while True：每轮重读队列、随导入随学，只有人点
+            # 停止或队列真空才退（见 scene_learn.py），所以**不挂时间上限**
+            # —— 否则 900s/5400s 超时会在半路把它掐掉，等于偷偷把"不停"改回
+            # "跑一会儿"（与 loop.py 的 --max-iterations 是同一道理：跑完当前题才退）。
             units_eff = units if job == "learn" else 1
             cmd = [PY, str(ROOT / "scene_learn.py"),
                    "--scene", scene_id, "--units", str(units_eff)]
-            what = (f"场景学习单元 · Scene {scene_id}（数据源非 VLML，只学本场景"
-                    f"没答出来的导入问题）· {units_eff} 单元 · {_now()}")
+            what = (f"场景学习循环（Voyager 式 while True，不停）· Scene {scene_id}"
+                    f"（数据源非 VLML，只学本场景没答出来的导入问题）· 每轮最多"
+                    f" {units_eff} 题 · 点「■ 停止」才退 · {_now()}")
+            timeout = None
         elif job == "learn":
             # learn 的 --rounds 是"每个学习单元里练几轮"，语义与"不停"无关，
             # 传 0 会让它一轮都不跑 → 兜回 1

@@ -427,11 +427,61 @@ def kick_learning(question: str, scene_id: str = "", *,
 
 
 def _record(result: dict[str, Any]) -> None:
-    """留痕：内存里给面板 API，因果时间线给复盘（面板时间线页签可见）。"""
+    """留痕：内存里给面板 API，因果时间线给复盘，**run_log 给轨迹页**。
+
+    为什么要落 run_log（2026-10-19 用户改设计）：学习改由人点「▶ 启动 Voyager」
+    触发后，每一轮都得在「运行日志/轨迹」页看得见 —— 原来只写内存 _LAST +
+    因果时间线，轨迹页永远「0 轮」。字段对齐 loop.py:525 那行的面板读取契约；
+    不编造 coverage/score（学习环不判 VLML 分，如实 None，judge=db_evidence）。
+    """
     result = dict(result)
     result["finished_at"] = round(time.time(), 1)
     _LAST.append(result)
     del _LAST[:-_LAST_MAX]
+    # ---- run_log 一行（轨迹页可见；写失败不拦学习本身）----
+    try:
+        import run_log
+        status = str(result.get("status") or "")
+        execution = result.get("execution") or {}
+        success = status in ("learned", "partial")
+        _VERDICT = {"learned": "ok", "partial": "partial",
+                    "no_data": "no_evidence", "unreachable": "unreachable",
+                    "prepared": "prepared", "failed": "failed"}
+        why = str(result.get("why") or "")
+        run_log.append({
+            "mode": "scene_learn",
+            # 显式带场景：scene_learn 在子进程里跑，人可能已切了场景，
+            # 按"当前场景"补会记错账（与 pilot.start 钉场景同一个道理）。
+            "scene": str(result.get("scene_id") or ""),
+            "topic_id": str((result.get("absorbed") or {}).get("topic_id") or ""),
+            "task": str(result.get("question") or "")[:60],
+            "question": str(result.get("question") or ""),
+            "round": 1,
+            "hint": "",
+            "coverage": None,
+            "score": None,
+            "verdict": _VERDICT.get(status, status or "failed"),
+            "success": success,
+            "done": status == "learned",
+            "evidence_status": "collected" if success else "none",
+            "judge": "db_evidence",
+            "no_tool_calls": not execution.get("calls"),
+            "feedback": {},
+            "tool_calls": int(execution.get("calls") or 0),
+            "errors": [why[:200]] if why else [],
+            "covered": [],
+            "missing": [] if success else [str(result.get("question") or "")[:60]],
+            "narrative": "",
+            "generated_task": False,
+            "sql": str(execution.get("sql") or ""),
+            "skill_key": "",
+            "reused_skills": [],
+            # 学习环原始状态与后端（轨迹页点开一条能看见学的是哪个数据源）
+            "learn_status": status,
+            "backend": str((result.get("backend") or {}).get("kind") or ""),
+        })
+    except Exception:
+        pass
     try:
         import causal_timeline
         causal_timeline.append(

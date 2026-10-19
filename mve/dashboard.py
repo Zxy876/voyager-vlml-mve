@@ -1627,21 +1627,32 @@ function renderGraph(g){
     <span class="hint">（全库图谱共 ${g.total_nodes==null?'—':g.total_nodes} 个节点；
     <b>其它场景的节点不画在这里</b> —— 场景间按命名空间隔离，切场景看各自的图）</span></div>`;
   const byId={}; nodes.forEach(n=>byId[n.id]=n);
-  // 只画**有边**的节点：孤立工具（VLML 有 9 个但多数没被任何题用到）
-  // 画进来只会让图变乱，且有边的才有信息量。
+  // 收集要画的节点（规则见下方 forEach 注释）：维度（含孤立）必画；
+  // 工具/表只有连边才画（避免 machinery 把图变乱）。
   const linked=new Set();
   edges.forEach(e=>{linked.add(e.from);linked.add(e.to);});
   const cols={table:[],tool:[],dimension:[]};
-  nodes.filter(n=>linked.has(n.id)).forEach(n=>{(cols[n.kind]||(cols[n.kind]=[])).push(n);});
+  // 1→n 冷启动：本场景导入的问题落成的是**孤立维度**（kind=dimension，没被任何
+  // 种子题的 rubric 连到工具/表）。维度是用户关心的知识点，无论是否连边都要画出来
+  // —— 它是"问题插进场景"的可见证明（淡黄虚线框见下方 cold 样式；被再命中升级为
+  // verified 后变成普通维度框，照样画）。工具/表是取数 machinery，没被任何维度用
+  // 到（没连边）时不画，避免图变乱（VLML 有 9 个工具，多数没被题用到）。两者按
+  // kind 区分，互不干扰。deleted 节点不画。
+  nodes.forEach(n=>{
+    if(n.status==='deleted') return;
+    const isolated = !linked.has(n.id);
+    if(!isolated || n.kind==='dimension')
+      (cols[n.kind]||(cols[n.kind]=[])).push(n);
+  });
   ['table','tool','dimension'].forEach(k=>cols[k].sort((a,b)=>a.label.localeCompare(b.label)));
-  if(!cols.dimension.length){
+  if(!cols.dimension.length && !cols.tool.length && !cols.table.length){
     // 场景图谱为空（只有场景根节点）= 冷启动期：说清楚"这是正常的、下一步干嘛"，
     // 不要报"图谱里还没有连上边的维度"那种像故障的文案。
     if(sceneSpecific===0) return sceneBanner+`<div class="empty">
       Scene ${ESC(sceneId)} 的图谱还是<b>空的</b>（冷启动期只有场景根节点）。
       <br>去「人导入」问一个<b>属于这个场景</b>的问题：未命中会先落待审区，
       解题成功后第一个节点就挂上来，Δ 专属节点 0 → 1。</div>`;
-    return sceneBanner+`<div class="empty">图谱里还没有连上边的维度</div>`;
+    return sceneBanner+`<div class="empty">这个场景还没有可画的节点</div>`;
   }
 
   // 待审候选条：运行期题带来的新维度名**不占节点位**（照伴学：运行期新建的
@@ -1744,7 +1755,8 @@ ${ESC(REL[e.relation]&&REL[e.relation][1]||e.relation)}${e.origin==='observed'?'
     </svg>
     <div class="note info" style="margin-top:10px">判错时反馈里的「这个维度由哪个工具产出」
       就来自这张图 —— 它是 <span class="mono">answer_spec.tool</span> 声明出来的，不是模型猜的。
-      孤立节点（没有任何边）不画：VLML 有 9 个工具，被真正用到的才进图。
+      冷启动期新建的维度（淡黄虚线框）即使还没连边也会画出来 —— 它是问题"插进场景"的
+      可见证明（证据数=1、待验证）；VLML 那些没被任何题用到的工具仍不画（避免图变乱）。
       <br><b>点任意维度</b>（或下表按钮）把它设成练习范围，出题器就只在这范围里出题。</div>
     <table class="tbl" style="margin-top:12px">
       <thead><tr><th>知识点（维度）</th><th>阶段·工具集梯度</th><th>学科·实体域</th>
@@ -2218,8 +2230,10 @@ function learnBar(s){
     ${running?`<span class="chip grey">已跑 ${ESC(s.learn_elapsed)} 秒</span>`:
       (st?`<span class="chip ${st==='learned'?'ok':(st==='no_data'?'warn':'bad')}">${ESC(st)}</span>`:'')}
     <div style="font-size:12px;color:var(--muted);margin-top:4px">
-      导入未命中就自动学（不用另点按钮）：拆分课程（子目标有抓手）→ 缺口<b>写插件</b>补上
-      → 真取数 → 配方进技能库 + 解锁里程碑（解锁后不再重复出题）。
+      学习由你在驾驶舱点「<b>▶ 启动 Voyager</b>」触发（2026-10-19 改：导入未命中
+      <b>不再自动后台学</b> —— 自动抢跑的轮次运行日志里一条都不落）。每一轮：
+      拆分课程（子目标有抓手）→ 缺口<b>写插件</b>补上 → 真取数 → 配方进技能库 +
+      解锁里程碑（解锁后不再重复出题），<b>每轮落一行 run_log（轨迹页可见）</b>。
       失败照实报：没取到数就不写技能库、不解锁。
     </div>${ev}</div>`;
 }

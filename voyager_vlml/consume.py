@@ -522,15 +522,15 @@ async def consume(
                             f"matched_on={route_info.get('matched_on') or '—'}）"))
             except Exception as _me:
                 miss_info = {"reason": f"{type(_me).__name__}: {_me}"}
-            # 第三步：启动 voyager 自主学习（拆分→补缺口→取数→入库→结晶）。
-            # 后台任务（分钟级），失败绝不影响本次回答 —— try/except 整个包住，
-            # 退回原行为（只有待审区登记 + 建点）。
-            try:
-                import learn_orchestrate as _lo
-                learn_kick = _lo.kick_learning(question, _scene_id)
-            except Exception as _le:
-                learn_kick = {"kicked": False,
-                              "why": f"{type(_le).__name__}: {_le}"}
+            # 第三步（2026-10-19 用户改设计）：**不再自动后台学**。原来未命中
+            # 就 kick_learning 抢跑 —— 学习在人看不见的后台跑完，运行日志
+            # （run_log/轨迹页）一条都不落，人还以为没学。现在学习由人自己在
+            # 驾驶舱点「▶ 启动 Voyager」触发（非 VLML 场景跑 scene_learn.py，
+            # 每学一题落一行 run_log）；这里只做完前两步（待审区 + 图谱建点），
+            # 并在导入历史里如实说明"等人工触发"。
+            learn_kick = {"kicked": False, "manual": True,
+                          "why": "已登记待审区+图谱节点 —— 学习等你在驾驶舱点"
+                                 "「▶ 启动 Voyager」触发（会落运行日志）"}
     except Exception:
         pass                                     # 待审区写不进去不能拦消费
     # ---- ②.5 场景后端（数据源）----
@@ -631,19 +631,13 @@ async def consume(
             obs, code = await _la.solve(question, _scene_dir, scene_id=_scene_id)
             real = [o for o in obs if o.get("ok") and o.get("data") is not None]
             data = (real[-1].get("data") if real else None)
-        # 没取到 → 还是没学会 → 踢一轮自学（与 VLML 路径同一条铁律：
-        # 「命中但没取到真数」也要学，不然闭环停在「认识这句话」）。
-        # 本机场景尤其需要：第一次问时场景目录往往是空的，得让 Voyager
-        # 自己去看本机有什么、能不能换个取法。
-        if data is None and not learn_kick.get("kicked"):
-            try:
-                import learn_orchestrate as _lo2
-                learn_kick = _lo2.kick_learning(
-                    question, _scene_id,
-                    reason="本机没取到结果（能力还没学会）")
-            except Exception as _ke:
-                learn_kick = {"kicked": False,
-                              "why": f"{type(_ke).__name__}: {_ke}"}
+        # 没取到 → 还是没学会。同样**不自动后台学**（2026-10-19 用户改设计）：
+        # 这条问题已在场景学习账上（coach_log 判读 = 没答出来），人点驾驶舱
+        # 「▶ 启动 Voyager」时 scene_learn.py 会排到它 —— 每轮落 run_log 可见。
+        if data is None:
+            learn_kick = {"kicked": False, "manual": True,
+                          "why": "没取到结果（能力还没学会）—— 学习等你在驾驶舱点"
+                                 "「▶ 启动 Voyager」触发"}
         answer = ""
         # 叙事层：取到的数是**素材**，答案得是人话。
         # 同构猫娘的「参考资料 → 回答」（config/prompts/prompts_knowledge.py:31-36
@@ -815,22 +809,15 @@ async def consume(
     real_rows = sum(int(o.get("rows") or 0) for o in real_calls)
     trajectory = [str(o.get("tool") or "") for o in ok_calls]
 
-    # 命中但**没取到数** = 还是没学会 —— 也要踢一轮自学。
-    # 为什么不能只靠「未命中」触发（2026-10-19 实测）：未命中会当场建一枚
-    # cold_start 节点，于是第二次问同一句就是 HIGH_CONFIDENCE「命中」了，
-    # 可节点只是记账、不会让模型突然会写这条 SQL —— 表现是「命中、但 rows=0」，
-    # 学习再也不会被触发，闭环永远停在「认识这句话」而不是「能回答这句话」。
-    # 原版铁律同构：任务做成（取到值）才固化；没做成就要继续学。
+    # 命中但**没取到数** = 还是没学会。同样**不自动后台学**（2026-10-19 用户改
+    # 设计）：「命中但没取到真数」要学没错，但学习由人在驾驶舱点「▶ 启动
+    # Voyager」触发（VLML 场景跑主循环、其他场景跑 scene_learn.py），每轮落
+    # run_log —— 自动抢跑的轮次人看不见、也不落账，才有截图里「轨迹 0 轮」。
+    # 原版铁律不变：任务做成（取到值）才固化；没做成就留在学习账上继续学。
     if not real_calls:
-        try:
-            import learn_orchestrate as _lo2
-            if not learn_kick.get("kicked"):
-                learn_kick = _lo2.kick_learning(
-                    question, _scene_id,
-                    reason="命中但没取到真数（能力还没学会）")
-        except Exception as _ke:
-            learn_kick = {"kicked": False,
-                          "why": f"{type(_ke).__name__}: {_ke}"}
+        learn_kick = {"kicked": False, "manual": True,
+                      "why": "命中但没取到真数（能力还没学会）—— 学习等你在"
+                             "驾驶舱点「▶ 启动 Voyager」触发"}
 
     # ---- ④ 整理事实（**面板披露「取到了哪些数」用，不再是判分的前提**）----
     # ⚠️ 2026-10-13 改判法（用户原话）：「整理事实这个事情本来就是交给 LLM 的，

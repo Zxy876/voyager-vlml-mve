@@ -110,51 +110,69 @@ def scene_questions(scene_id: str) -> list[dict[str, Any]]:
     return [{"question": q} for q in todo]
 
 
+def _run_one(q: str, scene: str) -> None:
+    """学一道（同构原版 voyager.py:326 那圈 rollout：取任务 → 写代码/取数 → 成功加技能）。
+    结果自身会落 run_log（轨迹页可见），不在这里另记。"""
+    _log(f"\n----- 场景学习 · Scene {scene} · {q} -----")
+    t0 = time.time()
+    try:
+        r = asyncio.run(learn_orchestrate.start_learning(q, scene))
+    except Exception as e:
+        r = {"status": "failed", "why": f"{type(e).__name__}: {e}"}
+    status = str(r.get("status") or "")
+    why = str(r.get("why") or "")
+    _log(f"[场景学习] → status={status}（{time.time() - t0:.0f}s）"
+         + (f" · {why[:160]}" if why else "")
+         + (f" · 后端={((r.get('backend') or {}).get('kind'))}" if r.get("backend") else ""))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--scene", required=True)
-    ap.add_argument("--units", type=int, default=4)
+    ap.add_argument("--units", type=int, default=4,
+                    help="每轮从待学队列最多取几个学（不是总上限——学完一轮会再读队列，"
+                         "随你导入随学）。默认 4。")
     ap.add_argument("--question", default="",
-                    help="强制重学这一句（即使账上记过 written —— 用于把"
-                         "历史误记的『成功』纠正回来，如 2026-10-19 那条把无关"
-                         "文件内容当答案的错误 written）")
+                    help="强制重学这一句（即使账上记过 written —— 用于把历史误记的"
+                         "『成功』纠正回来）。先单独跑一次，再进入正常循环。")
     args = ap.parse_args()
-    scene, units = args.scene, max(1, min(20, args.units))
-
-    tasks = scene_questions(scene)[:units]
-    if args.question:
-        q = str(args.question).strip()
-        if not any(t["question"] == q for t in tasks):
-            tasks.insert(0, {"question": q})
-        tasks = [t for t in tasks if t["question"] == q] or tasks[:units]
-    _log(f"\n[场景学习] Scene {scene} · 待学任务 {len(tasks)} 个"
-         f"（上限 {units}）· {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    if not tasks:
-        _log("[场景学习] 这个场景没有没答出来的导入问题 —— 没什么可学的，正常结束。")
-        return 0
+    scene = args.scene
+    units = max(1, min(50, args.units))
+    forced = str(args.question).strip()
 
     import learn_orchestrate
-    ok = 0
-    for i, t in enumerate(tasks, 1):
+
+    # 强制重学：先单独跑一次（纠正误记），再进入正常循环。
+    if forced:
+        _log(f"\n[场景学习] 强制重学这一句（纠正历史误记的 written）：{forced}")
+        _run_one(forced, scene)
+
+    # 同构原版 Voyager learn() 的「while True」：每轮从课程树取下一个任务执行，
+    # **只有人点「■ 停止」（SIGTERM → _asked_to_stop）或队列真的耗尽才退**——
+    # 不自己发明空闲 sleep、不靠计时器掐断、不跑 1 题就收。每轮重读队列，
+    # 你跑着的时候新导入的问题会被自动接进来接着学（这就是「随导入随学」）。
+    _log(f"\n[场景学习] Scene {scene} · 进入 Voyager 式循环（while True，"
+         f"每轮最多 {units} 题，点「■ 停止」才退）· {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    while True:
         if _asked_to_stop():
-            _log(f"\n[场景学习] 收到停止信号，跑完当前账就退（已完成 {i - 1}/{len(tasks)}）")
+            _log("\n[场景学习] 收到停止信号（人在驾驶舱点了停止），跑完当前题退出。")
             break
-        q = t["question"]
-        _log(f"\n----- 场景学习 {i}/{len(tasks)} · Scene {scene} · {q} -----")
-        t0 = time.time()
-        try:
-            r = asyncio.run(learn_orchestrate.start_learning(q, scene))
-        except Exception as e:
-            r = {"status": "failed", "why": f"{type(e).__name__}: {e}"}
-        status = str(r.get("status") or "")
-        why = str(r.get("why") or "")
-        _log(f"[场景学习] → status={status}（{time.time() - t0:.0f}s）"
-             + (f" · {why[:160]}" if why else "")
-             + (f" · 后端={((r.get('backend') or {}).get('kind'))}" if r.get("backend") else ""))
-        if status in ("learned", "partial"):
-            ok += 1
-    _log(f"\n[场景学习] 结束：{ok}/{len(tasks)} 个任务取到了内容（learned/partial）。"
-         "再次导入同一句应当命中并给出答案。")
+        tasks = scene_questions(scene)[:units]
+        if not tasks:
+            # 队列真空 = 这个场景当前没有没答出来的导入问题了。
+            # 同构 Voyager：课程树走完就退出（voyager.py:328 `if not self.env.cheat_n_save(): break`）。
+            # 不是故障、不是超时，是「该学的都学完了」；你再导入新问题，重新点
+            # 「▶ 启动 Voyager」即可。
+            _log("[场景学习] 待学队列空了 —— 当前场景没答出来的导入问题都学完了，循环结束。"
+                 "（再导入新问题，点「▶ 启动 Voyager」会接着学。）")
+            break
+        _log(f"\n[场景学习] 本轮待学 {len(tasks)} 个（队列上限 {units}）")
+        for i, t in enumerate(tasks, 1):
+            if _asked_to_stop():
+                _log(f"\n[场景学习] 收到停止信号，跑完当前题退出（{i - 1}/{len(tasks)}）。")
+                break
+            _run_one(t["question"], scene)
+        # 不 return —— 回到 while 顶，重读队列、随导入随学。
     return 0
 
 
