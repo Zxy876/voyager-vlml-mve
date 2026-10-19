@@ -65,11 +65,42 @@ def test_skill_scene_tag() -> None:
     assert s["source_scene"] == "B", s["source_scene"]
 
 
+def test_residual_graph_guard() -> None:
+    """残图不许覆盖真图（2026-10-19 服务器事故：365 节点被 2 节点覆盖）。"""
+    import json
+    import knowledge_graph as kg
+
+    tmp = Path(tempfile.mkdtemp()) / "knowledge_graph.json"
+    # 盘上：一张像样的图（带种子表节点 + 够多节点）
+    big = kg.KnowledgeGraph()
+    big.add_node(Node(id="table:rounds", kind="table", label="rounds"))
+    for i in range(60):
+        big.add_node(Node(id=f"fact:f{i}", kind="fact", label=f"事实 {i}"))
+    big.save(tmp, force=True)
+
+    # 内存里：一次冷启动建点后的残图（只有 scene + consume 两个点）
+    small = kg.KnowledgeGraph()
+    small.add_cold_start_node("B", "consume:consume_x", "dimension", label="某个问题")
+    small.save(tmp)                       # 没 force → 必须被拒
+
+    kept = json.loads(tmp.read_text(encoding="utf-8"))
+    assert len(kept["nodes"]) == 61, f"残图把真图覆盖了：{len(kept['nodes'])} 节点"
+
+    # 残图本身要被判过期（否则自检永远说「已是最新」）
+    assert kg._stale(kept) is False, "正常图不该被判过期"
+    assert kg._stale(small.to_dict()) is True, "残图必须被判过期 → 触发重建"
+
+    # 显式 force 才允许覆盖（人工 --build 改结构时用）
+    small.save(tmp, force=True)
+    assert len(json.loads(tmp.read_text(encoding="utf-8"))["nodes"]) == 2
+
+
 def main() -> int:
     test_cold_start_new_and_promote()
     test_existing_topic_not_cold_start()
     test_skill_scene_tag()
-    print("✅ 冷启动登记：新建/升级/非冷启动/技能场景归属 全部通过")
+    test_residual_graph_guard()
+    print("✅ 冷启动登记：新建/升级/非冷启动/技能场景归属/残图不覆盖真图 全部通过")
     return 0
 
 

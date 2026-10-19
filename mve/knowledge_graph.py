@@ -847,7 +847,37 @@ class KnowledgeGraph:
             },
         }
 
-    def save(self, path: Path = GRAPH_PATH) -> None:
+    def save(self, path: Path = GRAPH_PATH, *, force: bool = False) -> None:
+        """落盘缓存。**残图不许覆盖真图**（2026-10-19 实测事故的防呆）。
+
+        事故：`reset_all.py` 删了 knowledge_graph.json（备份在 `_backup_*`），
+        随后一次冷启动建点走到 `load()` —— 文件不存在 → 返回**空图** ——
+        建完点直接 `save()`，于是 365 节点 / 771 边 的 VLML 图谱被 620 字节
+        的「2 个节点」覆盖。面板自检看到「有节点」就判「已是最新」，
+        从此再也重建不回来（截图里图谱页只剩两个孤点）。
+
+        所以：新图比旧图**小得多**（<1/3）或**丢了种子表节点**时，拒绝写，
+        并大声说明原因。真要大改结构就显式 `force=True`。
+        """
+        if not force:
+            try:
+                if path.exists() and path.stat().st_size > 0:
+                    old = json.loads(path.read_text(encoding="utf-8",
+                                                    errors="replace"))
+                    olds = old.get("nodes") or []
+                    old_n, new_n = len(olds), len(self.nodes)
+                    old_tables = any(n.get("kind") == "table" for n in olds)
+                    new_tables = bool(self.tables())
+                    if old_n >= 50 and (new_n * 3 < old_n
+                                        or (old_tables and not new_tables)):
+                        why = ("种子表节点丢失" if (old_tables and not new_tables)
+                               else f"节点数缩到不足 1/3")
+                        print(f"[图谱] 拒绝用残图覆盖 {path.name}："
+                              f"{old_n} → {new_n} 节点（{why}）。"
+                              f"这通常说明内存里的图是空的 —— 先查 load() 为什么没读到。")
+                        return
+            except Exception:
+                pass          # 旧图读不出来就更该覆盖（坏文件不能挡住修复）
         path.write_text(json.dumps(self.to_dict(), ensure_ascii=False, indent=1),
                         encoding="utf-8")
 
@@ -866,11 +896,15 @@ class KnowledgeGraph:
         #   题指纹   —— 加题/改题（tasks.py 的 answer_spec 变了）
         #   建模指纹 —— VLML 的建模文档改了（表节点与维度节点的声明来自文档）
         #   格式版本 —— 节点的声明字段本身改了（题没变、文档也没变，但**代码**变了）
+        #   + 残图   —— 只剩冷启动点的图（种子全丢）也当过期，见 `_stale`
         if _stale(raw):
             try:
-                g = build()
-                g.save(path)
-                return g
+                g2 = build()
+                # 重建出来的图要是也小得离谱（题/文档/库读不到），
+                # 就别拿它覆盖盘上那张 —— 先保旧图，`save()` 里还有一道闸。
+                if len(g2.nodes) >= 50 or not (raw.get("nodes") or []):
+                    g2.save(path)
+                    return g2
             except Exception:
                 pass          # 重建失败就退回旧图，总比没有强
         for n in raw.get("nodes") or []:
@@ -922,8 +956,16 @@ def _model_fingerprint() -> str:
 
 
 def _stale(raw: dict[str, Any]) -> bool:
-    """三判据：格式版本 / 题指纹 / 建模文档指纹。"""
+    """四判据：格式版本 / 题指纹 / 建模文档指纹 / 残图。"""
     if int(raw.get("schema_version") or 0) != SCHEMA_VERSION:
+        return True
+    # 残图判据（2026-10-19 实测事故）：`reset_all.py` 删掉图谱后，一次冷启动
+    # 建点把一个「只有 scene + consume 两个节点」的空图写了回去；指纹全都对得上
+    # （save 时现算的），自检就判「已是最新」，365 节点的 VLML 图谱再也回不来。
+    # 正常图谱必然带种子表节点（build() 从 schema 派生 27 张表），
+    # 所以「没表节点且节点数很少」= 残图，必须重建。
+    nodes = raw.get("nodes") or []
+    if len(nodes) < 50 and not any(n.get("kind") == "table" for n in nodes):
         return True
     summary = raw.get("summary") or {}
     fp = _task_fingerprint()
