@@ -589,6 +589,19 @@ async def consume(
         obs, code = await _la.solve(question, _scene_dir)
         real = [o for o in obs if o.get("ok") and o.get("data") is not None]
         data = (real[-1].get("data") if real else None)
+        # 没取到 → 还是没学会 → 踢一轮自学（与 VLML 路径同一条铁律：
+        # 「命中但没取到真数」也要学，不然闭环停在「认识这句话」）。
+        # 本机场景尤其需要：第一次问时场景目录往往是空的，得让 Voyager
+        # 自己去看本机有什么、能不能换个取法。
+        if data is None and not learn_kick.get("kicked"):
+            try:
+                import learn_orchestrate as _lo2
+                learn_kick = _lo2.kick_learning(
+                    question, _scene_id,
+                    reason="本机没取到结果（能力还没学会）")
+            except Exception as _ke:
+                learn_kick = {"kicked": False,
+                              "why": f"{type(_ke).__name__}: {_ke}"}
         answer = ""
         if data is not None:
             try:

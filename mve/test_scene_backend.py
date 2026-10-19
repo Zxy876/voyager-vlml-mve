@@ -51,6 +51,7 @@ import topic_graph            # noqa: E402
 # `_log_import`（人导入日志），用桩顶替即可，断言反而更直接。
 import types                  # noqa: E402
 LOGS: list[dict] = []
+KICKS: list[dict] = []
 _coach_stub = types.ModuleType("coach")
 _coach_stub._log_import = lambda r: LOGS.append(dict(r))
 sys.modules.setdefault("coach", _coach_stub)
@@ -149,9 +150,12 @@ def _isolate(tmp: Path) -> None:
     _consume._RUNTIME_TOPICS_FILE = tmp / "runtime_topics.json"
     _consume.chat_json = lambda *_a, **_k: {"points": []}
     _llm.chat = FAKE
-    # 后台学习线程不在这里起（本文件单独测学习链路）
-    learn_orchestrate.kick_learning = lambda *_a, **_k: {
-        "kicked": False, "why": "测试内不起后台线程"}
+    # 后台学习线程不在这里起（本文件单独测学习链路），但要记下有没有被踢
+    def _fake_kick(question, scene_id="", *, reason=""):
+        KICKS.append({"question": question, "scene": scene_id, "reason": reason})
+        return {"kicked": False, "why": "测试内不起后台线程"}
+
+    learn_orchestrate.kick_learning = _fake_kick
 
 
 def _scene_dir(sid: str) -> Path:
@@ -338,6 +342,12 @@ def main() -> int:
     check("如实告诉人怎么办（放数据文件 / 换个问法）",
           "本机" in str(empty.get("skipped")) and empty.get("answer") == "",
           str(empty.get("skipped"))[:70])
+    check("本机没取到也要踢一轮自学（不把闭环停在『认识这句话』）",
+          any(k["scene"] == "F" and "本机" in k["reason"] for k in KICKS),
+          str([(k["scene"], k["reason"]) for k in KICKS])[:110])
+    check("取到数的那次不踢『本机没取到』（已解决就不用再学）",
+          not any(k["scene"] == "B" and "本机" in k["reason"] for k in KICKS),
+          str([(k["scene"], k["reason"]) for k in KICKS])[:110])
 
     # =====================================================================
     print("\n== 6. 学习侧同样按后端分流（A 走 VLML，B 走本机）==")
