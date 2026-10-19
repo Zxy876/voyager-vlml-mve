@@ -701,6 +701,10 @@ async def consume(
             except Exception:
                 abs_info = {}
         base.update({
+            # topic_id 用 `_absorb` **解析后**的那个（归不上已有题时它给了一个
+            # 稳定的 consume_<md5>）：面板的进步曲线就是按这一列累计
+            # 「答出来了 +1」，写空串的话 mastered 永远是 True 但曲线不涨。
+            "topic_id": str(abs_info.get("topic_id") or base.get("topic_id") or ""),
             "mastered": bool(abs_info.get("mastered")),
             "skill_action": str(abs_info.get("skill_action") or ""),
             "node_status": str(abs_info.get("node_status") or ""),

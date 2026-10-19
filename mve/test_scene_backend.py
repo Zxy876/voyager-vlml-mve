@@ -373,6 +373,11 @@ def main() -> int:
           int(again.get("mastered_total") or 0)
           <= int(again.get("ability_total") or 0),
           f"{again.get('mastered_total')}/{again.get('ability_total')}")
+    # 曲线按 topic_id 累计「答出来了 +1」：这一步写空串的话，mastered 是 True
+    # 但曲线永远不涨（面板看起来「掌握了却不进步」）。
+    check("消费记录带上解析后的 topic_id（曲线靠它累计）",
+          str(again.get("topic_id") or "").startswith("consume_"),
+          str(again.get("topic_id")))
 
     # 本机没数据时：如实说「没取到」，不编、也不偷偷去读 rib
     scenes.create_scene("空场景", scene_id="F")
