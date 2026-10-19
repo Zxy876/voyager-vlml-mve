@@ -41,6 +41,14 @@ for p in (str(HERE), str(REPO)):
 COACH_LOG = HERE / "coach_log.jsonl"
 PILOT_STATE = HERE / "pilot_state.json"
 
+# 模块级导入：_run_one 是模块级函数，必须能直接取到 learn_orchestrate。
+# 原来它写在 main() 局部 → 模块级作用域里没有这个名字 →
+#   NameError: name 'learn_orchestrate' is not defined
+# 于是 start_learning 一行都没跑，学习主循环（拆分/补缺口/MCP/取数/入库）全空转。
+# learn_orchestrate 不反向 import scene_learn（已 grep 确认只在注释里出现），
+# 放到顶层没有循环导入风险。
+import learn_orchestrate  # noqa: E402
+
 
 def _asked_to_stop() -> bool:
     """与驾驶舱共用一个停止信号：点「■ 停止」后跑完当前这一单元才退。"""
@@ -139,8 +147,6 @@ def main() -> int:
     scene = args.scene
     units = max(1, min(50, args.units))
     forced = str(args.question).strip()
-
-    import learn_orchestrate
 
     # 强制重学：先单独跑一次（纠正误记），再进入正常循环。
     if forced:
