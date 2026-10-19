@@ -78,6 +78,32 @@ def test_queue_priority_and_retry() -> None:
     print("PASS  test_queue_priority_and_retry")
 
 
+def test_dedupe_exact_only() -> None:
+    """去重只做归一化精确相等（原版口径）：换问法的新题不能被误杀。"""
+    import curriculum_auto as C
+    done = ["projects.json 中哪些项目的 2026 年 stars 数量比 2025 年增加了至少 20,000？"]
+    # 减少 vs 增加：长句共享字多，但这是两道不同的题 —— 必须判"不重复"
+    assert not C._too_similar(
+        "projects.json 中哪个项目的 2026 年 stars 数量比 2025 年减少了？", done)
+    assert C._too_similar(done[0], done)                     # 完全一样
+    assert C._too_similar(done[0].rstrip("？"), done)         # 只差标点
+    print("PASS  test_dedupe_exact_only")
+
+
+def test_retry_raise_with_reason() -> None:
+    """连续重复 → 走原版 raise，但消息里要带最后原因（否则线上无法定位）。"""
+    import curriculum_auto as C
+    a = C.CurriculumAgent("T", scene_dir="", llm=lambda m: "Task: q1\nContext: c")
+    a.completed_tasks = ["q1"]
+    try:
+        a.propose_next_ai_task(max_retries=2)
+        raise AssertionError("应 raise RuntimeError")
+    except RuntimeError as e:
+        assert "Max retries reached" in str(e)
+        assert "重复" in str(e), str(e)
+    print("PASS  test_retry_raise_with_reason")
+
+
 def test_needs_data() -> None:
     """题面分型：数据型 vs 知识型（决定要不要把"没取数"判死）。"""
     import task_critic as T
@@ -164,6 +190,8 @@ def main() -> None:
     test_parse_ai_message()
     test_two_books()
     test_queue_priority_and_retry()
+    test_dedupe_exact_only()
+    test_retry_raise_with_reason()
     test_needs_data()
     test_knowledge_vs_data_judge()
     test_critic_shortcut()

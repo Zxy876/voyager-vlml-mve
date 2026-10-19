@@ -71,21 +71,18 @@ def _norm(q: str) -> str:
 
 
 def _too_similar(q: str, others: Iterable[str]) -> bool:
-    """去重（原版 clean_up_tasks 只做精确去重；这里加一步字符集 Jaccard，
-    因为同一句话换个说法在自然语言里太常见，精确匹配挡不住）。"""
+    """去重：**只做归一化后的精确相等**（原版 clean_up_tasks 就是精确去重）。
+
+    ⚠️ 不要加相似度阈值（我一度加了"字符集 Jaccard ≥ 0.8"，2026-10-19 实测炸了：
+    「…比 2025 年**减少**了？」与「…**增加**了至少 20,000？」长句共享字太多，
+    被判成同一题 → 合法新题连续被拒 5 次 → 原版 RuntimeError。自然语言里
+    "换个问法"本来就是新任务，相似度挡不住语义差异，只会误杀。
+    归一化只去空白/标点（中英文标点混用很常见），不做同义词归一。
+    """
     n = _norm(q)
     if not n:
         return True
-    for o in others:
-        m = _norm(o)
-        if not m:
-            continue
-        if n == m:
-            return True
-        a, b = set(n), set(m)
-        if a and b and len(a & b) / len(a | b) >= 0.8:
-            return True
-    return False
+    return any(n == _norm(o) for o in others)
 
 
 class CurriculumAgent:
@@ -192,10 +189,23 @@ class CurriculumAgent:
                 return q, "人导入的待学问题（原版 manual 模式对应物）"
         return self.propose_next_ai_task(max_retries=max_retries)
 
-    def propose_next_ai_task(self, *, max_retries: int = 5) -> tuple[str, str]:
+    def propose_next_ai_task(self, *, max_retries: int = 5,
+                             _feedback: str = "") -> tuple[str, str]:
+        """原版 :293-311：LLM 出 `Task:` 行；解析失败重试 5 次后 raise。
+
+        多做的两件小事（都不改原版语义）：
+          · 重复/没格式时，把原因拼进下一轮 user 消息（迭代提示，同原版 action
+            agent 把 critic 的 critique 回灌下一次的做法）；
+          · raise 时把最后原因带进消息 —— 原版只有一句 "Max retries reached"，
+            线上看到它根本不知道是"模型没按格式"还是"全是重复"。
+        """
         if max_retries <= 0:
-            raise RuntimeError("Max retries reached, failed to propose ai task.")
+            raise RuntimeError(
+                "Max retries reached, failed to propose ai task."
+                + (f"（最后原因：{_feedback}）" if _feedback else ""))
         user = self.render_human_message() + "\n请按系统要求输出 Task: 与 Context: 两行。"
+        if _feedback:
+            user += f"\n\n上一次不行：{_feedback}。请务必换一个**不同**的任务。"
         msgs = [{"role": "system", "content": _SYSTEM},
                 {"role": "user", "content": user}]
         try:
@@ -212,8 +222,11 @@ class CurriculumAgent:
         if task and not _too_similar(
                 task, self.completed_tasks + self.failed_tasks):
             return task, context
+        why = ("模型输出里没有 `Task:` 行（没按格式）" if not task
+               else f"提的题与已完成/失败过的重复：{task[:40]}")
         # 解析失败 / 重复 → 重试（原版 :304-311 的递归重试）
-        return self.propose_next_ai_task(max_retries=max_retries - 1)
+        return self.propose_next_ai_task(max_retries=max_retries - 1,
+                                         _feedback=why)
 
     @staticmethod
     def parse_ai_message(message: str) -> tuple[str, str]:

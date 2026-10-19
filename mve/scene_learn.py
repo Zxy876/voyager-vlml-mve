@@ -291,7 +291,15 @@ def main() -> int:
             task, context = cur.propose_next_task(
                 queue=[t["question"] for t in queued], max_retries=5)
         except Exception as e:
-            _log(f"[场景学习] 课程规划失败：{type(e).__name__}: {e} —— 退出。")
+            if "Max retries reached" in str(e):
+                # 原版在这里也是 raise（curriculum.py:294-296）；它不是故障，是
+                # "当前数据被学完了、模型提不出不重复的题"。日志要说人话。
+                _log("[场景学习] 自动课程连续 5 次提不出可用的新题（"
+                     + str(e) + "）—— 这个场景现有数据大概已经学完了"
+                     f"（已完成 {len(cur.completed_tasks)} 条）。"
+                     "放新数据 / 导入新问题 / 改写问题后再启动，不是故障。")
+            else:
+                _log(f"[场景学习] 课程规划失败：{type(e).__name__}: {e} —— 退出。")
             break
         if not task:
             _log("[场景学习] 课程提不出下一个任务（工作区没数据 / LLM 不可用 / "
