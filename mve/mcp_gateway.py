@@ -48,6 +48,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -68,26 +69,48 @@ def _is_abs(path: str) -> bool:
     return bool(path) and (path.startswith("/") or (len(path) > 1 and path[1] == ":"))
 
 
+# 哨兵值：写 auto/python/python3/空都表示「用面板进程自己的解释器」
+_PY_SENTINELS = {"", "auto", "python", "python3"}
+
+
 def _resolve_command(cmd: str) -> str:
-    """命令解析：
-      · 绝对路径 → 原样；
-      · 哨兵 auto / python / python3 → 当前解释器（面板进程的解释器：服务器上是
-        `/root/mve/.venv/bin/python`，本地是管理虚拟环境 python），**跨机器通用**；
-      · 其它相对值 → 也退回当前解释器（避免歧义，反正 server 脚本由 python 拉起）。
+    """命令解析（本地与服务器共用同一份 mcp_servers.json）：
+      · 绝对路径 → 原样（如 /root/mve/.venv/bin/duckduckgo-mcp-server）；
+      · 哨兵 auto / python / python3 / 空 → 当前解释器（面板进程的解释器：
+        服务器上 /root/mve/.venv/bin/python，本地是管理虚拟环境 python）；
+      · 其它名字（npx / node / duckduckgo-mcp-server…）按序尝试：
+        PATH 里 shutil.which → 面板解释器同目录（venv 的 bin/，console script
+        装在哪，server 上 /root/mve/.venv/bin 不在 systemd PATH 里也能找到）；
+      都找不到 → 原样返回，create_subprocess_exec 如实报连接失败。
     """
     cmd = str(cmd or "").strip()
     if _is_abs(cmd):
         return cmd
-    return sys.executable
+    if cmd.lower() in _PY_SENTINELS:
+        return sys.executable
+    found = shutil.which(cmd)
+    if found:
+        return found
+    sibling = Path(sys.executable).resolve().parent / cmd
+    if sibling.exists():
+        return str(sibling)
+    return cmd
 
 
 def _resolve_arg(arg: str) -> str:
-    """参数里的相对路径解析到配置文件所在目录（mve/）：脚本无论被哪个工作目录
-    的面板进程拉起，都能找到。绝对路径原样。"""
+    """参数解析：
+      · 绝对路径 / 以 - 开头的 flag（-y/-m/--transport…）→ 原样；
+      · 以 .py 结尾或 CONFIG.parent 下确实存在的相对文件（如 mcp_neko_server.py）
+        → 解析成相对配置文件目录（mve/）的绝对路径，保证面板进程无论从哪个
+        工作目录拉起都能找到；
+      · 其余（模块名如 mcp_server_fetch、包名）→ 原样，交给 python -m 解释。
+    """
     arg = str(arg or "")
-    if _is_abs(arg):
+    if _is_abs(arg) or arg.startswith("-"):
         return arg
-    return str((CONFIG.parent / arg).resolve())
+    if arg.endswith(".py") or (CONFIG.parent / arg).exists():
+        return str((CONFIG.parent / arg).resolve())
+    return arg
 
 # 路由三态（同构 neko RouteMode；PLUGIN 在 MVE 的语义是「本地注册表优先」）
 SELF = "self"        # 本地动作注册表已有该条目（学过的/锻造的优先于远端通用工具）
