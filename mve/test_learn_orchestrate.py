@@ -75,7 +75,11 @@ class _FakeAgent:
     def __init__(self, env=None) -> None:
         pass
 
-    async def solve(self, question, *, max_iters=3, hints=None, skills=None):
+    async def solve(self, question, *, max_iters=3, hints=None, skills=None,
+                    grabs=None):
+        # 抓手清单必须真的传进来（2026-10-19 服务器实测：不传 → 执行层凭想象
+        # join → Binder Error → no_data，闭环停在第五步）。这里记下来给断言看。
+        _FakeAgent.last_grabs = list(grabs or [])
         data = ([{"n": None}] if self.vacuous
                 else [{"kills": 300}, {"kills": 180}])
         return ([{"ok": True, "rows": len(data), "data": data,
@@ -175,6 +179,10 @@ async def _main() -> int:
           and r["stuck"] == [], json.dumps(r["forged"]["counts"], ensure_ascii=False))
     check("执行取到真数（任务达成）",
           r["execution"].get("ok") is True and r["execution"].get("sql") == SQL)
+    check("抓手条目真的交给了执行层（同构 MCP tools/list，非空）",
+          len(getattr(_FakeAgent, "last_grabs", []) or []) > 0
+          and r.get("grabs_offered", 0) > 0,
+          f"grabs_offered={r.get('grabs_offered')}")
     items = skill_store.all_skills()
     check("计入技能库（配方 code=本次 SQL）",
           any(str(s.get("code") or "") == SQL for s in items))
@@ -224,11 +232,31 @@ async def _main() -> int:
     check("库里无相关表 → unreachable 如实报", r3["status"] == "unreachable",
           str(r3.get("why"))[:60])
 
-    print("\n== 6. kick_learning 语义 ==")
-    k1 = learn_orchestrate.kick_learning(QUESTION, SCENE)
-    check("循环内起后台任务", k1.get("kicked") is True, str(k1))
-    await asyncio.gather(*[t for t in learn_orchestrate._BG.values()
-                           if not t.done()], return_exceptions=True)
+    print("\n== 6. kick_learning：导入就把学习踢起来（异步上下文）==")
+    # 用假实现替掉真学习，只验「踢没踢起来 / 真的跑到了」这条接线，
+    # 不然会真调 LLM（慢且不可控）。
+    ran: list[str] = []
+
+    async def _fake_start(q, sid="", **kw):
+        ran.append(q)
+        return {"question": q, "scene_id": sid, "status": "learned"}
+
+    _real_start = learn_orchestrate.start_learning
+    learn_orchestrate.start_learning = _fake_start
+    try:
+        k1 = learn_orchestrate.kick_learning(QUESTION, SCENE)
+        check("异步上下文里 kick 成功", k1.get("kicked") is True, str(k1))
+        t1 = learn_orchestrate._BG.get(QUESTION)
+        if t1 is not None and hasattr(t1, "join"):
+            t1.join(timeout=5)
+        check("后台真的跑起来了（不是起了个立刻被回收的协程）",
+              ran == [QUESTION], str(ran))
+        k2 = learn_orchestrate.kick_learning(QUESTION, SCENE) \
+            if (t1 is not None and getattr(t1, "is_alive", lambda: False)()) \
+            else {"kicked": False, "why": "已跑完，不重复踢"}
+        check("同一问题不重复起两份", k2.get("kicked") is False, str(k2))
+    finally:
+        learn_orchestrate.start_learning = _real_start
 
     print(f"\n===== 结果：{len(PASS)} 过 / {len(FAIL)} 挂 =====")
     if FAIL:
@@ -241,11 +269,29 @@ async def _main() -> int:
 
 def main() -> int:
     code = asyncio.run(_main())
-    k = learn_orchestrate.kick_learning("循环外的问题", SCENE)
-    ok = (not k.get("kicked")) and bool(k.get("why"))
+    # 同步上下文（面板 consume 线程之外、coach 之类）也必须能踢起来：
+    # 学习挂在**独立线程的自己的事件循环**上，不受调用方循环退出影响
+    # （2026-10-19 实测：原来用 loop.create_task，asyncio.run 收尾会把任务
+    #  cancel 掉 —— 表现为「点了导入、说已启动学习，但从来没学过」）。
+    ran: list[str] = []
+
+    async def _fake_start(q, sid="", **kw):
+        ran.append(q)
+        return {"question": q, "scene_id": sid, "status": "learned"}
+
+    _real_start = learn_orchestrate.start_learning
+    learn_orchestrate.start_learning = _fake_start
+    try:
+        k = learn_orchestrate.kick_learning("循环外的问题", SCENE)
+        t = learn_orchestrate._BG.get("循环外的问题")
+        if t is not None and hasattr(t, "join"):
+            t.join(timeout=5)
+    finally:
+        learn_orchestrate.start_learning = _real_start
+    ok = bool(k.get("kicked")) and ran == ["循环外的问题"]
     print(f"\n== 7. 同步上下文 kick ==\n  {'✅' if ok else '❌'} "
-          f"kicked=False 且带原因 —— {k.get('why')}")
-    return 0 if ok else 1
+          f"kicked={k.get('kicked')} 且真的跑到了 —— {ran}")
+    return 0 if (ok and code == 0) else 1
 
 
 if __name__ == "__main__":

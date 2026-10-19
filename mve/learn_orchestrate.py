@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -303,38 +304,42 @@ async def start_learning(
 # ---------------------------------------------------------------------------
 # 后台触发（consume 未命中时接线用）+ 结果留痕（面板 API 读）
 # ---------------------------------------------------------------------------
-_BG: dict[str, asyncio.Task] = {}
+_BG: dict[str, threading.Thread] = {}   # 后台学习线程（问题 → 线程）
 _LAST: list[dict[str, Any]] = []
 _LAST_MAX = 20
 
 
 def kick_learning(question: str, scene_id: str = "") -> dict[str, Any]:
-    """在**运行中的事件循环**里后台启动学习（fire-and-forget）。
+    """后台启动一轮学习（fire-and-forget）—— 人导入未命中就自动走这里。
 
-    consume() 是 async，未命中分支直接调它 —— 学习要分钟级，不能堵住本次
-    回答。没有运行中的循环（同步上下文）就如实返回 kicked=False，调用方
-    自行决定怎么办；绝不起一个立刻被回收的协程假装启动了。
+    ⚠️ **必须用独立线程 + 自己的事件循环**（2026-10-19 服务器实测踩的坑）：
+    原来写成 `loop.create_task(...)`，而面板的 consume 是
+    `asyncio.run(_consume.consume(...))` —— run 收尾会 `_cancel_all_tasks`，
+    刚 create 的任务在第一次 await 就被 cancel。表现是「导入完成、说已启动
+    学习，但技能库始终是空的」（学习从未真正跑过）。线程的方案与调用方
+    生命周期解耦：consume 线程结束、面板重启都不影响它跑完这一轮。
+
+    同一问题已在跑 → 不重复起（如实回 kicked=False + why）。
     """
     question = str(question or "").strip()
     if not question:
         return {"kicked": False, "why": "空问题"}
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        return {"kicked": False, "why": "没有运行中的事件循环"}
-    if question in _BG and not _BG[question].done():
+    old = _BG.get(question)
+    if old is not None and getattr(old, "is_alive", lambda: False)():
         return {"kicked": False, "why": "同一问题的学习已在后台跑"}
 
-    async def _run() -> None:
+    def _run() -> None:
         try:
-            await start_learning(question, scene_id)
+            asyncio.run(start_learning(question, scene_id))
         except Exception as e:  # 后台任务自己兜住，绝不无声死掉
             _record({"question": question, "scene_id": scene_id,
                      "status": "failed", "why": f"{type(e).__name__}: {e}"})
 
-    task = loop.create_task(_run())
-    _BG[question] = task
-    return {"kicked": True, "question": question[:60]}
+    t = threading.Thread(target=_run, name=f"learn-{question[:16]}",
+                         daemon=True)
+    _BG[question] = t
+    t.start()
+    return {"kicked": True, "question": question[:60], "mode": "thread"}
 
 
 def _record(result: dict[str, Any]) -> None:
@@ -373,4 +378,5 @@ def last_learn_results(limit: int = 10) -> list[dict[str, Any]]:
 
 def learn_running() -> list[str]:
     """后台还在跑的问题（面板显示「学着呢」）。"""
-    return [q for q, t in _BG.items() if not t.done()]
+    return [q for q, t in _BG.items()
+            if getattr(t, "is_alive", lambda: False)()]

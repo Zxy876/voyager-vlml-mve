@@ -982,6 +982,7 @@ function pImport(s){
     <div class="panel__head"><h2>人导入意图</h2>
       <span class="hint">人提问 → Voyager 回答 · VLML 解析照旧披露</span></div>
     ${coachRunningBar(s)}
+    ${learnBar(s)}
     <div class="imp">
       <div style="font-size:12.5px;color:var(--muted);margin-bottom:8px">
         写一句你想问的话。<b>Voyager 会用它已积累的能力回答</b>——mem0 召回的既往经验、
@@ -991,7 +992,9 @@ function pImport(s){
       </div>
       <div style="font-size:12px;color:var(--muted);margin-bottom:8px">
         导入的问题归入<b>当前场景</b>的图谱（顶部场景栏切换；每个场景一张图，A=VLML Valorant 库）。
-        未命中先落本场景待审区，解题成功才升活节点；相关问题会给出「➜ 新建场景并迁过去」。
+        未命中先落本场景待审区 + 建一枚冷启动节点，并在后台<b>自动让 Voyager 自己学</b>
+        （拆分课程 → 补缺口写插件 → 取数 → 配方进技能库 + 解锁里程碑）。
+        学会了再导入同一句就是<b>命中且有答案</b>；相关问题会给出「➜ 新建场景并迁过去」。
       </div>
       <div style="font-size:12px;color:var(--muted);margin-bottom:8px">
         <b>收录判据</b>（不是"图谱里有没有同名维度"）：VLML 这次取数读到的表，
@@ -2114,6 +2117,42 @@ function graphLinkChips(gl){
     + `<span class="chip grey">覆盖层 ${ESC(gl.cover_level||'')}`
     + `｜洞察 ${(gl.insights||[]).length}/${ESC(gl.insights_total||0)} 个`
     + `｜表 ${(gl.tables||[]).length} 张</span>`;
+}
+
+function learnBar(s){
+  const R=(s.learn_recent||[])[0];
+  const running=!!s.learn_running;
+  if(!running && !R && !s.learn_error) return '';
+  /* 四步证据逐条摆出来（用户验收线）：拆分 → 补缺口 → 取数真行数 → 技能/里程碑。
+     只给一个 status 的话，人分不清断在第五步（没取到数）还是第二步（没抓手）。 */
+  let ev='';
+  if(R){
+    const cn=R.counts||{}, fo=R.forged||{}, ex=R.execution||{};
+    const chips=[
+      `<span class="chip grey">拆分 ${ESC(R.subgoals||0)} 个 · ${ESC(R.plan_origin||'—')}</span>`,
+      `<span class="chip ${(cn.unreachable||0)>0?'bad':(fo.forged?'warn':'ok')}">补缺口 ${ESC(fo.forged||0)} 个` +
+        ((cn.unreachable||0)>0?`｜硬不可达 ${ESC(cn.unreachable)}`:'') + '</span>',
+      `<span class="chip ${ex.ok?'ok':'bad'}">取数 ${ESC(ex.rows||0)} 行` +
+        `｜真调用 ${ESC(ex.real_calls||0)}/${ESC(ex.calls||0)}</span>`,
+      `<span class="chip ${R.skill?'ok':'grey'}">技能 ${R.skill?ESC(R.skill):'未结晶'}</span>`,
+      `<span class="chip ${(R.milestone||{}).unlocked?'ok':'grey'}">里程碑 ` +
+        `${(R.milestone||{}).unlocked?'已解锁':'未解锁'}</span>`,
+    ].filter(Boolean).join(' ');
+    ev=`<div style="margin-top:6px">${chips}</div>`
+      + (R.why?`<div style="font-size:12px;color:var(--muted);margin-top:4px">${ESC(R.why)}</div>`:'');
+  }
+  const st=R?String(R.status||''):'';
+  const tone=running?'info':(st==='learned'?'info':(st==='no_data'||st==='unreachable'||st==='failed'?'':'info'));
+  return `<div class="note ${tone}" style="margin:8px 0">
+    <b>${running?'Voyager 正在自己学：':(R?'上一轮自学结果：':'学习闭环')}</b>
+    ${ESC(running?(s.learn_question||''):(R?R.question:''))}
+    ${running?`<span class="chip grey">已跑 ${ESC(s.learn_elapsed)} 秒</span>`:
+      (st?`<span class="chip ${st==='learned'?'ok':(st==='no_data'?'warn':'bad')}">${ESC(st)}</span>`:'')}
+    <div style="font-size:12px;color:var(--muted);margin-top:4px">
+      导入未命中就自动学（不用另点按钮）：拆分课程（子目标有抓手）→ 缺口<b>写插件</b>补上
+      → 真取数 → 配方进技能库 + 解锁里程碑（解锁后不再重复出题）。
+      失败照实报：没取到数就不写技能库、不解锁。
+    </div>${ev}</div>`;
 }
 
 /* 后台任务进度条：消费要 1～3 分钟，没有这一条人只看到按钮空转，
