@@ -586,9 +586,32 @@ async def consume(
     # 「本机」场景（普通用户的默认形态）：用本机只读原语作答；取不到就如实说。
     if _non_vlml_why and _scene_kind == "local":
         import local_agent as _la
-        obs, code = await _la.solve(question, _scene_dir)
-        real = [o for o in obs if o.get("ok") and o.get("data") is not None]
-        data = (real[-1].get("data") if real else None)
+        # ③a 复用优先（同构 Voyager：retrieve → 重放 → 取不到才写新代码）。
+        # 只认「本机形态」的配方（代码里有 RESULT、能 run_saved 重放）；
+        # VLML 的 SQL 配方在本机场景重放不了 —— 那是另一个数据源的东西，
+        # 跨后端复用就等于场景隔离破功。
+        data = None
+        code = ""
+        obs: list[dict[str, Any]] = []
+        reused_skill: dict[str, Any] | None = None
+        for s in skills:
+            sc = str(s.get("code") or "")
+            if "RESULT" not in sc:
+                continue
+            try:
+                val = _la.run_saved(sc, _scene_dir)
+            except Exception:
+                val = None
+            if val in (None, [], {}):
+                continue
+            data, code, reused_skill = val, sc, dict(s)
+            obs = [{"ok": True, "tool": "local_python", "rows": 1, "data": val}]
+            break
+        # ③b 没有可复用的配方 → 现场写
+        if reused_skill is None:
+            obs, code = await _la.solve(question, _scene_dir)
+            real = [o for o in obs if o.get("ok") and o.get("data") is not None]
+            data = (real[-1].get("data") if real else None)
         # 没取到 → 还是没学会 → 踢一轮自学（与 VLML 路径同一条铁律：
         # 「命中但没取到真数」也要学，不然闭环停在「认识这句话」）。
         # 本机场景尤其需要：第一次问时场景目录往往是空的，得让 Voyager
@@ -628,16 +651,21 @@ async def consume(
             "errors": [str(o.get("error") or "") for o in obs if not o.get("ok")],
             "answer": answer, "sql": code,
             "rows": sum(int(o.get("rows") or 0) for o in obs if o.get("ok")),
-            "used_skills": [], "reused": False, "graph_link": {},
+            "used_skills": ([{"topic": reused_skill.get("topic"),
+                              "name": reused_skill.get("name"),
+                              "key": reused_skill.get("key")}]
+                            if reused_skill else []),
+            "reused": bool(reused_skill), "graph_link": {},
             "judgment_result": "written" if data is not None else "fetched_empty",
             "skipped": ("" if data is not None else
                         ("本机原语没取到结果（" + _scene_why + "）"
                          "—— 场景目录里放数据文件，或把问题问成本机能查到的东西")),
         }
-        try:
-            _absorb(question, code, "", scene_id=_scene_id)
-        except Exception:
-            pass
+        if not reused_skill:          # 复用已有配方时不必再记一遍账
+            try:
+                _absorb(question, code, "", scene_id=_scene_id)
+            except Exception:
+                pass
         _log(base)
         return base
 

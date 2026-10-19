@@ -330,6 +330,19 @@ def main() -> int:
     leaked = [t for t in FORBIDDEN if t in blob]
     check("答案里没有 rib 的任何痕迹（不再列战队）", not leaked, str(leaked))
 
+    # 再问同一句：必须**复用**已学到的本机配方 —— 这里故意不给模型任何回答
+    # 机会（假 LLM 队列空着），只要它想现场写代码就会拿不到代码块而失败。
+    FAKE.queue.clear()
+    again = asyncio.run(consume_mod.consume(QUESTION))
+    check("第二次问同一句：复用已学配方（reused=True）",
+          again.get("reused") is True,
+          f"reused={again.get('reused')} used={again.get('used_skills')}")
+    check("复用的结果还是本机真值",
+          LOCAL_ANSWER in str(again.get("answer")), str(again.get("answer"))[:50])
+    check("复用不需要再问模型（没现场重写代码）",
+          "REUSED" not in "".join(FAKE.queue) and again.get("sql") == res.get("sql"),
+          f"sql相同={again.get('sql') == res.get('sql')}")
+
     # 本机没数据时：如实说「没取到」，不编、也不偷偷去读 rib
     scenes.create_scene("空场景", scene_id="F")
     scenes.switch_scene("F")
