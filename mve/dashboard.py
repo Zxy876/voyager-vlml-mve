@@ -2786,11 +2786,27 @@ class Handler(BaseHTTPRequestHandler):
             st["learn_last_status"] = str(LEARN_JOB["last_status"] or "")
             try:
                 import learn_orchestrate as _lo
+                # 学习闭环的四步证据都要能在面板上看见（用户验收线）：
+                # 拆分（子目标/可达性）→ 补缺口（forge 条数）→ 取数（真行数）
+                # → 入库+里程碑（技能键 / unlocked）。只给 status 的话，人看不出
+                # 断在第五步（no_data）还是第二步（unreachable）。
                 st["learn_recent"] = [
                     {"question": str(r.get("question") or "")[:60],
                      "status": str(r.get("status") or ""),
                      "scene_id": str(r.get("scene_id") or ""),
-                     "why": str(r.get("why") or "")[:80]}
+                     "why": str(r.get("why") or "")[:120],
+                     "subgoals": len((r.get("plan") or {}).get("subgoals") or []),
+                     "plan_origin": str((r.get("plan") or {}).get("origin") or ""),
+                     "counts": (r.get("plan") or {}).get("counts") or {},
+                     "forged": ((r.get("forged") or {}).get("counts") or {}),
+                     "grabs_offered": r.get("grabs_offered"),
+                     "execution": {k: (r.get("execution") or {}).get(k)
+                                   for k in ("ok", "sql", "calls", "real_calls",
+                                             "rows")},
+                     "skill": ((r.get("crystallized") or {}).get("entry")
+                               or (r.get("crystallized") or {}).get("name") or ""),
+                     "milestone": r.get("milestone") or {},
+                     "stuck": len(r.get("stuck") or [])}
                     for r in _lo.last_learn_results(5)]
             except Exception:
                 st["learn_recent"] = []
