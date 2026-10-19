@@ -142,6 +142,7 @@ async def start_learning(
     db_path: str = "",
     execute: bool = True,
     use_mcp: bool = True,
+    critique: str = "",
 ) -> dict[str, Any]:
     """启动一轮学习（同构 learn() 单圈）。返回全量过程记录，失败如实带 why。
 
@@ -153,7 +154,7 @@ async def start_learning(
     try:
         return await _start_learning_impl(
             question, scene_id, llm=llm, db_path=db_path,
-            execute=execute, use_mcp=use_mcp)
+            execute=execute, use_mcp=use_mcp, critique=critique)
     finally:
         if use_mcp:
             try:
@@ -171,6 +172,7 @@ async def _start_learning_impl(
     db_path: str = "",
     execute: bool = True,
     use_mcp: bool = True,
+    critique: str = "",
 ) -> dict[str, Any]:
     """启动一轮学习（同构 learn() 单圈）的实现体（断开逻辑见外层 start_learning）。"""
     question = str(question or "").strip()
@@ -333,7 +335,8 @@ async def _start_learning_impl(
                 except Exception:
                     pass
                 observations, sql = await local_agent.solve(
-                    question, local_dir, llm=llm, scene_id=scene)
+                    question, local_dir, llm=llm, scene_id=scene,
+                    critique=str(critique or ""))
             else:
                 observations, sql = await agent.solve(
                     question, skills=skills, grabs=grabs, focus_tables=focus,

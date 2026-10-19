@@ -487,9 +487,10 @@ def _loop(mode: str, topic: str, rounds: int, logf, job: str = "practice",
             units_eff = units if job == "learn" else 1
             cmd = [PY, str(ROOT / "scene_learn.py"),
                    "--scene", scene_id, "--units", str(units_eff)]
-            what = (f"场景学习循环（Voyager 式 while True，不停）· Scene {scene_id}"
-                    f"（数据源非 VLML，只学本场景没答出来的导入问题）· 每轮最多"
-                    f" {units_eff} 题 · 点「■ 停止」才退 · {_now()}")
+            what = (f"场景学习循环（原版 Voyager learn()：propose → rollout → "
+                    f"completed/failed 记账）· Scene {scene_id}"
+                    f"（数据源非 VLML；人导入的题优先，队列空了自动出题）· "
+                    f"点「■ 停止」才退 · {_now()}")
             timeout = None
         elif job == "learn":
             # learn 的 --rounds 是"每个学习单元里练几轮"，语义与"不停"无关，

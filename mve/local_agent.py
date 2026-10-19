@@ -139,25 +139,44 @@ def read_json(scene_dir: str, path: str) -> Any:
         raise ValueError(f"不是合法 JSON：{Path(path).name}（{type(e).__name__}）") from e
 
 
-def inventory(scene_dir: str, limit: int = 50) -> list[dict[str, Any]]:
+def inventory(scene_dir: str, limit: int = 50, *, preview: int = 300,
+              preview_files: int = 3) -> list[dict[str, Any]]:
     """场景目录里**现有**的文件清单 —— 直接写进 prompt，别让它猜文件名。
 
     2026-10-19 服务器实测：模型不知道目录里有什么，凭想象写了
     `book_pattern = "*.txt"`（真实文件是 plan.json），还用了 `os.path`（受限
     命名空间里没有 import）→ ImportError → 取不到数。和 SQL 侧「执行层凭想象
     join」是同一类错：**不要让它猜，先把清单递给它**。
+
+    同一天第二次实测（Scene B projects.json）：清单只有名字和字节数，模型不知道
+    结构是 `{"as_of":..., "projects":[...]}`，直接 `for project in read_json(...)`
+    遍历了字典的 key → TypeError → 两轮重写都撞同一个坑。所以小文件顺带给
+    前 `preview` 个字符的**结构预览**（最多 `preview_files` 个）——读的是本机
+    工作区里用户自己的数据，给模型看不越界。
     """
     try:
         rows = list_files(scene_dir, "", "*", limit)
     except Exception:
         return []
     out = []
+    shown = 0
     for r in rows:
         if r.get("is_dir"):
             out.append({"name": r["name"], "kind": "dir"})
-        else:
-            out.append({"name": r["name"], "kind": "file",
-                        "size": int(r.get("size") or 0)})
+            continue
+        item = {"name": r["name"], "kind": "file",
+                "size": int(r.get("size") or 0)}
+        if (preview > 0 and shown < preview_files
+                and item["size"] <= 200_000
+                and str(r["name"]).lower().endswith(
+                    (".json", ".csv", ".txt", ".md", ".tsv", ".yaml", ".yml"))):
+            try:
+                item["preview"] = read_file(scene_dir, r["name"],
+                                            max_bytes=preview)["text"]
+                shown += 1
+            except Exception:
+                pass
+        out.append(item)
     return out
 
 
@@ -191,6 +210,9 @@ PROMPT_SYSTEM = """你是本机数据助手。你能用的是**这个应用工�
    「热门的/最新的/2026 的/排行/推荐」这类时效性问题，**一定**先 web_search
    （或 mcp_* 联网工具），再据检索到的真实结果作答；
 5. 本机问题按下面的文件清单直接读，不要猜文件名/扩展名（猜错就取不到数）；
+   **read_json 返回的是整个对象**：数据列表通常在某一个键下面（清单里给了
+   结构预览，按预览里的真实键名取值，别直接 `for x in read_json(...)` 遍历
+   字典的 key——那会拿到字符串然后 TypeError）；
    **清单里的文件和问题无关时，不要拿它凑答案** —— 本机没有就联网查；
    联网也取不到（没网/被限流）才 `RESULT = {"error": "..."}` 如实说。
    拿无关文件的内容当答案是比"没有答案"更糟的错（2026-10-19 服务器实测：
@@ -246,11 +268,14 @@ def _payload(value: Any) -> tuple[Any, str]:
 
 
 async def solve(question: str, scene_dir: str, *, llm=None,
-                max_iters: int = 2, scene_id: str = ""
+                max_iters: int = 2, scene_id: str = "", critique: str = ""
                 ) -> tuple[list[dict[str, Any]], str]:
     """写代码 → 跑 → 看结果；失败带反馈重写。返回 (观察列表, 最后一段代码)。
 
     scene_id 给了就按注册表里的**启用条目**注入原语（猫爪总开关生效）。
+    critique 是上一轮 **critic 的评语**（原版 voyager.py:262-268 把 critic 的
+    critique 拼进下一次 human message —— 迭代提示的来源）。给了就放在首轮
+    user 消息里，别让它重犯同一个坑。
     """
     from voyager_vlml.llm import chat
     call = llm or (lambda msgs: chat(msgs, temperature=0.2))
@@ -261,9 +286,16 @@ async def solve(question: str, scene_dir: str, *, llm=None,
     # 场景目录里**现有**什么，直接告诉它（否则它会猜 *.txt 而真实文件是 .json）
     inv = inventory(scene_dir)
     if inv:
-        inv_txt = ("场景目录里现有的文件：\n" + "\n".join(
-            f"- {r['name']}（{'目录' if r['kind'] == 'dir' else str(r.get('size', 0)) + ' 字节'}）"
-            for r in inv))
+        lines = []
+        for r in inv:
+            if r["kind"] == "dir":
+                lines.append(f"- {r['name']}（目录）")
+                continue
+            lines.append(f"- {r['name']}（{r.get('size', 0)} 字节）")
+            if r.get("preview"):
+                pv = str(r["preview"]).replace("\n", " ")
+                lines.append(f"    开头内容（结构预览）：{pv[:300]}")
+        inv_txt = "场景目录里现有的文件：\n" + "\n".join(lines)
     else:
         inv_txt = "场景目录里现在是空的（一个文件都没有）。"
 
@@ -278,6 +310,8 @@ async def solve(question: str, scene_dir: str, *, llm=None,
         system = PROMPT_SYSTEM + mcp_sec
     for _ in range(max(1, max_iters)):
         user = (f"问题：{question}\n\n{inv_txt}\n"
+                + (f"\n上一轮没通过 critic 检查，它的评语（务必针对它改）：{critique}\n"
+                   if critique else "")
                 + (f"\n上一次的代码：\n{code}\n执行反馈：{fb}\n请修正后重写。"
                    if fb else ""))
         text = call([{"role": "system", "content": system},

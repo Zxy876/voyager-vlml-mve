@@ -175,70 +175,128 @@ def _log_learning_detail(r: dict[str, Any]) -> None:
         _log("  · 技能结晶：" + str(cry.get("entry") or cry.get("name") or "ok"))
 
 
-def _run_one(q: str, scene: str) -> None:
-    """学一道（同构原版 voyager.py:326 那圈 rollout：取任务 → 写代码/取数 → 成功加技能）。
-    结果自身会落 run_log（轨迹页可见），这里再打一份可读的过程摘要到运行日志。"""
+def _run_one(q: str, scene: str, *, context: str = "",
+             max_retries: int = 4) -> dict[str, Any]:
+    """一次 rollout（原版 voyager.py:298-301）+ 内层重试（voyager.py:214-295）。
+
+    原版机制照抄：
+      · 单任务最多 `action_agent_task_max_retries=4` 次（voyager.py:30/:277-279）；
+      · 每次失败把 **critic 的 critique 拼进下一次**（:262-268）—— 迭代提示，
+        不是"同一段 prompt 重跑"；
+      · 4 次仍不过 → 任务进 failed_tasks，课程换下一个（curriculum.py:330-345
+        "Skipping to next task"），**不会原地无限重试**。
+    """
     _log(f"\n----- 场景学习 · Scene {scene} · {q} -----")
-    t0 = time.time()
-    try:
-        r = asyncio.run(learn_orchestrate.start_learning(q, scene))
-    except Exception as e:
-        r = {"status": "failed", "why": f"{type(e).__name__}: {e}"}
-    status = str(r.get("status") or "")
-    why = str(r.get("why") or "")
-    _log(f"[场景学习] → status={status}（{time.time() - t0:.0f}s）"
-         + (f" · {why[:160]}" if why else "")
-         + (f" · 后端={((r.get('backend') or {}).get('kind'))}" if r.get("backend") else ""))
-    _log_learning_detail(r)
+    critique = ""
+    info: dict[str, Any] = {"task": q, "success": False, "critique": "",
+                            "attempts": 0, "result": {}}
+    for i in range(max(1, int(max_retries))):
+        t0 = time.time()
+        try:
+            r = asyncio.run(learn_orchestrate.start_learning(
+                q, scene, critique=critique))
+        except Exception as e:
+            r = {"status": "failed", "why": f"{type(e).__name__}: {e}"}
+        status = str(r.get("status") or "")
+        why = str(r.get("why") or "")
+        _log(f"[场景学习] 第 {i + 1}/{max_retries} 次 → status={status}"
+             f"（{time.time() - t0:.0f}s）"
+             + (f" · {why[:160]}" if why else "")
+             + (f" · 后端={((r.get('backend') or {}).get('kind'))}"
+                if r.get("backend") else ""))
+        _log_learning_detail(r)
+        # 完成判定（原版 critic.check_task_success 的同构：LLM 判任务达成与否，
+        # 没取到真数直接 False 不叫 LLM —— 见 task_critic.py）
+        try:
+            import task_critic
+            success, critique2 = task_critic.check_task_success(q, context, r)
+        except Exception as e:
+            success, critique2 = False, f"critic 失败：{type(e).__name__}: {e}"
+        info.update(task=q, success=bool(success),
+                    critique=str(critique2 or ""), attempts=i + 1, result=r)
+        _log("  · critic 判完成：" + ("是" if success else "否")
+             + (f" · 评语：{str(critique2)[:160]}"
+                if (not success and critique2) else ""))
+        if success:
+            break
+        critique = str(critique2 or why or "")
+    return info
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--scene", required=True)
     ap.add_argument("--units", type=int, default=4,
-                    help="每轮从待学队列最多取几个学（不是总上限——学完一轮会再读队列，"
-                         "随你导入随学）。默认 4。")
+                    help="每次从待学队列取多少个候选（兼容保留；原版每轮只学 1 个）。")
     ap.add_argument("--question", default="",
                     help="强制重学这一句（即使账上记过 written —— 用于把历史误记的"
                          "『成功』纠正回来）。先单独跑一次，再进入正常循环。")
+    ap.add_argument("--curriculum", choices=["auto", "queue"], default="auto",
+                    help="auto=原版 Voyager 行为（人导入的题优先，队列空了自动出题，"
+                         "不停；默认）；queue=只学人导入的题，队列空就退。")
+    ap.add_argument("--max-retries", type=int, default=4,
+                    help="单任务最多重试几次（原版 action_agent_task_max_retries=4）")
+    ap.add_argument("--max-iterations", type=int, default=160,
+                    help="最多学多少个任务（原版 max_iterations=160）")
     args = ap.parse_args()
     scene = args.scene
     units = max(1, min(50, args.units))
+    max_retries = max(1, min(10, args.max_retries))
+    max_iter = max(1, int(args.max_iterations))
     forced = str(args.question).strip()
+
+    import curriculum_auto
+    cur = curriculum_auto.agent_for(scene)
 
     # 强制重学：先单独跑一次（纠正误记），再进入正常循环。
     if forced:
         _log(f"\n[场景学习] 强制重学这一句（纠正历史误记的 written）：{forced}")
-        _run_one(forced, scene)
+        info = _run_one(forced, scene, max_retries=max_retries)
+        cur.update_exploration_progress(info)
 
-    # 同构原版 Voyager learn() 的「while True」：每轮从课程树取下一个任务执行，
-    # **只有人点「■ 停止」（SIGTERM → _asked_to_stop）或队列真的耗尽才退**——
-    # 不自己发明空闲 sleep、不靠计时器掐断、不跑 1 题就收。每轮重读队列，
-    # 你跑着的时候新导入的问题会被自动接进来接着学（这就是「随导入随学」）。
-    _log(f"\n[场景学习] Scene {scene} · 进入 Voyager 式循环（while True，"
-         f"每轮最多 {units} 题，点「■ 停止」才退）· {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    # 同构原版 voyager.py:326 `while True`：每轮 propose_next_task → rollout →
+    # update_exploration_progress（completed/failed 两本账）→ 下一轮。退出只有三种：
+    # 人点「■ 停止」、达到 --max-iterations（原版 160）、课程提不出任务（数据源空/LLM 挂）。
+    _log(f"\n[场景学习] Scene {scene} · 进入 Voyager 式循环"
+         f"（原版 learn()：propose → rollout → 记账；已完成 {len(cur.completed_tasks)}"
+         f" / 失败 {len(cur.failed_tasks)}；任务上限 {max_iter}，单任务重试 {max_retries}）"
+         f" · {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    iteration = 0
     while True:
         if _asked_to_stop():
-            _log("\n[场景学习] 收到停止信号（人在驾驶舱点了停止），跑完当前题退出。")
+            _log("\n[场景学习] 收到停止信号（人在驾驶舱点了停止），当前任务已结束，退出。")
             break
-        tasks = scene_questions(scene)[:units]
-        if not tasks:
-            # 队列真空 = 这个场景当前没有没答出来的导入问题了。
-            # 同构 Voyager：课程树走完就退出（voyager.py:328 `if not self.env.cheat_n_save(): break`）。
-            # 不是故障、不是超时，是「该学的都学完了」；你再导入新问题，重新点
-            # 「▶ 启动 Voyager」即可。
-            _log("[场景学习] 待学队列空了 —— 当前场景没答出来的导入问题都学完了，循环结束。"
-                 "（再导入新问题，点「▶ 启动 Voyager」会接着学。）")
+        if iteration >= max_iter:
+            _log(f"[场景学习] 达到任务上限 {max_iter}（原版 max_iterations），退出。"
+                 "已完成 " + str(len(cur.completed_tasks)) + "，失败 "
+                 + str(len(cur.failed_tasks)) + "。")
             break
-        _log(f"\n[场景学习] 本轮待学 {len(tasks)} 个（队列上限 {units}）")
-        for i, t in enumerate(tasks, 1):
-            if _asked_to_stop():
-                _log(f"\n[场景学习] 收到停止信号，跑完当前题退出（{i - 1}/{len(tasks)}）。")
-                break
-            _run_one(t["question"], scene)
-        # 不 return —— 回到 while 顶，重读队列、随导入随学。
+        # 队列 = 人导入的题（原版 manual 模式的对应物）；两本账里的不再出
+        queued = [t for t in scene_questions(scene)[:units]
+                  if t["question"] not in cur.completed_tasks
+                  and t["question"] not in cur.failed_tasks]
+        if not queued and args.curriculum != "auto":
+            _log("[场景学习] 队列空了（queue 模式：只学人导入的题），退出。"
+                 "要原版那种不停出题，用 --curriculum auto。")
+            break
+        try:
+            task, context = cur.propose_next_task(
+                queue=[t["question"] for t in queued], max_retries=5)
+        except Exception as e:
+            _log(f"[场景学习] 课程规划失败：{type(e).__name__}: {e} —— 退出。")
+            break
+        if not task:
+            _log("[场景学习] 课程提不出下一个任务（工作区没数据 / LLM 不可用 / "
+                 "连续 5 次解析失败）—— 如实退出，不硬凑。")
+            break
+        iteration += 1
+        info = _run_one(task, scene, context=context, max_retries=max_retries)
+        # 原版 curriculum.update_exploration_progress：成功进 completed、失败进 failed
+        cur.update_exploration_progress(info)
+        _log(f"[场景学习] 进度 {iteration}/{max_iter}：已完成 "
+             f"{len(cur.completed_tasks)} / 失败 {len(cur.failed_tasks)}"
+             + ("（失败→Skipping to next task）" if not info.get("success") else ""))
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
