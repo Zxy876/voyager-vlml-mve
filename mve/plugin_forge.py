@@ -352,7 +352,8 @@ def forge_gaps(plan: dict[str, Any], scene_id: str, *,
 # 第一层②：crystallize_skill —— 技能库的可执行程序 → 插件条目
 # ---------------------------------------------------------------------------
 def crystallize_skill(skill: dict[str, Any] | str, *,
-                      into_scene: str | None = None) -> dict[str, Any]:
+                      into_scene: str | None = None,
+                      local_scene_dir: str = "") -> dict[str, Any]:
     """把一条技能（含可执行 code）结晶成插件条目并注册（origin="learned"）。
 
     为什么需要 exec：技能的 `code` 是判对后固化的程序（`_plan_program` 渲染的
@@ -382,19 +383,30 @@ def crystallize_skill(skill: dict[str, Any] | str, *,
         return out
     solve = _extract_solve_name(code)
     wrapped_sql = ""
+    local_dir = ""
     if not solve:
         # 第二形态：技能 code 是**裸 SQL**（consume._absorb 存的取数配方就是
         # SQL 文本，不是程序）→ 机械包成标准程序契约（async def + 单参数
         # mcp，调 mcp.query_sql）。SQL 一字不改（json.dumps 生成合法字面量），
         # 包的只是调用外壳 —— 这样消费侧配方也能结晶成可 invoke 的条目，
         # 闭环「写入技能库 → 条目表」对两条通道都成立。
-        wrapped_sql = _wrap_sql(code)
-        if not wrapped_sql:
+        # 第三形态（2026-10-19，非 VLML 场景 = 本机）：技能 code 是**一段
+        # Python**（模型调 list_files/read_file/query_sql 后把答案塞进 RESULT）。
+        # 这种技能不能当 SQL 包，也不能当 async def 程序包 —— 用本机执行器
+        # 重放：run_saved(code, scene_dir)。用户原话「数据源就是本机」。
+        if local_scene_dir and "RESULT" in code:
+            local_dir = str(local_scene_dir)
+        else:
+            wrapped_sql = _wrap_sql(code)
+        if local_dir:
+            pass                      # 走下面的本机渲染分支
+        elif not wrapped_sql:
             out["why"] = ("该技能的源码既不是可执行程序（AST 里找不到「单参数 "
                           "mcp 的 async def」）也不是 SQL（SELECT/WITH 开头）"
                           "—— 旁路观摩配方是伪代码形态，照实不结晶）")
             return out
-        code = wrapped_sql
+        if not local_dir:
+            code = wrapped_sql
         solve = _extract_solve_name(code) or ""
 
     name = str(s.get("name") or s.get("key") or "skill")
@@ -405,8 +417,9 @@ def crystallize_skill(skill: dict[str, Any] | str, *,
     path = PLUGIN_DIR / f"{module}.py"
     try:
         PLUGIN_DIR.mkdir(parents=True, exist_ok=True)
-        path.write_text(_render_crystal_source(s, code, solve, wrapper),
-                        encoding="utf-8")
+        src = (_render_local_crystal_source(s, code, wrapper, local_dir)
+               if local_dir else _render_crystal_source(s, code, solve, wrapper))
+        path.write_text(src, encoding="utf-8")
     except OSError as e:
         out["why"] = f"插件文件写入失败：{type(e).__name__}: {e}"
         return out
@@ -431,6 +444,32 @@ def crystallize_skill(skill: dict[str, Any] | str, *,
                module=module, scenes=ok_scenes,
                why="" if ok_scenes else "注册失败（actions.register 返回 None）")
     return out
+
+
+def _render_local_crystal_source(s: dict[str, Any], code: str, wrapper: str,
+                                 scene_dir: str) -> str:
+    """本机技能结晶：技能 code 原文照录，条目用 run_saved 重放（不经 VLML）。"""
+    lesson = _safe(_oneline(str(s.get("text") or "")))[:120]
+    code_lit = json.dumps(str(code))
+    dir_lit = json.dumps(str(scene_dir))
+    doc = ("本机技能（plugin_forge 自动生成，勿手改）。\n\n"
+           f"技能：{_safe(str(s.get('name') or ''))}（场景 {_safe(scene_dir)}）\n"
+           f"文字经验：{lesson}\n"
+           "数据源 = 本机：重放时用 local_agent 的本机原语（list_files / "
+           "read_file / query_sql），不碰 VLML。")
+    return (
+        "#!/usr/bin/env python3\n"
+        f'"""{doc}"""\n'
+        + _BOOTSTRAP
+        + "import actions\n"
+        + "from local_agent import run_saved\n\n"
+        + f"CODE = {code_lit}\n"
+        + f"SCENE_DIR = {dir_lit}\n\n\n"
+        + f'@actions.action(name="{wrapper}", description="本机技能（可重放）：{lesson}")\n'
+        + f"async def {wrapper}(mcp=None) -> Any:\n"
+        + '    """重放上面学到的本机代码（只读原语），返回它的结果。"""\n'
+        + "    return run_saved(CODE, SCENE_DIR)\n"
+    )
 
 
 def _render_crystal_source(s: dict[str, Any], code: str, solve: str,

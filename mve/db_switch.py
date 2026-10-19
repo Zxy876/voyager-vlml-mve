@@ -44,6 +44,16 @@ def _abs(p: str) -> str:
     return str(q if q.is_absolute() else (ROOT.parent / q).resolve())
 
 
+def resolve(p: str) -> str:
+    """公开口径：把「配置里写的库路径」解析成绝对路径（相对路径按仓库根）。
+
+    场景的 data_source 原来各模块各写一份解析（scenes / entity_catalog 里
+    各有一份 `HERE.parent / ds`）。学习侧要按场景取库，必须与它们同一把尺子，
+    所以把 `_abs` 公开出来，不另写一份。
+    """
+    return _abs(p)
+
+
 def current_path() -> str:
     try:
         obj = json.loads(CONFIG.read_text(encoding="utf-8"))

@@ -206,7 +206,8 @@ def _rule_decompose(task: str, obs: dict[str, Any]) -> list[str]:
 # ---------------------------------------------------------------------------
 # 可达性：每个子目标的抓手状态（确定性注册表查找，不用模型）
 # ---------------------------------------------------------------------------
-def reachability(need: str, scene_id: str) -> dict[str, Any]:
+def reachability(need: str, scene_id: str, *,
+                 db_path: str = "") -> dict[str, Any]:
     """一个子目标在当前场景有没有「抓手」。
 
     判据（与 orchestrate.entry_candidates 同一把尺子，不另造）：
@@ -243,7 +244,7 @@ def reachability(need: str, scene_id: str) -> dict[str, Any]:
         out["why"] = f"抓手条目：{cands[0].get('name')}"
         return out
     # 没有条目 → 看库里有没有相关表（可 forge 的依据）
-    tables = _related_tables(need)
+    tables = _related_tables(need, db_path)
     if tables:
         out["status"] = "gap"
         out["gap_hint"] = tables[:5]
@@ -254,11 +255,15 @@ def reachability(need: str, scene_id: str) -> dict[str, Any]:
     return out
 
 
-def _related_tables(need: str) -> list[str]:
-    """表名与需求词面有重合的表（实查，不手写清单）。"""
+def _related_tables(need: str, db_path: str = "") -> list[str]:
+    """表名与需求词面有重合的表（实查，不手写清单）。
+
+    `db_path` 空 = 当前 VLML 库；非空 = **该场景自己的库**（场景隔离：
+    非 VLML 场景的可达性只在它自己的库里判，不许拿 rib 的表冒充抓手）。
+    """
     try:
         import db_switch
-        tables = db_switch.list_tables()
+        tables = db_switch.list_tables(db_path)
     except Exception:
         return []
     toks = _lex_set(need)
@@ -271,9 +276,9 @@ def _related_tables(need: str) -> list[str]:
     return hit
 
 
-def related_tables(need: str) -> list[str]:
+def related_tables(need: str, db_path: str = "") -> list[str]:
     """公开口径：reachability 判 gap 用的就是这张表（plugin_forge 同一把尺子）。"""
-    return _related_tables(need)
+    return _related_tables(need, db_path)
 
 
 def _stem(tok: str) -> str:
@@ -333,7 +338,8 @@ def _content_query(need: str) -> str:
 # ---------------------------------------------------------------------------
 # 汇总：一次拆分 + 逐个子目标过可达性（学习循环的入口视图）
 # ---------------------------------------------------------------------------
-def plan(task: str, scene_id: str, *, llm: Callable | None = None) -> dict[str, Any]:
+def plan(task: str, scene_id: str, *, llm: Callable | None = None,
+         db_path: str = "") -> dict[str, Any]:
     """拆分一次任务并给每个子目标标注抓手状态。
 
     返回：
@@ -351,7 +357,7 @@ def plan(task: str, scene_id: str, *, llm: Callable | None = None) -> dict[str, 
     subtasks: list[dict[str, Any]] = []
     counts = {"reachable": 0, "gap": 0, "unreachable": 0}
     for i, need in enumerate(dec["subgoals"], start=1):
-        r = reachability(need, scene_id)
+        r = reachability(need, scene_id, db_path=db_path)
         counts[r["status"]] = counts.get(r["status"], 0) + 1
         subtasks.append({"seq": i, "need": need, **r})
     return {**dec, "subtasks": subtasks, "counts": counts}

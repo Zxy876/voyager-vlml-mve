@@ -255,7 +255,8 @@ def add(
 # ---------------- 检索（top_k） ----------------
 
 def retrieve(
-    topic: str, query: str, top_k: int = RETRIEVAL_TOP_K
+    topic: str, query: str, top_k: int = RETRIEVAL_TOP_K, *,
+    scene_id: str = "",
 ) -> list[dict[str, Any]]:
     """照 SkillManager.retrieve_skills：只取 top_k 条进 prompt。
 
@@ -270,8 +271,16 @@ def retrieve(
       2. 跨题最多 2 条。prompt 里该占主导的是本题经验。
     """
     data = _load_raw()
+    # 场景隔离（2026-10-19 用户要求「学习时场景隔离，只学习当前场景」）：
+    # 给了 scene_id 就只取「本场景 + default」的配方 —— 与面板技能卡的既有口径
+    # 同一条（技能是跨场景可复用资产，但**复用范围**是本场景 + 通用）。
+    # 不传 scene_id 仍按全局取（老调用方/测试行为不变）。
+    _sid = str(scene_id or "").strip()
+    allowed = {_sid, "default", ""} if _sid else set()
     scored: list[tuple[float, str, dict[str, Any]]] = []
     for key, s in data["skills"].items():
+        if _sid and str(s.get("source_scene") or "default") not in allowed:
+            continue
         same_topic = s.get("topic") == topic
         sim = similarity(query, f"{s.get('name','')} {s.get('text','')}")
         if not same_topic and sim < CROSS_TOPIC_MIN_SIM:

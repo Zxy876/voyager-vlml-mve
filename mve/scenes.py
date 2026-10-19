@@ -74,8 +74,12 @@ def _empty() -> dict[str, Any]:
                 "description": DEFAULT_SCENE_DESC,
                 "created_at": now,
                 "updated_at": now,
-                # data_source 为空 = 继承默认库（VLML rib）；非空 = 该场景专属库路径。
-                # 它决定 entity_catalog_status 实查哪份实体可填值。
+                # data_source 非空 = 该场景专属库路径。
+                # ⚠️ 为空**不是**「继承默认库」（1→n 之前的旧写法，2026-10-19 纠）：
+                # 默认场景 A 的数据源是 VLML 库；其它场景为空 = **数据源就是本机**
+                # （场景目录 scene_data/<id>/ + 本机只读原语）。判定唯一入口见
+                # scene_profile.profile() —— 那时「继承」导致在 Scene B 问世界模型
+                # 却去读 rib、答出一串 Valorant 战队。
                 "data_source": "",
             }
         },
@@ -156,7 +160,9 @@ def create_scene(name: str, *, description: str = "", scene_id: str | None = Non
     随消费侧提问动态挂载节点。
 
     返回新建场景的 id。若未指定 scene_id，按现有数量自动编号为 A、B、C…。
-    `data_source` 非空时该场景指向专属库，否则继承默认库（决定实体目录实查）。
+    `data_source` 非空时该场景指向专属库；**空 = 数据源就是本机**（场景目录
+    scene_data/<id>/，普通用户不用配库 —— 见 scene_profile 与 local_agent），
+    不再「继承默认库」。
     """
     data = _load()
     if not scene_id:
@@ -304,42 +310,49 @@ def entity_catalog_status(scene_id: str) -> str:
     默认场景 A 指向 VLML rib 库、实体充足 → ``present``；若某场景的数据源为空库
     （或尚未枚举）则 ``missing``（橙色告警，提示人补实体目录）。
 
+    ⚠️ 2026-10-19：「data_source 为空」**不再等于**默认库。判定统一走
+    `scene_profile.profile()`：
+      · VLML 后端（默认场景）→ 仍读 `ec.catalog()` 的全局缓存口径（保持不变）
+      · 场景自带库 → 只对这个库实查
+      · 本机后端 → 没有「实体目录」这一档，返回 ``present``（不告警）——
+        对普通场景报 missing 是误报，用户会去补一个不存在的概念。
+
     任何异常都不错报 —— 连不上库就按 ``present`` 处理（避免对 A 误报）。
     """
-    scene = get_scene(scene_id) or {}
-    ds = str(scene.get("data_source") or "")
     try:
-        import entity_catalog as ec
-        if ds:
-            # 指定了专属数据源：只查它
-            import duckdb
-            from pathlib import Path as _P
-            p = _P(ds).expanduser()
-            if not p.is_absolute():
-                p = (HERE.parent / ds).resolve()
-            if not p.exists():
+        import scene_profile as sp
+        prof = sp.profile(scene_id)
+        if prof.get("kind") == sp.VLML:
+            import entity_catalog as ec
+            data = ec.catalog()
+            counts = data.get("counts") or {}
+            total = sum(int(v) for v in counts.values())
+            if total == 0 and not data.get("error"):
                 return "missing"
-            con = duckdb.connect(str(p), read_only=True)
-            try:
-                total = 0
-                for _, table, col, extra in ec.PROBES:
-                    try:
-                        c = con.execute(
-                            f'SELECT COUNT(DISTINCT "{col}") '
-                            f'FROM "{table}" WHERE "{col}" IS NOT NULL').fetchone()
-                        total += int((c or [0])[0])
-                    except Exception:
-                        continue
-                return "present" if total > 0 else "missing"
-            finally:
-                con.close()
-        # 继承默认库：直接读全局实体目录缓存/实查
-        data = ec.catalog()
-        counts = data.get("counts") or {}
-        total = sum(int(v) for v in counts.values())
-        if total == 0 and not data.get("error"):
+            return "present"
+        db = str(prof.get("db_path") or "")
+        if not db:
+            return "present"          # 本机后端：不适用（见 docstring）
+        import duckdb
+        from pathlib import Path as _P
+        p = _P(db)
+        if not p.exists():
             return "missing"
-        return "present"
+        import entity_catalog as ec
+        con = duckdb.connect(str(p), read_only=True)
+        try:
+            total = 0
+            for _, table, col, extra in ec.PROBES:
+                try:
+                    c = con.execute(
+                        f'SELECT COUNT(DISTINCT "{col}") '
+                        f'FROM "{table}" WHERE "{col}" IS NOT NULL').fetchone()
+                    total += int((c or [0])[0])
+                except Exception:
+                    continue
+            return "present" if total > 0 else "missing"
+        finally:
+            con.close()
     except Exception:
         return "present"
 

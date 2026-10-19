@@ -1229,7 +1229,7 @@ function switchScene(sid){
 function createScene(){
   const name=prompt('新场景名（如：我的学习场景）：');
   if(!name) return;
-  const ds=prompt('专属数据源路径（留空 = 继承默认库）：')||'';
+  const ds=prompt('专属数据源 duckdb 路径（留空 = 数据源就是本机：场景目录里的文件 + 本机只读原语）：')||'';
   fetch('/api/scene/create',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({name:name,data_source:ds,description:''})}).then(x=>x.json()).then(r=>{
     alert(r.ok?('已插入场景 '+r.scene_id+'：注册命名空间 + '+(r.action_count!=null?r.action_count:'?')+
@@ -2084,12 +2084,12 @@ function outOfDomainNote(im){
       <button class="btn btn-secondary" style="padding:4px 10px;font-size:12px"
         data-migrate-q="${ESC(im.question||'')}">➜ 新建场景，并把这个问题导过去</button>
       <span class="hint">新场景 = 独立图谱（节点从 0 长起）+ 独立待审区 + 独立学习曲线；
-      数据源默认继承当前库，要接真数据在建场景时填 duckdb 路径。</span>
+      数据源默认就是本机（场景目录 scene_data/&lt;场景&gt;/ 里的文件 + 只读原语）；要接真库在建场景时填 duckdb 路径。</span>
     </div></div>`;
 }
 async function migrateToNewScene(q){
   if(!q) return;
-  const ds=prompt('新场景的数据源 duckdb 路径（留空 = 继承当前默认库）：')||'';
+  const ds=prompt('新场景的数据源 duckdb 路径（留空 = 数据源就是本机）：')||'';
   const name='域外导入 · '+String(q).slice(0,16);
   let c;
   try{

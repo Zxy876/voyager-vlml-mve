@@ -154,7 +154,8 @@ def _pick_ability_topic(question: str, skills: list[dict[str, Any]]) -> str:
     return best
 
 
-def _retrieve_skills(question: str, topic_hint: str = "") -> list[dict[str, Any]]:
+def _retrieve_skills(question: str, topic_hint: str = "",
+                     scene_id: str = "") -> list[dict[str, Any]]:
     """取已积累的技能（可复用 SQL 配方），top_k 照原仓库 retrieval_top_k=5。"""
     try:
         import skill_store
@@ -165,7 +166,8 @@ def _retrieve_skills(question: str, topic_hint: str = "") -> list[dict[str, Any]
     if not all_s:
         return []
     topic = topic_hint or _pick_ability_topic(question, all_s)
-    out = skill_store.retrieve(topic, question, top_k=5)
+    out = skill_store.retrieve(topic, question, top_k=5,
+                               scene_id=scene_id)
     try:
         skill_store.mark_used([str(s.get("key") or "") for s in out])
     except Exception:  # pragma: no cover
@@ -469,7 +471,10 @@ async def consume(
     auto_task: bool = True,
     env: VLMLMCPEnv | None = None,
 ) -> dict[str, Any]:
-    env = env or VLMLMCPEnv()
+    # ⚠️ 环境**延迟创建**：下面按场景后果判断要不要 VLML。非 VLML 场景
+    # （用户 2026-10-19：「别的场景下，voyager 的学习和 VLML 没有关系」）
+    # 连 `VLMLMCPEnv()` 都不该构造 —— 它的构造会引导 vlml_env（chdir + 打
+    # duckdb 补丁 + 指向 rib），那已经是「碰 VLML」了。
 
     # 当前场景：人导入的问题归属哪个命名空间（1→n 泛化）。
     # 取不到就按默认 A —— 但**必须取**，否则整条消费线没有场景归属，
@@ -528,6 +533,26 @@ async def consume(
                               "why": f"{type(_le).__name__}: {_le}"}
     except Exception:
         pass                                     # 待审区写不进去不能拦消费
+    # ---- ②.5 场景后端（数据源）----
+    # 非 VLML 场景**不做 VLML 取数**：那条路连的是 rib/GRID，在别的场景里
+    # 拿它回答就是上一次实测看到的「问世界模型，答出一串 Valorant 战队」。
+    # 这里只做：命中判定 + 建点 + 触发学习（学习按本场景自己的数据源走）。
+    _scene_kind, _scene_why, _scene_dir = "", "", ""
+    try:
+        import scene_profile as _sp
+        _prof = _sp.profile(_scene_id)
+        _scene_kind = str(_prof.get("kind") or "")
+        _scene_why = str(_prof.get("why") or "")
+        _scene_dir = str(_prof.get("scene_dir") or "")
+    except Exception as e:
+        _scene_kind = ""
+        _scene_why = f"场景后端判定失败：{type(e).__name__}: {e}"
+    _non_vlml_why = ""
+    if _scene_kind and _scene_kind != "vlml":
+        _non_vlml_why = (
+            f"当前场景不是 VLML 数据域（{_scene_why}）：消费侧不做 VLML 取数，"
+            f"只做命中判定与触发学习（学习按本场景自己的数据源走）")
+
     if topic_hint:
         hit = f"{hit}（指定）" if hit else "（指定）"
     if task is not None:
@@ -552,11 +577,84 @@ async def consume(
         subs = [dict(p.get("subject") or {}) for p in derived]
 
     # ---- ② 找已积累的能力（配方）----
-    skills = _retrieve_skills(question, topic_hint)
+    skills = _retrieve_skills(question, topic_hint, _scene_id)
     reused_list = [{"topic": s.get("topic"), "name": s.get("name"),
                     "key": s.get("key")} for s in skills]
 
     # ---- ③ 取数：优先复用配方，没有就现场写 ----
+    # 非 VLML 场景：不连 VLML、不读 rib。
+    # 「本机」场景（普通用户的默认形态）：用本机只读原语作答；取不到就如实说。
+    if _non_vlml_why and _scene_kind == "local":
+        import local_agent as _la
+        obs, code = await _la.solve(question, _scene_dir)
+        real = [o for o in obs if o.get("ok") and o.get("data") is not None]
+        data = (real[-1].get("data") if real else None)
+        answer = ""
+        if data is not None:
+            try:
+                answer = json.dumps(data, ensure_ascii=False, indent=1)[:4000]
+            except Exception:
+                answer = str(data)[:4000]
+        base = {
+            "question": question, "mode": "voyager_consume",
+            "topic_id": topic_id, "topic_hit": hit,
+            "source": "human_import", "validated_target": False,
+            "root_scene": _scene_id, "scene_kind": _scene_kind,
+            "route_decision": str(route_info.get("decision") or ""),
+            "route_score": int(route_info.get("max_score") or 0),
+            "route_matched_on": str(route_info.get("matched_on") or ""),
+            "route_node": str(route_info.get("node_id") or ""),
+            "learn_kicked": bool(learn_kick.get("kicked")),
+            "learn_kick_note": str(learn_kick.get("why")
+                                   or learn_kick.get("reason") or ""),
+            "miss_node": str(miss_info.get("node_id") or ""),
+            "miss_node_created": bool(miss_info.get("node_created")),
+            "trajectory": ["local_python"] if code else [],
+            "facts": [], "facts_count": 0,
+            "insights": [], "caveats": [],
+            "errors": [str(o.get("error") or "") for o in obs if not o.get("ok")],
+            "answer": answer, "sql": code,
+            "rows": sum(int(o.get("rows") or 0) for o in obs if o.get("ok")),
+            "used_skills": [], "reused": False, "graph_link": {},
+            "judgment_result": "written" if data is not None else "fetched_empty",
+            "skipped": ("" if data is not None else
+                        ("本机原语没取到结果（" + _scene_why + "）"
+                         "—— 场景目录里放数据文件，或把问题问成本机能查到的东西")),
+        }
+        try:
+            _absorb(question, code, "", scene_id=_scene_id)
+        except Exception:
+            pass
+        _log(base)
+        return base
+
+    # 其它非 VLML 后端（配了自己的库，但消费侧还没接）：整段跳过，如实记账。
+    if _non_vlml_why:
+        base = {
+            "question": question, "mode": "voyager_consume",
+            "topic_id": topic_id, "topic_hit": hit,
+            "source": "human_import", "validated_target": False,
+            "root_scene": _scene_id, "scene_kind": _scene_kind,
+            "route_decision": str(route_info.get("decision") or ""),
+            "route_score": int(route_info.get("max_score") or 0),
+            "route_matched_on": str(route_info.get("matched_on") or ""),
+            "route_node": str(route_info.get("node_id") or ""),
+            "learn_kicked": bool(learn_kick.get("kicked")),
+            "learn_kick_note": str(learn_kick.get("why")
+                                   or learn_kick.get("reason") or ""),
+            "miss_node": str(miss_info.get("node_id") or ""),
+            "miss_node_created": bool(miss_info.get("node_created")),
+            "trajectory": [], "facts": [], "facts_count": 0,
+            "insights": [], "caveats": [], "errors": [],
+            "answer": "", "sql": "", "rows": 0,
+            "used_skills": [], "reused": False,
+            "graph_link": {}, "judgment_result": "failed",
+            "skipped": _non_vlml_why,
+        }
+        _log(base)
+        return base
+
+    env = env or VLMLMCPEnv()
     schema = ""
     try:
         schema = await env.schema_block()
@@ -1240,7 +1338,8 @@ def _ability_universe() -> set[str]:
     return ids
 
 
-def _absorb(question: str, sql: str, topic_id: str) -> dict[str, Any]:
+def _absorb(question: str, sql: str, topic_id: str,
+            *, scene_id: str = "") -> dict[str, Any]:
     """答完了 → **这题就到他的能力里了 → 这就是掌握**（用户 2026-10-13 定）。
 
     掌握不是覆盖率折算出来的一个分数，而是**能力集合的增长**：
@@ -1270,11 +1369,16 @@ def _absorb(question: str, sql: str, topic_id: str) -> dict[str, Any]:
     # 学习闭环 learn_orchestrate 每次的走法）时读局部变量会直接
     # UnboundLocalError。2026-10-19 修：消费侧一直没炸只因历史上的成功消费
     # 都归上了有 rubric 的题（or 短路，根本读不到这行）。
-    try:
-        from scenes import current_scene_id as _cur
-        _scene_id = _cur()
-    except Exception:
-        _scene_id = "A"
+    # `scene_id` 显式传入时以它为准：后台学习跑在**独立线程**里，这期间人可能
+    # 已经切了场景 —— 跟着「当前场景」走会把 A 学到的东西记到 B 的头上
+    # （用户 2026-10-19：「学习时场景隔离，只学习当前场景」）。
+    _scene_id = str(scene_id or "").strip()
+    if not _scene_id:
+        try:
+            from scenes import current_scene_id as _cur
+            _scene_id = _cur()
+        except Exception:
+            _scene_id = "A"
     tid = topic_id or _runtime_topic_id(question, _scene_id)
     out["topic_id"] = tid
     out["root_scene"] = _scene_id

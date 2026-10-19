@@ -157,15 +157,51 @@ async def start_learning(
         _record(out)
         return out
 
+    # ---- ⓪ 场景隔离：这一轮学的是**哪个后端**，先定死 ----
+    # 用户 2026-10-19 两条要求：
+    #   「启动 voyager 学习时场景隔离，只学习当前场景」
+    #   「别的场景下，voyager 的学习和 VLML 没有关系」
+    #   「对于普通用户而言，数据源就是本机」
+    # 所以后端三分：Scene A → VLML（rib 库 / VLML 工具集）；场景配了自己的库
+    # → 只读那个库；其余 → **本机**（场景目录里的文件 + 只读原语），
+    # 不需要用户配任何库。三条都不许互相借数据。
+    import scene_profile
+    prof = scene_profile.profile(scene)
+    out["backend"] = {"kind": prof["kind"], "db_path": prof["db_path"],
+                      "scene_dir": prof.get("scene_dir", ""),
+                      "scene_name": prof.get("scene_name", ""),
+                      "why": prof.get("why", "")}
+    if prof["kind"] in (scene_profile.NONE, scene_profile.MISSING):
+        out.update(status="unreachable", why=str(prof.get("why") or ""))
+        _record(out)
+        return out
+    use_vlml = prof["kind"] == scene_profile.VLML
+    is_local = prof["kind"] == scene_profile.LOCAL
+    local_dir = str(prof.get("scene_dir") or "") if is_local else ""
+    scene_db = "" if (use_vlml or is_local) else str(prof["db_path"])
+    db_path = db_path or scene_db          # 调用方显式给的优先
+    out["backend"]["vlml"] = use_vlml
+
     # ---- ① 图谱任务拆分（同构 decompose_task；LLM 失败降级会如实标 origin）----
     import task_decompose
-    plan = task_decompose.plan(question, scene, llm=llm)
+    plan = task_decompose.plan(question, scene, llm=llm, db_path=db_path)
     out["plan"] = plan
     if not plan.get("subgoals"):
         out.update(status="failed", why="拆分不出子目标（LLM 不可用且规则兜底也空）")
         _record(out)
         return out
-    if plan["counts"]["unreachable"] == len(plan["subgoals"]):
+    if is_local:
+        # 本机场景：抓手 = 本机只读原语（同构「插件即本机能力」，猫娘同款）。
+        # 没有表可匹配，所以不走「相关表」那条判据；也不许退回 rib 的表。
+        prim = {"name": "local:list_files/read_file",
+                "description": "本机只读原语：list_files / read_file / query_sql"}
+        for st in plan["subtasks"]:
+            st.update(status="reachable", grab=prim, score=1.0,
+                      why="本机只读原语可用（数据源 = 本机）")
+        plan["counts"] = {"reachable": len(plan["subtasks"]),
+                          "gap": 0, "unreachable": 0}
+        out["plan"] = plan
+    elif plan["counts"]["unreachable"] == len(plan["subgoals"]):
         # 硬不可达：既无抓手也无相关表。学不出来不是循环的失败，是数据源
         # 缺席 —— 如实报给人（装数据源/换场景），不硬编一个"学过了"。
         out.update(status="unreachable",
@@ -173,8 +209,8 @@ async def start_learning(
         _record(out)
         return out
 
-    # ---- ② 缺口 → 写插件（第一层：写插件）----
-    if plan["counts"]["gap"]:
+    # ---- ② 缺口 → 写插件（第一层：写插件；本机场景没有"表缺口"这一档）----
+    if plan["counts"]["gap"] and not is_local:
         import plugin_forge
         out["forged"] = plugin_forge.forge_gaps(plan, scene, db_path=db_path)
 
@@ -194,10 +230,11 @@ async def start_learning(
 
     # ---- ④ 重判：forge/expose 之后还有没有抓不到的子目标（照实，不宣称全通）----
     stuck: list[dict[str, Any]] = []
-    for st in plan["subtasks"]:
+    for st in ([] if is_local else plan["subtasks"]):
         if st.get("status") == "reachable":
             continue
-        r = task_decompose.reachability(str(st.get("need") or ""), scene)
+        r = task_decompose.reachability(str(st.get("need") or ""), scene,
+                                       db_path=db_path)
         if r.get("status") != "reachable":
             stuck.append({"seq": st.get("seq"), "need": st.get("need"),
                           "status": r.get("status"), "why": r.get("why")})
@@ -214,9 +251,24 @@ async def start_learning(
     if execute:
         try:
             import skill_store
-            skills = skill_store.retrieve("", question)
-            from voyager_vlml.agents.action import VLMLActionAgent
-            agent = VLMLActionAgent()
+            # 技能按场景取（口径与面板一致：本场景 + default）。
+            # 跨场景复用 A 的配方去答 B 的问题，就是「场景隔离没做到」的另一种样子。
+            skills = skill_store.retrieve("", question, scene_id=scene)
+            agent = None
+            if use_vlml:
+                from voyager_vlml.agents.action import VLMLActionAgent
+                agent = VLMLActionAgent()
+            elif not is_local:
+                # 场景配了自己的库：写 SQL 的 prompt/critic 照旧复用，但**数据面**
+                # 只连这个库（SceneDBEnv），不引导 VLML、不读 rib。
+                from voyager_vlml.agents.action import VLMLActionAgent
+                from scene_db import SceneDBEnv
+                agent = VLMLActionAgent(env=SceneDBEnv(prof["db_path"]))
+                out["execution_backend"] = f"scene_db:{prof['db_path']}"
+            else:
+                # 本机场景：**写代码**调本机只读原语（原版 Voyager 就是写代码调
+                # control_primitives）。全程不构造 VLML 环境。
+                out["execution_backend"] = f"local:{local_dir}"
             # 抓手条目 = 注册表里本场景的**全部**条目（builtin + forged），
             # 同构 MCP tools/list 交给模型。forge 出来的条目描述里带着实查到的
             # 真实列名 —— 不交给它，它就凭 schema 瞎猜 join 键（实测踩过）。
@@ -236,15 +288,20 @@ async def start_learning(
             try:
                 for st in plan["subtasks"]:
                     for t in (task_decompose.related_tables(
-                            str(st.get("need") or "")) or []):
+                            str(st.get("need") or ""), db_path=db_path) or []):
                         if t not in focus:
                             focus.append(t)
             except Exception:
                 focus = []
             out["focus_tables"] = focus[:10]
-            observations, sql = await agent.solve(
-                question, skills=skills, grabs=grabs, focus_tables=focus,
-                hints=[str(s.get("need") or "") for s in plan["subtasks"]])
+            if is_local:
+                import local_agent
+                observations, sql = await local_agent.solve(
+                    question, local_dir, llm=llm)
+            else:
+                observations, sql = await agent.solve(
+                    question, skills=skills, grabs=grabs, focus_tables=focus,
+                    hints=[str(s.get("need") or "") for s in plan["subtasks"]])
             real = _has_real(list(observations or []))
             out["execution"] = {
                 "ok": real, "sql": sql,
@@ -274,7 +331,8 @@ async def start_learning(
     # ---- ⑥ 取到值 → 图谱建点 + 掌握 + 配方入库（复用消费侧同一套账）----
     try:
         import voyager_vlml.consume as _consume
-        out["absorbed"] = _consume._absorb(question, sql, "")
+        out["absorbed"] = _consume._absorb(question, sql, "",
+                                          scene_id=scene)
     except Exception as e:
         out.update(status="failed",
                    why=f"入库失败（_absorb）：{type(e).__name__}: {e}")
@@ -302,7 +360,8 @@ async def start_learning(
                  if str(s.get("code") or "") == str(sql)]
         if fresh:
             out["crystallized"] = plugin_forge.crystallize_skill(
-                fresh[-1], into_scene=scene)
+                fresh[-1], into_scene=scene,
+                local_scene_dir=(local_dir if is_local else ""))
     except Exception as e:
         out["crystallized"] = {"ok": False, "why": f"{type(e).__name__}: {e}"}
 
