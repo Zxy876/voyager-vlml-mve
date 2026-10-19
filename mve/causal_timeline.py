@@ -58,7 +58,19 @@ def _next_seq(rows: list[dict[str, Any]]) -> int:
 
 
 def append(kind: str, *, topic_id: str = "", summary: str = "",
-           detail: dict[str, Any] | None = None) -> dict[str, Any]:
+           detail: dict[str, Any] | None = None,
+           scene: str = "") -> dict[str, Any]:
+    """追加一条因果事实。
+
+    `scene`：这条事实归属哪个场景（1→n，2026-10-18）。面板按场景过滤因果
+    时间线；不传按当前场景计（旧调用方不传也能落对场景）。
+    """
+    if not scene:
+        try:
+            import scenes as _scn
+            scene = str(_scn.current_scene_id() or "A")
+        except Exception:
+            scene = "A"
     rows = load()
     fact = {
         "seq": _next_seq(rows),
@@ -66,6 +78,7 @@ def append(kind: str, *, topic_id: str = "", summary: str = "",
         "kind": kind,
         "topic_id": topic_id,
         "summary": summary,
+        "scene": str(scene),
         "detail": detail or {},
     }
     with LOG.open("a", encoding="utf-8") as f:
@@ -99,6 +112,29 @@ def for_panel(limit: int = 30) -> list[dict[str, Any]]:
             "kind_label": KIND_LABEL.get(r.get("kind", ""), r.get("kind", "")),
             "topic_id": r.get("topic_id", ""),
             "summary": r.get("summary", ""),
+            # 1→n：场景归属。旧记录（2026-10-18 前）没有这个键 → 按默认场景 A 计。
+            "scene": str(r.get("scene") or "A"),
+        }
+        for r in rows[-limit:]
+    ]
+
+
+def for_scene(scene_id: str, limit: int = 30) -> list[dict[str, Any]]:
+    """某场景的因果时间线（1→n 隔离：切场景后这一页只显示本场景的事实）。
+
+    旧记录无 scene 键 → 归 A（与 consume() 的默认场景一致），不丢历史。
+    """
+    sid = str(scene_id)
+    rows = [r for r in load() if str(r.get("scene") or "A") == sid]
+    return [
+        {
+            "seq": r.get("seq"),
+            "ts": r.get("ts", ""),
+            "kind": r.get("kind", ""),
+            "kind_label": KIND_LABEL.get(r.get("kind", ""), r.get("kind", "")),
+            "topic_id": r.get("topic_id", ""),
+            "summary": r.get("summary", ""),
+            "scene": sid,
         }
         for r in rows[-limit:]
     ]

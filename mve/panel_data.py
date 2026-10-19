@@ -268,11 +268,16 @@ def _final_view(tracks: list[dict[str, Any]],
     }
 
 
-def _human_imports(limit: int = 10) -> list[dict[str, Any]]:
+def _human_imports(limit: int = 10,
+                   scene_id: str | None = None) -> list[dict[str, Any]]:
     """人导入的历史（直接读文件，不 import coach —— 那条会拉起整个 VLML）。
 
     助产士第二轮的原话：伴学面板里「学习者可以导入题干和内容以换得系统对此的
     记忆和解释」，我们与之同构，只是记忆与解释的提供方换成 VLML。
+
+    1→n：`scene_id` 非空时只返回该场景的导入记录（先过滤再取末 N 条——
+    反过来会让别的场景的新记录把本场景的挤出末 N 条）。旧记录没有
+    `root_scene` 字段（1→n 改造前的导入）按默认场景 `A` 计，不丢历史。
     """
     log = ROOT / "coach_log.jsonl"
     if not log.exists():
@@ -283,9 +288,12 @@ def _human_imports(limit: int = 10) -> list[dict[str, Any]]:
         if not line:
             continue
         try:
-            out.append(json.loads(line))
+            rec = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if scene_id is not None and str(rec.get("root_scene") or "A") != str(scene_id):
+            continue
+        out.append(rec)
     return out[-limit:]
 
 
@@ -361,11 +369,10 @@ def _consume_curve(limit: int = 40,
     # 拿 A 的 360 题当分母，掌握度恒 ≈0，读起来像"没学会"）。
     universe = _ability_universe_size() if scene_id is None else None
     # 场景模式多读一些再过滤，避免末 N 条被别的场景挤占
-    recs = [r for r in _human_imports(limit=limit * 10 if scene_id else limit)
+    # （过滤口径统一在 _human_imports(scene_id=…)，不在这里重复一遍）
+    recs = [r for r in _human_imports(limit=limit * 10 if scene_id else limit,
+                                      scene_id=scene_id)
             if r.get("mode") == "voyager_consume"]
-    if scene_id is not None:
-        recs = [r for r in recs
-                if str(r.get("root_scene") or "A") == str(scene_id)]
     recs = recs[-limit:]
     book: set[str] = set()
     for i, rec in enumerate(recs, start=1):
@@ -480,14 +487,19 @@ def _db_view() -> dict[str, Any]:
                 "error": f"{type(e).__name__}: {e}"[:160]}
 
 
-def _causal_view(limit: int = 25) -> dict[str, Any]:
+def _causal_view(limit: int = 25,
+                 scene_id: str | None = None) -> dict[str, Any]:
     """行动因果时间线（control / attempt / referee / narrative 同一条单调序列）。
 
     面板要显示它是因为：人导入**不进掌握度**，如果面板只有掌握度视图，
     人就会觉得自己导入的东西石沉大海。这条线是「导入确实发生了」的唯一证据。
+
+    1→n：`scene_id` 非空时只返回该场景的事实（切场景后这一页只显本场景的
+    因果）。旧事实没有 `scene` 键（1→n 改造前写的）按默认场景 A 计。
     """
     try:
-        rows = causal_timeline.for_panel(limit)
+        rows = (causal_timeline.for_scene(scene_id, limit) if scene_id is not None
+                else causal_timeline.for_panel(limit))
         counts = causal_timeline.counts_by_topic()
     except Exception as e:
         return {"rows": [], "counts": {}, "reason": f"{type(e).__name__}: {e}"[:160]}
@@ -499,6 +511,31 @@ def _causal_view(limit: int = 25) -> dict[str, Any]:
         },
         "reason": "",
     }
+
+
+def _scene_ctx() -> dict[str, Any]:
+    """当前场景上下文（1→n，2026-10-18）：面板所有页签按它过滤。
+
+    用户指令：「切了场景之后应该这几个页面的内容都关于那个场景」——
+    build_state 里 imports / consume_curve / causal / series / attempted /
+    failed / skill_detail 全部按这里的 id 过滤。
+    返回 `{id, name, data_source, is_default}`，scenes 模块不可用时退化为
+    默认 A（绝不拖垮面板）。
+    """
+    try:
+        import scenes as _sc
+        sid = str(_sc.current_scene_id() or "A")
+        for s in _sc.list_scenes():
+            if str(s.get("id")) == sid:
+                return {
+                    "id": sid,
+                    "name": str(s.get("name") or sid),
+                    "data_source": str(s.get("data_source") or ""),
+                    "is_default": sid == "A",
+                }
+        return {"id": sid, "name": sid, "data_source": "", "is_default": sid == "A"}
+    except Exception:
+        return {"id": "A", "name": "A", "data_source": "", "is_default": True}
 
 
 def _pilot_view() -> dict[str, Any]:
@@ -581,7 +618,13 @@ def probe_env() -> dict[str, Any]:
 
 
 def build_state() -> dict[str, Any]:
-    rows = run_log.load_all()
+    # 1→n：全页签按当前场景过滤（用户 2026-10-18：「切了场景之后应该这几个
+    # 页面的内容都关于那个场景」）。练习线 run_log 同理 —— B 的练习轮不该
+    # 混进 A 的轨迹页。旧记录无 scene 键 → for_scene 归 A，与 consume() /
+    # coach.explain() 的默认口径一致，不丢历史。
+    scene_ctx = _scene_ctx()
+    sid = scene_ctx["id"]
+    rows = run_log.for_scene(sid)
     memory = skill_store.load()
     # 防膨胀/防幻觉能不能自证，就看这两个数
     skill_stats = skill_store.stats()
@@ -610,15 +653,20 @@ def build_state() -> dict[str, Any]:
                 if int(s.get("hits") or 0) else None
             ),
         }
+        # 1→n 场景过滤：技能是**跨场景复用资产**，所以口径是「本场景 + 无
+        # 归属的老技能（default）」——切到 B 时老技能仍在（它们本来就可能
+        # 被 B 复用），但 A 专属的技能不混进来。
         for s in skill_store.all_skills()
+        if str(s.get("source_scene") or "default") in (sid, "default")
     ]
     _detail.sort(key=lambda x: (-x["ok"], -x["hits"]))
     skill_detail = _detail
 
     # 人导入通路：这两块在「还没跑过」时也要显示 —— 它正是让人开始的地方
-    imports = _human_imports()
+    # 1→n：都按当前场景取（切到 B 时人导入页只显 B 导入过的问题）。
+    imports = _human_imports(scene_id=sid)
     recommend = _next_recommend()
-    causal = _causal_view()
+    causal = _causal_view(scene_id=sid)
     pilot_view = _pilot_view()
     db = _db_view()
     # 练习范围（知识图谱页上点「练习此知识点」设的）。面板只读，不推断。
@@ -627,6 +675,8 @@ def build_state() -> dict[str, Any]:
     if not rows:
         return {
             "has_data": False,
+            # 1→n：当前场景上下文（前端场景栏/横幅/空态说明都要读它）
+            "scene": scene_ctx,
             "env": probe_env(),
             "db": db,
             "pilot": pilot_view,
@@ -634,8 +684,9 @@ def build_state() -> dict[str, Any]:
             "practice_scope": scope,
             "imports": imports,
             # 消费进步曲线：run_log 为空（比如刚清库）也要照常给 ——
-            # 进步是在消费这条线上测的，练习没跑过不影响它
-            "consume_curve": _consume_curve(),
+            # 进步是在消费这条线上测的，练习没跑过不影响它。
+            # 1→n：按当前场景取（B 冷启动时曲线为空是事实，不是 bug）。
+            "consume_curve": _consume_curve(scene_id=sid),
             "recommend": recommend,
             "causal": causal,
             "tasks": _task_library(),
@@ -652,8 +703,8 @@ def build_state() -> dict[str, Any]:
             # 导航上的「轨迹 N 轮」读它；不给就是 "undefined 轮"
             "total_rounds": 0,
             "topic_id": "",
-            "hint": ("还没有练习记录。摸底/考核不入 run_log（走 exam_log）——"
-                     "有裸考数据时下面会照常显示。"),
+            "hint": (f"Scene {sid} 还没有练习记录。摸底/考核不入 run_log"
+                     f"（走 exam_log）——有裸考数据时下面会照常显示。"),
         }
 
     # ---- 全局进度序列（跨运行连续编号）----
@@ -791,12 +842,17 @@ def build_state() -> dict[str, Any]:
     last = series[-1]
     prev_mastery = series[-2]["mastery"] if len(series) >= 2 else None
 
-    attempted = run_log.attempted_counts()
-    failed = run_log.failed_counts()
+    attempted = run_log.attempted_counts(sid)
+    failed = run_log.failed_counts(sid)
     topic_id = str(rows[-1].get("topic_id") or "")
 
     return {
         "has_data": True,
+        # 1→n：当前场景上下文（id/name/data_source/is_default）。
+        # 前端场景栏、图谱横幅、各页签空态说明都读它；切场景时 state 重建，
+        # 下面的 imports/consume_curve/causal/series/attempted/failed/
+        # skill_detail 已全部按它过滤。
+        "scene": scene_ctx,
         "env": probe_env(),
         "db": db,
         "pilot": pilot_view,
@@ -809,8 +865,10 @@ def build_state() -> dict[str, Any]:
         "tasks": _task_library(),
         # 人导入通路：导入过什么 + 出题器因此改成推哪题
         "imports": imports,
-        # 消费进步曲线：进步与掌握度**在消费这条线上测**（练习不判分）
-        "consume_curve": _consume_curve(),
+        # 消费进步曲线：进步与掌握度**在消费这条线上测**（练习不判分）。
+        # 1→n：按当前场景取 —— B 的曲线只画 B 的导入历史（否则"B 从零开始"
+        # 会被画成"接在 A 的尾声上"，Δ 掌握数虚高）。
+        "consume_curve": _consume_curve(scene_id=sid),
         "recommend": recommend,
         "causal": causal,
         "attempted": attempted,

@@ -765,11 +765,22 @@ function renderNav(s){
 
 /* ---------------- 各分区 ---------------- */
 /* 真实水平曲线：撤支架考核（学习曲线该看的那一列） */
+/* 1→n 诚实披露（examCard / pPractice / pAdaptive 三处复用，不各写一份）：
+   exam_log（摸底考核）/ topic_graph（教学图谱）/ planner（出题器）都不带
+   场景字段 → 这些区块是**全局**数据，不随场景切换过滤。不假装隔离。 */
+function globalDataNote(s, what){
+  if(!((s.scene||{}).id && s.scene.id!=='A')) return '';
+  return `<div class="note warn">当前场景是 <b>Scene ${ESC(s.scene.id)}</b>，但${ESC(what)}
+    读的是<b>全局</b>数据（不带场景字段，不随场景切换过滤）。要按场景隔离，得先给
+    对应数据补场景归属（未做，先如实说明）。</div>`;
+}
+
 function examCard(s){
   const e=s.exam_curve||{};
   const p=s.pilot||{};
   const busy=!!p.running;
   const runningJob=busy?(p.job_label||p.job||'任务'):'';
+  const sceneNote=globalDataNote(s,'摸底/考核走 exam_log');
   const ctl=`<div class="runctl">
       <button class="btn btn-primary" id="btnPlacement" ${busy?'disabled':''}>摸底（全库撤图谱考一遍）</button>
       <button class="btn btn-secondary" id="btnFinal" ${busy?'disabled':''}>结业考（带技能库再考一遍）</button>
@@ -786,6 +797,7 @@ function examCard(s){
   if(!e.has_data) return `<div class="panel"><div class="panel__head"><h2>真实水平曲线 · 撤支架考核</h2>
       <span class="hint">练习那条线是带知识图谱跑的，量的是支架不是水平</span></div>
     <div class="empty">${ESC(e.hint||'还没有裸考记录')}</div>
+    ${sceneNote}
     <div class="note">点「摸底」开始：把全库每道题**撤掉知识图谱**考一遍（约 7 分钟），
       得出零基础的真实水平。它要求技能库为空 —— 带着技能库考出来的是
       "练过之后的水平"，不是起点。</div>
@@ -813,6 +825,7 @@ function examCard(s){
     —— 这是<b>带着技能库</b>撤图谱再考一遍的结果，和摸底同一个分母，可直接比。</div>`:'';
   return `<div class="panel"><div class="panel__head"><h2>真实水平曲线 · 撤支架考核</h2>
       <span class="hint">练习给图谱 / 考核撤图谱 —— 按题分行，不首尾相连</span></div>
+    ${sceneNote}
     <div class="kpis">
       <div class="kpi"><div class="label">摸底均值</div><div class="value">${e.avg_baseline}%</div></div>
       <div class="kpi"><div class="label">最新均值</div><div class="value">${e.avg_latest}%</div></div>
@@ -940,6 +953,7 @@ function pPractice(s){
   return `<div class="panel">
       <div class="panel__head"><h2>出题器 · 下一题</h2>
         <span class="hint">优先级链照伴学：错题重试 &gt; 到期复习 &gt; 人导入方向 &gt; 补工具覆盖 &gt; 推进新题</span></div>
+      ${globalDataNote(s,'出题器（planner）——推荐与题库')}
       ${recmd||'<div class="empty">出题器不可用</div>'}
     </div>
     <div class="panel">
@@ -1048,16 +1062,20 @@ async function previewRoute(){
    点上标命中判定（双阈值，非人审）与判定结果，二次导入同一问题命中即可达证据。 */
 function consumeCurve(s){
   const cc=s.consume_curve||[];
+  // 1→n：主面板数据 = 当前场景（build_state 已按场景过滤），曲线选择器
+  // 默认落到当前场景；「全部场景」是对比视图，另走接口（见 switchCurveScene）。
+  const curScene=(s.scene&&s.scene.id)||'A';
   if(!cc.length) return `<h3>学习曲线 · 消费能力侧</h3>
-    <div class="empty">还没有消费记录。在上面问一句话，Voyager 会用已积累的能力回答 ——
+    <div class="empty">Scene ${ESC(curScene)} 还没有消费记录。在上面问一句话，Voyager 会用已积累的能力回答 ——
     答完了这题就进它的能力库，掌握与进步从这里开始累计。</div>`;
-  window.__consumeCurveAll=cc;   // 场景筛选回「全部」时用，不再请求一次
+  window.__consumeCurveAll=cc;   // 场景筛选回「当前场景」时用，不再请求一次
   const inData=[...new Set(cc.map(c=>c.root_scene||'A'))];
   const known=window.__sceneList||[];
   const all=[...new Set([...inData,...known])];
-  const opts=`<option value="__all__">全部场景（${cc.length} 次）</option>`+
-    all.map(id=>`<option value="${ESC(id)}">Scene ${ESC(id)}</option>`).join('');
-  return `<h3>学习曲线 · 消费能力侧（${cc.length} 次消费）</h3>
+  const opts=`<option value="${ESC(curScene)}" selected>Scene ${ESC(curScene)}（当前）</option>`+
+    all.filter(id=>id!==curScene).map(id=>`<option value="${ESC(id)}">Scene ${ESC(id)}</option>`).join('')+
+    `<option value="__all__">全部场景（对比用）</option>`;
+  return `<h3>学习曲线 · 消费能力侧（${cc.length} 次消费 · Scene ${ESC(curScene)}）</h3>
     <div class="legend"><b>掌握 = 能力集合的增长</b>：人问一句 → Voyager 答完了 →
     这题进它的能力库。纵轴是<b>累计会做的题有几道</b>，照原版 Voyager
     <span class="mono">curriculum.py:135 len(completed_tasks)</span>。
@@ -1066,7 +1084,7 @@ function consumeCurve(s){
     （<span class="mono">:339</span>），失败不计。</div>
     <div class="imp-row" style="margin:6px 0">
       <select id="curveScene" onchange="switchCurveScene(this.value)">${opts}</select>
-      <span class="hint">按场景筛选：A 的导入历史不混进 B 的曲线（混了 Δ 掌握数虚高）</span>
+      <span class="hint">默认只看当前场景（顶部场景栏切换）；「全部场景」可把各场景曲线放在一张图上对比</span>
     </div>
     <div id="curveBody">${consumeCurveBody(cc)}</div>`;
 }
@@ -1146,14 +1164,15 @@ function consumeCurveBody(cc){
       <th>一致度</th><th>同一个量</th><th>Voyager 做法</th><th>判据 / 差别</th></tr></thead>
       <tbody>${cmpRows}</tbody></table>`;
 }
-/* 场景筛选：走各自的取数口径， curves 已在内存的回「全部」，其余按场景现取
-   （同一函数 _consume_curve 的场景参数，不新造尺子）。 */
+/* 场景筛选：选具体场景现取该场景曲线；「全部场景」是对比视图，
+   也走同一个接口（scene=__all__ → 后端不过滤，各场景曲线同图）。
+   同一个函数 _consume_curve 的场景参数，不新造尺子。 */
 function switchCurveScene(sid){
   const body=document.getElementById('curveBody');
   if(!body) return;
-  if(sid==='__all__'){body.innerHTML=consumeCurveBody(window.__consumeCurveAll||[]);return;}
-  body.innerHTML='<span class="muted">取 Scene '+ESC(sid)+' 的曲线…</span>';
-  fetch('/api/scene-curve?scene='+encodeURIComponent(sid)).then(x=>x.json()).then(r=>{
+  const allSid=(sid==='__all__')?'__all__':sid;
+  body.innerHTML='<span class="muted">取 '+(allSid==='__all__'?'全部场景':'Scene '+ESC(allSid))+' 的曲线…</span>';
+  fetch('/api/scene-curve?scene='+encodeURIComponent(allSid)).then(x=>x.json()).then(r=>{
     if(r.error){body.innerHTML='<span class="muted">'+ESC(r.error)+'</span>';return;}
     body.innerHTML=consumeCurveBody(r.curve||[]);
   }).catch(e=>{body.innerHTML='<span class="muted">取曲线失败：'+ESC(String(e))+'</span>';});
@@ -1196,9 +1215,11 @@ function switchScene(sid){
     alert(r.ok?('已切换到场景 '+sid+'。之后的导入与学习曲线都按这个场景隔离。')
               :('切换失败：'+(r.error||'')));
     GRAPH=null;                       // 图谱缓存作废：每个场景一张图，重拉本场景的
+    // 曲线选择器跟着顶层场景走：人在曲线里手选过别的场景时，切顶层场景要
+    // 把那个手洗掉（否则顶栏已是 B、曲线还显示 A 的对比图）—— 由 render()
+    // 里的 __curveSceneReset 跳过控件值恢复，重新默认到新当前场景。
+    window.__curveSceneReset=true;
     loadSceneBar();
-    const cs2=document.getElementById('curveScene');
-    if(cs2&&[...cs2.options].some(o=>o.value===sid)){cs2.value=sid;switchCurveScene(sid);}
     load();
   });
 }
@@ -1222,7 +1243,8 @@ const JUDGE_LABEL={db_evidence:'DB 取证', referee:'VLML0 裁判', rubric:'rubr
                    method_compare:'两边做法比对', none:'未判'};
 
 function pTrace(s){
-  if(!s.has_data) return '<div class="panel"><div class="empty">还没有轨迹数据。</div></div>';
+  if(!s.has_data) return `<div class="panel"><div class="empty">Scene ${ESC((s.scene||{}).id||'A')} 还没有轨迹数据。
+    （别的场景练过的轮次不混进来；要看去别的场景，用顶部场景栏切。）</div></div>`;
 
   // 「编排轨迹」整块**条件渲染**：工具序列（trajectory）只由已冻结的旧后端写入，
   // 新后端不落 run_log。线上 36 条记录里它恒为空 —— 以前这页是一整张
@@ -1328,7 +1350,8 @@ function pSkill(s){
         <span class="kd"><span class="chip ${kc[r.kind]||'grey'}">${ESC(r.kind_label)}</span></span>
         <span>${ESC(r.summary)}</span>
         <span class="ts">${ESC(String(r.ts||'').replace('T',' ').slice(5,19))}</span></div>`).join('')}</div>`
-    :'<div class="empty">时间线为空。</div>';
+    :`<div class="empty">Scene ${ESC((s.scene||{}).id||'A')} 的时间线还是空的 ——
+      人导入一个问题（哪怕没取到数）就会在这里落下一条 control 事实。</div>`;
   return `<div class="panel">
       <div class="panel__head"><h2>技能库</h2>
         <span class="hint">照原版 voyager.py:195/199：每轮<b>先检索</b>再写 SQL；按有效性排序</span></div>
@@ -1874,6 +1897,7 @@ function pAdaptive(s){
   const sel=oq?((oq.selection&&oq.selection.explanation)||''):'';
   const gradeHTML=window.__oqGradeHTML||'';
   const gradeDisp=gradeHTML?'block':'none';
+  const sceneNote=globalDataNote(s,'教学图谱与出题器（topic_graph / planner）——全局题库的种子题来自默认场景 A');
   return `<div class="panel">
   <div class="panel__head"><h2>🧩 自适应练习 · 教学图谱</h2>
     <span class="hint">前置门控 + 薄弱优先 + 题型轮换（移植自猫娘伴学）</span></div>
@@ -1883,6 +1907,7 @@ function pAdaptive(s){
     <span class="chip">目标难度 ${tg.difficulty_target||1}</span>
     <span class="chip grey">知识点总数 ${tg.total||nodes.length}</span>
   </div>
+  ${sceneNote}
   <div class="note info">出题围绕<b>当前库真实实体</b>（系列赛/队伍/地图跟着库走），不再考不存在的图；
     同一知识点多次练习会<b>轮换题型</b>并明确错开上次题目，解决"重复出一道题"。</div>
   <div class="row" style="margin-top:8px">
@@ -1973,7 +1998,8 @@ function fillTopics(s){
 
 function importsList(s){
   const imps=s.imports||[];
-  if(!imps.length) return '<div class="empty">还没有人工导入过。</div>';
+  if(!imps.length) return `<div class="empty">Scene ${ESC((s.scene||{}).id||'A')} 还没有人工导入过。
+    在上面问一句话（会按当前场景的图谱判定命中），Voyager 会用已积累的能力回答。</div>`;
   return imps.slice().reverse().map(im=>`
     <div class="nocmp" style="margin-top:8px">
       <div class="nocmp-tag">不参与掌握度评价 · validated_target: false</div>
@@ -2005,7 +2031,10 @@ function consumeBlock(im){
     <div style="margin-top:6px;border-top:1px dashed var(--line);padding-top:6px">
       <span class="chip ${im.reused?'ok':'warn'}">${im.reused?'复用已学配方':'现场现做'}</span>
       ${im.mastered
-        ? `<span class="chip ok">已掌握 · 累计 ${ESC(im.mastered_total)}/${ESC(im.ability_total)} 题</span>`
+        // 分母只对默认场景 A 有意义（它的题库就是全局题库）；B/C 的记录拿
+        // 全局 360 题当分母会算出"永远学不会"的假象（与场景曲线的
+        // ability_total=None 同一口径，见 _consume_curve 的场景模式）。
+        ? `<span class="chip ok">已掌握 · 累计 ${ESC(im.mastered_total)}${im.root_scene&&im.root_scene!=='A'?' 题':`/${ESC(im.ability_total)} 题`}</span>`
         : '<span class="chip bad">没答出来，未进能力库</span>'}
       ${judged
         ? (im.judged
@@ -2508,7 +2537,12 @@ function render(s){
     // 不能因为刷新把人刚选的单元数/迁移间隔/草稿重置掉。
     const vals={}, afId=(af&&af.id&&stage.contains(af))?af.id:null;
     stage.querySelectorAll('select[id],input[id],textarea[id]')
-      .forEach(el=>{ vals[el.id]=el.value; });
+      .forEach(el=>{
+        // 顶层场景刚切换过：曲线选择器不保留人手选的值，重新默认到新当前场景
+        if(window.__curveSceneReset && el.id==='curveScene') return;
+        vals[el.id]=el.value;
+      });
+    window.__curveSceneReset=false;
     stage.innerHTML=(PANELS[TAB]||pOverview)(s);
     Object.entries(vals).forEach(([id,v])=>{
       const n=document.getElementById(id);
@@ -2519,6 +2553,10 @@ function render(s){
       if(n && n.tagName && FORM.includes(n.tagName)) n.focus();
     }
     fillTopics(s);          // 重建后 #topic 是新元素，得重新填（在恢复值之后跑，keep 才保得住）
+    // 曲线主体与选择器对齐：选择器还是本场景 → 面板数据就是本场景的，不用动；
+    // 人手选过别的场景/「全部场景」→ 现取一次，别让身子和脑袋不一致。
+    const cs3=document.getElementById('curveScene');
+    if(cs3 && cs3.value && cs3.value!==((s.scene||{}).id)) switchCurveScene(cs3.value);
     const il=document.getElementById('implist');
     if(il) il.innerHTML=importsList(s);
 
@@ -2708,17 +2746,16 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/scene-curve":
             # 1→n：单场景学习曲线（主面板学习曲线的场景筛选口）。
             # 与面板全局曲线同一个函数 _consume_curve 的场景参数，不新造尺子。
+            # scene=__all__（或空）= 对比视图：不过滤，各场景曲线同图返回。
             import urllib.parse as _up
             qs = _up.parse_qs(_up.urlsplit(self.path).query or "")
             sid = str((qs.get("scene") or [""])[0]).strip()
-            if not sid:
-                self._json(400, {"error": "scene 参数为空"})
-                return
+            scene_arg = None if sid in ("", "__all__") else sid
             try:
-                curve = panel_data._consume_curve(limit=40, scene_id=sid)
+                curve = panel_data._consume_curve(limit=40, scene_id=scene_arg)
                 body = json.dumps(
-                    {"ok": True, "scene_id": sid, "curve": curve,
-                     "summary": panel_data.curve_summary(sid)},
+                    {"ok": True, "scene_id": sid or "__all__", "curve": curve,
+                     "summary": (panel_data.curve_summary(sid) if scene_arg else {})},
                     ensure_ascii=False, default=str).encode("utf-8")
                 ctype = "application/json; charset=utf-8"
             except Exception as e:

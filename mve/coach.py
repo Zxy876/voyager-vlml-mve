@@ -90,6 +90,13 @@ def recent_imports(limit: int = 10) -> list[dict[str, Any]]:
 
 def _log_import(result: dict[str, Any]) -> None:
     """落一条人导入记录。不存完整 facts（面板只看摘要 + 解释）。"""
+    # 记录归属哪个场景：调用方（consume）显式带就用它的；没带（旧 VLML 通路/
+    # 失败兜底）按**当前场景**计 —— 与 consume() 的默认口径一致。
+    try:
+        import scenes as _scn
+        _cur_scene = str(_scn.current_scene_id() or "A")
+    except Exception:
+        _cur_scene = "A"
     rec = {
         "ts": datetime.now().isoformat(timespec="seconds"),
         "question": result.get("question", ""),
@@ -151,6 +158,18 @@ def _log_import(result: dict[str, Any]) -> None:
         "verdict_referee": result.get("verdict_referee", ""),
         "covered_points": result.get("covered_points") or [],
         "missing_points": result.get("missing_points") or [],
+        # —— 1→n 场景归属与命中判定（2026-10-18 补）——
+        # ⚠️ 这四个字段之前**不在白名单里**：consume.py 的 base 明明带了
+        # root_scene / route_decision / judgment_result，但 _log_import 用
+        # 白名单重建记录时把它们丢了 → 导入历史永远按场景筛不出来
+        # （实测：特斯拉问题在 Scene C 导入，切回 A 照样显示，切到 C 反而不显示）。
+        # 消费现场路由不了时（路由层异常）decision 为空串，面板容错显示"—"。
+        "root_scene": result.get("root_scene") or _cur_scene,
+        "route_decision": result.get("route_decision") or "",
+        "route_score": result.get("route_score") or 0,
+        "judgment_result": result.get("judgment_result") or "",
+        "node_status": result.get("node_status") or "",
+        "cold_start": bool(result.get("cold_start")),
     }
     with COACH_LOG.open("a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -437,6 +456,15 @@ async def explain(question: str, *, topic_id: str = "",
         topic_id = inferred
         # 归不上时不在这里生成题 —— 等取完数拿到维度再说（见 docstring）
 
+    # 1→n：这条导入归属哪个场景。旧 VLML 通路不做路由，按**当前场景**计
+    #（与 consume() 的口径一致）。base 带上 root_scene，_log_import 白名单
+    # 才留得住它；causal append 也显式传，不依赖默认值。
+    try:
+        import scenes as _scp
+        _scene = str(_scp.current_scene_id() or "A")
+    except Exception:
+        _scene = "A"
+
     # Voyager 消费链：编排前收集能力（记忆/技能/场景）。归题先行，
     # 技能检索才能吃到同题加成。
     vctx: dict[str, Any] | None = None
@@ -452,6 +480,7 @@ async def explain(question: str, *, topic_id: str = "",
         "source": "human_import",           # 出题器产出才是 targeted_question
         "validated_target": VALIDATED_TARGET_IMPORTED,
         "mode": "voyager" if voyager else "vlml",
+        "root_scene": _scene,               # 1→n：导入记录归属当前场景
     }
     if voyager and vctx is not None:
         base["voyager_context"] = {
@@ -504,6 +533,7 @@ async def explain(question: str, *, topic_id: str = "",
             topic_id=topic_id,
             summary=f"人导入问题（未取到数据）：{question[:80]}",
             detail={"trajectory": [], "facts": 0, "validated_target": False},
+            scene=_scene,
         )
         _log_import(result)
         return result
@@ -585,6 +615,7 @@ async def explain(question: str, *, topic_id: str = "",
         summary=f"人导入问题：{question[:80]}",
         detail={"trajectory": traj, "facts": len(facts),
                 "validated_target": False},
+        scene=_scene,
     )
     _log_import(result)
     return result

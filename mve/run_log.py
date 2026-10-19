@@ -20,6 +20,14 @@ LOG = Path(__file__).resolve().parent / "run_log.jsonl"
 
 def append(record: dict[str, Any]) -> None:
     record.setdefault("ts", datetime.now().isoformat(timespec="seconds"))
+    # 1→n：每轮归属当前场景（2026-10-18）。面板按场景过滤轨迹线；
+    # 写入方不显式带 scene 时按当前场景补 —— 与 consume() 的默认口径一致。
+    if not record.get("scene"):
+        try:
+            import scenes as _scn
+            record["scene"] = str(_scn.current_scene_id() or "A")
+        except Exception:
+            record["scene"] = "A"
     with LOG.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -39,20 +47,30 @@ def load_all() -> list[dict[str, Any]]:
     return out
 
 
-def attempted_counts() -> dict[str, int]:
-    """每题做过几次（照伴学 ordered_scope_topics 的 attempted 键）。"""
+def for_scene(scene_id: str) -> list[dict[str, Any]]:
+    """某场景的练习轮记录（1→n 隔离）。旧记录无 scene 键 → 归 A，不丢历史。"""
+    sid = str(scene_id)
+    return [r for r in load_all() if str(r.get("scene") or "A") == sid]
+
+
+def attempted_counts(scene_id: str | None = None) -> dict[str, int]:
+    """每题做过几次（照伴学 ordered_scope_topics 的 attempted 键）。
+
+    `scene_id` 非空时只数该场景的轮次（1→n：切场景后「轨迹/练习」页只反映
+    当前场景练过什么）。
+    """
     out: dict[str, int] = {}
-    for r in load_all():
+    for r in (for_scene(scene_id) if scene_id else load_all()):
         t = str(r.get("topic_id") or "")
         if t:
             out[t] = out.get(t, 0) + 1
     return out
 
 
-def failed_counts() -> dict[str, int]:
+def failed_counts(scene_id: str | None = None) -> dict[str, int]:
     """每题错（wrong/dont_know）几次 —— 伴学的 retry_wrong_questions 就挑这些。"""
     out: dict[str, int] = {}
-    for r in load_all():
+    for r in (for_scene(scene_id) if scene_id else load_all()):
         t = str(r.get("topic_id") or "")
         if t and str(r.get("verdict") or "") in ("wrong", "dont_know"):
             out[t] = out.get(t, 0) + 1
