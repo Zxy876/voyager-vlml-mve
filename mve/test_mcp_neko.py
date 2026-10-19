@@ -75,6 +75,22 @@ def test_resolve_units() -> None:
     assert r.endswith("mcp_neko_server.py") and G.Path(r).is_absolute(), r
     # arg：绝对路径原样
     assert G._resolve_arg("/a/b/c.py") == "/a/b/c.py"
+
+    # sibling 回退必须能穿透 venv symlink：/v/bin/python → python3 →（外部），
+    # 直接 resolve() 会跳出 venv 导致 console script 找不到（服务器实测踩过）
+    import tempfile
+    v = Path(tempfile.mkdtemp())
+    (v / "bin").mkdir()
+    (v / "bin" / "python3").write_text("#!/bin/sh\n")     # 充当系统解释器
+    (v / "bin" / "python").symlink_to("python3")          # venv 式 symlink
+    (v / "bin" / "mve-fake-cli").write_text("#!/bin/sh\n")
+    old_exe = G.sys.executable
+    G.sys.executable = str(v / "bin" / "python")
+    try:
+        assert G._resolve_command("mve-fake-cli") == str(v / "bin" / "mve-fake-cli"), \
+            G._resolve_command("mve-fake-cli")
+    finally:
+        G.sys.executable = old_exe
     print("PASS  test_resolve_units")
 
 

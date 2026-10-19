@@ -91,9 +91,17 @@ def _resolve_command(cmd: str) -> str:
     found = shutil.which(cmd)
     if found:
         return found
-    sibling = Path(sys.executable).resolve().parent / cmd
-    if sibling.exists():
-        return str(sibling)
+    # 面板解释器同目录（venv 的 bin/）：console script 装在哪，server 上
+    # /root/mve/.venv/bin 不在 systemd PATH 里也能找到。注意不能对
+    # sys.executable 直接 resolve()——venv 的 python 是指向系统解释器的
+    # symlink（/root/mve/.venv/bin/python → python3 → /usr/bin/python3.12），
+    # resolve() 会跳出 venv（实测踩过：ddg 因此 FileNotFoundError）。
+    # 未解析目录优先，再兜底解析后的目录（解释器本身是 symlink 的部署形态）。
+    exe = Path(sys.executable)
+    for base in (exe.parent, exe.resolve().parent):
+        sibling = base / cmd
+        if sibling.exists():
+            return str(sibling)
     return cmd
 
 
