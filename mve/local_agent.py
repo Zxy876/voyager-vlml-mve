@@ -375,13 +375,19 @@ async def solve(question: str, scene_dir: str, *, llm=None,
         # 11 个 MCP 工具里挑花眼，反而不调。
         fetch_txt = ""
         if require_tools and _can_fetch:
-            fetch_txt = ("\n【取证要求】这是**学习环节**：答案必须来自你真正调用"
-                         "下面这些函数取回的内容 —— "
-                         + "、".join(sorted(_probe)[:14])
-                         + "。直接凭记忆写一段「正确」答案 = 没取证 = 判不通过，"
-                           "也不会被记成能力。先调函数取证，再据实组织答案。\n")
-        user = (f"问题：{question}\n\n{inv_txt}\n" + dim_txt + avoid_txt
-                + fetch_txt
+            _names = [n for n in sorted(_probe) if not n.startswith("__")]
+            fetch_txt = (
+                "【取证要求（先做这个，再写答案）】这是**学习环节**：你的答案必须"
+                "来自你**真正调用**下列函数取回的内容，凭记忆直接写的答案判不通"
+                "过、也不会被记成能力。\n可用函数："
+                + "、".join(_names[:16]) + "\n"
+                "代码必须长这样（先取证，再据实组织）：\n"
+                "```python\n"
+                "r = web_search(\"<本题关键词>\")\n"
+                "RESULT = {\"answer\": r, \"source\": \"web_search\"}\n"
+                "```\n")
+        user = (f"问题：{question}\n\n{inv_txt}\n" + fetch_txt
+                + dim_txt + avoid_txt
                 + (f"\n上一轮没通过 critic 检查，它的评语（务必针对它改）：{critique}\n"
                    if critique else "")
                 + (f"\n上一次的代码：\n{code}\n执行反馈：{fb}\n请修正后重写。"
