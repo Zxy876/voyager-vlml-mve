@@ -200,6 +200,7 @@ def available_grabs(scene_id: str, scene_dir: str = "") -> list[str]:
 def learn_milestone_skills(scene_id: str, topic_id: str, question: str,
                            milestone: dict[str, Any],
                            dim_codes: list[dict[str, Any]],
+                           *, import_id: str = "",
                            ) -> dict[str, Any]:
     """里程碑**闭合**后把这一轮跑通的代码写进技能库 —— 同构原版
     `skill.py:64-99 add_new_skill`（原版只在 rollout **成功**后写：
@@ -257,6 +258,11 @@ def learn_milestone_skills(scene_id: str, topic_id: str, question: str,
                            "dimension": did,
                            "question": str(item.get("question") or ""),
                            "scene": scene_id,
+                           # 技能归属那次人导入（用户 2026-10-20）：
+                           # 「技能的归属也是如此」。面板据此显示
+                           # 「这条技能来自 imp_xxx（第 N 次导入）」，
+                           # 第二次导入同一问题时掌握度涨的那一分能解释。
+                           "import_id": str(import_id or ""),
                            "tools": list(item.get("tools") or [])},
                 source_scene=str(scene_id or "A"))
             if key:
@@ -282,7 +288,8 @@ def _called_tools(code: str) -> list[str]:
 
 def close_one_dimension(scene_id: str, topic_id: str, question: str,
                         dim: dict[str, Any], *, bump: bool = True,
-                        tools: list[str] | None = None) -> list[str]:
+                        tools: list[str] | None = None,
+                        import_id: str = "") -> list[str]:
     """闭合**一个**（维度）问题 = 落**一枚**节点 —— 最小技能单位。
 
     用户 2026-10-19 定：最小技能单位是一个节点（也就是闭合了一个问题）。
@@ -304,7 +311,9 @@ def close_one_dimension(scene_id: str, topic_id: str, question: str,
         did = str(dim.get("id") or "").strip()
         return list(_ms.attach_dimensions(
             scene_id, tid, [dim], verified=True, bump=bump,
-            tools=({did: list(tools or [])} if did and tools else None)))
+            tools=({did: list(tools or [])} if did and tools else None),
+            # 挂到**这次导入**下面：谁长出来的要能追（用户 2026-10-20）
+            import_id=str(import_id or ""), import_label=str(question or "")))
     except Exception:
         return []
 
@@ -320,6 +329,7 @@ async def start_learning(
     critique: str = "",
     judge: bool = False,
     context: str = "",
+    import_id: str = "",
 ) -> dict[str, Any]:
     """启动一轮学习（同构 learn() 单圈）。返回全量过程记录，失败如实带 why。
 
@@ -332,7 +342,7 @@ async def start_learning(
         return await _start_learning_impl(
             question, scene_id, llm=llm, db_path=db_path,
             execute=execute, use_mcp=use_mcp, critique=critique,
-            judge=judge, context=context)
+            judge=judge, context=context, import_id=import_id)
     finally:
         if use_mcp:
             try:
@@ -353,14 +363,36 @@ async def _start_learning_impl(
     critique: str = "",
     judge: bool = False,
     context: str = "",
+    import_id: str = "",
 ) -> dict[str, Any]:
     """启动一轮学习（同构 learn() 单圈）的实现体（断开逻辑见外层 start_learning）。"""
     question = str(question or "").strip()
     scene = _resolve_scene(scene_id)
+    # ---- 导入批次（用户 2026-10-20）----
+    # 「每次人导入-运行学习一批内容，这批图谱上长出来的内容就是那次人导入的
+    #   子节点，技能归属也是如此」。调用方没给批次 id 时，按问句文本找**最近
+    #   一次**人导入记录（同场景、严格同句），拿它的批次 id —— 这样无论是
+    #   面板点「启动 Voyager」还是命令行 scene_learn.py，都能挂到那次导入下。
+    # 找不到（纯手动学、没导过）就留空：不编一个假批次。
+    imp_id = str(import_id or "").strip()
+    imp_n = 0
+    if not imp_id:
+        try:
+            import coach as _coach_h
+            _hist = _coach_h.import_history(question, scene)
+            imp_id = str(_hist.get("import_id") or "")
+            imp_n = int(_hist.get("count") or 0)
+        except Exception:
+            imp_id, imp_n = "", 0
+    if imp_id:
+        print(f"  · 导入批次：{imp_id}"
+              + (f"（这个问题第 {imp_n} 次导入）" if imp_n else "")
+              + " —— 这一轮长出来的节点都挂在它下面", flush=True)
     out: dict[str, Any] = {
         "question": question, "scene_id": scene, "status": "", "why": "",
         "plan": {}, "forged": {}, "exposed": {}, "stuck": [],
         "execution": {}, "absorbed": {}, "crystallized": {}, "milestone": {},
+        "import_id": imp_id, "import_count": imp_n,
         "started_at": round(time.time(), 1),
     }
     if not question:
@@ -635,6 +667,7 @@ async def _start_learning_impl(
                             closed_nodes.extend(
                                 close_one_dimension(
                                     scene, _tid, question, _d, bump=False,
+                                    import_id=imp_id,
                                     tools=list(_old_codes.get(_did, {}).get(
                                         "tools") or [])
                                     or _called_tools(
@@ -739,7 +772,7 @@ async def _start_learning_impl(
                             # return 而颗粒无收（2026-10-19 服务器实测）。
                             closed_nodes.extend(
                                 close_one_dimension(
-                                    scene, _tid, question, _d,
+                                    scene, _tid, question, _d, import_id=imp_id,
                                     tools=tools_map.get(_did)))
                             if _did:
                                 closed_ids.add(_did)
@@ -809,7 +842,8 @@ async def _start_learning_impl(
                         # 没全闭合也照样把**已闭合**那几条入库 —— 它们各自是一次
                         # 成功 rollout，不该因为别的维度没闭合就被连坐丢掉。
                         out["skills"] = learn_milestone_skills(
-                            scene, _tid, question, _mst, dim_codes)
+                            scene, _tid, question, _mst, dim_codes,
+                            import_id=imp_id)
                     except Exception as e:
                         out["milestone_scaffold"] = {
                             "error": f"{type(e).__name__}: {e}"}
@@ -955,6 +989,7 @@ async def _start_learning_impl(
             out["dimension_nodes"] = list(out.get("dimension_nodes") or []) + list(
                 _ms.attach_dimensions(
                     scene, tid, good, verified=True,
+                    import_id=imp_id, import_label=question,
                     tools={str(d.get("id") or ""): tools_map.get(
                         str(d.get("id") or ""), [])
                         for d in good if tools_map.get(str(d.get("id") or ""))}))

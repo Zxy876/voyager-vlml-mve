@@ -88,6 +88,45 @@ def recent_imports(limit: int = 10) -> list[dict[str, Any]]:
     return out[-limit:]
 
 
+def _import_id_from_ts(ts: str) -> str:
+    """ts → 批次 id（`imp_20261020T093012`）。老记录没有 import_id 时现算，
+    算法与写入时一致，所以同一条记录永远得到同一个 id。"""
+    t = str(ts or "").strip()
+    if not t:
+        return ""
+    return "imp_" + t.replace("-", "").replace(":", "").replace(" ", "T")[:15]
+
+
+def import_id_of(rec: dict[str, Any]) -> str:
+    """一条导入记录的批次 id（新记录有字段，老记录按 ts 现算）。"""
+    iid = str((rec or {}).get("import_id") or "").strip()
+    return iid or _import_id_from_ts(str((rec or {}).get("ts") or ""))
+
+
+def import_history(question: str, scene_id: str = "") -> dict[str, Any]:
+    """这个问题**导入过几次**、最近一次是哪批、上次学出了什么。
+
+    用户 2026-10-20 的原话：「我希望我第二次导入相同问题的时候能够用上之前
+    学的东西」。所以消费/学习两侧都要能先回答"以前导入过吗、哪一批"：
+      · 严格按问句文本匹配（不靠相似度 —— 相似的是另一句话，复用会答偏）
+      · 场景也要对（跨场景复用是另一种串味）
+    返回 {"count": n, "last": 最近一条记录, "import_id": 最近批次 id,
+          "first_id": 第一批 id}
+    """
+    q = str(question or "").strip()
+    if not q:
+        return {"count": 0, "last": {}, "import_id": "", "first_id": ""}
+    rows = [r for r in recent_imports(10000)
+            if str(r.get("question") or "").strip() == q
+            and (not scene_id
+                 or str(r.get("root_scene") or "A") == str(scene_id))]
+    if not rows:
+        return {"count": 0, "last": {}, "import_id": "", "first_id": ""}
+    return {"count": len(rows), "last": rows[-1],
+            "import_id": import_id_of(rows[-1]),
+            "first_id": import_id_of(rows[0])}
+
+
 def _log_import(result: dict[str, Any]) -> None:
     """落一条人导入记录。不存完整 facts（面板只看摘要 + 解释）。"""
     # 记录归属哪个场景：调用方（consume）显式带就用它的；没带（旧 VLML 通路/
@@ -97,8 +136,15 @@ def _log_import(result: dict[str, Any]) -> None:
         _cur_scene = str(_scn.current_scene_id() or "A")
     except Exception:
         _cur_scene = "A"
+    _ts = datetime.now().isoformat(timespec="seconds")
     rec = {
-        "ts": datetime.now().isoformat(timespec="seconds"),
+        "ts": _ts,
+        # 一次人导入 = 一个批次 id（用户 2026-10-20 定：「每次人导入-运行学习
+        # 一批内容，这批知识图谱上长出来的内容就是那次人导入的子节点，技能
+        # 归属也是如此」）。图谱用 `import:<id>` 当父节点，技能 blueprint 里
+        # 记同一个 id —— 这样"哪次导入长的"可回看、"第二次导入同一问题"能
+        # 直接找到上次那批产物复用。算法与 `import_id_of()` 完全一致（幂等）。
+        "import_id": _import_id_from_ts(_ts),
         "question": result.get("question", ""),
         "mode": result.get("mode", "vlml"),
         "voyager": (result.get("voyager_context") or {}).get("memory_count", 0),

@@ -458,7 +458,9 @@ def attach_dimensions(scene_id: str, topic_id: str,
                       dimensions: list[dict[str, Any]], *,
                       verified: bool = False, graph: Any = None,
                       bump: bool = True,
-                      tools: dict[str, list[str]] | None = None) -> list[str]:
+                      tools: dict[str, list[str]] | None = None,
+                      import_id: str = "",
+                      import_label: str = "") -> list[str]:
     """把追问骨架的维度**挂进知识图谱**（这是"图谱靠不停学习长大"的那一步）。
 
     每个维度 = 一枚 kind="dimension" 的节点，边 `问题节点 -has_dimension-> 维度`。
@@ -496,6 +498,22 @@ def attach_dimensions(scene_id: str, topic_id: str,
     parent = f"consume:{tid}" if tid.startswith("consume_") else f"topic:{tid}"
     if parent not in g.nodes:
         parent = f"scene:{scene_id}"
+    # ---- 导入批次层（用户 2026-10-20）----
+    # 「每次人导入-运行学习一批内容，这批知识图谱上长出来的内容就是那次人导入
+    #   的子节点，技能归属也是如此」。
+    # 所以图谱要能回答"这批是哪一次导入长的"：建 `import:<批次id>` 节点，
+    # 每条维度连 `import:<id> -has_dimension-> dim:...`。
+    # 与 `consume:<tid>` 那层**并存**：topic 层是"这题的知识"，import 层是
+    # "哪一次导入把它学出来的" —— 第二次导入同一问题时，一眼能看出复用。
+    # 维度节点已存在也要补这条边（幂等去重）：第二次导入确实覆盖/复用了它。
+    imp = str(import_id or "").strip()
+    imp_node = f"import:{imp}" if imp else ""
+    if imp_node and imp_node not in g.nodes:
+        g.add_node(Node(id=imp_node, kind="import",
+                        label=(str(import_label or "").strip() or (tid or imp))[:60],
+                        detail={"import_id": imp, "topic": tid,
+                                "source": "human_import"},
+                        root_scene=str(scene_id)))
     added: list[str] = []
     for d in dims:
         label = str(d.get("question") or "").strip()
@@ -520,6 +538,13 @@ def attach_dimensions(scene_id: str, topic_id: str,
                 g.add_edge(Edge(src=parent, dst=did, relation="has_dimension",
                                 origin="observed", reason="Maieutic 追问骨架"))
             added.append(did)
+        # 导入批次 → 维度（**节点已存在也补边**）：第二次导入同一问题时，
+        # 复用到的维度也会挂在这次导入下面 —— 「这批内容是哪次导入长的」
+        # 和「这次导入学到了/复用了哪些」是同一张图上的两层事实。
+        if imp_node and imp_node in g.nodes:
+            g.add_edge(Edge(src=imp_node, dst=did, relation="has_dimension",
+                            origin="observed",
+                            reason=f"导入批次 {imp} 长出/复用的维度"))
         # 实测"由谁产出"：这一维闭合时真的调用过的动作（不是猜的）。
         for t in sorted({str(x).strip() for x in (tools or {}).get(
                 str(d.get("id") or ""), []) if str(x).strip()}):

@@ -741,6 +741,34 @@ async def consume(
                               / int(abs_info.get("ability_total") or 0), 4)
                         if int(abs_info.get("ability_total") or 0) else None),
         })
+        # ---- 「这一分是哪次导入给的」要能被解释（用户 2026-10-20）----
+        # 用户要的是：第二次导入同一问题时，掌握度上升不仅发生，还能说清
+        # 涨的那一分来自**上一次导入**长出来的技能/节点。
+        #   import_count  = 这个问题一共导入过几次（1 = 这是第一次）
+        #   reused_import = 这次真正复用的技能属于哪一批导入
+        #   reuse_explain = 一句人话，面板/CLI 直接显示
+        try:
+            import coach as _coach_e
+            _h = _coach_e.import_history(question, _scene_id)
+            _cnt = int(_h.get("count") or 0)
+            _bp = (reused_skill or {}).get("blueprint") or {}
+            _from_imp = str(_bp.get("import_id") or "")
+            base["import_count"] = _cnt
+            base["reused_import"] = _from_imp
+            if reused_skill and _cnt >= 1:
+                _where = (f"第 {_cnt} 次导入复用了 {_from_imp or '之前导入'} "
+                          f"学到的配方 `{reused_skill.get('key')}`"
+                          if _cnt > 1 else
+                          f"第 1 次导入，命中已有配方 `{reused_skill.get('key')}`"
+                          f"（来自 {_from_imp or '本场景既有技能'}）")
+                base["reuse_explain"] = (
+                    _where + f"；掌握累计 {base.get('mastered_total')}/"
+                    f"{base.get('ability_total')}")
+            elif _cnt > 1:
+                base["reuse_explain"] = (
+                    f"第 {_cnt} 次导入同一问题（之前导入过 {_cnt - 1} 次）")
+        except Exception:
+            pass
         _log(base)
         return base
 
@@ -1638,6 +1666,9 @@ def _main() -> int:
     # 这里统一按「用到了几条技能 / 真正成功的调用次数」容错取。
     print("用能力 :", "复用配方" if r.get("reused") else "现场现做",
           f"（用到 {len(r.get('used_skills') or [])} 条技能）", r.get("reuse_note") or "")
+    if r.get("reuse_explain"):
+        # 掌握度涨的那一分是哪次导入给的 —— 不解释就等于让人"信我"
+        print("解释   :", r.get("reuse_explain"))
     print("工具   :", r.get("trajectory") or "—",
           f"| 调用 {r.get('ok_tool_calls') or r.get('tool_calls') or 0} 次，"
           f"取到 {r.get('rows') or 0} 行")
