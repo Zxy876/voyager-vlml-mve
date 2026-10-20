@@ -602,6 +602,11 @@ async def consume(
             _act.register_net(_scene_id)
         except Exception:
             pass
+        # 远端 MCP 工具必须先挂上：复用配方时 `_ns_base` 只注入**注册表里已有**
+        # 的 mcp 条目，而它们在 learn 那边是 connect_all + expose 才注册的。
+        # consume 是新进程 —— 不接这一步，重放 `mcp_xxx` 就是 NameError
+        # （2026-10-20 实测：命中 3 条配方，3 条全 NameError → "用到 0 条技能"）。
+        mcp_ready = await _la.ensure_mcp_tools(_scene_id)
         # ③a 复用优先（同构 Voyager：retrieve → 重放 → 取不到才写新代码）。
         # 只认「本机形态」的配方（代码里有 RESULT、能 run_saved 重放）；
         # VLML 的 SQL 配方在本机场景重放不了 —— 那是另一个数据源的东西，
@@ -703,6 +708,8 @@ async def consume(
             "reused": bool(reused_skill), "graph_link": {},
             # 复用阶段被真空判据挡下的每一条，都留下证据（不静默跳过）
             "reuse_errors": reuse_errors,
+            # 远端工具接入情况（exposed = 这次能用上的 mcp_*；没连上如实带原因）
+            "mcp_tools": mcp_ready,
             "judgment_result": "written" if data is not None else "fetched_empty",
             "skipped": ("" if data is not None else
                         ("本机工作区里没有能回答它的数据（" + _scene_why + "）"
@@ -1686,6 +1693,14 @@ def _main() -> int:
     if r.get("reuse_errors"):
         # 配方为什么没复用上，必须看得见（否则又是"命中却用不上"的黑箱）
         print("复用失败:", "；".join(str(x)[:70] for x in r["reuse_errors"][:3]))
+    _mcp = r.get("mcp_tools") or {}
+    if _mcp:
+        _exp = _mcp.get("exposed") or []
+        print("远端工具:", (f"{len(_exp)} 个（{'、'.join(str(x) for x in _exp[:3])}…）"
+                          if _exp else
+                          "0 个 —— " + str(_mcp.get("error")
+                                          or _mcp.get("reason")
+                                          or _mcp.get("why") or "没配 MCP server")))
     print("工具   :", r.get("trajectory") or "—",
           f"| 调用 {r.get('ok_tool_calls') or r.get('tool_calls') or 0} 次，"
           f"取到 {r.get('rows') or 0} 行")

@@ -598,6 +598,34 @@ def _mcp_prompt_section(scene_id: str) -> str:
     return ""
 
 
+async def ensure_mcp_tools(scene_id: str) -> dict[str, Any]:
+    """把**当前场景**的远端 MCP 工具挂进注册表（连 server + expose 成场景条目）。
+
+    为什么必须在使用它的每条路径上都做一次（2026-10-20 服务器实测）：
+    `_ns_base` 只注入「注册表里已有」的 mcp 条目，而这些条目是
+    `learn_orchestrate` ③ 步 `connect_all() + expose_as_actions()` 才注册的。
+    consume 是**新进程**，从没走过那一步 → 复用配方时 `mcp_neko_web_search`
+    一个都注入不进去 → 重放直接 `NameError` → 用户看到「第二次导入还是用不上
+    第一次学的」。能力来源（网关）必须先接上，后面才有"注入"可言。
+
+    幂等：已连上的 server 不重连（重连会白起子进程）。连不上/没配置都如实返回
+    原因，不假装工具有了。
+    """
+    if not scene_id:
+        return {"exposed": [], "why": "未指定场景 → 不接远端工具"}
+    try:
+        import mcp_gateway
+        gw = mcp_gateway.get_gateway()
+        if not gw.connected_servers():
+            await gw.connect_all()
+        exp = gw.expose_as_actions(scene_id)
+        return {"exposed": list(exp.get("exposed") or []),
+                "servers": gw.connected_servers(),
+                "reason": str(exp.get("reason") or "")}
+    except Exception as e:      # 网关挂了不该拖垮消费/学习，如实报即可
+        return {"exposed": [], "error": f"{type(e).__name__}: {e}"}
+
+
 # ---------------------------------------------------------------------------
 # 条目化：本机原语是「猫爪总开关」下的一组条目（同构 neko 的插件条目）
 # ---------------------------------------------------------------------------

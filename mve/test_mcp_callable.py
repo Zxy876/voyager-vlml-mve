@@ -163,6 +163,65 @@ def test_run_saved_async_offloads_to_worker_thread():
     print("PASS  test_run_saved_async_offloads_to_worker_thread")
 
 
+def test_ensure_mcp_tools_mounts_scene_entries():
+    """`ensure_mcp_tools` 必须把远端工具挂进场景，且已连上就不重连。
+
+    这是「第二次导入能用上第一次学的」链条上最容易漏的一环：`_ns_base` 只注入
+    **注册表里已有**的 mcp 条目，而条目是 connect + expose 才注册的。consume 是
+    新进程，不接这一步 → 重放 `mcp_xxx` 直接 NameError（2026-10-20 实测）。
+    """
+    import asyncio
+    import mcp_gateway
+
+    class _FakeGW:
+        def __init__(self, connected):
+            self._connected = connected
+            self.calls: list[str] = []
+
+        def connected_servers(self):
+            return list(self._connected)
+
+        async def connect_all(self, timeout=30.0):
+            self.calls.append("connect")
+            self._connected = ["neko"]
+            return {"connected": [{"server": "neko", "tools": 3}], "failed": []}
+
+        def expose_as_actions(self, scene_id):
+            self.calls.append(f"expose:{scene_id}")
+            return {"exposed": ["mcp_neko_web_search"]}
+
+    # ① 没连上 → 先 connect 再 expose，工具清单透传
+    gw = _FakeGW([])
+    real = mcp_gateway.get_gateway
+    mcp_gateway.get_gateway = lambda: gw
+    try:
+        out = asyncio.run(local_agent.ensure_mcp_tools("D"))
+        assert gw.calls == ["connect", "expose:D"], gw.calls
+        assert out["exposed"] == ["mcp_neko_web_search"], out
+
+        # ② 已连上 → 不重连（重连会白起子进程）
+        gw2 = _FakeGW(["neko"])
+        mcp_gateway.get_gateway = lambda: gw2
+        asyncio.run(local_agent.ensure_mcp_tools("D"))
+        assert gw2.calls == ["expose:D"], gw2.calls
+
+        # ③ 没指定场景 → 什么都不做，如实说原因
+        out3 = asyncio.run(local_agent.ensure_mcp_tools(""))
+        assert out3["exposed"] == [] and out3.get("why"), out3
+
+        # ④ 网关抛错不拖垮上层，错误进返回值
+        class _BoomGW:
+            def connected_servers(self):
+                raise RuntimeError("网关坏了")
+
+        mcp_gateway.get_gateway = lambda: _BoomGW()
+        out4 = asyncio.run(local_agent.ensure_mcp_tools("D"))
+        assert out4["exposed"] == [] and "网关坏了" in out4.get("error", ""), out4
+    finally:
+        mcp_gateway.get_gateway = real
+    print("PASS  test_ensure_mcp_tools_mounts_scene_entries")
+
+
 if __name__ == "__main__":
     test_positional_args_are_mapped_by_schema_order()
     test_keyword_args_pass_through()
@@ -170,4 +229,5 @@ if __name__ == "__main__":
     test_no_schema_positional_call_raises()
     test_docstring_exposes_signature_for_prompt()
     test_run_saved_async_offloads_to_worker_thread()
+    test_ensure_mcp_tools_mounts_scene_entries()
     print("\nALL PASS")

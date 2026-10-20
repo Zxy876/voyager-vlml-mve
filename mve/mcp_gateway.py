@@ -478,6 +478,10 @@ class MCPGateway:
                  "input_schema": t.input_schema}
                 for c in self._clients.values() for t in c.tools]
 
+    def connected_servers(self) -> list[str]:
+        """已连上的 server 名（重复 `connect_all` 前先问一句，别白起子进程）。"""
+        return [n for n, c in self._clients.items() if getattr(c, "connected", False)]
+
     def status(self) -> dict[str, Any]:
         servers = []
         for name, c in self._configs.items():
