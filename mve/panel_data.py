@@ -647,6 +647,13 @@ def build_state() -> dict[str, Any]:
             # 1→n 场景归属：技能卡上直接标「来自 Scene X」（溯源并入技能页，
             # 不再单开页面）。字段引入前入库的老技能显示 default。
             "source_scene": str(s.get("source_scene") or "default"),
+            # 技能归属（2026-10-20 用户定）：一次人导入 = 一个批次，这批学习长出
+            # 的维度/里程碑/技能都记同一个 `import_id`。面板上直接标出来，
+            # 「这条技能是哪次导入、哪个里程碑长的」才可回看（Obsidian 式反链的
+            # 可见形态）；字段引入前的技能没有 → 空串，前端不显示。
+            "import_id": str((s.get("blueprint") or {}).get("import_id") or ""),
+            "milestone": str((s.get("blueprint") or {}).get("milestone") or ""),
+            "dimension": str((s.get("blueprint") or {}).get("dimension") or ""),
             "versions": s.get("versions", 1),
             "rate": (
                 round(int(s.get("ok") or 0) / int(s.get("hits") or 1), 3)
@@ -665,6 +672,16 @@ def build_state() -> dict[str, Any]:
     # 人导入通路：这两块在「还没跑过」时也要显示 —— 它正是让人开始的地方
     # 1→n：都按当前场景取（切到 B 时人导入页只显 B 导入过的问题）。
     imports = _human_imports(scene_id=sid)
+    # 反链（Obsidian 式）：每条导入记录标出「这批长出了几条技能」。
+    # 技能归属不在导入记录上另存一份账（那会两本账打架），而是按
+    # `blueprint.import_id` 反查 —— 派生索引，删技能它自动跟着变。
+    _grown: dict[str, int] = {}
+    for _s in skill_store.all_skills():
+        _iid = str((_s.get("blueprint") or {}).get("import_id") or "")
+        if _iid:
+            _grown[_iid] = _grown.get(_iid, 0) + 1
+    for _im in imports:
+        _im["skills_grown"] = _grown.get(str(_im.get("import_id") or ""), 0)
     recommend = _next_recommend()
     causal = _causal_view(scene_id=sid)
     pilot_view = _pilot_view()

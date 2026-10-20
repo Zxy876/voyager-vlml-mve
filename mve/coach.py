@@ -234,6 +234,18 @@ def _log_import(result: dict[str, Any]) -> None:
         "miss_node_created": bool(result.get("miss_node_created")),
         "learn_kicked": bool(result.get("learn_kicked")),
         "learn_kick_note": str(result.get("learn_kick_note") or "")[:200],
+        # —— 复用可解释（2026-10-20 补）——
+        # 用户原话：「这样子两次导入掌握度上升会直观，且能被解释」。consume 在
+        # 复用分支里算出了 reuse_explain（哪次导入的哪条配方），但**白名单没带
+        # 它** → 面板只显示"复用已学配方"这一枚 chip，涨的那一分从哪来仍然
+        # 无法解释。这类"写了却没落盘"的字段已经踩过三次，加字段时顺手进白名单。
+        "reuse_explain": str(result.get("reuse_explain") or "")[:300],
+        "reuse_note": str(result.get("reuse_note") or "")[:200],
+        # 这次能用上几个远端工具（能力来源接没接上，面板要看得见）
+        "mcp_exposed": list((result.get("mcp_tools") or {}).get("exposed") or [])[:12],
+        "mcp_note": str((result.get("mcp_tools") or {}).get("error")
+                        or (result.get("mcp_tools") or {}).get("reason")
+                        or (result.get("mcp_tools") or {}).get("why") or "")[:200],
     }
     with COACH_LOG.open("a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")

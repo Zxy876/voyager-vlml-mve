@@ -1370,6 +1370,8 @@ function pSkill(s){
       <div class="th">${ESC(x.text)}</div>
       <div class="tm"><span class="chip grey">${ESC(x.topic||'—')}</span>
         <span class="chip grey">Scene ${ESC(x.source_scene||'default')}</span>
+        ${x.import_id?`<span class="chip grey" title="这次人导入长的技能">来自批次 ${ESC(x.import_id)}</span>`:''}
+        ${x.milestone?`<span class="chip grey">里程碑 ${ESC(x.milestone)}${x.dimension?' · '+ESC(x.dimension):''}</span>`:''}
         <span class="chip grey">命中 ${x.hits}</span>
         <span class="chip ${x.ok>0?'ok':'grey'}">有效 ${x.ok}</span>
         ${x.hits>0
@@ -2077,6 +2079,7 @@ function importsList(s){
         ${ESC(String(im.ts||'').replace('T',' '))}
         ${im.topic_id?`<span class="chip">${ESC(im.topic_id)}</span>`:'<span class="chip bad">未归入任何题</span>'}
         ${im.topic_hit?`<span class="chip grey">命中「${ESC(im.topic_hit)}」</span>`:''}
+        ${im.skills_grown?`<span class="chip ok" title="按 blueprint.import_id 反查（派生索引，不另记账）">这批长出 ${im.skills_grown} 条技能</span>`:''}
         ${(im.trajectory||[]).length?`<span class="chip grey">编排：${(im.trajectory||[]).map(t=>ESC(t)).join(' → ')}</span>`:'<span class="chip bad">未取到数据</span>'}
         ${graphLinkChips(im.graph_link)}
         <span class="chip grey">${im.facts_count} 条事实</span>
@@ -2134,6 +2137,10 @@ function consumeBlock(im){
       ${(im.coverage_referee!==null&&im.coverage_referee!==undefined)
         ? `<span class="chip grey">硬尺子 ${pct(im.coverage_referee)}</span>`:''}
       <span class="chip grey">工具 ${ESC(im.ok_tool_calls||0)} 次 · ${ESC(im.rows||0)} 行</span>
+      ${im.import_id?`<span class="chip grey" title="一次人导入=一个批次；它长的节点与技能都挂在这个 id 上">批次 ${ESC(im.import_id)}</span>`:''}
+      ${(im.mcp_exposed||[]).length
+        ? `<span class="chip grey">远端工具 ${(im.mcp_exposed||[]).length} 个</span>`
+        : (im.mcp_note?`<span class="chip warn" title="${ESC(im.mcp_note)}">远端工具 0 个</span>`:'')}
       ${im.root_scene?`<span class="chip grey">Scene ${ESC(im.root_scene)}</span>`:''}
       ${im.scene_kind==='local'?'<span class="chip grey">本机数据源</span>'
         :im.scene_kind==='scene'?'<span class="chip grey">场景自带库</span>':''}
@@ -2142,6 +2149,7 @@ function consumeBlock(im){
         :im.route_decision==='REJECTED'?'<span class="chip grey">未命中 → 新建节点</span>':''}
       ${im.judgment_result?`<span class="chip ${im.judgment_result==='written'?'ok':(im.judgment_result==='failed'?'bad':'grey')}">${{written:'✅ 写入图谱',insufficient_evidence:'🌱 冷启动单证据',fetched_empty:'取到真空',failed:'失败'}[im.judgment_result]||ESC(im.judgment_result)}</span>`:''}
     </div>
+    ${im.reuse_explain?`<div style="margin-top:5px;font-size:12px"><b>为什么算复用：</b>${ESC(im.reuse_explain)}</div>`:''}
     ${outOfDomainNote(im)}
     ${im.answer?`<div style="margin-top:6px"><b>Voyager 的回答：</b>
       <div class="nocmp-body" style="margin-top:4px">${ESC(im.answer)}</div></div>`:''}
