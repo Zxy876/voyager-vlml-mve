@@ -253,6 +253,9 @@ def learn_milestone_skills(scene_id: str, topic_id: str, question: str,
                 f"：闭合这个维度时跑通的取数做法",
                 code=code,
                 source="learn",
+                # 维度 id 是精确主键：不许相似度合并（实测把 differences 并进
+                # 了叫 def 的老条目，key 与实际维度对不上，面板报的配方名失真）。
+                exact_only=True,
                 blueprint={"from": "maieutic_milestone",
                            "milestone": out["milestone"],
                            "dimension": did,

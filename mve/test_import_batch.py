@@ -178,10 +178,59 @@ def test_origin_upgrade_keeps_backlink_index_honest():
     print("PASS  test_origin_upgrade_keeps_backlink_index_honest")
 
 
+def test_learn_skills_are_not_merged_by_similarity():
+    """里程碑维度技能只认**精确同名**，不许相似度合并。
+
+    2026-10-20 线上实测：`consume_010245c5::def` 这条的 key 还叫 `def`，
+    blueprint.dimension 已经是 `differences` —— 相似度把两个维度并成一条，
+    CLI/面板报的配方名和它真正干的事对不上，人没法核（「可解释」就断了）。
+    口径同课程侧那次教训：去重只许精确。
+    """
+    import skill_store
+
+    tmp = Path(tempfile.mkdtemp())
+    old = skill_store.STORE
+    try:
+        skill_store.STORE = tmp / "skill_store.json"
+        base = "【阿斯伯格综合症概述】{}：闭合这个维度时跑通的取数做法"
+        # ① 精确模式：两个语义相近、文字相近的维度 → 两条独立条目
+        a1, k1 = skill_store.add("consume_x", "differences",
+                                 base.format("它与孤独症的区别是什么"),
+                                 code="RESULT = {'a': 1}", source="learn",
+                                 exact_only=True)
+        a2, k2 = skill_store.add("consume_x", "def",
+                                 base.format("它的定义是什么"),
+                                 code="RESULT = {'a': 2}", source="learn",
+                                 exact_only=True)
+        assert (a1, a2) == ("added", "added"), (a1, a2)
+        assert k1 != k2, (k1, k2)
+        assert k2 == "consume_x::def", k2
+        # 同名再来 → 覆盖，不新增
+        a3, k3 = skill_store.add("consume_x", "def",
+                                 base.format("它的定义是什么（改）"),
+                                 code="RESULT = {'a': 3}", source="learn",
+                                 exact_only=True)
+        assert (a3, k3) == ("rewritten", k2), (a3, k3)
+        assert len(skill_store.all_skills()) == 2, skill_store.all_skills()
+
+        # ② 对照：不传 exact_only 时，相似文字会被并进已有条目（旧行为）
+        skill_store.STORE = tmp / "skill_store2.json"
+        skill_store.add("consume_y", "differences", base.format("区别是什么"),
+                        source="learn")
+        a4, k4 = skill_store.add("consume_y", "def", base.format("定义是什么"),
+                                 source="learn")
+        assert a4 == "rewritten" and k4 == "consume_y::differences", (a4, k4)
+    finally:
+        skill_store.STORE = old
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("PASS  test_learn_skills_are_not_merged_by_similarity")
+
+
 if __name__ == "__main__":
     test_import_id_is_stable_for_old_records()
     test_import_history_counts_same_question_once_per_batch()
     test_dimensions_hang_under_import_node()
     test_backlinks_and_imports_of()
     test_origin_upgrade_keeps_backlink_index_honest()
+    test_learn_skills_are_not_merged_by_similarity()
     print("\nALL PASS")

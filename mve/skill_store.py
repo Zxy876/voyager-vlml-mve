@@ -155,6 +155,7 @@ def add(
     blueprint: dict[str, Any] | None = None,
     code: str = "",
     source_scene: str = "default",
+    exact_only: bool = False,
 ) -> tuple[str, str]:
     """写一条技能。返回 (动作, key)，动作 ∈ added / rewritten / skipped。
 
@@ -182,6 +183,12 @@ def add(
     区分的意义：**判错时我们不写自己的做法**（那已被证明是错的），
     但旁路学到的是裁判的做法、已被验证正确 —— 两条通道的可信度不同，
     复盘时要能分清一条技能到底是"我试出来的"还是"我学来的"。
+
+    `exact_only`：**只认精确同名**，关掉「相似度合并」（2026-10-20 实测踩到）。
+    里程碑维度的 id 本身就是精确主键，而相似度合并会把**不同维度**并进同一条：
+    实测 `consume_010245c5::def` 这条的 key 还叫 `def`，blueprint 已经是
+    `differences` —— 面板与 CLI 报的配方名和它真正干的事对不上，人没法核。
+    这与课程侧那条教训同一个口径（去重只许精确，相似度阈值撞过两次）。
     """
     text = str(text or "").strip()
     # 照 "Deposit useless items" 特判：没内容的经验不入库
@@ -200,7 +207,7 @@ def add(
     # 同名主键命中 → 直接覆盖
     hit = data["skills"].get(key)
     best_key, best_sim = key, 1.0 if hit else 0.0
-    if not hit:
+    if not hit and not exact_only:
         # LLM 每轮可能给不同名字 —— 照 curriculum 的 qa_cache：
         # similarity_search_with_score < 阈值 就算命中缓存，不能当新条目
         probe = f"{name} {text}"
