@@ -728,6 +728,12 @@ async def consume(
             "cold_start": bool(abs_info.get("cold_start")),
             "mastered_total": int(abs_info.get("mastered_total") or 0),
             "ability_total": abs_info.get("ability_total"),
+            # 复用分支原本没有 mastery 键 → CLI/面板按 `mastery or 0` 读成 0%，
+            # 明明「累计 2/39」却显示掌握度 0%（2026-10-20 实测）。与主路径
+            # 同一口径：已掌握 / 该掌握的总量（不是覆盖率的折算）。
+            "mastery": (round(int(abs_info.get("mastered_total") or 0)
+                              / int(abs_info.get("ability_total") or 0), 4)
+                        if int(abs_info.get("ability_total") or 0) else None),
         })
         _log(base)
         return base
