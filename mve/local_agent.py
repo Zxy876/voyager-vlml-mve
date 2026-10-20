@@ -327,12 +327,13 @@ async def solve(question: str, scene_dir: str, *, llm=None,
     fb = ""
     # 学习环节的"必须真取数"只在**确实有手段可取**时开（见 docstring 兜底）：
     # 命名空间里一个原语都没有就别硬逼，那是没工具可用。
-    _can_fetch = False
+    _probe: dict[str, Any] = {}
     if require_tools:
         try:
-            _can_fetch = bool(_ns_base(scene_dir, scene_id, tracer=None))
+            _probe = _ns_base(scene_dir, scene_id, tracer=None)
         except Exception:
-            _can_fetch = False
+            _probe = {}
+    _can_fetch = bool(_probe)
     # 经 MCP 接入的远端工具（名字/签名）动态拼进 system —— server 连上了才出现，
     # 没连上不误导模型去调一个不存在的函数。
     system = PROMPT_SYSTEM
@@ -359,7 +360,20 @@ async def solve(question: str, scene_dir: str, *, llm=None,
             avoid_txt = ("\n常见答偏方式（明确别这么答）：\n"
                          + "\n".join(f"- {str(a)}" for a in avoid if str(a).strip())
                          + "\n")
+        # 取证要求必须**写进 user**，不能只在 system：整轮的 user 里有
+        # "逐条答到"这种更强的答题指令，模型会照着直接写答案而不取证
+        # （2026-10-20 实测：system 里写了要取证，8 条维度 7 条"调过：无"）。
+        # 同时把**真正可用的函数名**列出来 —— 光说"调用数据源"，模型在
+        # 11 个 MCP 工具里挑花眼，反而不调。
+        fetch_txt = ""
+        if require_tools and _can_fetch:
+            fetch_txt = ("\n【取证要求】这是**学习环节**：答案必须来自你真正调用"
+                         "下面这些函数取回的内容 —— "
+                         + "、".join(sorted(_probe)[:14])
+                         + "。直接凭记忆写一段「正确」答案 = 没取证 = 判不通过，"
+                           "也不会被记成能力。先调函数取证，再据实组织答案。\n")
         user = (f"问题：{question}\n\n{inv_txt}\n" + dim_txt + avoid_txt
+                + fetch_txt
                 + (f"\n上一轮没通过 critic 检查，它的评语（务必针对它改）：{critique}\n"
                    if critique else "")
                 + (f"\n上一次的代码：\n{code}\n执行反馈：{fb}\n请修正后重写。"
