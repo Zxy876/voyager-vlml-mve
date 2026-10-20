@@ -1373,7 +1373,7 @@ function pSkill(s){
         <span class="chip grey">命中 ${x.hits}</span>
         <span class="chip ${x.ok>0?'ok':'grey'}">有效 ${x.ok}</span>
         ${x.hits>0
-          ? `<span class="chip ${x.ok>0?'ok':'bad'}">有效率 ${Math.round(100*x.ok/x.hits)}%</span>`
+          ? `<span class="chip ${x.ok>0?'ok':'bad'}">有效率 ${Math.min(100,Math.round(100*x.ok/x.hits))}%</span>`
           : '<span class="chip dim">还没被用过</span>'}
         ${health(x)}
         ${x.versions>1?`<span class="chip warn">已覆盖 ${x.versions} 版</span>`:''}</div>

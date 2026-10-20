@@ -328,14 +328,24 @@ def mark_used(keys: list[str]) -> None:
 
 
 def mark_result(keys: list[str], ok: bool) -> None:
-    """注入后这一轮判对了 → ok +1。有效性低的技能会在检索里自然沉底。"""
+    """注入后这一轮判对了 → ok +1。有效性低的技能会在检索里自然沉底。
+
+    ⚠️ 不变量：**ok ≤ hits**（面板/检索都把 `ok/hits` 当"有效率"，
+    dashboard.py:1376、`retrieve()` 的 0.6 权重）。旧实现只加 ok 不管 hits，
+    而 hits 只在 mark_used（检索注入）时加 —— 一旦出现"没走检索注入却判成功"
+    的路径（复用配方重放、面板 boost 按钮），分子就跑到分母前面，面板出现
+    「有效率 150% / 300%」（2026-10-20 截图实测）。这里兜底：ok 涨时若
+    hits 落后，把这次算作**一次实际使用**把 hits 补上（它确实被用到了）。
+    """
     if not keys or not ok:
         return
     data = _load_raw()
     touched = False
     for k in keys:
         if k in data["skills"]:
-            data["skills"][k]["ok"] = int(data["skills"][k].get("ok") or 0) + 1
+            s = data["skills"][k]
+            s["ok"] = int(s.get("ok") or 0) + 1
+            s["hits"] = max(int(s.get("hits") or 0), s["ok"])
             touched = True
     if touched:
         _save(data)
@@ -354,8 +364,9 @@ def boost_skill(key: str) -> bool:
         return False
     s = data["skills"][key]
     s["ok"] = int(s.get("ok") or 0) + 1
-    if int(s.get("hits") or 0) == 0:
-        s["hits"] = 1
+    # 同 mark_result 的不变量：ok ≤ hits。旧写法是「hits==0 就补 1」，
+    # 连点两次「标记有效」就变成 ok=2/hits=1 → 有效率 200%（同一处病根）。
+    s["hits"] = max(int(s.get("hits") or 0), s["ok"])
     _save(data)
     return True
 

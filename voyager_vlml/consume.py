@@ -714,7 +714,13 @@ async def consume(
         abs_info: dict[str, Any] = {}
         if data is not None:
             try:
-                abs_info = _absorb(question, code, "", scene_id=_scene_id)
+                # 只把**本次真正复用的那一条**记成"用过且有效"（used_keys）。
+                # 不传的话 _absorb 会按 topic 前缀扫出同题下全部技能集体 +1，
+                # 于是"有效率"（ok/hits）冲到 150%/300%（2026-10-20 截图）。
+                _used = ([str(reused_skill.get("key"))]
+                         if reused_skill and reused_skill.get("key") else None)
+                abs_info = _absorb(question, code, "", scene_id=_scene_id,
+                                   used_keys=_used)
             except Exception:
                 abs_info = {}
         base.update({
@@ -1461,7 +1467,8 @@ def _looks_like_recipe(code: str) -> bool:
 
 
 def _absorb(question: str, sql: str, topic_id: str,
-            *, scene_id: str = "", answer: str = "") -> dict[str, Any]:
+            *, scene_id: str = "", answer: str = "",
+            used_keys: list[str] | None = None) -> dict[str, Any]:
     """答完了 → **这题就到他的能力里了 → 这就是掌握**（用户 2026-10-13 定）。
 
     掌握不是覆盖率折算出来的一个分数，而是**能力集合的增长**：
@@ -1558,11 +1565,19 @@ def _absorb(question: str, sql: str, topic_id: str,
         return out
     try:
         import skill_store
-        have = [k for k in (skill_store._load_raw().get("skills") or {})
-                if str(k).startswith(f"{tid}::")]
+        # 记账对象只能是**这次真的用上的那条**（used_keys）。旧实现按
+        # `f"{tid}::"` 前缀把同题下所有技能全捞出来集体 +1 —— 而 hits 只涨
+        # 被检索注入的那条，分子分母不同源 → 面板「有效率 150%/300%」
+        # （2026-10-20 截图实测；同一题下堆了 22 条技能时尤其明显）。
+        have = ([k for k in (used_keys or [])
+                 if k in (skill_store._load_raw().get("skills") or {})]
+                if used_keys else
+                [k for k in (skill_store._load_raw().get("skills") or {})
+                 if str(k).startswith(f"{tid}::")])
         if have:
             skill_store.mark_result(have, True)
-            out["skill_action"] = "已有配方，标记为用过且有效"
+            out["skill_action"] = ("已有配方，标记为用过且有效"
+                                   + ("" if used_keys else "（按同题全量记账）"))
         else:
             _, key = skill_store.add(
                 tid, tid,
