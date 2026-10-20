@@ -123,14 +123,20 @@ def on_miss(question: str, scene_id: str = "", *,
     return out
 
 
-def _answer_text(obs: list[dict[str, Any]]) -> str:
+def _answer_text(obs: list[dict[str, Any]], *, ok_only: bool = False) -> str:
     """取最后一轮观察里的 RESULT 当"答案"（critic 判知识型任务靠它）。
 
     原版 critic 看的是环境观察（inventory 等）；MVE 的知识型任务没有环境数据，
     模型交的 RESULT 就是全部证据 —— 不把它交给 critic，critic 只能看执行汇总，
     等于让它猜。截断到 1200 字，够判切不切题。
+
+    `ok_only` —— 只认**判定通过**的观察。学习环节（`require_tools`）必须开：
+    没取证被判失败的那一轮，data 里仍留着那段凭记忆写的答案，直接取出来
+    交 gate = 闸门又判"答到了"，强制取证就白强制了（2026-10-20 修）。
     """
     for o in reversed(obs or []):
+        if ok_only and not (o or {}).get("ok"):
+            continue
         d = (o or {}).get("data")
         if d in (None, "", [], {}):
             continue
@@ -591,7 +597,10 @@ async def _start_learning_impl(
                             # 掉 → 知识型场景永远学不到技能（2026-10-20 定位）。
                             obs1, code1 = await local_agent.solve(
                                 _q1, local_dir, llm=llm, scene_id=scene,
-                                avoid=_avoid, critique=str(crit1 or ""))
+                                avoid=_avoid, critique=str(crit1 or ""),
+                                # 学习环节：必须真的调数据源取证（原版 rollout
+                                # 必须调 primitive；凭记忆答不入库、不算学会）
+                                require_tools=True)
                             observations.extend(obs1)
                             r1: dict[str, Any] = {
                                 "execution": {
@@ -605,7 +614,7 @@ async def _start_learning_impl(
                                         {s for o in obs1
                                          for s in (o.get("data_sources") or [])}),
                                     "sql": "", "ok": _has_real(obs1)},
-                                "answer": _answer_text(obs1),
+                                "answer": _answer_text(obs1, ok_only=True),
                                 "status": "learned"}
                             try:
                                 import task_critic as _tc1
@@ -685,7 +694,8 @@ async def _start_learning_impl(
                     observations, sql = await local_agent.solve(
                         question, local_dir, llm=llm, scene_id=scene,
                         critique=str(critique or ""),
-                        dimensions=_dims, avoid=_avoid)
+                        dimensions=_dims, avoid=_avoid,
+                        require_tools=True)      # 同维度分支：学习环节必须取证
                     _answer_override = ""
             else:
                 observations, sql = await agent.solve(

@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -441,6 +442,38 @@ def test_called_tools_parses_code() -> None:
     print("PASS  test_called_tools_parses_code")
 
 
+def test_learning_must_fetch_consuming_may_answer() -> None:
+    """学习 vs 消费的分工（用户 2026-10-20："消费时凭记忆答，学习时用工具"）：
+
+    · **学习**（require_tools=True）：没调数据源 → 判失败，反馈点明"学习环节"；
+    · **消费**（默认）：同一段纯答案代码照样通过（消费是用已学到的能力）。
+    · 场景里没有可取数手段时不强制（避免学习循环卡死，见 local_agent 兜底）。
+    """
+    import asyncio
+    import local_agent
+
+    tmp = Path(tempfile.mkdtemp())
+
+    def fake(messages):                      # 只写答案，一个数据源都不调
+        return "```python\nRESULT = {'answer': '凭训练记忆写的一段话'}\n```"
+
+    try:
+        obs, _code = asyncio.run(local_agent.solve(
+            "定义是什么？", str(tmp), llm=fake, scene_id="",
+            require_tools=True, max_iters=1))
+        assert obs and not obs[-1].get("ok"), obs
+        assert "学习环节" in str(obs[-1].get("error") or ""), obs[-1]
+        assert not (obs[-1].get("data_sources") or []), obs
+
+        obs2, _ = asyncio.run(local_agent.solve(
+            "定义是什么？", str(tmp), llm=fake, scene_id="",
+            require_tools=False, max_iters=1))
+        assert obs2[-1].get("ok"), obs2        # 消费侧：知识型照旧过
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("PASS  test_learning_must_fetch_consuming_may_answer")
+
+
 def main() -> None:
     test_parse_and_cache()
     test_plan_uses_dimensions()
@@ -455,6 +488,7 @@ def main() -> None:
     test_milestone_closure_writes_skills()
     test_observed_tools_are_written_back()
     test_called_tools_parses_code()
+    test_learning_must_fetch_consuming_may_answer()
     print("\nALL PASS")
 
 

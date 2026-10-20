@@ -273,7 +273,8 @@ def _payload(value: Any) -> tuple[Any, str]:
 async def solve(question: str, scene_dir: str, *, llm=None,
                 max_iters: int = 2, scene_id: str = "", critique: str = "",
                 dimensions: list[dict[str, Any]] | None = None,
-                avoid: list[str] | None = None
+                avoid: list[str] | None = None,
+                require_tools: bool = False
                 ) -> tuple[list[dict[str, Any]], str]:
     """写代码 → 跑 → 看结果；失败带反馈重写。返回 (观察列表, 最后一段代码)。
 
@@ -287,6 +288,17 @@ async def solve(question: str, scene_dir: str, *, llm=None,
         执行层就会按维度组织，而不是糊一段话；
       · avoid —— 预判的偏差（drift/bug），直接告诉它别这么答。
     两者都可能为空（骨架没产出来），为空就不出现那两段，不编。
+
+    `require_tools` —— **学习环节**才开的硬要求（用户 2026-10-20："按道理不是
+    消费时凭记忆答、学习时用工具吗"）：这一轮必须**真的调用数据源**取回证据，
+    凭训练记忆直接写答案判失败 —— 同构原版：rollout 必须调 control primitive，
+    `skill.py` 只在成功 rollout 后存 program_code，没调过 primitive 的代码
+    压根不算技能。消费侧不开（消费是"用已学到的能力"：有技能就重放，没技能
+    才让模型直接答，那是另一条口径）。
+
+    ⚠️ 兜底：场景里**根本没有可取数的手段**（本机能力 + 联网 + MCP 全关）时不
+    强制 —— 那是"没工具可用"，不是"有工具不用"。否则学习循环会在这种场景里
+    永远判失败，卡死（如实放行，让 critic 去判）。
     """
     from voyager_vlml.llm import chat
     call = llm or (lambda msgs: chat(msgs, temperature=0.2))
@@ -313,12 +325,26 @@ async def solve(question: str, scene_dir: str, *, llm=None,
     obs: list[dict[str, Any]] = []
     code = ""
     fb = ""
+    # 学习环节的"必须真取数"只在**确实有手段可取**时开（见 docstring 兜底）：
+    # 命名空间里一个原语都没有就别硬逼，那是没工具可用。
+    _can_fetch = False
+    if require_tools:
+        try:
+            _can_fetch = bool(_ns_base(scene_dir, scene_id, tracer=None))
+        except Exception:
+            _can_fetch = False
     # 经 MCP 接入的远端工具（名字/签名）动态拼进 system —— server 连上了才出现，
     # 没连上不误导模型去调一个不存在的函数。
     system = PROMPT_SYSTEM
     mcp_sec = _mcp_prompt_section(scene_id)
     if mcp_sec:
         system = PROMPT_SYSTEM + mcp_sec
+    if require_tools and _can_fetch:
+        system += ("\n\n【这是**学习环节**，不是答题】你的答案必须来自你**真正调用"
+                   "数据源取回的内容**（list_files / read_file / read_json / "
+                   "query_sql / web_search / web_fetch / mcp_*）。直接凭记忆写一段"
+                   "「正确」答案 = 没有取证 = 这轮判不通过，也不会被记成能力。"
+                   "先调工具取证，再据实组织答案；取不到就如实说取到了什么。")
     for _ in range(max(1, max_iters)):
         dim_txt = ""
         if dimensions:
@@ -361,11 +387,18 @@ async def solve(question: str, scene_dir: str, *, llm=None,
             _needs_data = _tc.needs_data(question)
         except Exception:
             _needs_data = True
-        if not err and res.get("ok") and data is not None and not tracer and _needs_data:
+        # 真空成功：代码跑通、RESULT 非空，却一次数据源都没调。
+        #   · 数据型题：一直就判失败（题面要数却没取数）；
+        #   · 学习环节（require_tools）：**无条件**判失败 —— 原版 rollout 必须调
+        #     primitive，凭记忆写完就交的东西进不了技能库（用户 2026-10-20）。
+        if (not err and res.get("ok") and data is not None and not tracer
+                and (_needs_data or (require_tools and _can_fetch))):
             err = ("这题要具体数据（文件/库/统计/时效），但没调用任何数据源"
                    "（list_files/read_file/read_json/query_sql/web_search/"
                    "web_fetch/mcp_*）——答案疑似凭训练记忆编造，不算完成；"
-                   "请调用数据源取真实数据再作答")
+                   "请调用数据源取真实数据再作答"
+                   + ("（**学习环节**：没取证就写答案 = 这轮不算学会，也不会"
+                      "被记成技能和图谱上的能力）" if require_tools else ""))
         o = {"ok": bool(res.get("ok")) and data is not None and not err,
              "tool": "local_python", "rows": rows, "data": data,
              "data_sources": list(tracer),
