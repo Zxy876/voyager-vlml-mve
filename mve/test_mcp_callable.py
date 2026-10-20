@@ -222,6 +222,27 @@ def test_ensure_mcp_tools_mounts_scene_entries():
     print("PASS  test_ensure_mcp_tools_mounts_scene_entries")
 
 
+def test_tools_in_code_reports_real_grabs():
+    """披露栏的抓手必须从**代码**里认出来，不能写死 local_python。
+
+    2026-10-20 实测：复用一条联网配方（`mcp_neko_web_search` 真取到数），CLI
+    却打印「调用 0 次」—— 人会以为答案是模型编的。纯计算（`json.dumps`）
+    不算工具，不许虚报。
+    """
+    root = Path(__file__).resolve().parents[1]
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    from voyager_vlml.consume import _tools_in_code
+
+    code = ('r = mcp_neko_web_search(query="阿斯伯格")\n'
+            'RESULT = {"answer": r}')
+    assert _tools_in_code(code, "D") == ["mcp_neko_web_search"], _tools_in_code(code, "D")
+    assert _tools_in_code('x = json.dumps({})\nRESULT = 1', "D") == []
+    assert _tools_in_code('rows = query_sql("select 1")\nRESULT = rows', "") == ["query_sql"]
+    assert _tools_in_code("", "D") == []
+    print("PASS  test_tools_in_code_reports_real_grabs")
+
+
 if __name__ == "__main__":
     test_positional_args_are_mapped_by_schema_order()
     test_keyword_args_pass_through()
@@ -230,4 +251,5 @@ if __name__ == "__main__":
     test_docstring_exposes_signature_for_prompt()
     test_run_saved_async_offloads_to_worker_thread()
     test_ensure_mcp_tools_mounts_scene_entries()
+    test_tools_in_code_reports_real_grabs()
     print("\nALL PASS")

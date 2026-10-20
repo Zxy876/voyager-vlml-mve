@@ -465,6 +465,43 @@ def _answer(question: str, facts: list[dict[str, Any]],
 # 主流程
 # ---------------------------------------------------------------------------
 
+_BUILTIN_CALLS = {"print", "len", "str", "int", "float", "list", "dict", "tuple",
+                  "set", "sorted", "sum", "min", "max", "any", "all", "range",
+                  "enumerate", "zip", "round", "abs", "isinstance", "json"}
+
+
+def _tools_in_code(code: str, scene_id: str = "") -> list[str]:
+    """从**跑过的代码**里认出实际调用了哪些抓手（本机原语 / 场景条目 / mcp_*）。
+
+    为什么不能写死 `["local_python"]`（2026-10-20 实测）：复用一条联网配方时，
+    它明明调了 `mcp_neko_web_search` 取到数，披露栏却写「调用 0 次」——
+    **披露失真比不披露更坏**，人会以为答案是模型编的。这里按注册表里的抓手名
+    认，认不出的标识符不算（避免把 `json.dumps` 当工具）。
+    """
+    if not code:
+        return []
+    names: set[str] = set()
+    try:
+        import local_agent
+        names |= set(local_agent.primitive_names())
+    except Exception:
+        pass
+    if scene_id:
+        try:
+            import actions
+            names |= {str(n) for n in actions.names(scene_id)}
+        except Exception:
+            pass
+    out: list[str] = []
+    for ident in re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(", code):
+        if ident in _BUILTIN_CALLS or ident in out:
+            continue
+        if ident not in names and not ident.startswith("mcp_"):
+            continue
+        out.append(ident)
+    return out
+
+
 async def consume(
     question: str,
     *,
@@ -673,6 +710,8 @@ async def consume(
                 nar = {"ok": False, "why": f"{type(e).__name__}: {e}"}
             if nar.get("ok") and str(nar.get("answer") or "").strip():
                 answer = str(nar["answer"])
+        # 这段代码到底调了哪些抓手（披露用；不含纯计算，见 `_tools_in_code`）
+        _mve_traj = _tools_in_code(code, _scene_id)
         base = {
             "question": question, "mode": "voyager_consume",
             "topic_id": topic_id, "topic_hit": hit,
@@ -687,7 +726,9 @@ async def consume(
                                    or learn_kick.get("reason") or ""),
             "miss_node": str(miss_info.get("node_id") or ""),
             "miss_node_created": bool(miss_info.get("node_created")),
-            "trajectory": ["local_python"] if code else [],
+            "trajectory": (_mve_traj or (["local_python"] if code else [])),
+            "ok_tool_calls": (len(_mve_traj) if data is not None else 0),
+            "tool_calls": len(_mve_traj),
             "facts": [], "facts_count": 0,
             # 叙事层的产物（洞察 / 局限 / 依据）—— 面板「Voyager 的回答」下方
             # 直接列出来源，人一眼能核；叙事没产出时如实说明为什么退回原始数据。
