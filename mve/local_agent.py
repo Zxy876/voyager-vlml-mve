@@ -351,7 +351,8 @@ async def solve(question: str, scene_dir: str, *, llm=None,
                 dimensions: list[dict[str, Any]] | None = None,
                 avoid: list[str] | None = None,
                 require_tools: bool = False,
-                skills: list[dict[str, Any]] | None = None
+                skills: list[dict[str, Any]] | None = None,
+                require_skills: bool = False,
                 ) -> tuple[list[dict[str, Any]], str]:
     """写代码 → 跑 → 看结果；失败带反馈重写。返回 (观察列表, 最后一段代码)。
 
@@ -482,13 +483,25 @@ async def solve(question: str, scene_dir: str, *, llm=None,
                 "     RESULT = {\"定义\": skill_def(), \"起源\": skill_origin()}\n"
                 "     ```\n"
                 "  3. 全部用不上时才自己写取数代码（用上面的原语/MCP 工具）。")
+    if require_skills and _skill_names:
+        # 「命中的题必须用已学技能」（用户 2026-10-20）—— 同构原版：技能就是
+        # 新的 primitive（action.py:94），命中意味着能力边界已经覆盖这道题，
+        # 再"现场现做"等于技能库白建。不强制的话模型一律走最省事的路线：
+        # 凭训练记忆直接写答案（实测：给了 2 条可调用技能，它一个都没调）。
+        system += ("\n\n【命中即复用】这道题**已经学过**（图谱命中），而且你上面"
+                   "有 " + str(len(_skill_names)) + " 个已学函数可调用。规则：\n"
+                   "  1. 你必须**调用**它们（" + "、".join(_skill_names[:6]) +
+                   "）来取数/组合答案；\n"
+                   "  2. 一条都不调用、直接凭记忆写答案 —— 判**不通过**，"
+                   "会带着评语让你重写；\n"
+                   "  3. 只有全部调用失败（报错）时，才允许自己写取数代码。")
     if require_tools and _can_fetch:
         system += ("\n\n【这是**学习环节**，不是答题】你的答案必须来自你**真正调用"
                    "数据源取回的内容**（list_files / read_file / read_json / "
                    "query_sql / web_search / web_fetch / mcp_*）。直接凭记忆写一段"
                    "「正确」答案 = 没有取证 = 这轮判不通过，也不会被记成能力。"
                    "先调工具取证，再据实组织答案；取不到就如实说取到了什么。")
-    for _ in range(max(1, max_iters)):
+    for _i in range(max(1, max_iters)):
         dim_txt = ""
         if dimensions:
             rows = [f"{i}. {str((d or {}).get('question') or '').strip()}"
@@ -566,9 +579,19 @@ async def solve(question: str, scene_dir: str, *, llm=None,
                    "请调用数据源取真实数据再作答"
                    + ("（**学习环节**：没取证就写答案 = 这轮不算学会，也不会"
                       "被记成技能和图谱上的能力）" if require_tools else ""))
+        # 命中即复用：给了技能却不调用 → 带评语重写一次（不无限循环，最后一轮
+        # 如实放行并记下"没调用"，不假装复用过）。
+        _called = [str(t)[6:] for t in tracer if str(t).startswith("skill:")]
+        if (require_skills and _skill_names and not _called
+                and not err and data is not None
+                and _i < max(1, max_iters) - 1):
+            err = (f"你一条已学技能都没调用（可调用的有："
+                   + "、".join(_skill_names[:6]) + "）。这道题已经学过，"
+                   "必须调用它们取数/组合答案 —— 凭记忆写的答案不算复用，重写。")
         o = {"ok": bool(res.get("ok")) and data is not None and not err,
              "tool": "local_python", "rows": rows, "data": data,
              "data_sources": list(tracer),
+             "skills_called": _called,
              "evidence": ("data" if tracer else "knowledge"),
              "error": err or ("" if data is not None else why_empty)}
         obs.append(o)

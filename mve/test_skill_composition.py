@@ -147,9 +147,52 @@ def test_retrieve_uses_this_questions_topic():
     print("PASS  test_retrieve_uses_this_questions_topic")
 
 
+def test_hit_question_must_call_learned_skills():
+    """命中的题**必须**调用已学技能（用户 2026-10-20：「所有命中的题目都要用到
+    已经学到的技能」）。
+
+    给 2 条可调用技能，模型第一版照旧凭记忆写答案（实测就是这样）→ 判不通过
+    并带评语重写 → 第二版调用 `skill_def()` 才通过。没有这条强制，技能库就是
+    摆设：图谱命中、技能在库，消费却永远"现场现做 · 用到 0 条技能"。
+    """
+    import asyncio
+
+    tmp = Path(tempfile.mkdtemp())
+    n = {"i": 0}
+
+    def fake(_msgs):
+        n["i"] += 1
+        if n["i"] == 1:                       # 第一版：凭记忆（没调用技能）
+            return "```python\nRESULT = {'answer': '凭记忆写的'}\n```"
+        return "```python\nRESULT = skill_def()\n```"
+
+    try:
+        obs, _ = asyncio.run(local_agent.solve(
+            "正念是什么", str(tmp), llm=fake, scene_id="", max_iters=2,
+            require_skills=True,
+            skills=[{"name": "def", "code": "RESULT = {'answer': '从技能来'}"}]))
+        assert len(obs) == 2, obs                # 第一版被判不通过 → 重写
+        assert not obs[0]["ok"], obs[0]
+        assert "一条已学技能都没调用" in (obs[0].get("error") or ""), obs[0]
+        assert obs[-1]["ok"], obs[-1]
+        assert obs[-1]["data"] == {"answer": "从技能来"}, obs[-1]
+        assert obs[-1].get("skills_called") == ["def"], obs[-1]
+
+        # 对照：不强制时凭记忆的答案照收（学习/本机场景不能一律判死）
+        n["i"] = 0
+        obs2, _ = asyncio.run(local_agent.solve(
+            "正念是什么", str(tmp), llm=fake, scene_id="", max_iters=1,
+            skills=[{"name": "def", "code": "RESULT = {'answer': '从技能来'}"}]))
+        assert obs2[-1]["ok"] and obs2[-1]["data"] == {"answer": "凭记忆写的"}, obs2
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("PASS  test_hit_question_must_call_learned_skills")
+
+
 if __name__ == "__main__":
     test_skill_name_is_stable_and_safe()
     test_skill_function_is_callable_in_execution_scope()
     test_model_code_can_compose_two_skills()
     test_retrieve_uses_this_questions_topic()
+    test_hit_question_must_call_learned_skills()
     print("\nALL PASS")

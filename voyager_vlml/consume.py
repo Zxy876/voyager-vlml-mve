@@ -698,8 +698,14 @@ async def consume(
             # `+ skills`）：命中（HIGH_CONFIDENCE）的题尤其如此 —— 图谱里
             # 已经学过它，却还去"现场现做"，等于技能库白建（用户 2026-10-20
             # 「所有命中的题目都要用到已经学到的技能」）。
-            obs, code = await _la.solve(question, _scene_dir,
-                                        scene_id=_scene_id, skills=skills)
+            obs, code = await _la.solve(
+                question, _scene_dir, scene_id=_scene_id, skills=skills,
+                # 命中（HIGH/MEDIUM_CONFIDENCE）且库里有已学技能 → **必须用**。
+                # 不强制的话模型一律走最省事的路线：凭记忆直接写答案
+                # （2026-10-20 实测：给了可调用技能，它一条都没调）。
+                require_skills=(str(route_info.get("decision") or "")
+                                in ("HIGH_CONFIDENCE", "MEDIUM_CONFIDENCE"))
+                and bool(skills))
             real = [o for o in obs if o.get("ok") and o.get("data") is not None]
             data = (real[-1].get("data") if real else None)
         # 没取到 → 还是没学会。同样**不自动后台学**（2026-10-19 用户改设计）：
