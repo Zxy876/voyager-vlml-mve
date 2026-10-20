@@ -1612,11 +1612,16 @@ def _main() -> int:
     print("=== 消费结果 ===")
     print("问     :", r.get("question"))
     print("归题   :", r.get("topic_id") or "（未归上）", "|", r.get("topic_hit"))
+    # 复用分支的返回字典没有 skills_found / tool_calls 这两个键（只有
+    # used_skills / ok_tool_calls）→ 直接 .get 会打出 "None 条 / 调用 None 次"。
+    # 这里统一按「用到了几条技能 / 真正成功的调用次数」容错取。
     print("用能力 :", "复用配方" if r.get("reused") else "现场现做",
-          f"（库里找到 {r.get('skills_found')} 条）", r.get("reuse_note") or "")
-    print("工具   :", r.get("trajectory"), f"| 调用 {r.get('tool_calls')} 次，取到 {r.get('rows')} 行")
+          f"（用到 {len(r.get('used_skills') or [])} 条技能）", r.get("reuse_note") or "")
+    print("工具   :", r.get("trajectory") or "—",
+          f"| 调用 {r.get('ok_tool_calls') or r.get('tool_calls') or 0} 次，"
+          f"取到 {r.get('rows') or 0} 行")
     print("SQL    :", str(r.get("sql") or "").replace("\n", " ")[:160])
-    print("事实   :", r.get("facts_count"), "条")
+    print("事实   :", len(r.get("facts") or []), "条")
     for f in (r.get("facts") or [])[:6]:
         subj = "/".join(f"{k}={v}" for k, v in (f.get("subject") or {}).items())
         print(f"   {subj} · {f.get('dimension')} = {f.get('value')} (base={f.get('base')})")
