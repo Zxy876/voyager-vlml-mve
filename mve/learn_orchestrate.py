@@ -168,6 +168,35 @@ def _has_real(obs: list[dict[str, Any]]) -> bool:
 SUBTASK_MAX_RETRIES = 4
 
 
+def available_grabs(scene_id: str, scene_dir: str = "") -> list[str]:
+    """这个场景**现在真的能调**哪些取证手段（本机原语 + 联网 + 经 MCP 接入的）。
+
+    为什么单开这个函数（2026-10-20 调研两个原项目后补）：
+      原版 Voyager **没有**"先判任务可不可达"这一环 —— 它靠两条软机制：
+        · 生成期 prompt 约束（curriculum.txt:29/33「别提需要没学会资源的任务」）
+        · 执行反馈（critic.py:42-45 onError 直接短路 + action.py:263-273 把
+          「我还缺什么」提炼成下一轮检索 query）
+      而 MVE 有明确的**能力清单**（猫爪总开关下面的条目 = 同构 neko 插件），
+      所以可达可以也应该**真判**，不该退化成常量 true。
+
+      旧代码在本机分支把每条子任务硬写成 `status="reachable"`、why 写死一句
+      "本机只读原语可用" —— 那是不判，不是判过。这里改成查注册表：
+      · 有可用条目 → reachable，并把**依据**（手段名）写进 why，人看得见
+      · 一个都没有 → gap（不是 unreachable：装数据源/开开关就有，如实给路）
+    """
+    try:
+        import actions
+        actions.restore_switches()
+        if scene_dir:
+            actions.register_local(scene_id, scene_dir)
+        actions.register_net(scene_id)
+        return [str(e.get("name") or "").strip()
+                for e in actions.enabled_entries(scene_id)
+                if str(e.get("name") or "").strip()]
+    except Exception:
+        return []
+
+
 def learn_milestone_skills(scene_id: str, topic_id: str, question: str,
                            milestone: dict[str, Any],
                            dim_codes: list[dict[str, Any]],
@@ -393,16 +422,32 @@ async def _start_learning_impl(
         _record(out)
         return out
     if is_local:
-        # 本机场景：抓手 = 本机只读原语（同构「插件即本机能力」，猫娘同款）。
+        # 本机场景：抓手 = 本机只读原语 + 联网 + MCP（同构「插件即本机能力」）。
         # 没有表可匹配，所以不走「相关表」那条判据；也不许退回 rib 的表。
-        prim = {"name": "local:list_files/read_file",
-                "description": "本机只读原语：list_files / read_file / query_sql"}
+        # ⚠️ 2026-10-20 改：不再无条件写 `reachable`（那是不判，不是判过）。
+        # 真去查注册表里现在能调什么，把**依据**写进 why —— 一个手段都没有
+        # 时报 gap 并说清怎么补（装数据源 / 打开猫爪总开关 / 接 MCP）。
+        _grabs = available_grabs(scene, str(local_dir or ""))
+        _n = len(plan["subtasks"])
+        _why = ("可用取证手段："
+                + "、".join(_grabs[:6]) + (f" 等 {len(_grabs)} 个" if _grabs else "")
+                if _grabs else
+                "本场景没有任何可用取证手段（本机原语/联网/MCP 全不可用 —— "
+                "装数据源、打开猫爪总开关，或接一个 MCP server）")
+        prim = {"name": (_grabs[0] if _grabs else "local:list_files/read_file"),
+                "description": _why}
         for st in plan["subtasks"]:
-            st.update(status="reachable", grab=prim, score=1.0,
-                      why="本机只读原语可用（数据源 = 本机）")
-        plan["counts"] = {"reachable": len(plan["subtasks"]),
-                          "gap": 0, "unreachable": 0}
+            st.update(status=("reachable" if _grabs else "gap"), grab=prim,
+                      score=1.0, why=_why)
+        plan["counts"] = {"reachable": (_n if _grabs else 0),
+                          "gap": (0 if _grabs else _n), "unreachable": 0}
         out["plan"] = plan
+        out["plan_reachability"] = {"grabs": _grabs, "basis": _why,
+                                    "counts": dict(plan["counts"])}
+        print(f"  · 可达：{plan['counts']['reachable']}/{_n} 个子目标可达"
+              f"（依据：{len(_grabs)} 个可用手段"
+              + (f"：{'、'.join(_grabs[:4])}" if _grabs else "，一个都没有")
+              + "）", flush=True)
     elif plan["counts"]["unreachable"] == len(plan["subgoals"]):
         # 硬不可达：既无抓手也无相关表。学不出来不是循环的失败，是数据源
         # 缺席 —— 如实报给人（装数据源/换场景），不硬编一个"学过了"。
@@ -431,6 +476,23 @@ async def _start_learning_impl(
             out["exposed"] = {"error": f"{type(e).__name__}: {e}"}
 
     # ---- ④ 重判：forge/expose 之后还有没有抓不到的子目标（照实，不宣称全通）----
+    # 本机场景在 ① 判可达时 mcp 条目还没注册（③ 才 expose），可能低估 →
+    # 这里用**现在的**可用手段复核一次。旧代码 `[] if is_local` 整段跳过本机，
+    # 于是"可达"在本机/知识型路径上永远是常量，判了等于没判。
+    if is_local:
+        _grabs2 = available_grabs(scene, str(local_dir or ""))
+        if _grabs2:
+            for st in plan["subtasks"]:
+                if st.get("status") != "reachable":
+                    st.update(status="reachable", why=str(st.get("why") or "")
+                              + "｜MCP 接入后复核：现在有 "
+                              + "、".join(_grabs2[:6]))
+            plan["counts"] = {"reachable": len(plan["subtasks"]),
+                              "gap": 0, "unreachable": 0}
+            out["plan"] = plan
+            out["plan_reachability"] = {"grabs": _grabs2,
+                                        "basis": "MCP 接入后复核",
+                                        "counts": dict(plan["counts"])}
     stuck: list[dict[str, Any]] = []
     for st in ([] if is_local else plan["subtasks"]):
         if st.get("status") == "reachable":
@@ -545,6 +607,13 @@ async def _start_learning_impl(
                         _old_codes = _ms.load_progress_codes(scene, question)
                     except Exception:
                         _old_codes = {}
+                    try:
+                        # 追问历史（同 maieutic 的 priorIterations）：上次问了
+                        # 什么、还差什么 —— 跨次学习不丢，否则同一批维度反复
+                        # 撞同一堵墙，且看不出"上次卡在哪"。
+                        _iters = _ms.load_progress_iterations(scene, question)
+                    except Exception:
+                        _iters = {}
                     for _d in _dims:
                         _did = str(_d.get("id") or "")
                         _q1 = str(_d.get("question") or "").strip()
@@ -591,6 +660,15 @@ async def _start_learning_impl(
                         # （curriculum.py:342 "Skipping to next task"），
                         # 不原地无限重试。
                         ok1, crit1, obs1, r1 = False, "", [], {}
+                        # 追问历史回灌：这条维度上次（上一轮/上一次学这句话）
+                        # 被问过什么、还差什么 —— 直接作为第一轮的输入，别让
+                        # 它从零开始撞同一堵墙（maieutic priorIterations 同款）。
+                        _h = _iters.get(_did) or {}
+                        if _h and not _h.get("passed"):
+                            crit1 = str(_h.get("asked") or _h.get("gap") or "")
+                            if crit1:
+                                print(f"  · 追问历史：{_q1[:24]}｜上次问过："
+                                      f"{crit1[:70]}", flush=True)
                         for _t in range(SUBTASK_MAX_RETRIES):
                             # ⚠️ 第二个返回值是**这一轮跑通的代码**（原版的
                             # `program_code`）。以前写成 `obs1, _ =`，代码直接丢
@@ -598,6 +676,10 @@ async def _start_learning_impl(
                             obs1, code1 = await local_agent.solve(
                                 _q1, local_dir, llm=llm, scene_id=scene,
                                 avoid=_avoid, critique=str(crit1 or ""),
+                                # 已学会的配方回注（原版 retrieve_skills →
+                                # system）：技能是新的 primitive，学会之后
+                                # 下一轮就更够得着 —— 可达是循环不是判定。
+                                skills=skills,
                                 # 学习环节：必须真的调数据源取证（原版 rollout
                                 # 必须调 primitive；凭记忆答不入库、不算学会）
                                 require_tools=True)
@@ -684,11 +766,21 @@ async def _start_learning_impl(
                                   + (f"｜执行报错：{_e1}" if _e1 else "")
                                   + f"｜调过：{','.join(sorted({s for o in obs1 for s in (o.get('data_sources') or [])})) or '无'}",
                                   flush=True)
+                        # 记一条追问历史（同 maieutic 的 appendPhase1Iteration）：
+                        # **成没闭合都要记** —— 下次才知道这题问过、卡在哪一句。
+                        _iters[_did] = {
+                            "rounds": 1,
+                            "asked": str(crit1)[:300],
+                            "gap": ("" if ok1 else str(_q1)[:300]),
+                            "passed": bool(ok1),
+                            "tools": list(tools_map.get(_did) or []),
+                        }
                     try:
                         _ms.save_progress(scene, question,
                                           [str(d.get("id") or "")
                                            for d in learned_dims])
                         _ms.save_progress_codes(scene, question, dim_codes)
+                        _ms.save_progress_iterations(scene, question, _iters)
                     except Exception:
                         pass
                     out["dimension_results"] = {
@@ -721,6 +813,7 @@ async def _start_learning_impl(
                         question, local_dir, llm=llm, scene_id=scene,
                         critique=str(critique or ""),
                         dimensions=_dims, avoid=_avoid,
+                        skills=skills,           # 同上：已学配方回注执行层
                         require_tools=True)      # 同维度分支：学习环节必须取证
                     _answer_override = ""
             else:

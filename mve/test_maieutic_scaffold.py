@@ -474,6 +474,57 @@ def test_learning_must_fetch_consuming_may_answer() -> None:
     print("PASS  test_learning_must_fetch_consuming_may_answer")
 
 
+def test_progress_iterations_accumulate() -> None:
+    """追问历史（同构 maieutic 的 Phase1Iteration，schemas.ts:148-158）：
+
+    跨次学习（重跑同一句话）时，上次"问了什么 / 还差什么 / 成了没"要留下来
+    —— maieutic 把 priorIterations 原样喂回下一轮 examiner（spec-examiner.ts:
+    227-234）。MVE 之前只在本轮 4 步内回灌 critique，一跨次就全丢 → 同一批
+    维度反复撞同一堵墙。这里钉死：轮次**累加**、asked/gap/passed 都留得下。
+    """
+    import maieutic_scaffold as M
+
+    tmp = Path(tempfile.mkdtemp())
+    old = M.CKPT
+    try:
+        M.CKPT = tmp
+        p = M._cache_path("T", "什么是阿斯伯格")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"dimensions": [], "milestone": {}}),
+                     encoding="utf-8")
+
+        assert M.load_progress_iterations("T", "什么是阿斯伯格") == {}
+
+        M.save_progress_iterations("T", "什么是阿斯伯格", {
+            "def": {"rounds": 1, "asked": "有没有官方诊断标准？",
+                    "gap": "定义是什么？", "passed": False, "tools": ["web_search"]},
+        })
+        it = M.load_progress_iterations("T", "什么是阿斯伯格")
+        assert it["def"]["rounds"] == 1 and it["def"]["passed"] is False
+        assert it["def"]["asked"] == "有没有官方诊断标准？"
+
+        # 第二次学同一句：轮次累加（不是覆盖成 1），闭合了就标 passed
+        M.save_progress_iterations("T", "什么是阿斯伯格", {
+            "def": {"rounds": 1, "asked": "这次问的是发病率", "gap": "",
+                    "passed": True, "tools": ["mcp_ddg_search"]},
+        })
+        it2 = M.load_progress_iterations("T", "什么是阿斯伯格")
+        assert it2["def"]["rounds"] == 2, it2          # 累加，别回到 1
+        assert it2["def"]["passed"] is True, it2
+        assert it2["def"]["tools"] == ["mcp_ddg_search"], it2
+        # 另一条维度独立记账
+        M.save_progress_iterations("T", "什么是阿斯伯格", {
+            "history": {"rounds": 1, "asked": "起源？", "gap": "起源？",
+                        "passed": False, "tools": []}})
+        it3 = M.load_progress_iterations("T", "什么是阿斯伯格")
+        assert set(it3) == {"def", "history"}, it3
+        assert it3["def"]["rounds"] == 2, "不该被别的维度写掉"
+    finally:
+        M.CKPT = old
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("PASS  test_progress_iterations_accumulate")
+
+
 def main() -> None:
     test_parse_and_cache()
     test_plan_uses_dimensions()
@@ -489,6 +540,7 @@ def main() -> None:
     test_observed_tools_are_written_back()
     test_called_tools_parses_code()
     test_learning_must_fetch_consuming_may_answer()
+    test_progress_iterations_accumulate()
     print("\nALL PASS")
 
 

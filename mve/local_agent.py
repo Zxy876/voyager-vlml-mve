@@ -274,7 +274,8 @@ async def solve(question: str, scene_dir: str, *, llm=None,
                 max_iters: int = 2, scene_id: str = "", critique: str = "",
                 dimensions: list[dict[str, Any]] | None = None,
                 avoid: list[str] | None = None,
-                require_tools: bool = False
+                require_tools: bool = False,
+                skills: list[dict[str, Any]] | None = None
                 ) -> tuple[list[dict[str, Any]], str]:
     """写代码 → 跑 → 看结果；失败带反馈重写。返回 (观察列表, 最后一段代码)。
 
@@ -348,6 +349,26 @@ async def solve(question: str, scene_dir: str, *, llm=None,
     mcp_sec = _mcp_prompt_section(scene_id)
     if mcp_sec:
         system = PROMPT_SYSTEM + mcp_sec
+    if skills:
+        # 已学会的配方**回注执行层** —— 这是「可达 = 一整个循环」的那一环
+        # （用户 2026-10-20 指出）：原版不是先判"能不能做到"，而是
+        # `retrieve_skills`（voyager.py:195）把技能 code 拼在 control_primitives
+        # 后面（action.py:94 `+ skills`）一起喂模型 —— **技能本身就是新的
+        # primitive**，所以能力边界随技能库增长而扩张：以前做不到的，学会之后
+        # 下次就够得着了。MVE 的 VLML 路径一直有（voyager_vlml/agents/action.py:
+        # 159-199 render_system_message(skills=...)），本机/知识型路径没有 →
+        # 技能只进库、不回流，学再多次也不会更快、也不会更可达。
+        _lines: list[str] = []
+        for _s in list(skills)[:5]:
+            _nm = str((_s or {}).get("name") or (_s or {}).get("topic") or "")
+            _cd = str((_s or {}).get("code") or "").strip()
+            if _cd:
+                _lines.append(f"- {_nm}：\n{_cd[:400]}")
+        if _lines:
+            system += ("\n\n【你已经学会的配方（原版 voyager.py:195 先 retrieve "
+                       "再跑；技能 code 直接拼进可用函数清单）】下面这些是你以前"
+                       "跑通过的代码 —— **能复用就复用**（照抄或改一改再跑），"
+                       "别从零重写；用不上就不用：\n" + "\n".join(_lines))
     if require_tools and _can_fetch:
         system += ("\n\n【这是**学习环节**，不是答题】你的答案必须来自你**真正调用"
                    "数据源取回的内容**（list_files / read_file / read_json / "

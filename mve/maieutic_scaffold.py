@@ -379,6 +379,81 @@ def save_progress_codes(scene_id: str, question: str,
         pass
 
 
+# ---------------------------------------------------------------------------
+# 追问历史（同构 maieutic 的 Phase1Iteration）
+# ---------------------------------------------------------------------------
+# maieutic 把每一轮记成一条 `Phase1Iteration`（schemas.ts:148-158：
+# studentSpecText / opusQuestions / gapsIdentified / passed），下一轮 examiner
+# 的输入里原样带上「PRIOR ITERATIONS IN THIS SESSION」
+# （spec-examiner.ts:227-234 的 "you asked:\n… gaps still open: […]"）。
+# 于是追问是**跨轮累积**的，学生不会在原地打转。
+#
+# MVE 之前只有「本轮 4 步内的 critique 回灌」（learn_orchestrate 的重试循环），
+# 一跨次学习（重跑同一问题）历史就全丢 —— 同一批维度反复撞同一堵墙，看不出来
+# "上次卡在哪、当时问了什么"。这里补齐那本账：
+#   iterations[dim_id] = {"rounds": n, "asked": 上次追问, "gap": 上次缺口,
+#                         "passed": bool, "tools": [上次调用过的动作]}
+def load_progress_iterations(scene_id: str, question: str) -> dict[str, dict]:
+    """读追问历史：维度 id → 上次那一轮的记录。读不到返回 {}（首次学习）。"""
+    path = _cache_path(scene_id, question)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        pr = data.get("progress") or {}
+        out: dict[str, dict] = {}
+        for it in (pr.get("iterations") or []):
+            if isinstance(it, dict) and str(it.get("id") or ""):
+                out[str(it["id"])] = {
+                    "rounds": int(it.get("rounds") or 0),
+                    "asked": str(it.get("asked") or ""),
+                    "gap": str(it.get("gap") or ""),
+                    "passed": bool(it.get("passed")),
+                    "tools": [str(x) for x in (it.get("tools") or [])
+                              if str(x).strip()],
+                }
+        return out
+    except Exception:
+        return {}
+
+
+def save_progress_iterations(scene_id: str, question: str,
+                             iterations: dict[str, dict]) -> None:
+    """写追问历史（整轮结束写一次；与 learned/codes 同在一个 progress 里）。"""
+    if not iterations:
+        return
+    path = _cache_path(scene_id, question)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    pr = data.get("progress") or {}
+    merged: dict[str, dict] = {}
+    for it in (pr.get("iterations") or []):
+        if isinstance(it, dict) and str(it.get("id") or ""):
+            merged[str(it["id"])] = dict(it)
+    for did, rec in iterations.items():
+        if not str(did).strip():
+            continue
+        old = merged.get(str(did)) or {}
+        merged[str(did)] = {
+            "id": str(did),
+            # 轮次**累加**：maieutic 的 priorIterations 是按轮累积的，
+            # 重跑第 N 次时模型得知道"这题已经问过 N-1 次都没闭合"。
+            "rounds": int(old.get("rounds") or 0) + int(rec.get("rounds") or 0),
+            "asked": str(rec.get("asked") or "")[:300],
+            "gap": str(rec.get("gap") or "")[:300],
+            "passed": bool(rec.get("passed")),
+            "tools": [str(x) for x in (rec.get("tools") or []) if str(x).strip()],
+        }
+    pr["iterations"] = list(merged.values())
+    data["progress"] = pr
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=1),
+                        encoding="utf-8")
+    except Exception:
+        pass
+
+
 def attach_dimensions(scene_id: str, topic_id: str,
                       dimensions: list[dict[str, Any]], *,
                       verified: bool = False, graph: Any = None,
