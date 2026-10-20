@@ -653,6 +653,23 @@ async def _start_learning_impl(
                                     tools=tools_map.get(_did)))
                             if _did:
                                 closed_ids.add(_did)
+                            # 每闭合一条就**落盘 + 打一行**：原版 rollout 是一条
+                            # 一条推进的，日志不逐条可见时，人只能干等（实测
+                            # 15 分钟看不到任何输出，以为卡死）。同时断点续学
+                            # 的粒度也从"整轮"细到"每条"——中途挂掉不丢已闭合的。
+                            try:
+                                _ms.save_progress(
+                                    scene, question,
+                                    [str(d.get("id") or "")
+                                     for d in learned_dims])
+                                _ms.save_progress_codes(scene, question,
+                                                        dim_codes)
+                            except Exception:
+                                pass
+                            print(f"  · 维度闭合 {len(learned_dims)}/{len(_dims)}"
+                                  f"：{_q1[:30]}"
+                                  + (f"（工具：{','.join(_t1)}）" if _t1
+                                     else "（没调工具）"), flush=True)
                         else:
                             failed_dims.append({
                                 "id": _did, "question": _q1,
