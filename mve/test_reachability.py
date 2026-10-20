@@ -106,8 +106,11 @@ def test_learned_skills_are_injected_back_into_execution():
         asyncio.run(local_agent.solve(
             "诊断标准有哪些？", str(tmp), llm=fake, scene_id="", max_iters=1,
             skills=[{"name": "diagnosis", "code": code}]))
-        assert code in seen["system"], "已学配方没进 system：" + seen["system"][-300:]
-        assert "你已经学会的配方" in seen["system"], seen["system"][-300:]
+        # 合成（不是照抄）：prompt 给的是**可调用的函数名** + 原版那条规则
+        assert "skill_diagnosis()" in seen["system"], \
+            "已学技能没进 system：" + seen["system"][-300:]
+        assert "Reuse the above useful programs" in seen["system"], \
+            seen["system"][-300:]
 
         seen.clear()
         asyncio.run(local_agent.solve(

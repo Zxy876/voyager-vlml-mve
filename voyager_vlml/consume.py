@@ -166,9 +166,15 @@ def _retrieve_skills(question: str, topic_hint: str = "",
         return []
     if not all_s:
         return []
-    topic = topic_hint or _pick_ability_topic(question, all_s)
+    topic = str(topic_hint or "").strip() or _pick_ability_topic(question, all_s)
     out = skill_store.retrieve(topic, question, top_k=5,
                                scene_id=scene_id)
+    # 归题结果在本场景没有技能 → 再按词面兜底一次（照原版：检索不到就现场写，
+    # 但**先试过**再放弃）。两次都空才真空。
+    if not out:
+        _t2 = _pick_ability_topic(question, all_s)
+        if _t2 and _t2 != topic:
+            out = skill_store.retrieve(_t2, question, top_k=5, scene_id=scene_id)
     try:
         skill_store.mark_used([str(s.get("key") or "") for s in out])
     except Exception:  # pragma: no cover
@@ -496,7 +502,9 @@ def _tools_in_code(code: str, scene_id: str = "") -> list[str]:
     for ident in re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(", code):
         if ident in _BUILTIN_CALLS or ident in out:
             continue
-        if ident not in names and not ident.startswith("mcp_"):
+        # 合成出来的调用也算：`skill_def()` 是**已学技能**被调用了（原版
+        # `smeltFiveRawIron` 里调 `craftFurnace` 就是这一类）。
+        if ident not in names and not ident.startswith(("mcp_", "skill_")):
             continue
         out.append(ident)
     return out
@@ -621,7 +629,13 @@ async def consume(
         subs = [dict(p.get("subject") or {}) for p in derived]
 
     # ---- ② 找已积累的能力（配方）----
-    skills = _retrieve_skills(question, topic_hint, _scene_id)
+    # ⚠️ 检索键必须是**本题归题结果**（2026-10-20 实测根因）：原来这里传的是
+    # 函数入参 `topic_hint`（默认空），`_pick_ability_topic` 于是按词面**随便
+    # 挑最像的** —— 问「正念是什么」时挑中了「正念练习的常见误区」那批技能
+    # （consume_2461737d），本题自己那批（consume_ca2125be）一条都没进 prompt。
+    # 表现就是：图谱已经高置信命中、技能库里明明有 6 条，消费却报"用到 0 条"。
+    # 同原版 `retrieve_skills(query=self.context)` —— context 里就是当前这道题。
+    skills = _retrieve_skills(question, topic_id or topic_hint, _scene_id)
     reused_list = [{"topic": s.get("topic"), "name": s.get("name"),
                     "key": s.get("key")} for s in skills]
 
@@ -680,7 +694,12 @@ async def consume(
             break
         # ③b 没有可复用的配方 → 现场写
         if reused_skill is None:
-            obs, code = await _la.solve(question, _scene_dir, scene_id=_scene_id)
+            # 已学技能**必须进执行层让模型调用合成**（原版 action.py:94
+            # `+ skills`）：命中（HIGH_CONFIDENCE）的题尤其如此 —— 图谱里
+            # 已经学过它，却还去"现场现做"，等于技能库白建（用户 2026-10-20
+            # 「所有命中的题目都要用到已经学到的技能」）。
+            obs, code = await _la.solve(question, _scene_dir,
+                                        scene_id=_scene_id, skills=skills)
             real = [o for o in obs if o.get("ok") and o.get("data") is not None]
             data = (real[-1].get("data") if real else None)
         # 没取到 → 还是没学会。同样**不自动后台学**（2026-10-19 用户改设计）：

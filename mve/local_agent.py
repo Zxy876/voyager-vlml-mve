@@ -270,6 +270,82 @@ def _payload(value: Any) -> tuple[Any, str]:
     return ({"value": value}, "")
 
 
+def _skill_call_name(raw: str) -> str:
+    """技能名 → 可调用的 Python 函数名（原版是 `async function name(bot)`）。
+
+    原版技能本身就是**具名函数**（skill.py:96-101 `generate_skill_description`
+    生成 `async function {program_name}(bot){//描述}`），所以新代码能直接写
+    `await craftFurnace(bot)`。MVE 的技能是**脚本**形态（`RESULT = {...}`），
+    没有名字 → 这里按名字造一个，命名规则确定性（同名技能同一个函数名）。
+    """
+    import re as _re
+    s = _re.sub(r"[^0-9A-Za-z_]+", "_", str(raw or "").strip()).strip("_")
+    if not s:
+        return ""
+    if s[0].isdigit():
+        s = "d" + s
+    return "skill_" + s
+
+
+def _make_skill_fn(skill: dict[str, Any], scene_dir: str, scene_id: str,
+                   tracer: list[str] | None, timeout: float = 45.0):
+    """一条已学技能 → 一个**可调用**的函数（同构原版 `programs`）。
+
+    原版怎么合成（取证）：
+      · `skill.py` 的 `programs` 属性 = control_primitives + **全部技能代码**；
+      · `env/mineflayer/index.js:253-256`
+        `await eval("(async () => {" + programs + "\\n" + code + "})()")`
+        —— 技能定义与新写的代码在**同一个作用域**里，所以新代码能直接调用
+        已学技能。证据：skill_library/trial1 里 `smeltFiveRawIron` 内部调用了
+        `craftFurnace`、`mineTenCobblestone` 内部调用了 `craftWoodenPickaxe`
+        （51 条技能共 7 处真实合成）；
+      · prompt 明说 "Reuse the above useful programs as much as possible"
+        （prompts/action_template.txt:39）。
+
+    MVE 之前只把技能 code **贴进 system 让模型照抄** —— 那是"给个例子"，
+    不是合成：执行命名空间里压根没有这个函数，模型想调用也调不了，于是
+    命中的题照样现场现做（2026-10-20 截图：两次导入都"用到 0 条技能"）。
+
+    这里把每条技能包成 `skill_<name>()`：在带原语/MCP 的干净命名空间里跑
+    那段脚本并返回它的 RESULT。于是新代码可以合成：
+        RESULT = {"定义": skill_def(), "起源": skill_origin()}
+    """
+    code = str(skill.get("code") or "").strip()
+    label = str(skill.get("name") or skill.get("topic") or "?")
+    fname = _skill_call_name(label)
+
+    def _fn() -> Any:
+        if tracer is not None:
+            tracer.append(f"skill:{label}")     # 先记后跑：真调用过才有据
+        ns: dict[str, Any] = _ns_base(scene_dir, scene_id, tracer=tracer)
+        box = _run_restricted(code, ns, timeout=timeout)
+        if not box.get("ok"):
+            raise RuntimeError(
+                f"已学技能 {label} 重放失败：{box.get('error') or '未知错误'}")
+        val = ns.get("RESULT")
+        if val is None:
+            raise RuntimeError(f"已学技能 {label} 没产出 RESULT（配方失效）")
+        return val
+
+    _fn.__name__ = fname
+    _fn.__doc__ = str(skill.get("text") or "")[:220]
+    return _fn
+
+
+def _build_skill_fns(skills: list[dict[str, Any]] | None, scene_dir: str,
+                     scene_id: str, tracer: list[str],
+                     limit: int = 8) -> dict[str, Any]:
+    """把检索到的技能编成一组可调用函数（同原版 `programs` 拼进同一作用域）。"""
+    out: dict[str, Any] = {}
+    for s in list(skills or [])[:limit]:
+        if not str((s or {}).get("code") or "").strip():
+            continue
+        fn = _make_skill_fn(s, scene_dir, scene_id, tracer)
+        if fn.__name__ and fn.__name__ not in out:
+            out[fn.__name__] = fn
+    return out
+
+
 async def solve(question: str, scene_dir: str, *, llm=None,
                 max_iters: int = 2, scene_id: str = "", critique: str = "",
                 dimensions: list[dict[str, Any]] | None = None,
@@ -301,11 +377,22 @@ async def solve(question: str, scene_dir: str, *, llm=None,
     强制 —— 那是"没工具可用"，不是"有工具不用"。否则学习循环会在这种场景里
     永远判失败，卡死（如实放行，让 critic 去判）。
     """
-    from voyager_vlml.llm import chat
-    call = llm or (lambda msgs: chat(msgs, temperature=0.2))
+    # ⚠️ 延迟 import：传了 `llm` 的调用方（测试/别的编排）不该被迫拉起整条
+    # VLML 依赖链 —— 实测 `from voyager_vlml.llm import chat` 在只插了 mve/
+    # 的进程里直接 ModuleNotFoundError，把调用方拖死。
+    def call(msgs):
+        if llm is not None:
+            return llm(msgs)
+        from voyager_vlml.llm import chat
+        return chat(msgs, temperature=0.2)
 
     def _ns(tracer: list[str]) -> dict[str, Any]:
-        return _ns_base(scene_dir, scene_id, tracer=tracer)
+        ns = _ns_base(scene_dir, scene_id, tracer=tracer)
+        # 已学技能进**执行域**（不是只进 prompt）—— 同构原版
+        # index.js:256 的 `programs + code` 同作用域 eval：模型写的
+        # `skill_def()` 才真的调得到。
+        ns.update(_build_skill_fns(skills, scene_dir, scene_id, tracer))
+        return ns
 
     # 场景目录里**现有**什么，直接告诉它（否则它会猜 *.txt 而真实文件是 .json）
     inv = inventory(scene_dir)
@@ -334,14 +421,22 @@ async def solve(question: str, scene_dir: str, *, llm=None,
             _probe = _ns_base(scene_dir, scene_id, tracer=None)
         except Exception:
             _probe = {}
-    _can_fetch = bool(_probe)
+    # 已学技能也是**取证手段**（重放配方 = 真调一次数据源），所以只有原语
+    # 全关、但有技能时仍然算"有办法取数"—— 别把这种场景误判成没工具可用。
+    _skill_names = [_skill_call_name(str((s or {}).get("name") or ""))
+                    for s in (skills or [])
+                    if str((s or {}).get("code") or "").strip()]
+    _skill_names = [n for n in _skill_names if n]
+    _can_fetch = bool(_probe) or bool(_skill_names)
     if require_tools:
         # 这个场景到底有没有取证手段、有哪些 —— 必须看得见：
         # 2026-10-20 整轮 8 条维度 7 条"调过：无"，靠这行定位是"没工具可用"
         # 还是"有工具不用"（两者是截然不同的失败，处理也完全不同）。
         print(f"  · 取证手段：{len(_probe)} 个"
               + (f"（{'、'.join(sorted(_probe)[:10])}）" if _probe
-                 else "（一个都没有 —— 本机/联网/MCP 全不可用，不强制取证）"),
+                 else "（一个都没有 —— 本机/联网/MCP 全不可用，不强制取证）")
+              + (f"｜已学技能 {len(_skill_names)} 条可调用"
+                 if _skill_names else ""),
               flush=True)
     # 经 MCP 接入的远端工具（名字/签名）动态拼进 system —— server 连上了才出现，
     # 没连上不误导模型去调一个不存在的函数。
@@ -349,26 +444,44 @@ async def solve(question: str, scene_dir: str, *, llm=None,
     mcp_sec = _mcp_prompt_section(scene_id)
     if mcp_sec:
         system = PROMPT_SYSTEM + mcp_sec
-    if skills:
-        # 已学会的配方**回注执行层** —— 这是「可达 = 一整个循环」的那一环
-        # （用户 2026-10-20 指出）：原版不是先判"能不能做到"，而是
+    if _skill_names:
+        # 已学会的技能**回注执行层** —— 这是「可达 = 一整个循环」的那一环
+        # （用户 2026-10-20 指出）：原版不先判"能不能做到"，而是
         # `retrieve_skills`（voyager.py:195）把技能 code 拼在 control_primitives
         # 后面（action.py:94 `+ skills`）一起喂模型 —— **技能本身就是新的
         # primitive**，所以能力边界随技能库增长而扩张：以前做不到的，学会之后
-        # 下次就够得着了。MVE 的 VLML 路径一直有（voyager_vlml/agents/action.py:
-        # 159-199 render_system_message(skills=...)），本机/知识型路径没有 →
-        # 技能只进库、不回流，学再多次也不会更快、也不会更可达。
+        # 下次就够得着了。
+        #
+        # ⚠️ 合成（composition）才是原版的重点，不是"照抄"：
+        #   · 执行时技能与 primitives 在**同一个作用域**
+        #     （env/mineflayer/index.js:256 `eval(programs + code)`），
+        #     所以新代码能直接 `skill_def()`；
+        #   · 原版真这么干 —— skill_library/trial1 的 51 条技能里有 7 处
+        #     技能调用技能（`smeltFiveRawIron` → `craftFurnace` 等）；
+        #   · prompt 的原话是 "Reuse the above useful programs as much as
+        #     possible"（prompts/action_template.txt:39）。
+        # 只把 code 贴进 system 等于"给个例子"，模型看得见却调不到 →
+        # 命中的题照样现场现做（2026-10-20 截图：两次导入都"用到 0 条技能"）。
         _lines: list[str] = []
-        for _s in list(skills)[:5]:
-            _nm = str((_s or {}).get("name") or (_s or {}).get("topic") or "")
-            _cd = str((_s or {}).get("code") or "").strip()
-            if _cd:
-                _lines.append(f"- {_nm}：\n{_cd[:400]}")
+        for _s in list(skills)[:8]:
+            _nm = _skill_call_name(str((_s or {}).get("name") or ""))
+            if not _nm or not str((_s or {}).get("code") or "").strip():
+                continue
+            _what = str((_s or {}).get("text") or "")[:80].replace("\n", " ")
+            _lines.append(f"- {_nm}()  → {_what}")
         if _lines:
-            system += ("\n\n【你已经学会的配方（原版 voyager.py:195 先 retrieve "
-                       "再跑；技能 code 直接拼进可用函数清单）】下面这些是你以前"
-                       "跑通过的代码 —— **能复用就复用**（照抄或改一改再跑），"
-                       "别从零重写；用不上就不用：\n" + "\n".join(_lines))
+            system += (
+                "\n\n【你已经学会的技能（原版 voyager.py:195 先 retrieve，"
+                "action.py:94 拼进可用函数清单；执行时它们与原语在**同一个作用域**，"
+                "可以直接调用）】\n" + "\n".join(_lines) + "\n"
+                "调用规则（原版 prompts/action_template.txt:39 「Reuse the above "
+                "useful programs as much as possible」）：\n"
+                "  1. 这些技能覆盖得了这道题就**直接调用**它们，不要重写它们做过的事；\n"
+                "  2. 可以同时调多条**合成**一个完整答案：\n"
+                "     ```python\n"
+                "     RESULT = {\"定义\": skill_def(), \"起源\": skill_origin()}\n"
+                "     ```\n"
+                "  3. 全部用不上时才自己写取数代码（用上面的原语/MCP 工具）。")
     if require_tools and _can_fetch:
         system += ("\n\n【这是**学习环节**，不是答题】你的答案必须来自你**真正调用"
                    "数据源取回的内容**（list_files / read_file / read_json / "
