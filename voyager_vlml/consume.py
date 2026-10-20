@@ -616,7 +616,10 @@ async def consume(
             if "RESULT" not in sc:
                 continue
             try:
-                val = _la.run_saved(sc, _scene_dir, scene_id=_scene_id)
+                # 必须走 async 版：同步 run_saved 会在事件循环线程里阻塞等
+                # 自己提交给同一 loop 的 MCP 调用 → 60s 超时 → 配方被误判失效
+                # （2026-10-20 实测：明明命中 3 条配方，却"用到 0 条技能"）。
+                val = await _la.run_saved_async(sc, _scene_dir, scene_id=_scene_id)
             except Exception as e:
                 reuse_errors.append(f"重放 {s.get('name')} 抛错：{e}")
                 continue
@@ -1680,6 +1683,9 @@ def _main() -> int:
     if r.get("reuse_explain"):
         # 掌握度涨的那一分是哪次导入给的 —— 不解释就等于让人"信我"
         print("解释   :", r.get("reuse_explain"))
+    if r.get("reuse_errors"):
+        # 配方为什么没复用上，必须看得见（否则又是"命中却用不上"的黑箱）
+        print("复用失败:", "；".join(str(x)[:70] for x in r["reuse_errors"][:3]))
     print("工具   :", r.get("trajectory") or "—",
           f"| 调用 {r.get('ok_tool_calls') or r.get('tool_calls') or 0} 次，"
           f"取到 {r.get('rows') or 0} 行")

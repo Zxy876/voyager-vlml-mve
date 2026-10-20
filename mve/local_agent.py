@@ -650,7 +650,8 @@ def primitive_names() -> list[str]:
 # 技能结晶：把一段跑通的 Python 存成可重放的条目
 # ---------------------------------------------------------------------------
 def _ns_base(scene_dir: str, scene_id: str = "",
-             tracer: list[str] | None = None) -> dict[str, Any]:
+             tracer: list[str] | None = None,
+             loop: Any = None) -> dict[str, Any]:
     """执行命名空间。
 
     给了 scene_id 就**按注册表里的启用条目**建（猫爪总开关关掉的组不注入 ——
@@ -660,6 +661,11 @@ def _ns_base(scene_dir: str, scene_id: str = "",
 
     `tracer`：给了就记录**哪些数据源被真正调用**（先记后调，失败也留痕）——
     solve 用它堵「代码跑通、RESULT 非空却一次都没取数」的真空成功新形态。
+
+    `loop`：MCP 同步包装器要把调用桥回**哪个**事件循环。不传就取当前线程正在跑的
+    循环（solve 在 loop 线程里调用，够用）；`run_saved_async` 把 exec 挪到 worker
+    线程后必须**显式传**（worker 线程自己没有运行中的循环，`get_running_loop()`
+    必抛 RuntimeError → mcp_* 一个都注入不进去 → 重放配方 NameError）。
     """
     full: dict[str, Any] = {
         "list_files": lambda path="", pattern="*": list_files(
@@ -707,7 +713,9 @@ def _ns_base(scene_dir: str, scene_id: str = "",
         try:
             import actions
             import mcp_gateway
-            loop = asyncio.get_running_loop()
+            # ⚠️ 必须先取 `loop` 再取网关：worker 线程里 `get_running_loop()` 会抛，
+            # 位置不能换到后面去（换了就变成"网关建好了、工具却没注入"）。
+            _loop = loop if loop is not None else asyncio.get_running_loop()
             gw = mcp_gateway.get_gateway()
             for e in actions.enabled_entries(scene_id):
                 if str(e.get("origin") or "") != "mcp":
@@ -715,12 +723,13 @@ def _ns_base(scene_dir: str, scene_id: str = "",
                 tid = str(e.get("name"))
                 if tid in ns:        # 不覆盖本机/联网同名（理论上不会重名）
                     continue
-                _entry = _make_mcp_callable(gw, tid, loop,
+                _entry = _make_mcp_callable(gw, tid, _loop,
                                             e.get("input_schema") or {})
                 ns[tid] = (_recorder(tracer, tid)(_entry)
                            if tracer is not None else _entry)
         except RuntimeError:
-            # 没有运行中的事件循环（技能重放 run_saved 等）→ 不注入 mcp 远端工具
+            # 既没传 loop、当前线程也没有运行中的事件循环 → 不注入 mcp 远端工具
+            # （技能重放请走 run_saved_async，它会把主循环显式带进来）
             pass
     ns["__builtins__"] = {"len": len, "list": list, "dict": dict, "str": str,
                           "int": int, "float": float, "sorted": sorted,
@@ -731,10 +740,40 @@ def _ns_base(scene_dir: str, scene_id: str = "",
 
 
 def run_saved(code: str, scene_dir: str, timeout: float = 30.0,
-              scene_id: str = "") -> Any:
-    """跑一段已存下来的本机技能代码，返回它的 RESULT（失败抛异常，由调用方如实报）。"""
-    ns = _ns_base(scene_dir, scene_id)
+              scene_id: str = "", loop: Any = None) -> Any:
+    """跑一段已存下来的本机技能代码，返回它的 RESULT（失败抛异常，由调用方如实报）。
+
+    `loop` 见 `_ns_base`：在事件循环里重放要走 `run_saved_async`（它负责把
+    exec 挪到 worker 线程并把主循环带进来），**不要**在协程里直接调这个同步版。
+    """
+    ns = _ns_base(scene_dir, scene_id, loop=loop)
     box = _run_restricted(code, ns, timeout=timeout)
     if not box.get("ok"):
         raise RuntimeError(box.get("error") or "本机技能执行失败")
     return ns.get("RESULT")
+
+
+async def run_saved_async(code: str, scene_dir: str, timeout: float = 30.0,
+                          scene_id: str = "") -> Any:
+    """在**事件循环里**重放配方 —— 必须换到 worker 线程跑 exec。
+
+    为什么（2026-10-20 实测）：配方里的取数动作是 MCP 工具，而 MCP 调用靠
+    `run_coroutine_threadsafe(..., loop)` 桥回主事件循环（见 `_make_mcp_callable`
+    的说明）。如果 exec 就在主循环线程里同步跑，这个"提交给 loop 再阻塞等结果"
+    就变成**自己等自己**：loop 正卡在 `cfut.result(timeout=60)` 上，没机会推进
+    MCP 请求 → 60 秒后超时抛错。
+
+    现象极具误导性：命中配方、`reuse_errors` 里只有一句超时，于是被当成"配方
+    失效"跳过，退回现场现做 —— 用户看到的就是"学过的东西第二次没用上"。
+
+    换到 worker 线程后，`run_coroutine_threadsafe` 才是它设计时的用法（跨线程
+    桥接），主循环可以正常推进。`asyncio.to_thread` 在 3.9+ 可用。
+
+    ⚠️ 光换线程还不够（2026-10-20 补）：worker 线程**没有运行中的事件循环**，
+    `_ns_base` 里 `asyncio.get_running_loop()` 会抛 RuntimeError → 被 `except
+    RuntimeError: pass` 吞掉 → `mcp_*` 一个都不注入，重放直接
+    `NameError: name 'mcp_xxx' is not defined`。所以这里把**主循环显式传进去**。
+    """
+    loop = asyncio.get_running_loop()
+    return await asyncio.to_thread(run_saved, code, scene_dir, timeout,
+                                   scene_id, loop)

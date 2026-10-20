@@ -110,10 +110,64 @@ def test_docstring_exposes_signature_for_prompt():
     print("PASS  test_docstring_exposes_signature_for_prompt")
 
 
+def test_run_saved_async_offloads_to_worker_thread():
+    """在事件循环里重放配方必须换线程（`asyncio.to_thread`）。
+
+    否则 exec 在主循环线程里同步等 `run_coroutine_threadsafe` 提交给**同一个
+    loop** 的 MCP 调用 —— 自己等自己，60s 超时，配方被误判失效。这里钉死
+    async 版能正常返回、失败如实抛，且**把主循环显式带进 worker 线程**
+    （worker 线程没有运行中的循环，不带 loop 就注入不了 mcp_*）。
+    """
+    import asyncio
+    import shutil
+    import tempfile
+
+    tmp = tempfile.mkdtemp()
+    try:
+        out = asyncio.run(local_agent.run_saved_async(
+            'RESULT = {"answer": 42, "source": "pure"}', tmp))
+        assert out == {"answer": 42, "source": "pure"}, out
+
+        # 失败要如实抛，不许把空结果当成功
+        # ⚠️ 受限命名空间只放白了 Exception，ValueError 之类不在里面
+        try:
+            asyncio.run(local_agent.run_saved_async("raise Exception('boom')", tmp))
+        except Exception as e:
+            assert "boom" in str(e), e
+        else:
+            raise AssertionError("执行失败必须抛异常")
+
+        # 主循环必须被显式传下去（否则 worker 线程里 get_running_loop() 抛错，
+        # mcp_* 静默不注入 → 重放配方 NameError）
+        seen: dict = {}
+        real = local_agent.run_saved
+
+        def _spy(code, scene_dir, timeout=30.0, scene_id="", loop=None):
+            seen["loop"] = loop
+            seen["thread"] = threading.get_ident()
+            return {"ok": True}
+
+        async def _go():
+            seen["loop_obj"] = asyncio.get_running_loop()
+            local_agent.run_saved = _spy
+            try:
+                return await local_agent.run_saved_async("RESULT = 1", tmp)
+            finally:
+                local_agent.run_saved = real
+
+        asyncio.run(_go())
+        assert seen.get("loop") is seen.get("loop_obj"), "主循环没传进 run_saved"
+        assert seen.get("thread") != threading.get_ident(), "exec 没换线程"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("PASS  test_run_saved_async_offloads_to_worker_thread")
+
+
 if __name__ == "__main__":
     test_positional_args_are_mapped_by_schema_order()
     test_keyword_args_pass_through()
     test_too_many_positional_args_raises_with_names()
     test_no_schema_positional_call_raises()
     test_docstring_exposes_signature_for_prompt()
+    test_run_saved_async_offloads_to_worker_thread()
     print("\nALL PASS")
