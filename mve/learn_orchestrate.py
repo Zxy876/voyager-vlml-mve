@@ -675,6 +675,15 @@ async def _start_learning_impl(
                                 "id": _did, "question": _q1,
                                 "attempts": SUBTASK_MAX_RETRIES,
                                 "critique": str(crit1)[:200]})
+                            # 失败的也要逐条可见：否则整轮跑完只看到"N 条没闭合"，
+                            # 不知道是模型没调工具、还是工具本身报错（2026-10-20）
+                            _e1 = str((obs1 or [{}])[-1].get("error") or "")[:90]
+                            print(f"  · 维度未闭合 {len(learned_dims)}"
+                                  f"/{len(_dims)}：{_q1[:28]}"
+                                  f"｜{str(crit1)[:60]}"
+                                  + (f"｜执行报错：{_e1}" if _e1 else "")
+                                  + f"｜调过：{','.join(sorted({s for o in obs1 for s in (o.get('data_sources') or [])})) or '无'}",
+                                  flush=True)
                     try:
                         _ms.save_progress(scene, question,
                                           [str(d.get("id") or "")
