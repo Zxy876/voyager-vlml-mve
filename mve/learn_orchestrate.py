@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import threading
 import time
@@ -166,6 +167,15 @@ def _has_real(obs: list[dict[str, Any]]) -> bool:
 # success`）。到上限仍不闭合就跳过这条维度（curriculum.py:342 "Skipping to
 # next task"）—— 不是"再试一次看看"，原版就没有无限重试。
 SUBTASK_MAX_RETRIES = 4
+
+# 一次 rollout（跑一段取证代码）的墙钟上限。
+# 为什么不是默认的 30s（2026-10-20 实测致命点）：单次 MCP 调用自己就有 60s
+# 上限（local_agent.py:680），外层比内层短 → 工具还没回来就判超时，而超时又
+# 不会杀掉线程（Python 做不到），于是 4 次重试只是往同一个被限流的接口上堆
+# 4 个僵尸线程；7 条维度 × 4 次 = 整轮十几分钟、颗粒无收。
+# 原版 rollout 里 bot 执行本来就允许几十秒（`bot.chat` 一路打进度），这里按
+# 外部工具的量级给，可用环境变量覆盖（跑本地/纯 SQL 场景时可以调小）。
+EXEC_TIMEOUT = float(os.environ.get("MVE_EXEC_TIMEOUT") or 90.0)
 
 
 def available_grabs(scene_id: str, scene_dir: str = "") -> list[str]:
@@ -657,11 +667,20 @@ async def _start_learning_impl(
                         _iters = _ms.load_progress_iterations(scene, question)
                     except Exception:
                         _iters = {}
+                    _timed_out_dims = 0
                     for _d in _dims:
                         _did = str(_d.get("id") or "")
                         _q1 = str(_d.get("question") or "").strip()
                         if not _q1:
                             continue
+                        # 外部工具已经连续超时两条 → 剩下的维度大概率同样卡住，
+                        # 继续跑只是堆僵尸线程（原版也不会在环境不可用时硬撑：
+                        # 它靠 critic 的 onError 短路 + 跳到下一个任务）。
+                        if _timed_out_dims >= 2:
+                            print("  · 外部工具连续超时 2 条 —— 本轮到此为止"
+                                  "（已闭合的已落盘，剩下的下一轮续学），不硬撑",
+                                  flush=True)
+                            break
                         if _did and _did in _prog:
                             learned_dims.append(_d)     # 断点续学：答到过的不重跑
                             # 但仍要**保证节点在**（闭合过就该有那一枚技能单位）：
@@ -738,7 +757,13 @@ async def _start_learning_impl(
                                 skills=skills,
                                 # 学习环节：必须真的调数据源取证（原版 rollout
                                 # 必须调 primitive；凭记忆答不入库、不算学会）
-                                require_tools=True)
+                                require_tools=True,
+                                # ⚠️ 致命点（2026-10-20 实测）：默认 30s 比**单次
+                                # MCP 调用的上限 60s**（local_agent.py:680
+                                # `cfut.result(timeout=60)`）还短 —— 工具还没
+                                # 回来就被判超时，4 次重试因此全部无效。
+                                # 原版 rollout 里 bot 执行本来就允许几十秒。
+                                timeout=EXEC_TIMEOUT)
                             observations.extend(obs1)
                             r1: dict[str, Any] = {
                                 "execution": {
@@ -762,6 +787,18 @@ async def _start_learning_impl(
                             except Exception as e1:
                                 ok1, crit1 = False, f"critic 异常：{type(e1).__name__}: {e1}"
                             if ok1:
+                                break
+                            # 超时 = 外部工具没回来（慢/被限流），**不是代码写错
+                            # 了** —— 原地重试毫无意义（原线程还在等，新线程又
+                            # 起），照原版 curriculum.py:342 "Skipping to next
+                            # task" 跳过这条维度，等下一轮（断点续学）再来。
+                            if any(bool(o.get("timed_out")) for o in obs1):
+                                crit1 = (f"上一次执行超时（>{int(EXEC_TIMEOUT)}s，"
+                                         "外部工具没回来：慢或被限流）—— 本轮跳过"
+                                         "这条维度，不原地重试")
+                                print(f"  · 执行超时 → 跳过本条维度（不重试）："
+                                      f"{_q1[:28]}", flush=True)
+                                _timed_out_dims += 1
                                 break
                         if ok1:
                             learned_dims.append(_d)

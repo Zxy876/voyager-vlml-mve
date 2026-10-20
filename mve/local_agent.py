@@ -245,7 +245,13 @@ def _run_restricted(code: str, ns: dict[str, Any], timeout: float = 30.0
     t.start()
     t.join(timeout)
     if t.is_alive():
-        return {"ok": False, "error": f"执行超时（>{int(timeout)}s）"}
+        # ⚠️ 超时**不会**杀掉这个线程（Python 没法安全地中止线程）：它还在
+        # 里面等 MCP 返回。所以调用方必须能**认出**这是超时而不是"代码错了"
+        # —— 否则会原地重试，越重试越多僵尸线程在等同一个被限流的接口
+        # （2026-10-20 实测：外层 30s 先爆、内层 MCP 上限 60s，4 次重试全部
+        # 无效，7 条维度全未闭合 → 整轮颗粒无收）。
+        return {"ok": False, "error": f"执行超时（>{int(timeout)}s）",
+                "timed_out": True}
     return box
 
 
@@ -353,6 +359,7 @@ async def solve(question: str, scene_dir: str, *, llm=None,
                 require_tools: bool = False,
                 skills: list[dict[str, Any]] | None = None,
                 require_skills: bool = False,
+                timeout: float = 30.0,
                 ) -> tuple[list[dict[str, Any]], str]:
     """写代码 → 跑 → 看结果；失败带反馈重写。返回 (观察列表, 最后一段代码)。
 
@@ -554,7 +561,7 @@ async def solve(question: str, scene_dir: str, *, llm=None,
             continue
         tracer: list[str] = []
         ns = _ns(tracer)
-        res = await asyncio.to_thread(_run_restricted, code, ns)
+        res = await asyncio.to_thread(_run_restricted, code, ns, timeout)
         data, why_empty = _payload(ns.get("RESULT"))
         rows = len(data) if isinstance(data, list) else (1 if data else 0)
         err = str(res.get("error") or "")
@@ -591,6 +598,9 @@ async def solve(question: str, scene_dir: str, *, llm=None,
         o = {"ok": bool(res.get("ok")) and data is not None and not err,
              "tool": "local_python", "rows": rows, "data": data,
              "data_sources": list(tracer),
+             # 超时要能被上层认出来（见 `_run_restricted` 的说明）：重试一个
+             # 还在等外部接口的执行是纯浪费，且僵尸线程会越堆越多。
+             "timed_out": bool(res.get("timed_out")),
              "skills_called": _called,
              "evidence": ("data" if tracer else "knowledge"),
              "error": err or ("" if data is not None else why_empty)}
