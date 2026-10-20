@@ -376,15 +376,20 @@ async def solve(question: str, scene_dir: str, *, llm=None,
         fetch_txt = ""
         if require_tools and _can_fetch:
             _names = [n for n in sorted(_probe) if not n.startswith("__")]
+            # 示例里的函数名必须**真的存在**：写 `web_search` 而本场景只有
+            # mcp_*_search（本机联网没注册）时，模型照抄就 NameError。
+            _ex = ("web_search" if "web_search" in _names
+                   else next((n for n in _names if "search" in n),
+                             _names[0] if _names else "web_search"))
             fetch_txt = (
                 "【取证要求（先做这个，再写答案）】这是**学习环节**：你的答案必须"
                 "来自你**真正调用**下列函数取回的内容，凭记忆直接写的答案判不通"
                 "过、也不会被记成能力。\n可用函数："
                 + "、".join(_names[:16]) + "\n"
-                "代码必须长这样（先取证，再据实组织）：\n"
+                "代码必须长这样（先取证，再据实组织；参数照上面签名的名字传）：\n"
                 "```python\n"
-                "r = web_search(\"<本题关键词>\")\n"
-                "RESULT = {\"answer\": r, \"source\": \"web_search\"}\n"
+                f"r = {_ex}(query=\"<本题关键词>\")\n"
+                f"RESULT = {{\"answer\": r, \"source\": \"{_ex}\"}}\n"
                 "```\n")
         user = (f"问题：{question}\n\n{inv_txt}\n" + fetch_txt
                 + dim_txt + avoid_txt
@@ -483,7 +488,8 @@ def _unwrap_mcp(payload: Any) -> Any:
     return inner
 
 
-def _make_mcp_callable(gw: Any, tool_id: str, loop: Any):
+def _make_mcp_callable(gw: Any, tool_id: str, loop: Any,
+                       schema: dict[str, Any] | None = None):
     """造一个**同步**包装器：模型在受限 exec 里只能调同步函数，而 MCP 调用是
     异步的。用 `run_coroutine_threadsafe` 把调用桥回主事件循环（网关的 MCP 客户端
     子进程与读循环都绑在那个循环上），worker 线程阻塞等结果。
@@ -491,12 +497,33 @@ def _make_mcp_callable(gw: Any, tool_id: str, loop: Any):
     ⚠️ 跨线程桥接是必须的：网关的 `_request` 在**主循环**里 `await` 读循环解析
     出来的 future，若在执行线程里另起一个事件循环跑它，future 跨循环不唤醒 → 死锁。
     run_coroutine_threadsafe 是标准正确路径。
+
+    ⚠️ 必须收 `*args`（2026-10-20 服务器实测根因）：MCP 工具的入参是**具名**的
+    （schema.properties），而模型照 prompt 示例写的是位置调用 `mcp_x("关键词")`。
+    只收 `**kwargs` 会直接抛
+    `TypeError: _sync() takes 0 positional arguments but 1 was given`
+    —— 表现为「调过：mcp_x」却取不到数、维度判未闭合。这里按 schema 声明顺序
+    把位置参数补成关键字（MCP 侧仍只认具名入参）。
     """
-    def _sync(**kwargs: Any) -> Any:
+    props: list[str] = list(((schema or {}).get("properties") or {}).keys())
+
+    def _sync(*args: Any, **kwargs: Any) -> Any:
+        if args:
+            if not props:
+                raise TypeError(
+                    f"{tool_id}() 不接受位置参数（该工具没声明入参，请用关键字传）")
+            if len(args) > len(props):
+                raise TypeError(
+                    f"{tool_id}() 最多 {len(props)} 个位置参数"
+                    f"（{'、'.join(props)}），收到 {len(args)} 个")
+            for key, val in zip(props, args):
+                kwargs.setdefault(key, val)
         cfut = asyncio.run_coroutine_threadsafe(
             gw.call_remote(tool_id, **kwargs), loop)
         return _unwrap_mcp(cfut.result(timeout=60))
     _sync.__name__ = str(tool_id)
+    if props:
+        _sync.__doc__ = f"{tool_id}({', '.join(props)}) —— MCP 远端工具"
     return _sync
 
 
@@ -667,7 +694,8 @@ def _ns_base(scene_dir: str, scene_id: str = "",
                 tid = str(e.get("name"))
                 if tid in ns:        # 不覆盖本机/联网同名（理论上不会重名）
                     continue
-                _entry = _make_mcp_callable(gw, tid, loop)
+                _entry = _make_mcp_callable(gw, tid, loop,
+                                            e.get("input_schema") or {})
                 ns[tid] = (_recorder(tracer, tid)(_entry)
                            if tracer is not None else _entry)
         except RuntimeError:
