@@ -334,6 +334,14 @@ async def solve(question: str, scene_dir: str, *, llm=None,
         except Exception:
             _probe = {}
     _can_fetch = bool(_probe)
+    if require_tools:
+        # 这个场景到底有没有取证手段、有哪些 —— 必须看得见：
+        # 2026-10-20 整轮 8 条维度 7 条"调过：无"，靠这行定位是"没工具可用"
+        # 还是"有工具不用"（两者是截然不同的失败，处理也完全不同）。
+        print(f"  · 取证手段：{len(_probe)} 个"
+              + (f"（{'、'.join(sorted(_probe)[:10])}）" if _probe
+                 else "（一个都没有 —— 本机/联网/MCP 全不可用，不强制取证）"),
+              flush=True)
     # 经 MCP 接入的远端工具（名字/签名）动态拼进 system —— server 连上了才出现，
     # 没连上不误导模型去调一个不存在的函数。
     system = PROMPT_SYSTEM
