@@ -674,6 +674,18 @@ async def _start_learning_impl(
                                         _old_codes.get(_did, {}).get("code"))))
                             if _did:
                                 closed_ids.add(_did)
+                            # Obsidian 式反链：这条维度**被哪几次导入学过**。
+                            # 第二次导入同一问题时，这里会数出 2 条 —— 复用不是
+                            # 口头保证，是图上的入边（maieutic_scaffold.imports_of）。
+                            try:
+                                _imps = _ms.imports_of(scene, _tid, _did)
+                            except Exception:
+                                _imps = []
+                            if len(_imps) >= 1:
+                                print(f"  · 维重复用：{_q1[:22]}｜已有 "
+                                      f"{len(_imps)} 次导入学过它"
+                                      f"（{', '.join(i['import_id'] for i in _imps[-3:])}）",
+                                      flush=True)
                             # 这一轮没重跑，但**上次跑通的代码**还在 —— 那次
                             # rollout 的成果不该因为续学被丢掉（原版 program_code）
                             _c0 = _old_codes.get(_did) or {}

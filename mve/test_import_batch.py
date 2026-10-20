@@ -124,8 +124,64 @@ def test_dimensions_hang_under_import_node():
     print("PASS  test_dimensions_hang_under_import_node")
 
 
+def test_backlinks_and_imports_of():
+    """Obsidian 式反链：归属是**图上算出来的**，不另存一张表。
+
+    第二次导入同一问题时 `backlinks / imports_of` 会数出两个 import —— 这就是
+    "掌握度为什么涨"的解释（复用第 1 次导入学到的维度）。
+    """
+    from knowledge_graph import KnowledgeGraph
+
+    g = KnowledgeGraph()
+    g.ensure_scene_root("T")
+    g.add_cold_start_node("T", "consume:consume_abc", "dimension", label="q")
+    dim = {"id": "def", "question": "定义是什么？"}
+    M.attach_dimensions("T", "consume_abc", [dim], verified=True, graph=g,
+                        import_id="imp_A", import_label="q")
+    M.attach_dimensions("T", "consume_abc", [dim], verified=True, graph=g,
+                        import_id="imp_B", import_label="q")
+    did = "dim:consume_abc:def"
+    assert len(g.backlinks(did, "has_dimension")) == 3, \
+        g.backlinks(did, "has_dimension")     # topic 层 1 + 两次导入各 1
+    assert set(g.sources_of(did, "has_dimension")) == {
+        "consume:consume_abc", "import:imp_A", "import:imp_B"}
+    imps = M.imports_of("T", "consume_abc", "def", graph=g)
+    assert [i["import_id"] for i in imps] == ["imp_A", "imp_B"], imps
+    assert all(i["label"] == "q" for i in imps), imps
+    # 局部图谱：以维度为中心 1 跳就能看到两次导入 + topic
+    lg = g.local_graph(did, depth=1)
+    ids = {n["id"] for n in lg["nodes"]}
+    assert {"import:imp_A", "import:imp_B", "consume:consume_abc"} <= ids, ids
+    assert lg["edges"], "局部图得带边"
+    # 没有节点的 id → 空图，不炸
+    assert g.local_graph("nope") == {"nodes": [], "edges": []}
+    print("PASS  test_backlinks_and_imports_of")
+
+
+def test_origin_upgrade_keeps_backlink_index_honest():
+    """同一 key 的边从 declared 升级为 observed 时，反链索引必须跟着换。
+
+    否则 `backlinks()` 返回的是被丢掉的那个旧对象 —— 反链会报告 origin=
+    "declared" 的陈旧证据（Obsidian 式反链全靠这个索引，错一份就等于说假话）。
+    """
+    from knowledge_graph import Edge, KnowledgeGraph, Node
+
+    g = KnowledgeGraph()
+    for nid in ("a", "b"):
+        g.add_node(Node(id=nid, kind="dimension", label=nid))
+    g.add_edge(Edge(src="a", dst="b", relation="produced_by", origin="declared"))
+    g.add_edge(Edge(src="a", dst="b", relation="produced_by", origin="observed"))
+    back = g.backlinks("b", "produced_by")
+    assert len(back) == 1, back
+    assert back[0].origin == "observed", back[0]
+    assert g.outlinks("a", "produced_by")[0].origin == "observed"
+    print("PASS  test_origin_upgrade_keeps_backlink_index_honest")
+
+
 if __name__ == "__main__":
     test_import_id_is_stable_for_old_records()
     test_import_history_counts_same_question_once_per_batch()
     test_dimensions_hang_under_import_node()
+    test_backlinks_and_imports_of()
+    test_origin_upgrade_keeps_backlink_index_honest()
     print("\nALL PASS")

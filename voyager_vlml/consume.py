@@ -482,8 +482,14 @@ async def consume(
     # 切回 A 时无法证明「这条记录属于谁」。
     _scene_id = "A"
     try:
+        import os as _os
+        # 命令行必须能指定场景（2026-10-20 实测踩坑：`MVE_SCENE=D` 被忽略，
+        # 人导入的记录写进了面板**当前**场景 F，而技能属于 D → 场景隔离把
+        # 技能全挡掉，明明学过却"用到 0 条技能"，两次导入也永远对不上批次）。
+        # 优先级：环境变量（CLI/脚本显式指定）> 面板当前场景 > A。
+        _env_sid = str(_os.environ.get("MVE_SCENE") or "").strip()
         import scenes as _sc
-        _scene_id = str(_sc.current_scene_id() or "A")
+        _scene_id = _env_sid or str(_sc.current_scene_id() or "A")
     except Exception:
         pass
 
@@ -1655,7 +1661,12 @@ def _log(result: dict[str, Any]) -> None:
 def _main() -> int:
     ap = argparse.ArgumentParser(description="消费：人问一句，Voyager 用已积累的能力回答")
     ap.add_argument("question", nargs="*", help="你想问的话")
+    # 与 scene_learn.py --scene 对齐：命令行不指定就跟着面板当前场景走
+    ap.add_argument("--scene", default="", help="场景 id（缺省用面板当前场景）")
     a = ap.parse_args()
+    if a.scene:
+        import os
+        os.environ["MVE_SCENE"] = str(a.scene)
     q = " ".join(a.question).strip() or "Cloud9 在哪张图上崩得最厉害？"
     r = asyncio.run(consume(q))
     print("=== 消费结果 ===")

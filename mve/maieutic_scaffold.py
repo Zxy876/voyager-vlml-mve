@@ -563,3 +563,35 @@ def attach_dimensions(scene_id: str, topic_id: str,
         except Exception:
             pass
     return added
+
+
+def imports_of(scene_id: str, topic_id: str, dim_id: str, *,
+               graph: Any = None) -> list[dict[str, str]]:
+    """这条维度被**哪几次人导入**学过/复用过 —— Obsidian 式反链，不用另记账。
+
+    用户 2026-10-20：「这批图谱上长出来的内容就是那次人导入的子节点……第二
+    次导入同一问题的时候能够用上之前学的东西」，并且「掌握度上升要能被解释」。
+
+    所以"解释"不该靠一张单独的归属表（记漏一次就说不清），而是**图上算出来**：
+    `import:<批次> -has_dimension-> dim:<topic>:<slug>` 的入边就是答案。
+    第二次导入时这条维度的反链里会出现两个 import 节点 —— 一眼看出"复用"。
+    """
+    try:
+        from knowledge_graph import KnowledgeGraph
+    except Exception:
+        return []
+    g = graph if graph is not None else KnowledgeGraph.load()
+    tid = str(topic_id or "").strip()
+    slug = str(dim_id or "").strip()
+    if not tid or not slug:
+        return []
+    did = f"dim:{tid}:{slug}"
+    out: list[dict[str, str]] = []
+    for src in g.sources_of(did, "has_dimension"):
+        if not src.startswith("import:"):
+            continue
+        node = g.nodes.get(src)
+        out.append({"import_id": src.split(":", 1)[1],
+                    "label": str(getattr(node, "label", "") or ""),
+                    "node": src})
+    return out

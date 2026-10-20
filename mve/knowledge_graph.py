@@ -244,6 +244,13 @@ class KnowledgeGraph:
             # 实测证据可以升级声明式边，但反过来不行
             if edge.origin == "observed" and old.origin == "declared":
                 self.edges.remove(old)
+                # 索引里的那份也要换掉，否则 _out/_in（反链查询）还指着旧对象，
+                # 查出来是 origin="declared" 的陈旧证据（Obsidian 式反链全靠
+                # 这两个索引，错一份就等于反链说假话）。
+                for idx in (self._out.get(old.src, []), self._in.get(old.dst, [])):
+                    for i, e in enumerate(idx):
+                        if e is old:
+                            idx[i] = edge
                 old = edge
                 self._by_key[k] = old
                 self.edges.append(old)
@@ -252,6 +259,60 @@ class KnowledgeGraph:
         self.edges.append(edge)
         self._out.setdefault(edge.src, []).append(edge)
         self._in.setdefault(edge.dst, []).append(edge)
+
+    # ---- Obsidian 式双向链接：出链 / 反链 / 局部图（用户 2026-10-20 建议）----
+    # Obsidian 里没有"父子"，只有 `[[链接]]`；**反链是派生索引**，不另存一份。
+    # 这张图本来就在 add_edge 里维护了 `_out`/`_in`（:253-254），只是一直没
+    # 公开查询口 —— 于是"这条维度被哪几次导入学过/复用过"只能靠额外记账，
+    # 记漏了就查不到。暴露出来之后，归属关系是**图上算出来的**：
+    #   backlinks("dim:consume_x:def", "has_dimension")
+    #     → [import:imp_20261020T090000, import:imp_20261020T100000]
+    # 这就是「第二次导入能解释掌握度为什么涨」的依据，不需要新开一张表。
+    def outlinks(self, node_id: str, relation: str | None = None) -> list[Edge]:
+        """它指向别人（Obsidian 的 outgoing links）。"""
+        return [e for e in self._out.get(str(node_id), [])
+                if relation is None or e.relation == relation]
+
+    def backlinks(self, node_id: str, relation: str | None = None) -> list[Edge]:
+        """谁指向它（Obsidian 的反向链接，派生自 _in 索引）。"""
+        return [e for e in self._in.get(str(node_id), [])
+                if relation is None or e.relation == relation]
+
+    def sources_of(self, node_id: str, relation: str | None = None) -> list[str]:
+        """反链的**来源节点 id**（最常用的一问：这条是谁长出来的）。"""
+        seen: list[str] = []
+        for e in self.backlinks(node_id, relation):
+            if e.src not in seen:
+                seen.append(e.src)
+        return seen
+
+    def local_graph(self, node_id: str, depth: int = 2) -> dict[str, Any]:
+        """局部图谱（Obsidian 的 Local Graph）：以它为中心**双向**跳 depth 层。
+
+        面板/模型要回答"这条维度周围有什么"时，不该把整张 800 条边的图扔过去；
+        局部图和 Obsidian 一样，只给邻域。
+        """
+        start = str(node_id)
+        if start not in self.nodes:
+            return {"nodes": [], "edges": []}
+        seen: set[str] = {start}
+        frontier: list[str] = [start]
+        hit: dict[tuple[str, str, str], Edge] = {}
+        for _ in range(max(1, int(depth))):
+            nxt: list[str] = []
+            for nid in frontier:
+                for e in (self._out.get(nid, []) + self._in.get(nid, [])):
+                    hit[e.key()] = e
+                    other = e.dst if e.src == nid else e.src
+                    if other not in seen:
+                        seen.add(other)
+                        nxt.append(other)
+            frontier = nxt
+            if not frontier:
+                break
+        return {"nodes": [self.nodes[n].to_dict() for n in seen
+                          if n in self.nodes],
+                "edges": [e.to_dict() for e in hit.values()]}
 
     # ---- 1→n 场景化（命名空间 / 冷启动 / 增量指标） ----
 
