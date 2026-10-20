@@ -518,6 +518,14 @@ async def _start_learning_impl(
             # 技能按场景取（口径与面板一致：本场景 + default）。
             # 跨场景复用 A 的配方去答 B 的问题，就是「场景隔离没做到」的另一种样子。
             skills = skill_store.retrieve("", question, scene_id=scene)
+            # 可观测：回注了几条、哪几条。技能是新的 primitive（原版
+            # action.py:94 `+ skills`），所以这条数就是"能力边界"的可视化 ——
+            # 不打印的话，人只能从"学得快没快"猜它有没有生效。
+            if skills:
+                _snm = [str((s or {}).get("name") or (s or {}).get("topic") or "")
+                        for s in skills[:6]]
+                print(f"  · 已学配方回注执行层：{len(skills)} 条"
+                      f"（{'、'.join(x for x in _snm if x)}）", flush=True)
             agent = None
             if use_vlml:
                 from voyager_vlml.agents.action import VLMLActionAgent
