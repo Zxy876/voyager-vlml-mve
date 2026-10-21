@@ -54,6 +54,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -64,6 +65,25 @@ _MVE_DIR = _REPO_ROOT / "mve"
 for _p in (str(_REPO_ROOT), str(_MVE_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
+
+
+def _consume_timeout(n_skills: int) -> float:
+    """消费侧重放已学技能的墙钟预算（秒）。
+
+    为什么不能沿用 30s 默认值（2026-10-21 Scene G 实测）：每条技能都是一次
+    **真实的联网/MCP 取数**（一次 web_search 5~20s），命中的题一次要串行合成
+    5 条技能 —— 30s 把整次重放判死：trace 里 5 条技能全进了、一条都没跑回来，
+    面板显示「工具 0 次 · 0 行 / 取到真空」，掌握度（只认消费侧成功取数）
+    自然一次都不涨。预算 = 30s 基础 + 每条技能 25s，封顶 180s；
+    env `MVE_CONSUME_TIMEOUT` 可整体覆盖（下限仍 30s）。
+    """
+    env = os.environ.get("MVE_CONSUME_TIMEOUT")
+    if env:
+        try:
+            return max(30.0, float(env))
+        except ValueError:
+            pass
+    return min(180.0, 30.0 + 25.0 * max(0, int(n_skills or 0)))
 
 from voyager_vlml.agents.action import VLMLActionAgent  # noqa: E402
 from voyager_vlml.agents.critic import has_real_data  # noqa: E402
@@ -675,7 +695,10 @@ async def consume(
                 # 必须走 async 版：同步 run_saved 会在事件循环线程里阻塞等
                 # 自己提交给同一 loop 的 MCP 调用 → 60s 超时 → 配方被误判失效
                 # （2026-10-20 实测：明明命中 3 条配方，却"用到 0 条技能"）。
-                val = await _la.run_saved_async(sc, _scene_dir, scene_id=_scene_id)
+                # 墙钟同样要给足：单条技能 = 一次真实联网取数（2026-10-21）。
+                val = await _la.run_saved_async(
+                    sc, _scene_dir, scene_id=_scene_id,
+                    timeout=_consume_timeout(1))
             except Exception as e:
                 reuse_errors.append(f"重放 {s.get('name')} 抛错：{e}")
                 continue
@@ -705,7 +728,12 @@ async def consume(
                 # （2026-10-20 实测：给了可调用技能，它一条都没调）。
                 require_skills=(str(route_info.get("decision") or "")
                                 in ("HIGH_CONFIDENCE", "MEDIUM_CONFIDENCE"))
-                and bool(skills))
+                and bool(skills),
+                # 墙钟预算要跟着技能条数走（2026-10-21 Scene G 实测）：每条
+                # 技能都是一次真实联网/MCP 取数（一次 web_search 5~20s），
+                # 命中的题一次合成 5 条 → 30s 默认值把整次重放判死
+                # （trace 里 5 条技能全进了、一条都没跑回来 →"执行超时"）。
+                timeout=_consume_timeout(len(skills or [])))
             real = [o for o in obs if o.get("ok") and o.get("data") is not None]
             data = (real[-1].get("data") if real else None)
         # 没取到 → 还是没学会。同样**不自动后台学**（2026-10-19 用户改设计）：
