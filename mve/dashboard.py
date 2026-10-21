@@ -2717,8 +2717,16 @@ function render(s){
     }
   }
   const cl=document.getElementById('clearLog'); if(cl) cl.onclick=async()=>{
-    await fetch('/api/pilot/clear-log',{method:'POST'});
-    uiEvent('clear_log',{},'运行日志已清空');
+    try{
+      const r=await fetch('/api/pilot/clear-log',{method:'POST'});
+      const d=await r.json().catch(()=>({}));
+      if(d && d.ok===false){
+        // 运行中拒绝清屏（unlink 会把整轮日志连句柄一起丢掉）——必须让人看见
+        alert(d.why || '循环还在跑，暂不能清屏');
+        return;
+      }
+      uiEvent('clear_log',{},'运行日志已清空');
+    }catch(e){ alert('清屏失败：'+e); }
     await load();
   };
   const bp=document.getElementById('btnPlacement');
@@ -3528,8 +3536,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/pilot/clear-log":
-            pilot.clear_log()
-            self._json(200, {"ok": True})
+            # 运行中拒绝清屏（pilot 还握着日志 fd，unlink = 整轮日志全丢）
+            self._json(200, pilot.clear_log())
             return
 
         # 清档：摸底前要先把技能库清空（否则考出来的是"练过之后的水平"）。

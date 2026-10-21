@@ -349,10 +349,26 @@ def stop() -> dict[str, Any]:
     return {"ok": True, "stopped": True, "iterations": st.get("iterations", 0)}
 
 
-def clear_log() -> None:
-    """清空驾驶舱日志（面板上「清屏」用）。"""
+def clear_log() -> dict[str, Any]:
+    """清空驾驶舱日志（面板上「清屏」用）。
+
+    ⚠️ 运行中**不许 unlink**（2026-10-21 用户实测「日志怎么没了」）：
+    pilot 与 scene_learn 子进程全程握着 pilot.log 的 fd 在写 —— unlink 之后
+    它们继续往**已删除的 inode** 里写，磁盘上这个文件再也不会出现，面板
+    「暂无日志」一直挂到本轮跑完，整轮日志等于全丢（/proc/<pid>/fd 全是
+    `(deleted)`）。运行中就拒绝并说明；要清屏请先「■ 停止」。
+    """
+    try:
+        st = json.loads(STATE.read_text(encoding="utf-8"))
+    except Exception:
+        st = {}
+    if st.get("running") or st.get("child_pid"):
+        return {"ok": False,
+                "why": "循环还在跑：现在清屏会把整轮日志一起丢掉（写日志的句柄"
+                       "还开着，文件删了也不会再出现）。先「■ 停止」再清。"}
     if LOG.exists():
         LOG.unlink()
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
