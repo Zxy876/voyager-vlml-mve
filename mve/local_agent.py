@@ -294,7 +294,8 @@ def _skill_call_name(raw: str) -> str:
 
 
 def _make_skill_fn(skill: dict[str, Any], scene_dir: str, scene_id: str,
-                   tracer: list[str] | None, timeout: float = 45.0):
+                   tracer: list[str] | None, timeout: float = 45.0,
+                   loop: Any = None):
     """一条已学技能 → 一个**可调用**的函数（同构原版 `programs`）。
 
     原版怎么合成（取证）：
@@ -315,6 +316,13 @@ def _make_skill_fn(skill: dict[str, Any], scene_dir: str, scene_id: str,
     这里把每条技能包成 `skill_<name>()`：在带原语/MCP 的干净命名空间里跑
     那段脚本并返回它的 RESULT。于是新代码可以合成：
         RESULT = {"定义": skill_def(), "起源": skill_origin()}
+
+    `loop`：技能重放要桥回的事件循环，**调用方必须显式传**（solve 在循环线程
+    里捕获好）。技能函数是在外层 `_run_restricted` 的 worker 线程里被调用的，
+    那个线程 `get_running_loop()` 必抛、`_ns_base` 又把 RuntimeError 吞掉
+    → mcp_* 一个都注入不进 → 技能代码里调 `mcp_neko_web_search` 直接
+    NameError（2026-10-21 服务器实测：许嵩 4 次导入全部「技能重放失败」）。
+    与 run_saved_async 忘传主循环是同一类坑，只是长在嵌套的技能函数路径上。
     """
     code = str(skill.get("code") or "").strip()
     label = str(skill.get("name") or skill.get("topic") or "?")
@@ -323,7 +331,8 @@ def _make_skill_fn(skill: dict[str, Any], scene_dir: str, scene_id: str,
     def _fn() -> Any:
         if tracer is not None:
             tracer.append(f"skill:{label}")     # 先记后跑：真调用过才有据
-        ns: dict[str, Any] = _ns_base(scene_dir, scene_id, tracer=tracer)
+        ns: dict[str, Any] = _ns_base(scene_dir, scene_id, tracer=tracer,
+                                      loop=loop)
         box = _run_restricted(code, ns, timeout=timeout)
         if not box.get("ok"):
             raise RuntimeError(
@@ -340,13 +349,13 @@ def _make_skill_fn(skill: dict[str, Any], scene_dir: str, scene_id: str,
 
 def _build_skill_fns(skills: list[dict[str, Any]] | None, scene_dir: str,
                      scene_id: str, tracer: list[str],
-                     limit: int = 8) -> dict[str, Any]:
+                     limit: int = 8, loop: Any = None) -> dict[str, Any]:
     """把检索到的技能编成一组可调用函数（同原版 `programs` 拼进同一作用域）。"""
     out: dict[str, Any] = {}
     for s in list(skills or [])[:limit]:
         if not str((s or {}).get("code") or "").strip():
             continue
-        fn = _make_skill_fn(s, scene_dir, scene_id, tracer)
+        fn = _make_skill_fn(s, scene_dir, scene_id, tracer, loop=loop)
         if fn.__name__ and fn.__name__ not in out:
             out[fn.__name__] = fn
     return out
@@ -395,11 +404,19 @@ async def solve(question: str, scene_dir: str, *, llm=None,
         return chat(msgs, temperature=0.2)
 
     def _ns(tracer: list[str]) -> dict[str, Any]:
-        ns = _ns_base(scene_dir, scene_id, tracer=tracer)
+        # solve 是协程、跑在事件循环线程里 → 这里能拿到主循环。技能函数
+        # 稍后在 worker 线程里执行，届时再取循环必抛（_ns_base 吞掉后
+        # mcp_* 全部注入失败 → 技能内 NameError），所以**现在**捕获好传下去。
+        try:
+            _loop = asyncio.get_running_loop()
+        except RuntimeError:      # 测试等非协程环境：退回旧行为（如实降级）
+            _loop = None
+        ns = _ns_base(scene_dir, scene_id, tracer=tracer, loop=_loop)
         # 已学技能进**执行域**（不是只进 prompt）—— 同构原版
         # index.js:256 的 `programs + code` 同作用域 eval：模型写的
         # `skill_def()` 才真的调得到。
-        ns.update(_build_skill_fns(skills, scene_dir, scene_id, tracer))
+        ns.update(_build_skill_fns(skills, scene_dir, scene_id, tracer,
+                                   loop=_loop))
         return ns
 
     # 场景目录里**现有**什么，直接告诉它（否则它会猜 *.txt 而真实文件是 .json）

@@ -32,6 +32,7 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import local_agent  # noqa: E402
@@ -189,10 +190,57 @@ def test_hit_question_must_call_learned_skills():
     print("PASS  test_hit_question_must_call_learned_skills")
 
 
+def test_skill_replay_inherits_event_loop():
+    """技能重放必须**显式继承主循环**（2026-10-21 服务器实测根因）。
+
+    许嵩 4 次导入全报 `已学技能 style 重放失败：NameError: name
+    'mcp_neko_web_search' is not defined`：技能函数在外层 `_run_restricted`
+    的 worker 线程里重新构建命名空间，那个线程没有运行中的循环，
+    `_ns_base` 吞掉 RuntimeError → mcp_* 一个都注入不进 → 技能内 NameError。
+    与 run_saved_async 忘传主循环是同一类坑，只是长在嵌套的技能函数路径上。
+    """
+    import asyncio
+    import threading
+
+    tmp = Path(tempfile.mkdtemp())
+    real = local_agent._ns_base
+    seen: list[tuple[str, Any]] = []
+
+    def spy(scene_dir, scene_id="", tracer=None, loop=None):
+        seen.append((threading.current_thread().name, loop))
+        return real(scene_dir, scene_id, tracer=tracer, loop=loop)
+
+    local_agent._ns_base = spy
+
+    def fake(_msgs):
+        return "```python\nRESULT = skill_def()\n```"
+
+    try:
+        obs, _ = asyncio.run(local_agent.solve(
+            "许嵩的音乐风格", str(tmp), llm=fake, scene_id="", max_iters=1,
+            skills=[{"name": "def", "code": "RESULT = {'a': 1}"}]))
+        assert obs and obs[-1]["ok"], obs[-1]
+        assert seen, "spy 没被调到"
+        main_loop = seen[0][1]
+        assert main_loop is not None, "solve 必须在循环线程捕获主循环"
+        worker_calls = [s for s in seen[1:]
+                        if s[0] != threading.main_thread().name]
+        assert worker_calls, f"技能重放应发生在 worker 线程：{seen}"
+        for tname, loop in worker_calls:
+            assert loop is main_loop, (
+                f"worker 线程（{tname}）里的技能重放收到 loop={loop}，"
+                "必须显式传主循环，否则 mcp_* 注入全失败 → 技能内 NameError")
+    finally:
+        local_agent._ns_base = real
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("PASS  test_skill_replay_inherits_event_loop")
+
+
 if __name__ == "__main__":
     test_skill_name_is_stable_and_safe()
     test_skill_function_is_callable_in_execution_scope()
     test_model_code_can_compose_two_skills()
     test_retrieve_uses_this_questions_topic()
     test_hit_question_must_call_learned_skills()
+    test_skill_replay_inherits_event_loop()
     print("\nALL PASS")
