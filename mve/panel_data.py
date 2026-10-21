@@ -13,6 +13,8 @@ VLML 没有前端（仓库内无 html/tsx/jsx），所以面板形态取自伴�
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,41 @@ import skill_store  # noqa: E402
 import practice_scope  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent
+
+
+# ---------------------------------------------------------------------------
+# build_state 的单飞 + 短缓存（2026-10-21 黑客松面板挂死取证后补）
+#
+# 事故形态：前端每 4 秒轮询 /api/state，每次 build_state 里 probe_env 都要
+# `asyncio.run(get_database_info())` 开一个 duckdb 连接。第一个请求一慢
+# （内存吃紧 / duckdb 争锁），后续轮询**并发堆线程**——ThreadingHTTPServer
+# 来者不拒，几十个线程各自开 duckdb、各自算一遍完整 state，内存冲到 3.2G
+# 开始换页 → 更慢 → 更多堆积。接口永远不返回，浏览器侧就是
+# "Unexpected end of JSON input"（进程被 py-spy 实锤：几十个线程卡在
+# probe_env / _load_raw，77 个 duckdb fd 同时开着）。
+#
+# 治法：同一时刻只允许一个 build 在跑（单飞），其余请求直接给**上一份结果**；
+# 算完的缓存 3 秒内直接复用。数据是日志聚合，3 秒内的旧值人眼看不出差别。
+# ---------------------------------------------------------------------------
+_STATE_CACHE: dict[str, Any] = {"at": 0.0, "value": None}
+_STATE_LOCK = threading.Lock()
+_STATE_TTL = 3.0
+
+# 单飞的闸门：同一时刻只允许一个 build 在算，其余请求等它算完拿同一份。
+_INFLIGHT_LOCK = threading.Lock()
+_INFLIGHT: dict[str, Any] = {"on": False, "done": threading.Event()}
+
+# probe_env 每次都要新开一个 duckdb 连接（vlml db/manager.py 即开即关），
+# 而 /api/state 一个 build 里要调两次；换库/切场景之外没必要那么勤。15s 足够。
+_ENV_CACHE: dict[str, Any] = {"at": 0.0, "value": None}
+_ENV_TTL = 15.0
+
+
+def build_state_invalidate() -> None:
+    """改动了账目（学习落盘/清库/切场景）之后叫一声，让下一轮强制重算。"""
+    with _STATE_LOCK:
+        _STATE_CACHE["at"] = 0.0
+        _ENV_CACHE["at"] = 0.0
 
 
 def _task_library() -> list[dict[str, Any]]:
@@ -585,12 +622,28 @@ def _next_recommend() -> dict[str, Any]:
                 "question": "", "difficulty": 0}
 
 
-def probe_env() -> dict[str, Any]:
+def probe_env(force: bool = False) -> dict[str, Any]:
     """探测 VLML 是否可用。
 
     助产士第三轮的要求：MCP 连不上时面板必须说清楚，不能静默显示空。
     这里不做重试，只报状态 + 原因，由人决定下一步。
+
+    2026-10-21 起带 15s 缓存：每次探测都要新开 duckdb 连接，面板轮询下
+    这是最贵的一次系统调用（事故里 77 个 fd 全卡在这一步）。
     """
+    if not force:
+        with _STATE_LOCK:
+            if (_ENV_CACHE["value"] is not None
+                    and time.time() - _ENV_CACHE["at"] < _ENV_TTL):
+                return _ENV_CACHE["value"]
+    result = _probe_env_uncached()
+    with _STATE_LOCK:
+        _ENV_CACHE["value"] = result
+        _ENV_CACHE["at"] = time.time()
+    return result
+
+
+def _probe_env_uncached() -> dict[str, Any]:
     try:
         import vlml_env  # noqa: F401  (会 chdir + 打补丁)
         from vlml_env import get_database_info
@@ -617,7 +670,70 @@ def probe_env() -> dict[str, Any]:
                 "reason": f"{type(e).__name__}: {e}"[:200]}
 
 
+def _scene_cache_key() -> str:
+    """缓存必须按场景分桶 —— 否则切了场景前端还在读上一份（用户 2026-10-18
+    「切了场景之后应该这几个页面的内容都关于那个场景」的最直接违反）。
+    test_scene_isolation 就是靠这条守着的。"""
+    try:
+        import scenes as _sc
+        return str(_sc.current_scene_id() or "A")
+    except Exception:
+        return "A"
+
+
 def build_state() -> dict[str, Any]:
+    """聚合面板全部视图（单飞 + 3s 缓存，为什么必须：见文件头的事故记录）。
+
+    1→n：全页签按当前场景过滤（用户 2026-10-18「切了场景之后应该这几个
+    页面的内容都关于那个场景」）；练习线 run_log 同理。旧记录无 scene 键 →
+    for_scene 归 A，与 consume() / coach.explain() 的默认口径一致。
+    """
+    key = _scene_cache_key()
+    with _STATE_LOCK:
+        if (_STATE_CACHE["value"] is not None
+                and _STATE_CACHE.get("key") == key
+                and time.time() - _STATE_CACHE["at"] < _STATE_TTL):
+            return _STATE_CACHE["value"]
+    with _INFLIGHT_LOCK:
+        if _INFLIGHT["on"]:
+            ev, mine = _INFLIGHT["done"], False
+        else:
+            _INFLIGHT["on"] = True
+            _INFLIGHT["done"] = ev = threading.Event()
+            mine = True
+    if not mine:
+        # 已经有一个 build 在跑：**等它算完拿同一份**（最多 30s），而不是
+        # 各自再开一个 duckdb 连接 —— 事故里 77 个 fd 就是这么堆出来的。
+        ev.wait(timeout=30.0)
+        with _STATE_LOCK:
+            cached = _STATE_CACHE["value"]
+            cached_key = _STATE_CACHE.get("key")
+        if cached is not None and cached_key == key:
+            return cached
+        # 等了 30s 还一份都没有（首个请求就算崩了），或刚切了场景而那一份
+        # 是别人场景的：给**合法 JSON**，前端至少能显示"正在聚合"，
+        # 不再出现 Unexpected end of JSON input。
+        return {"ok": False, "pending": True,
+                "reasons": ["面板正在聚合数据，请稍后刷新"], "scene": {}}
+    try:
+        state = _build_state_uncached()
+    except Exception as e:  # 单飞闸门必须放行，否则整个面板永久 500
+        with _INFLIGHT_LOCK:
+            _INFLIGHT["on"] = False
+            ev.set()
+        return {"ok": False, "pending": False,
+                "reasons": [f"聚合失败：{type(e).__name__}: {e}"[:200]], "scene": {}}
+    with _INFLIGHT_LOCK:
+        _INFLIGHT["on"] = False
+        ev.set()
+    with _STATE_LOCK:
+        _STATE_CACHE["value"] = state
+        _STATE_CACHE["key"] = key
+        _STATE_CACHE["at"] = time.time()
+    return state
+
+
+def _build_state_uncached() -> dict[str, Any]:
     # 1→n：全页签按当前场景过滤（用户 2026-10-18：「切了场景之后应该这几个
     # 页面的内容都关于那个场景」）。练习线 run_log 同理 —— B 的练习轮不该
     # 混进 A 的轨迹页。旧记录无 scene 键 → for_scene 归 A，与 consume() /
