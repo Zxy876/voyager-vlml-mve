@@ -773,17 +773,32 @@ async def ensure_mcp_tools(scene_id: str) -> dict[str, Any]:
 
     幂等：已连上的 server 不重连（重连会白起子进程）。连不上/没配置都如实返回
     原因，不假装工具有了。
+
+    **但「已连上」必须按事件循环判**（2026-10-21 Scene H 实测，第二层坑）：
+    面板每次导入都 `asyncio.run()` 起一个**新循环**，网关却是进程级单例；
+    stdio 的 transport / _read_loop 绑在连接时的那个循环上。第一次导入连的
+    循环跑完就关了，之后每次导入 `connected_servers()` 都非空 → 跳过重连 →
+    把 MCP 调用桥到已关闭的旧循环 → 永远等不到响应，每条技能重放撑满墙钟
+    （5 条全部「执行超时（>55s）」，而 16:14 重启后第一次导入明明是通的）。
+    所以这里发现「绑在别的循环上的死连接」就断开重连 —— 子进程会白起一批，
+    这是换取「每次导入 MCP 都真能用」的代价。
     """
     if not scene_id:
         return {"exposed": [], "why": "未指定场景 → 不接远端工具"}
     try:
         import mcp_gateway
         gw = mcp_gateway.get_gateway()
+        cur = asyncio.get_running_loop()
+        reconnected: list[str] = []
+        if gw.stale_servers(cur):
+            reconnected = list(gw.stale_servers(cur))
+            await gw.disconnect_all()      # 死连接必须整批换掉（都绑旧循环）
         if not gw.connected_servers():
             await gw.connect_all()
         exp = gw.expose_as_actions(scene_id)
         return {"exposed": list(exp.get("exposed") or []),
                 "servers": gw.connected_servers(),
+                "reconnected": reconnected,
                 "reason": str(exp.get("reason") or "")}
     except Exception as e:      # 网关挂了不该拖垮消费/学习，如实报即可
         return {"exposed": [], "error": f"{type(e).__name__}: {e}"}

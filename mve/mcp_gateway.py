@@ -186,6 +186,7 @@ class MCPClient:
         self.connected = False
         self.tools: list[MCPTool] = []
         self.error = ""                     # 连接失败原因（如实报给上层）
+        self.loop: Any = None               # **连接时所在的事件循环**（见 connect）
         self._request_id = 0
         self._pending: dict[int, asyncio.Future] = {}
         self._read_task: asyncio.Task | None = None
@@ -226,6 +227,12 @@ class MCPClient:
                 raise RuntimeError(f"tools/list 失败：{listed['error']}")
             self.tools = _parse_tools(listed.get("result"), self.config.name)
             self.connected = True
+            # stdio 的 transport / _read_loop 都绑在**当前**循环上。面板每次
+            # 导入都是 asyncio.run() 起的新循环，网关却是进程级单例 —— 不记
+            # 这个循环，第二次导入就会把调用桥到已关闭的旧循环上，永远等不到
+            # 响应（2026-10-21 Scene H 实测：5 条技能重放全部 >55s 超时，而
+            # 第一次导入明明是通的）。ensure_mcp_tools 靠它判断要不要重连。
+            self.loop = asyncio.get_running_loop()
             return True
         except asyncio.TimeoutError:
             self.error = f"连接超时（{timeout}s）"
@@ -290,6 +297,7 @@ class MCPClient:
                 pass
         self.process = None
         self.tools = []
+        self.loop = None
         self._fail_pending("连接已关闭")
 
     # ---- 帧收发（换行分隔 JSON-RPC）----
@@ -478,9 +486,27 @@ class MCPGateway:
                  "input_schema": t.input_schema}
                 for c in self._clients.values() for t in c.tools]
 
-    def connected_servers(self) -> list[str]:
-        """已连上的 server 名（重复 `connect_all` 前先问一句，别白起子进程）。"""
-        return [n for n, c in self._clients.items() if getattr(c, "connected", False)]
+    def connected_servers(self, loop: Any = None) -> list[str]:
+        """已连上的 server 名（重复 `connect_all` 前先问一句，别白起子进程）。
+
+        `loop` 给了就只算**绑在这个循环上**的连接：stdio 的 transport 和
+        _read_loop 都属于连接时的那个循环，换循环后连接虽然在、却已经是
+        死的（跨循环等不到响应）。面板每次导入都是新循环 → 必须按循环判。
+        """
+        out = []
+        for n, c in self._clients.items():
+            if not getattr(c, "connected", False):
+                continue
+            if loop is not None and getattr(c, "loop", None) is not loop:
+                continue
+            out.append(n)
+        return out
+
+    def stale_servers(self, loop: Any) -> list[str]:
+        """连接还在、但绑在**别的循环**上的 server（要断开重连的一批）。"""
+        return [n for n, c in self._clients.items()
+                if getattr(c, "connected", False)
+                and getattr(c, "loop", None) is not loop]
 
     def status(self) -> dict[str, Any]:
         servers = []

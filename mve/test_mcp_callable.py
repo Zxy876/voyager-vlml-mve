@@ -174,15 +174,25 @@ def test_ensure_mcp_tools_mounts_scene_entries():
     import mcp_gateway
 
     class _FakeGW:
-        def __init__(self, connected):
+        def __init__(self, connected, stale=None):
             self._connected = connected
+            self._stale = list(stale or [])
             self.calls: list[str] = []
 
-        def connected_servers(self):
-            return list(self._connected)
+        def connected_servers(self, loop=None):
+            return [] if self._stale else list(self._connected)
+
+        def stale_servers(self, loop):
+            return list(self._stale)
+
+        async def disconnect_all(self):
+            self.calls.append("disconnect")
+            self._stale = []
+            self._connected = []
 
         async def connect_all(self, timeout=30.0):
             self.calls.append("connect")
+            self._stale = []
             self._connected = ["neko"]
             return {"connected": [{"server": "neko", "tools": 3}], "failed": []}
 
@@ -199,24 +209,33 @@ def test_ensure_mcp_tools_mounts_scene_entries():
         assert gw.calls == ["connect", "expose:D"], gw.calls
         assert out["exposed"] == ["mcp_neko_web_search"], out
 
-        # ② 已连上 → 不重连（重连会白起子进程）
+        # ② 已连上（循环匹配）→ 不重连（重连会白起子进程）
         gw2 = _FakeGW(["neko"])
         mcp_gateway.get_gateway = lambda: gw2
         asyncio.run(local_agent.ensure_mcp_tools("D"))
         assert gw2.calls == ["expose:D"], gw2.calls
 
-        # ③ 没指定场景 → 什么都不做，如实说原因
-        out3 = asyncio.run(local_agent.ensure_mcp_tools(""))
-        assert out3["exposed"] == [] and out3.get("why"), out3
+        # ③ 连接还在但绑在**别的循环**上（面板每次导入都是新 asyncio.run 循环）
+        #    → 必须整批断开重连，否则调用桥到已关闭的旧循环、永远等不到响应
+        #    （2026-10-21 Scene H 实测：5 条技能重放全部 >55s 超时）。
+        gw3 = _FakeGW(["neko"], stale=["neko"])
+        mcp_gateway.get_gateway = lambda: gw3
+        out3 = asyncio.run(local_agent.ensure_mcp_tools("D"))
+        assert gw3.calls == ["disconnect", "connect", "expose:D"], gw3.calls
+        assert out3.get("reconnected") == ["neko"], out3
 
-        # ④ 网关抛错不拖垮上层，错误进返回值
+        # ④ 没指定场景 → 什么都不做，如实说原因
+        out4 = asyncio.run(local_agent.ensure_mcp_tools(""))
+        assert out4["exposed"] == [] and out4.get("why"), out4
+
+        # ⑤ 网关抛错不拖垮上层，错误进返回值
         class _BoomGW:
-            def connected_servers(self):
+            def stale_servers(self, loop):
                 raise RuntimeError("网关坏了")
 
         mcp_gateway.get_gateway = lambda: _BoomGW()
-        out4 = asyncio.run(local_agent.ensure_mcp_tools("D"))
-        assert out4["exposed"] == [] and "网关坏了" in out4.get("error", ""), out4
+        out5 = asyncio.run(local_agent.ensure_mcp_tools("D"))
+        assert out5["exposed"] == [] and "网关坏了" in out5.get("error", ""), out5
     finally:
         mcp_gateway.get_gateway = real
     print("PASS  test_ensure_mcp_tools_mounts_scene_entries")
