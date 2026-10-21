@@ -31,11 +31,17 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any
 
 STORE = Path(__file__).resolve().parent / "skill_store.json"
+
+# 解析结果的进程内缓存（键=文件指纹）。作用见 _load_raw 的 docstring：
+# 大库（110MB）下"一次 build_state 解析 5 遍"足以把整机拖进 swap。
+_RAW_CACHE: dict[str, Any] = {"sig": None, "data": None}
+_RAW_LOCK = threading.Lock()
 
 # 照原仓库 retrieval_top_k=5：进 prompt 的经验条数上限
 RETRIEVAL_TOP_K = 5
@@ -64,7 +70,41 @@ def _empty() -> dict[str, Any]:
     }
 
 
+def _store_sig() -> tuple[int, int] | None:
+    """文件指纹（mtime_ns, size）。拿不到就返回 None（按"没缓存"处理）。"""
+    try:
+        st = STORE.stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
 def _load_raw() -> dict[str, Any]:
+    """读技能库（带**进程内解析缓存**，2026-10-21 面板挂死取证后补）。
+
+    为什么必须缓存：黑客松实例的 skill_store.json 有 **110MB**（878 条 × 每条
+    约 93KB，大头是每条 4096 维 embedding 原样存成 JSON）。面板一个 build_state
+    里 all_skills() 被调 5 次 —— 没缓存就是 5 次全量 json.loads，实测
+    build_state 13.7s、进程 RSS 涨到 **3.0G**，而这台 VPS 只有 3.6G，
+    整机进 swap 之后接口永不返回（浏览器 "Unexpected end of JSON input"）。
+
+    缓存键是文件指纹：文件没变就不重复解析；`_save()` 之后立刻把新对象写回
+    缓存（写盘那一路的 data 就是权威副本，不用再解析一遍 110MB）。
+    """
+    sig = _store_sig()
+    if sig is None:
+        return _empty()
+    with _RAW_LOCK:
+        if _RAW_CACHE["sig"] == sig and _RAW_CACHE["data"] is not None:
+            return _RAW_CACHE["data"]
+    data = _load_raw_uncached()
+    with _RAW_LOCK:
+        _RAW_CACHE["sig"] = sig
+        _RAW_CACHE["data"] = data
+    return data
+
+
+def _load_raw_uncached() -> dict[str, Any]:
     if not STORE.exists():
         return _empty()
     try:
@@ -109,6 +149,11 @@ def _save(data: dict[str, Any]) -> None:
         json.dumps(data, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    # 写盘这一路的 data 就是权威副本：直接塞进解析缓存（顺带把指纹换成
+    # 写完之后的新指纹），省掉下一次对 110MB 文件的重新解析。
+    with _RAW_LOCK:
+        _RAW_CACHE["sig"] = _store_sig()
+        _RAW_CACHE["data"] = data
 
 
 # ---------------- 名字归一化与相似度 ----------------
