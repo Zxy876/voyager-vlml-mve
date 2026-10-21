@@ -2150,6 +2150,7 @@ function consumeBlock(im){
       ${im.judgment_result?`<span class="chip ${im.judgment_result==='written'?'ok':(im.judgment_result==='failed'?'bad':'grey')}">${{written:'✅ 写入图谱',insufficient_evidence:'🌱 冷启动单证据',fetched_empty:'取到真空',failed:'失败'}[im.judgment_result]||ESC(im.judgment_result)}</span>`:''}
     </div>
     ${im.reuse_explain?`<div style="margin-top:5px;font-size:12px"><b>为什么算复用：</b>${ESC(im.reuse_explain)}</div>`:''}
+    ${(im.reuse_errors&&im.reuse_errors.length)?`<div style="margin-top:5px;font-size:12px"><b>配方为什么没复用上：</b>${ESC(im.reuse_errors.join('；'))}</div>`:''}
     ${outOfDomainNote(im)}
     ${im.answer?`<div style="margin-top:6px"><b>Voyager 的回答：</b>
       <div class="nocmp-body" style="margin-top:4px">${ESC(im.answer)}</div></div>`:''}

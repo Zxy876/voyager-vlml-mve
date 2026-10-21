@@ -241,6 +241,11 @@ def _log_import(result: dict[str, Any]) -> None:
         # 无法解释。这类"写了却没落盘"的字段已经踩过三次，加字段时顺手进白名单。
         "reuse_explain": str(result.get("reuse_explain") or "")[:300],
         "reuse_note": str(result.get("reuse_note") or "")[:200],
+        # 直接重放每条配方**为什么没成**（超时/没取到数/抛错）——2026-10-21
+        # 又是一个"算了却没落盘"：Scene G 那次 5 条技能直接重放全没成、改走
+        # 合成，但 reuse_errors 不在白名单里，日志里是 null，无法判断是超时
+        # 还是配方失效。**第五次**踩同一个坑，加字段必须同步这里。
+        "reuse_errors": [str(x)[:200] for x in (result.get("reuse_errors") or [])][:6],
         # 这次能用上几个远端工具（能力来源接没接上，面板要看得见）
         "mcp_exposed": list((result.get("mcp_tools") or {}).get("exposed") or [])[:12],
         "mcp_note": str((result.get("mcp_tools") or {}).get("error")
