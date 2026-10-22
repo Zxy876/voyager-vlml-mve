@@ -746,15 +746,27 @@ class MCPGateway:
         return await client.call_tool(tool_name, arguments)
 
     # ---- 暴露 / 撤回（同构「远端工具注入聊天」）----
-    def expose_as_actions(self, scene_id: str) -> dict[str, Any]:
+    def expose_as_actions(self, scene_id: Any) -> dict[str, Any]:
         """把已连接 server 的工具注册成场景动作条目（origin="mcp"）。
 
         注册后 task_decompose.reachability 就能在注册表里判到这些远端工具
         （词面匹配条目名/描述）—— 这就是「用猫娘计划的 mcp 编排插件使用」的
         接入点：远端工具与 forged / learned 条目并列，编排器一视同仁。
+
+        `scene_id` 收 id 字符串，也**容忍** scene dict / Scene 对象（调用方
+        很容易顺手把整个 scene 传进来）。这一点必须归一化（2026-10-22 踩到）：
+        `str({"id": "B", ...})` 会造出一个垃圾 key，条目注册进去后
+        `_ns_base` 按真 id 查永远查不到 —— 现场表现是「重放缺 mcp_xxx 名字」，
+        看上去像开关/注册表陈旧，实际是键错了。宁可这里报错，也不要静默写垃圾键。
         """
         import actions
-        scene_id = str(scene_id)
+        if isinstance(scene_id, dict):
+            scene_id = scene_id.get("id") or scene_id.get("scene_id") or ""
+        elif not isinstance(scene_id, str) and hasattr(scene_id, "id"):
+            scene_id = getattr(scene_id, "id")
+        scene_id = str(scene_id or "").strip()
+        if not scene_id:
+            raise ValueError("expose_as_actions 需要场景 id，收到空值")
         exposed: list[str] = []
         skipped: list[str] = []
         for t in _dedup_tools(self.list_tools()):
