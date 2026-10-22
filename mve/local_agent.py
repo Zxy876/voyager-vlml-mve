@@ -1045,7 +1045,10 @@ def _ns_base(scene_dir: str, scene_id: str = "",
     # tracer 为空（技能重放 run_saved / 测试直连）时**不套**，保持函数原样 ——
     # 免得 repr 变成 <function _w> 而不是 <function web_search>（test_scene_backend
     # 靠 str(web_search) 认名，实测被这个包装破坏过一次）。
-    if tracer is not None:
+    # `evidence` 单独给也要套（2026-10-22 技能体检踩到）：材料账不看 tracer，
+    # 只看「每次调用的实际返回」，而只传 evidence 不传 tracer 时原先不套记录器
+    # → 每次调用都不留痕 → 体检把所有技能判成「凭记忆写的」。
+    if tracer is not None or evidence is not None:
         full = {k: _recorder(tracer, k, evidence)(v) for k, v in full.items()}
     allowed_origins = {"local", "net"}
     names = set(full)
@@ -1086,7 +1089,8 @@ def _ns_base(scene_dir: str, scene_id: str = "",
                 _entry = _make_mcp_callable(gw, tid, _loop,
                                             e.get("input_schema") or {})
                 ns[tid] = (_recorder(tracer, tid, evidence)(_entry)
-                           if tracer is not None else _entry)
+                           if (tracer is not None or evidence is not None)
+                           else _entry)
         except RuntimeError:
             # 既没传 loop、当前线程也没有运行中的事件循环 → 不注入 mcp 远端工具
             # （技能重放请走 run_saved_async，它会把主循环显式带进来）

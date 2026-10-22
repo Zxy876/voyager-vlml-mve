@@ -142,8 +142,10 @@ def test_run_saved_async_offloads_to_worker_thread():
         seen: dict = {}
         real = local_agent.run_saved
 
-        def _spy(code, scene_dir, timeout=30.0, scene_id="", loop=None):
+        def _spy(code, scene_dir, timeout=30.0, scene_id="", loop=None,
+                 evidence=None):
             seen["loop"] = loop
+            seen["evidence"] = evidence
             seen["thread"] = threading.get_ident()
             return {"ok": True}
 
