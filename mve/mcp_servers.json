@@ -1,38 +1,45 @@
 {
+  "_note": "MCP 服务常驻化（2026-10-22）：默认走 url（systemd 常驻的 streamable-http，见 mve/mcp_services.sh install）；服务没起的部署会退回 fallback_command 自己 spawn stdio —— 两条路协议一致。",
   "servers": {
     "neko": {
-      "command": "auto",
-      "args": ["mcp_neko_server.py"],
+      "url": "http://172.18.0.1:8791/mcp",
+      "fallback_command": "auto",
+      "fallback_args": ["mcp_neko_server.py"],
       "env": {},
       "enabled": true
     },
     "fetch": {
-      "command": "auto",
-      "args": ["-m", "mcp_server_fetch"],
+      "url": "http://172.18.0.1:8792/mcp",
+      "fallback_command": "auto",
+      "fallback_args": ["-m", "mcp_server_fetch"],
       "env": {},
       "enabled": true
     },
     "time": {
-      "command": "auto",
-      "args": ["-m", "mcp_server_time"],
+      "url": "http://172.18.0.1:8793/mcp",
+      "fallback_command": "auto",
+      "fallback_args": ["-m", "mcp_server_time"],
       "env": {},
       "enabled": true
     },
     "ddg": {
-      "command": "duckduckgo-mcp-server",
-      "args": [],
+      "url": "http://172.18.0.1:8794/mcp",
+      "fallback_command": "duckduckgo-mcp-server",
+      "fallback_args": [],
       "env": {},
       "enabled": true
     },
     "sequential-thinking": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
+      "url": "http://172.18.0.1:8795/mcp",
+      "fallback_command": "npx",
+      "fallback_args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
       "env": {},
       "enabled": true
     },
     "context7": {
-      "command": "npx",
-      "args": ["-y", "@upstash/context7-mcp"],
+      "url": "http://172.18.0.1:8796/mcp",
+      "fallback_command": "npx",
+      "fallback_args": ["-y", "@upstash/context7-mcp"],
       "env": {},
       "enabled": true
     }

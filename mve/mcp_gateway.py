@@ -131,13 +131,25 @@ DROP = "drop"        # 查无此工具 → 如实报
 # ---------------------------------------------------------------------------
 @dataclass
 class MCPServerConfig:
-    """一个外部 MCP server 的启动配置（stdio：command + args + env）。"""
+    """一个外部 MCP server 的配置。
+
+    两种传输：
+      · stdio（command + args + env）—— 每个进程各自 spawn 一套，代价是
+        transport 绑事件循环、注册表在各自内存里（今天踩的两个坑都在这儿）；
+      · HTTP（url）—— 服务由 systemd 常驻（mcp-proxy 把 stdio 转成
+        streamable-http），每次 tools/call 就是一次 POST，**没有长连接**。
+        这也是用户 2026-10-22 定的方向：「像猫娘一样挂在网关上，不能挂」。
+    `fallback_command/args`：HTTP 不通时退回 stdio（服务没起来的部署仍可用）。
+    """
 
     name: str
     command: str = ""
     args: list[str] = field(default_factory=list)
     env: dict[str, str] = field(default_factory=dict)
     enabled: bool = True
+    url: str = ""
+    fallback_command: str = ""
+    fallback_args: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -387,6 +399,151 @@ class MCPClient:
 
 
 # ---------------------------------------------------------------------------
+# MCPHTTPClient：streamable-HTTP（服务常驻，由 mcp-proxy 把 stdio 转出来）
+# ---------------------------------------------------------------------------
+class MCPHTTPClient:
+    """一次调用 = 一次 POST；**不持有长连接**，因此不绑事件循环。
+
+    背景（2026-10-22 用户定方向：「像猫娘一样挂在网关上，不能挂」）：
+      · stdio 的 transport/`_read_loop` 绑在**连接时**的循环上，面板每次
+        `asyncio.run()` 起新循环就得整批重连（`stale_servers` 那套补丁）；
+      · 每个进程各 spawn 一套 server，注册表/开关快照在各自内存里 ——
+        长驻面板读到陈旧态，重放技能就 NameError（今天 21:23 实测）。
+    HTTP 把这两件事都消掉了：服务是 systemd 常驻，请求彼此独立。
+
+    帧格式照 streamable-http：POST JSON-RPC；响应可能是 application/json
+    （直接一个对象）或 text/event-stream（SSE，取 id 匹配的那条 data 帧）。
+    session 走 `mcp-session-id` 响应头（initialize 时下发，后续请求带回）。
+    """
+
+    def __init__(self, config: MCPServerConfig) -> None:
+        self.config = config
+        self.url = str(config.url or "")
+        self.session_id = ""
+        self.connected = False
+        self.tools: list[MCPTool] = []
+        self.error = ""
+        self.loop: Any = None            # 兼容旧接口（HTTP 用不到）
+        self._request_id = 0
+
+    # ---- 底层：一次 POST ----
+    def _post(self, payload: dict[str, Any], timeout: float) -> dict[str, Any]:
+        import urllib.error
+        import urllib.request
+        headers = {"Content-Type": "application/json",
+                   "Accept": "application/json, text/event-stream"}
+        if self.session_id:
+            headers["mcp-session-id"] = self.session_id
+        req = urllib.request.Request(
+            self.url, data=json.dumps(payload).encode(),
+            headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                sid = resp.headers.get("mcp-session-id")
+                if sid:
+                    self.session_id = sid
+                ctype = str(resp.headers.get("content-type") or "")
+                raw = resp.read()
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode("utf-8", "replace")[:200]
+            except Exception:
+                pass
+            raise RuntimeError(f"HTTP {e.code}：{body or e.reason}") from e
+        text = raw.decode("utf-8", errors="replace")
+        if "text/event-stream" in ctype:
+            out: dict[str, Any] = {}
+            for line in text.splitlines():
+                line = line.strip()
+                if not line.startswith("data:"):
+                    continue
+                try:
+                    obj = json.loads(line[5:].strip())
+                except Exception:
+                    continue
+                if isinstance(obj, dict) and obj.get("id") == payload.get("id"):
+                    out = obj
+            return out
+        try:
+            data = json.loads(text)
+        except Exception:
+            return {}
+        # 批量返回（部分实现会包成数组）
+        if isinstance(data, list):
+            for obj in data:
+                if isinstance(obj, dict) and obj.get("id") == payload.get("id"):
+                    return obj
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _request(self, method: str, params: dict[str, Any], *,
+                 timeout: float = 30.0) -> dict[str, Any]:
+        self._request_id += 1
+        return self._post({"jsonrpc": "2.0", "id": self._request_id,
+                           "method": method, "params": params}, timeout)
+
+    def _notify(self, method: str, params: dict[str, Any],
+                timeout: float = 15.0) -> None:
+        self._post({"jsonrpc": "2.0", "method": method, "params": params},
+                   timeout)
+
+    # ---- 对外接口（与 MCPClient 一致）----
+    async def connect(self, timeout: float = 30.0) -> bool:
+        if not self.url:
+            self.error = "HTTP 传输必须配 url"
+            return False
+        try:
+            init = await asyncio.to_thread(self._request, "initialize", {
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": dict(CLIENT_INFO),
+            }, timeout=timeout)
+            if init.get("error"):
+                raise RuntimeError(f"initialize 失败：{init['error']}")
+            # 握手完成通知：服务端可能回 202/空体，失败不算致命
+            try:
+                await asyncio.to_thread(
+                    self._notify, "notifications/initialized", {})
+            except Exception:
+                pass
+            listed = await asyncio.to_thread(
+                self._request, "tools/list", {}, timeout=timeout)
+            if listed.get("error"):
+                raise RuntimeError(f"tools/list 失败：{listed['error']}")
+            self.tools = _parse_tools(listed.get("result"), self.config.name)
+            self.connected = True
+            return True
+        except Exception as e:
+            self.error = f"{type(e).__name__}: {e}"
+            self.connected = False
+            self.tools = []
+            return False
+
+    async def call_tool(self, tool_name: str, arguments: dict[str, Any], *,
+                        timeout: float = 60.0) -> dict[str, Any]:
+        if not self.connected:
+            return {"error": f"server '{self.config.name}' 未连接"}
+        try:
+            res = await asyncio.to_thread(
+                self._request, "tools/call",
+                {"name": str(tool_name), "arguments": dict(arguments or {})},
+                timeout=timeout)
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {e}"}
+        if res.get("error"):
+            return {"error": res["error"]}
+        return {"result": res.get("result")}
+
+    async def disconnect(self) -> None:
+        """HTTP 没有长连接要关：清状态即可（服务是常驻的，不该被客户端关掉）。"""
+        self.connected = False
+        self.tools = []
+        self.session_id = ""
+        self.loop = None
+
+
+# ---------------------------------------------------------------------------
 # MCPGateway：多 server 管理 + 路由 + 远端工具暴露为场景动作条目
 # ---------------------------------------------------------------------------
 def _make_remote_entry(gateway: "MCPGateway", tool: MCPTool):
@@ -436,12 +593,18 @@ class MCPGateway:
                 continue
             env = cfg.get("env") if isinstance(cfg.get("env"), dict) else {}
             raw_args = cfg.get("args") if isinstance(cfg.get("args"), list) else []
+            fb_cmd = cfg.get("fallback_command")
+            fb_args = cfg.get("fallback_args") if isinstance(
+                cfg.get("fallback_args"), list) else []
             servers[str(name)] = MCPServerConfig(
                 name=str(name),
                 command=_resolve_command(cfg.get("command")),
                 args=[_resolve_arg(str(a)) for a in raw_args],
                 env={str(k): str(v) for k, v in env.items()},
                 enabled=bool(cfg.get("enabled", True)),
+                url=str(cfg.get("url") or "").strip(),
+                fallback_command=(_resolve_command(fb_cmd) if fb_cmd else ""),
+                fallback_args=[_resolve_arg(str(a)) for a in fb_args],
             )
         return {"servers": servers, "reason": ""}
 
@@ -454,11 +617,31 @@ class MCPGateway:
         for name, c in self._configs.items():
             if not c.enabled:
                 continue
-            client = MCPClient(c)
-            if await client.connect(timeout=timeout):
+            # 配了 url 就走常驻 HTTP 服务（用户 2026-10-22：像猫娘一样挂网关）；
+            # 连不上再退回 stdio 自己 spawn —— 服务没起的部署仍可用，且失败原因
+            # 会带上「HTTP 那次为什么失败」，不是一句笼统的连不上。
+            if c.url:
+                client: Any = MCPHTTPClient(c)
+                ok = await client.connect(timeout=timeout)
+                why_http = "" if ok else client.error
+                if not ok and c.fallback_command:
+                    client = MCPClient(MCPServerConfig(
+                        name=c.name, command=c.fallback_command,
+                        args=list(c.fallback_args), env=dict(c.env)))
+                    ok = await client.connect(timeout=timeout)
+                    if not ok:
+                        client.error = (f"HTTP 失败（{why_http}）；退回 stdio 也失败"
+                                        f"（{client.error}）")
+                elif not ok:
+                    client.error = f"HTTP 失败：{why_http}"
+            else:
+                client = MCPClient(c)
+                ok = await client.connect(timeout=timeout)
+            if ok:
                 self._clients[name] = client
                 out["connected"].append({"server": name,
-                                         "tools": len(client.tools)})
+                                         "tools": len(client.tools),
+                                         "transport": ("http" if c.url and isinstance(client, MCPHTTPClient) else "stdio")})
             else:
                 out["failed"].append({"server": name, "why": client.error})
         out["servers"] = self.status()
