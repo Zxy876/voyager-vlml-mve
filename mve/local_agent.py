@@ -220,7 +220,13 @@ PROMPT_SYSTEM = """你是本机数据助手。你能用的是**这个应用工�
    联网也取不到（没网/被限流）才 `RESULT = {"error": "..."}` 如实说。
    拿无关文件的内容当答案是比"没有答案"更糟的错（2026-10-19 服务器实测：
    问世界模型，它把 subjects.json 整份当成答案交了上来）；
-6. 取不到就如实说，不要编造。"""
+6. 取不到就如实说，不要编造。
+
+联网取证的正确链路（同构 maieutic 研究管道：搜索只是种子，正文才是证据）：
+· 搜索结果是**索引不是证据**：snippet 常为空/太短，不能直接当答案交上来；
+· 从结果里挑最相关的 1~2 个 URL，用 `web_fetch(url)` 拿**正文**，
+  从正文里提炼答案写 RESULT（带来源 URL）；第一个抓不到就换下一个；
+· 只 search 不 fetch 就交答案 = 没拿到证据，不算完成。"""
 
 
 def _run_restricted(code: str, ns: dict[str, Any], timeout: float = 30.0
@@ -552,16 +558,32 @@ async def solve(question: str, scene_dir: str, *, llm=None,
             _ex = ("web_search" if "web_search" in _names
                    else next((n for n in _names if "search" in n),
                              _names[0] if _names else "web_search"))
+            # 有 fetch 类工具就演示**两步链**（照 maieutic 管道：search 只是
+            # 种子，正文才是证据）。2026-10-22 场景 B 实测根因：示例只有
+            # `r = web_search(query)`，模型照抄 → 把空 snippet 当答案交上来
+            # → 维度拿不到正文 → 闸门闭合不了（24 次失败里零次 web_fetch）。
+            _fx = next((n for n in _names if n == "web_fetch"
+                        or (n.startswith("web_") and "fetch" in n)), "")
+            if _fx:
+                _code_ex = (
+                    f"hits = {_ex}(query=\"<本题关键词>\")\n"
+                    f"page = {_fx}(hits[0][\"url\"])   # 抓正文；抓不到就换 hits[1]\n"
+                    f"RESULT = {{\"answer\": <从 page[\"text\"] 提炼的答案>, "
+                    f"\"source\": hits[0][\"url\"]}}")
+            else:
+                _code_ex = (
+                    f"r = {_ex}(query=\"<本题关键词>\")\n"
+                    f"RESULT = {{\"answer\": r, \"source\": \"{_ex}\"}}")
             fetch_txt = (
                 "【取证要求（先做这个，再写答案）】这是**学习环节**：你的答案必须"
                 "来自你**真正调用**下列函数取回的内容，凭记忆直接写的答案判不通"
                 "过、也不会被记成能力。\n可用函数："
                 + "、".join(_names[:16]) + "\n"
-                "代码必须长这样（先取证，再据实组织；参数照上面签名的名字传）：\n"
-                "```python\n"
-                f"r = {_ex}(query=\"<本题关键词>\")\n"
-                f"RESULT = {{\"answer\": r, \"source\": \"{_ex}\"}}\n"
-                "```\n")
+                + ("搜索结果只是索引：必须再对最相关的结果做网页抓取拿**正文**，"
+                   "从正文提炼答案（snippet 常为空，不能当证据）。\n"
+                   if _fx else "")
+                + "代码必须长这样（先取证，再据实组织；参数照上面签名的名字传）：\n"
+                "```python\n" + _code_ex + "\n```\n")
         user = (f"问题：{question}\n\n{inv_txt}\n" + fetch_txt
                 + dim_txt + avoid_txt
                 + (f"\n上一轮没通过 critic 检查，它的评语（务必针对它改）：{critique}\n"

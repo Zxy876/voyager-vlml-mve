@@ -89,6 +89,11 @@ def web_search(query: str, max_results: int = 5) -> list[dict[str, Any]]:
             last_err = "页面里解析不出结果（可能被限流）"
         except Exception as e:
             last_err = f"{type(e).__name__}: {e}"
+            # 2026-10-22 场景 B：VPS 出口 IP 被 DDG 限流（403），24 次撞墙没一次
+            # 换关键词 —— 报错里必须给出路，别让模型对着同一堵墙原地重试。
+            if "403" in last_err or "429" in last_err:
+                last_err += ("（可能被搜索服务限流：换个更具体的关键词重试，"
+                             "或稍后再试；不要用同一个关键词反复撞）")
     raise RuntimeError(f"联网搜索失败：{last_err} —— 取不到就如实说，不编造")
 
 
@@ -113,10 +118,16 @@ def _parse_ddg(html: str) -> list[dict[str, Any]]:
             if ("duckduckgo" in url) or (not title):
                 continue
             out.append({"title": title, "url": url, "snippet": ""})
-    # snippet：跟在结果后面的 result__snippet
+    # snippet：跟在结果后面的 result__snippet（html 版）
     for i, m in enumerate(re.finditer(
             r'class="result__snippet"[^>]*>(.*?)</a>', html, re.S)):
         if i < len(out):
+            out[i]["snippet"] = re.sub(r"<[^>]+>", "", m.group(1)).strip()[:300]
+    # lite 版的摘要在 <td class="result-snippet"> 里（与结果同序；2026-10-22 补
+    # —— 之前 lite 端点的结果 snippet 恒空，模型拿到索引页没摘要更不会去 fetch）
+    for i, m in enumerate(re.finditer(
+            r'class="result-snippet"[^>]*>(.*?)</td>', html, re.S)):
+        if i < len(out) and not out[i]["snippet"]:
             out[i]["snippet"] = re.sub(r"<[^>]+>", "", m.group(1)).strip()[:300]
     return out
 
