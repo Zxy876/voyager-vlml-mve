@@ -1045,6 +1045,28 @@ def _ns_base(scene_dir: str, scene_id: str = "",
     return ns
 
 
+def _missing_names(code: str, ns: dict[str, Any]) -> set[str]:
+    """代码引用了、但命名空间里没有的名字（Load 语境；排除代码自定义的）。"""
+    import ast
+    try:
+        tree = ast.parse(str(code or ""))
+    except SyntaxError:
+        return set()
+    defined: set[str] = set()
+    loaded: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            (loaded if isinstance(node.ctx, ast.Load) else defined).add(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+            defined.add(node.name)
+        elif isinstance(node, ast.arg):
+            defined.add(node.arg)
+    bi = set(ns.get("__builtins__") or {}) if isinstance(
+        ns.get("__builtins__"), dict) else set()
+    return {n for n in loaded - defined
+            if n not in ns and n not in bi and not n.startswith("__")}
+
+
 def run_saved(code: str, scene_dir: str, timeout: float = 30.0,
               scene_id: str = "", loop: Any = None) -> Any:
     """跑一段已存下来的本机技能代码，返回它的 RESULT（失败抛异常，由调用方如实报）。
@@ -1053,6 +1075,26 @@ def run_saved(code: str, scene_dir: str, timeout: float = 30.0,
     exec 挪到 worker 线程并把主循环带进来），**不要**在协程里直接调这个同步版。
     """
     ns = _ns_base(scene_dir, scene_id, loop=loop)
+    # 自愈（2026-10-22 场景 B 实测）：技能代码引用 web_search，重放却报
+    # NameError —— 同一次消费里 ③b 现场写的 mcp_* 却能用。说明**长驻进程**
+    # （面板）内存里的注册表/开关快照可能陈旧，重放不能依赖「调用方刚好
+    # 注册过、开关刚好新鲜」。代码引用了 ns 里没有的名字 → 重新注册一遍
+    # （本地/联网）再建一次命名空间；还缺就**如实报缺什么**，别让模型侧
+    # 只看到一句 NameError（那既没法归因，也没法在面板上解释）。
+    missing = _missing_names(code, ns)
+    if missing:
+        try:
+            import actions
+            actions.register_local(scene_id, str(scene_dir))
+            actions.register_net(scene_id)
+        except Exception:
+            pass
+        ns = _ns_base(scene_dir, scene_id, loop=loop)
+        missing = _missing_names(code, ns)
+        if missing:
+            raise RuntimeError(
+                f"重放环境缺这些名字：{', '.join(sorted(missing))}"
+                "（重注册后仍缺 —— 技能引用的能力当前不在启用清单里）")
     box = _run_restricted(code, ns, timeout=timeout)
     if not box.get("ok"):
         raise RuntimeError(box.get("error") or "本机技能执行失败")
