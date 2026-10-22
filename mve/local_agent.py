@@ -559,7 +559,8 @@ async def solve(question: str, scene_dir: str, *, llm=None,
         # 11 个 MCP 工具里挑花眼，反而不调。
         fetch_txt = ""
         if require_tools and _can_fetch:
-            _names = [n for n in sorted(_probe) if not n.startswith("__")]
+            _names = [n for n in sorted(_probe)
+                      if not n.startswith("__") and n != "ok_text"]
             # 示例里的函数名必须**真的存在**：写 `web_search` 而本场景只有
             # mcp_*_search（本机联网没注册）时，模型照抄就 NameError。
             _ex = ("web_search" if "web_search" in _names
@@ -578,8 +579,8 @@ async def solve(question: str, scene_dir: str, *, llm=None,
                     f"hits = {_ex}(query=\"<本题关键词>\")\n"
                     f"for h in hits[:3]:                 # 抓不到就换下一个\n"
                     f"    page = {_fx}(url=h[\"url\"])    # 参数名以它的签名为准\n"
-                    f"    if page and \"error\" not in str(page).lower():\n"
-                    f"        RESULT = {{\"answer\": <从 page 正文提炼的答案>, "
+                    f"    if ok_text(page):              # 403/超时/解析失败都会是 False\n"
+                    f"        RESULT = {{\"answer\": <只写 page 正文里能印证的要点>, "
                     f"\"source\": h[\"url\"]}}\n"
                     f"        break\n"
                     f"else:\n"
@@ -594,10 +595,12 @@ async def solve(question: str, scene_dir: str, *, llm=None,
                 "过、也不会被记成能力。\n可用函数："
                 + "、".join(_names[:16]) + "\n"
                 + ("搜索结果只是摘要：够用就直接据实组织（标来源）；摘要不够就"
-                   "对最相关的 1~2 个结果抓**正文**再提炼。抓取返回值里带 "
-                   "`error`、`status>=400`（403/404 等）或有 Forbidden/Timeout "
-                   "字样，就算**失败**，必须换 `hits[1]`/`hits[2]` 再试（最多 3 "
-                   "个），不许把错误信息当答案交上来。\n"
+                   "对最相关的 1~2 个结果抓**正文**再提炼。\n"
+                   "**抓回来的东西是不是正文，一律用 `ok_text(page)` 判**（我们提供的"
+                   "函数，和闸门用的是同一个口径）：返回 False 表示这是 403/超时/"
+                   "解析失败之类的失败说明，**不是内容** → 必须换 `hits[1]`/`hits[2]` "
+                   "再试（最多 3 个）。不许把错误信息或内存里的记忆当答案交上来；"
+                   "3 个都失败就如实写 `RESULT = {\"error\": ...}`。\n"
                    if _fx else "")
                 + "代码必须长这样（先取证，再据实组织；参数照上面签名的名字传）：\n"
                 "```python\n" + _code_ex + "\n```\n")
@@ -752,6 +755,59 @@ def _make_mcp_callable(gw: Any, tool_id: str, loop: Any,
 
 _EVIDENCE_CHARS = 4000
 
+# fetch/搜索工具把失败包成**普通文本**返回时的措辞（2026-10-22 场景 B 实测）。
+# 这些是「工具自己的失败说明」，不是网页正文；必须配合长度闸一起用。
+_TOOL_ERR_HINTS = (
+    "could not access the webpage",
+    "refusing to fetch",
+    "could not resolve host",
+    "name or service not known",
+    "client error '4",
+    "client error '5",
+    "server error '5",
+)
+
+
+def _flat_text(ret: Any) -> str:
+    """把工具返回压成一段文本（判失败 / 剪证据共用这一套展开规则）。
+
+    MCP 的返回被网关包成 `{"result": <工具原始返回>}`，而工具原始返回可能是
+    `{"content":[{"type":"text","text":...}]}`、可能是 list、也可能直接是 str。
+    展开规则只写一处，免得「证据层认得出失败、执行层认不出」。
+    """
+    if isinstance(ret, dict):
+        if set(ret) == {"result"}:
+            ret = ret["result"]
+        else:
+            body = (ret.get("text") or ret.get("content") or ret.get("answer")
+                    or ret.get("rows") or ret)
+            return body if isinstance(body, str) else json.dumps(
+                body, ensure_ascii=False)
+    if isinstance(ret, (list, tuple)):
+        return json.dumps(list(ret), ensure_ascii=False)
+    return str(ret or "")
+
+
+def _looks_like_tool_error(text: Any) -> bool:
+    """这段返回是不是**工具层的失败说明**，而不是正文。
+
+    为什么需要（同构助产士的 `result.ok`）：MCP 的 fetch 工具把失败包成
+    `isError: false` 的普通文本，例如
+      "Error: Could not access the webpage (Client error '403 Forbidden' ...)"
+    技能代码只判 `if not page:` → 报错字符串非空 → 被当成正文写进答案。
+    场景 B 那 5 条学到的配方里 4 条，答案就是 403/521/DNS 错误页 —— 学的时候
+    没拦住，就固化成技能了。
+
+    判据要**两个条件同时成立**：**短**（失败说明是一两句话）+ **命中工具的
+    失败措辞**。只判关键词会误伤「正文里正常讨论 HTTPS 403」（上一版裸黑名单
+    踩过这个坑）；只判长度又会误伤短正文。误判方向选安全：宁可重抓一次。
+    """
+    s = str(text or "").strip()
+    if not s or len(s) > 900:
+        return False
+    low = s.lower()
+    return any(h in low for h in _TOOL_ERR_HINTS)
+
 
 def _clip(s: Any, n: int = _EVIDENCE_CHARS) -> str:
     return str(s or "")[:n]
@@ -764,7 +820,8 @@ def _evidence_item(name: str, ret: Any) -> dict[str, Any]:
         if (result.ok && result.text) { gathered.push(`【网页 URL】\\n正文`) }
         else { report.push({status:"failed"}) }        ← 失败只进汇报，**不进材料**
     所以「403 错误页当答案」在那边结构上不会发生 —— 不是靠字符串黑名单挡的。
-    MVE 这里补同一层：失败（带 error / status>=400 / 空）记 ok=False，不成为材料。
+    MVE 这里补同一层：失败（带 error / status>=400 / 空 / **工具把失败包成文本**）
+    记 ok=False，不成材料。
     """
     item: dict[str, Any] = {"tool": str(name), "ok": True, "text": ""}
     if isinstance(ret, dict):
@@ -779,19 +836,16 @@ def _evidence_item(name: str, ret: Any) -> dict[str, Any]:
             if ret.get("url"):
                 item["source"] = _clip(ret.get("url"), 200)
             return item
-        body = (ret.get("text") or ret.get("content") or ret.get("answer")
-                or ret.get("rows") or ret)
-        item["text"] = _clip(body if isinstance(body, str)
-                             else json.dumps(body, ensure_ascii=False))
         if ret.get("url"):
             item["source"] = _clip(ret.get("url"), 200)
-    elif isinstance(ret, (list, tuple)):
-        item["text"] = _clip(json.dumps(list(ret), ensure_ascii=False))
-    else:
-        item["text"] = _clip(ret)
+    item["text"] = _clip(_flat_text(ret))
     if not item["text"].strip():
         item["ok"] = False
         item["error"] = "返回为空"
+        return item
+    if _looks_like_tool_error(item["text"]):
+        item["ok"] = False
+        item["error"] = "工具返回的是失败说明，不是正文：" + _clip(item["text"], 120)
     return item
 
 
@@ -1037,6 +1091,11 @@ def _ns_base(scene_dir: str, scene_id: str = "",
             # 既没传 loop、当前线程也没有运行中的事件循环 → 不注入 mcp 远端工具
             # （技能重放请走 run_saved_async，它会把主循环显式带进来）
             pass
+    # 「这段返回是正文还是工具失败说明」的**唯一口径**，注入执行域给模型用。
+    # 不放进 `full`：`full` 要按启用清单过滤，helper 不在注册表里会被剔掉。
+    # 判据只有 `_looks_like_tool_error` 一份 —— 证据层拒收失败项、模型挑来源，
+    # 用的是同一个函数，不会出现「闸门认失败、模型认成功」两套口径。
+    ns["ok_text"] = lambda ret: not _looks_like_tool_error(_flat_text(ret))
     ns["__builtins__"] = {"len": len, "list": list, "dict": dict, "str": str,
                           "int": int, "float": float, "sorted": sorted,
                           "sum": sum, "min": min, "max": max, "any": any,
@@ -1068,13 +1127,18 @@ def _missing_names(code: str, ns: dict[str, Any]) -> set[str]:
 
 
 def run_saved(code: str, scene_dir: str, timeout: float = 30.0,
-              scene_id: str = "", loop: Any = None) -> Any:
+              scene_id: str = "", loop: Any = None,
+              evidence: list[dict[str, Any]] | None = None) -> Any:
     """跑一段已存下来的本机技能代码，返回它的 RESULT（失败抛异常，由调用方如实报）。
 
     `loop` 见 `_ns_base`：在事件循环里重放要走 `run_saved_async`（它负责把
     exec 挪到 worker 线程并把主循环带进来），**不要**在协程里直接调这个同步版。
+
+    `evidence`：给了就把这次重放每次取数的**实际返回**记成材料账（同 `solve`）。
+    技能体检要用它 —— 光看 RESULT 判不出「这段是正文还是 403 说明」时，
+    材料账是唯一可信口径（与闸门同一个 `_evidence_item`）。
     """
-    ns = _ns_base(scene_dir, scene_id, loop=loop)
+    ns = _ns_base(scene_dir, scene_id, loop=loop, evidence=evidence)
     # 自愈（2026-10-22 场景 B 实测）：技能代码引用 web_search，重放却报
     # NameError —— 同一次消费里 ③b 现场写的 mcp_* 却能用。说明**长驻进程**
     # （面板）内存里的注册表/开关快照可能陈旧，重放不能依赖「调用方刚好
@@ -1089,7 +1153,7 @@ def run_saved(code: str, scene_dir: str, timeout: float = 30.0,
             actions.register_net(scene_id)
         except Exception:
             pass
-        ns = _ns_base(scene_dir, scene_id, loop=loop)
+        ns = _ns_base(scene_dir, scene_id, loop=loop, evidence=evidence)
         missing = _missing_names(code, ns)
         if missing:
             raise RuntimeError(
@@ -1102,7 +1166,8 @@ def run_saved(code: str, scene_dir: str, timeout: float = 30.0,
 
 
 async def run_saved_async(code: str, scene_dir: str, timeout: float = 30.0,
-                          scene_id: str = "") -> Any:
+                          scene_id: str = "",
+                          evidence: list[dict[str, Any]] | None = None) -> Any:
     """在**事件循环里**重放配方 —— 必须换到 worker 线程跑 exec。
 
     为什么（2026-10-20 实测）：配方里的取数动作是 MCP 工具，而 MCP 调用靠
@@ -1124,4 +1189,4 @@ async def run_saved_async(code: str, scene_dir: str, timeout: float = 30.0,
     """
     loop = asyncio.get_running_loop()
     return await asyncio.to_thread(run_saved, code, scene_dir, timeout,
-                                   scene_id, loop)
+                                   scene_id, loop, evidence)
