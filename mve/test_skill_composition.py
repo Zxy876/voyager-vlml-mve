@@ -206,9 +206,10 @@ def test_skill_replay_inherits_event_loop():
     real = local_agent._ns_base
     seen: list[tuple[str, Any]] = []
 
-    def spy(scene_dir, scene_id="", tracer=None, loop=None):
+    def spy(scene_dir, scene_id="", tracer=None, loop=None, evidence=None):
         seen.append((threading.current_thread().name, loop))
-        return real(scene_dir, scene_id, tracer=tracer, loop=loop)
+        return real(scene_dir, scene_id, tracer=tracer, loop=loop,
+                    evidence=evidence)
 
     local_agent._ns_base = spy
 

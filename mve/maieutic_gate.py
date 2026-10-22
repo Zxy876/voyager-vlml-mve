@@ -44,6 +44,9 @@ GATE_SYSTEM = """你是产婆术（Maieutic）的**闸门检查员**。一个助
   只是提到了这个词（"也要注意输入为空的情况"）**不算**；
   给出具体说法（"输入为空时返回 0"）才算。
 - `passed` 为 true **当且仅当** `gaps_still_open` 为空。
+- 判定**以材料为准**：用户消息里会给你「助手取到的材料」（来自执行层，失败项
+  已剔除）。答案只有落在材料上的内容才算答到；材料为空 = 没有任何可取证的
+  内容，全部维度都算没答到（别拿"它写了段话"当答到）。
 - 如果你还发现了清单外的遗漏（`emergent_gaps`），照样可以列 —— 但它**不阻塞**
   闭合：清单全部答到就 passed=true，把额外发现当信息带回去即可。
 
@@ -86,8 +89,24 @@ def _parse(text: str) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _material_block(evidence: Any, limit: int = 3, per: int = 1200) -> str:
+    """材料清单（同构助产士的 gathered）：只列**取成功**的条目，带来源。"""
+    items = [e for e in (evidence or []) if isinstance(e, dict) and e.get("ok")]
+    if not items:
+        return "  （没有取到任何材料）"
+    out = []
+    for e in items[:limit]:
+        src = e.get("source") or e.get("tool") or "?"
+        text = " ".join(str(e.get("text") or "").split())[:per]
+        out.append(f"  - 来源：{src}\n    内容：{text}")
+    if len(items) > limit:
+        out.append(f"  （另有 {len(items) - limit} 条材料未列出）")
+    return "\n".join(out)
+
+
 def render(question: str, answer: str,
-           dimensions: list[dict[str, Any]], *, critique: str = "") -> str:
+           dimensions: list[dict[str, Any]], *, critique: str = "",
+           evidence: Any = None) -> str:
     """照 spec-examiner 的 user 模板：任务 + 维度清单（含内部理由）+ 它交上来的回答。"""
     dim_block = "\n".join(
         f"  - id: {str(d.get('id') or '')}\n"
@@ -98,13 +117,15 @@ def render(question: str, answer: str,
              if critique else "")
     return (f"任务：{question}\n\n"
             f"必须回答的维度清单：\n{dim_block or '  （无）'}\n{prior}\n"
+            f"助手取到的材料（执行层剪裁，失败项已剔除）：\n"
+            f"{_material_block(evidence)}\n\n"
             f"它交上来的回答：\n\"\"\"\n{str(answer or '')[:2500]}\n\"\"\"\n\n"
             f"逐条核。只输出 JSON。")
 
 
 def check(question: str, answer: str, dimensions: list[dict[str, Any]], *,
           llm: Callable | None = None, critique: str = "",
-          max_retries: int = 2) -> dict[str, Any]:
+          max_retries: int = 2, evidence: Any = None) -> dict[str, Any]:
     """闸门判定。返回 {"passed","addressed","open","questions","emergent","origin"}。
 
     `origin="failed"` = 模型/解析不可用（调用方应退回原版 critic，不假装判过）。
@@ -128,7 +149,8 @@ def check(question: str, answer: str, dimensions: list[dict[str, Any]], *,
         try:
             text = call([{"role": "system", "content": GATE_SYSTEM},
                          {"role": "user", "content": render(
-                             question, answer, dims, critique=critique)}])
+                             question, answer, dims, critique=critique,
+                             evidence=evidence)}])
         except Exception as e:
             last = f"LLM 调用失败：{type(e).__name__}: {e}"
             continue

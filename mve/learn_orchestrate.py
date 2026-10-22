@@ -744,6 +744,10 @@ async def _start_learning_impl(
                             if crit1:
                                 print(f"  · 追问历史：{_q1[:24]}｜上次问过："
                                       f"{crit1[:70]}", flush=True)
+                        # 证据账（同构助产士的 gathered）：每次工具调用成功取回的
+                        # 内容 —— 失败项 ok=False，**不进材料**。闸门判的是「材料
+                        # 有没有答到维度」，不是「模型写的文本像不像答案」。
+                        _ev1: list[dict[str, Any]] = []
                         for _t in range(SUBTASK_MAX_RETRIES):
                             # ⚠️ 第二个返回值是**这一轮跑通的代码**（原版的
                             # `program_code`）。以前写成 `obs1, _ =`，代码直接丢
@@ -751,6 +755,7 @@ async def _start_learning_impl(
                             obs1, code1 = await local_agent.solve(
                                 _q1, local_dir, llm=llm, scene_id=scene,
                                 avoid=_avoid, critique=str(crit1 or ""),
+                                evidence=_ev1,
                                 # 已学会的配方回注（原版 retrieve_skills →
                                 # system）：技能是新的 primitive，学会之后
                                 # 下一轮就更够得着 —— 可达是循环不是判定。
@@ -778,6 +783,9 @@ async def _start_learning_impl(
                                          for s in (o.get("data_sources") or [])}),
                                     "sql": "", "ok": _has_real(obs1)},
                                 "answer": _answer_text(obs1, ok_only=True),
+                                # 材料（代码剪裁的，不是模型自述的）交给
+                                # critic/闸门：没有材料 = 没取到内容，直接不闭合
+                                "evidence": _ev1,
                                 "status": "learned"}
                             try:
                                 import task_critic as _tc1
@@ -903,12 +911,16 @@ async def _start_learning_impl(
                     sql = ""
                     _answer_override = "\n\n".join(answers)[:2500]
                 else:
+                    # 材料账（同构 gathered）：整题一次执行也可能直接交 answer，
+                    # 同样把「实际取回的内容」按账收着，供 critic/闸门判定。
+                    _ev3: list[dict[str, Any]] = []
                     observations, sql = await local_agent.solve(
                         question, local_dir, llm=llm, scene_id=scene,
                         critique=str(critique or ""),
                         dimensions=_dims, avoid=_avoid,
                         skills=skills,           # 同上：已学配方回注执行层
-                        require_tools=True)      # 同维度分支：学习环节必须取证
+                        require_tools=True,      # 同维度分支：学习环节必须取证
+                        evidence=_ev3)
                     _answer_override = ""
             else:
                 observations, sql = await agent.solve(
@@ -932,6 +944,13 @@ async def _start_learning_impl(
                                            for o in (observations or []))
                              else "knowledge"),
             }
+            # 材料账挂在 result 顶层（execution.evidence 是另一个含义：data/knowledge）
+            # ⚠️ 维度分支没有 _ev3（每条维度自己记），这时**不设这个键** ——
+            # 设成空列表会被 critic 当成「一次都没取到内容」误判失败。
+            try:
+                out["evidence"] = list(_ev3)          # type: ignore[name-defined]
+            except NameError:
+                pass
             # 答案与逐轮观察留给 critic / 面板（知识型任务没有数据源，critic 靠答案判）
             out["answer"] = (str(_answer_override or "").strip()
                              or _answer_text(observations))

@@ -302,7 +302,8 @@ def _skill_call_name(raw: str) -> str:
 
 def _make_skill_fn(skill: dict[str, Any], scene_dir: str, scene_id: str,
                    tracer: list[str] | None, timeout: float = 45.0,
-                   loop: Any = None):
+                   loop: Any = None,
+                   evidence: list[dict[str, Any]] | None = None):
     """一条已学技能 → 一个**可调用**的函数（同构原版 `programs`）。
 
     原版怎么合成（取证）：
@@ -339,7 +340,7 @@ def _make_skill_fn(skill: dict[str, Any], scene_dir: str, scene_id: str,
         if tracer is not None:
             tracer.append(f"skill:{label}")     # 先记后跑：真调用过才有据
         ns: dict[str, Any] = _ns_base(scene_dir, scene_id, tracer=tracer,
-                                      loop=loop)
+                                      loop=loop, evidence=evidence)
         box = _run_restricted(code, ns, timeout=timeout)
         if not box.get("ok"):
             raise RuntimeError(
@@ -356,13 +357,16 @@ def _make_skill_fn(skill: dict[str, Any], scene_dir: str, scene_id: str,
 
 def _build_skill_fns(skills: list[dict[str, Any]] | None, scene_dir: str,
                      scene_id: str, tracer: list[str],
-                     limit: int = 8, loop: Any = None) -> dict[str, Any]:
+                     limit: int = 8, loop: Any = None,
+                     evidence: list[dict[str, Any]] | None = None
+                     ) -> dict[str, Any]:
     """把检索到的技能编成一组可调用函数（同原版 `programs` 拼进同一作用域）。"""
     out: dict[str, Any] = {}
     for s in list(skills or [])[:limit]:
         if not str((s or {}).get("code") or "").strip():
             continue
-        fn = _make_skill_fn(s, scene_dir, scene_id, tracer, loop=loop)
+        fn = _make_skill_fn(s, scene_dir, scene_id, tracer, loop=loop,
+                            evidence=evidence)
         if fn.__name__ and fn.__name__ not in out:
             out[fn.__name__] = fn
     return out
@@ -376,6 +380,7 @@ async def solve(question: str, scene_dir: str, *, llm=None,
                 skills: list[dict[str, Any]] | None = None,
                 require_skills: bool = False,
                 timeout: float = 30.0,
+                evidence: list[dict[str, Any]] | None = None,
                 ) -> tuple[list[dict[str, Any]], str]:
     """写代码 → 跑 → 看结果；失败带反馈重写。返回 (观察列表, 最后一段代码)。
 
@@ -418,12 +423,13 @@ async def solve(question: str, scene_dir: str, *, llm=None,
             _loop = asyncio.get_running_loop()
         except RuntimeError:      # 测试等非协程环境：退回旧行为（如实降级）
             _loop = None
-        ns = _ns_base(scene_dir, scene_id, tracer=tracer, loop=_loop)
+        ns = _ns_base(scene_dir, scene_id, tracer=tracer, loop=_loop,
+                      evidence=evidence)
         # 已学技能进**执行域**（不是只进 prompt）—— 同构原版
         # index.js:256 的 `programs + code` 同作用域 eval：模型写的
         # `skill_def()` 才真的调得到。
         ns.update(_build_skill_fns(skills, scene_dir, scene_id, tracer,
-                                   loop=_loop))
+                                   loop=_loop, evidence=evidence))
         return ns
 
     # 场景目录里**现有**什么，直接告诉它（否则它会猜 *.txt 而真实文件是 .json）
@@ -744,17 +750,77 @@ def _make_mcp_callable(gw: Any, tool_id: str, loop: Any,
     return _sync
 
 
-def _recorder(tracer: list[str] | None, name: str):
+_EVIDENCE_CHARS = 4000
+
+
+def _clip(s: Any, n: int = _EVIDENCE_CHARS) -> str:
+    return str(s or "")[:n]
+
+
+def _evidence_item(name: str, ret: Any) -> dict[str, Any]:
+    """把一次**成功**调用的返回剪成一条证据（同构 maieutic 的 `gathered`）。
+
+    助产士的口径（`src/lib/research/agent.ts`）：
+        if (result.ok && result.text) { gathered.push(`【网页 URL】\\n正文`) }
+        else { report.push({status:"failed"}) }        ← 失败只进汇报，**不进材料**
+    所以「403 错误页当答案」在那边结构上不会发生 —— 不是靠字符串黑名单挡的。
+    MVE 这里补同一层：失败（带 error / status>=400 / 空）记 ok=False，不成为材料。
+    """
+    item: dict[str, Any] = {"tool": str(name), "ok": True, "text": ""}
+    if isinstance(ret, dict):
+        err = ret.get("error")
+        try:
+            st = int(ret.get("status") or 0)
+        except Exception:
+            st = 0
+        if err or (st and st >= 400):
+            item["ok"] = False
+            item["error"] = _clip(err or f"status={st}", 200)
+            if ret.get("url"):
+                item["source"] = _clip(ret.get("url"), 200)
+            return item
+        body = (ret.get("text") or ret.get("content") or ret.get("answer")
+                or ret.get("rows") or ret)
+        item["text"] = _clip(body if isinstance(body, str)
+                             else json.dumps(body, ensure_ascii=False))
+        if ret.get("url"):
+            item["source"] = _clip(ret.get("url"), 200)
+    elif isinstance(ret, (list, tuple)):
+        item["text"] = _clip(json.dumps(list(ret), ensure_ascii=False))
+    else:
+        item["text"] = _clip(ret)
+    if not item["text"].strip():
+        item["ok"] = False
+        item["error"] = "返回为空"
+    return item
+
+
+def _recorder(tracer: list[str] | None, name: str,
+              evidence: list[dict[str, Any]] | None = None):
     """给一个可调用套一层：**被调用时**把 name 记进 tracer（先记后调，调用失败也留痕）。
 
     这是堵「真空成功」新形态的关键：代码跑通、RESULT 非空，但如果一次数据源都没
     真正调用，答案八成是拿训练记忆编的 —— tracer 空就是证据。
+
+    `evidence`：给了就把每次调用的**实际返回**剪成证据条目（见 `_evidence_item`）。
+    tracer 只回答「调没调」，evidence 才回答「取到了什么」—— 后者才是闸门判
+    闭合时要看的东西（同构助产士的 gathered/report 两本账）。
     """
     def deco(fn: Any) -> Any:
         def _w(*a: Any, **k: Any) -> Any:
             if tracer is not None:
                 tracer.append(name)
-            return fn(*a, **k)
+            try:
+                ret = fn(*a, **k)
+            except Exception as e:
+                if evidence is not None:
+                    evidence.append({"tool": str(name), "ok": False,
+                                     "error": _clip(f"{type(e).__name__}: {e}",
+                                                    200)})
+                raise
+            if evidence is not None:
+                evidence.append(_evidence_item(name, ret))
+            return ret
         _w.__name__ = str(name)
         return _w
     return deco
@@ -890,7 +956,8 @@ def primitive_names() -> list[str]:
 # ---------------------------------------------------------------------------
 def _ns_base(scene_dir: str, scene_id: str = "",
              tracer: list[str] | None = None,
-             loop: Any = None) -> dict[str, Any]:
+             loop: Any = None,
+             evidence: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """执行命名空间。
 
     给了 scene_id 就**按注册表里的启用条目**建（猫爪总开关关掉的组不注入 ——
@@ -925,7 +992,7 @@ def _ns_base(scene_dir: str, scene_id: str = "",
     # 免得 repr 变成 <function _w> 而不是 <function web_search>（test_scene_backend
     # 靠 str(web_search) 认名，实测被这个包装破坏过一次）。
     if tracer is not None:
-        full = {k: _recorder(tracer, k)(v) for k, v in full.items()}
+        full = {k: _recorder(tracer, k, evidence)(v) for k, v in full.items()}
     allowed_origins = {"local", "net"}
     names = set(full)
     if scene_id:
@@ -964,7 +1031,7 @@ def _ns_base(scene_dir: str, scene_id: str = "",
                     continue
                 _entry = _make_mcp_callable(gw, tid, _loop,
                                             e.get("input_schema") or {})
-                ns[tid] = (_recorder(tracer, tid)(_entry)
+                ns[tid] = (_recorder(tracer, tid, evidence)(_entry)
                            if tracer is not None else _entry)
         except RuntimeError:
             # 既没传 loop、当前线程也没有运行中的事件循环 → 不注入 mcp 远端工具
