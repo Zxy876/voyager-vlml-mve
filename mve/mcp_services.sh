@@ -91,11 +91,17 @@ UNIT
 probe() {
   local name="$1" port="$2"
   local state; state=$(systemctl is-active "${UNIT_PREFIX}-${name}.service" 2>/dev/null || true)
-  local code
-  code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' -X POST "http://${HOST}:${port}/mcp" \
-    -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
-    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}' 2>/dev/null || echo 000)
-  printf '  %-20s systemd=%-9s http=%s\n' "$name" "$state" "$code"
+  local code="" i
+  # 首次启动可能要 npx 拉包（context7 实测 ~30s），探活必须等，否则假阳性 000。
+  # 也不要用 `|| echo 000`：curl 失败时 %{http_code} 本身已是 000，追加会变 000000。
+  for i in $(seq 1 15); do
+    code=$(curl -s -o /dev/null -m 5 -w '%{http_code}' -X POST "http://${HOST}:${port}/mcp" \
+      -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+      -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}' 2>/dev/null)
+    [ "$code" = "200" ] && break
+    sleep 2
+  done
+  printf '  %-20s systemd=%-9s http=%s\n' "$name" "$state" "${code:-000}"
 }
 
 cmd_install() {
