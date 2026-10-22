@@ -662,22 +662,33 @@ async def consume(
     # ---- ③ 取数：优先复用配方，没有就现场写 ----
     # 非 VLML 场景：不连 VLML、不读 rib。
     # 「本机」场景（普通用户的默认形态）：用本机只读原语作答；取不到就如实说。
-    if _non_vlml_why and _scene_kind == "local":
+    if _non_vlml_why and _scene_kind in ("local", "scene"):
         import local_agent as _la
-        # 本机原语注册成条目（origin=local / group=本机能力）——同构猫娘：
-        # 插件（能力来源）+ 猫爪总开关（这一组的开关）+ 开关下面的条目。
-        # 注册了才在执行层的抓手清单里出现；开关关掉就注入不到命名空间里。
-        try:
-            import actions as _act
-            _act.register_local(_scene_id, _scene_dir)
-            _act.register_net(_scene_id)
-        except Exception:
-            pass
-        # 远端 MCP 工具必须先挂上：复用配方时 `_ns_base` 只注入**注册表里已有**
-        # 的 mcp 条目，而它们在 learn 那边是 connect_all + expose 才注册的。
-        # consume 是新进程 —— 不接这一步，重放 `mcp_xxx` 就是 NameError
-        # （2026-10-20 实测：命中 3 条配方，3 条全 NameError → "用到 0 条技能"）。
-        mcp_ready = await _la.ensure_mcp_tools(_scene_id)
+        # kind=scene（场景目录里自己的 .duckdb）与 kind=local 共用这条消费链：
+        # 同构 Scene A 的「SQL 重放 → 没有才现场写」，数据面换成 SceneDBEnv
+        # （只读场景库）。此前没接 scene 形态（2026-10-22 数学场景实测：
+        # 路由 HIGH_CONFIDENCE 命中却整段跳过，answer 恒空 —— 泛化最后一公里）。
+        _env = None
+        if _scene_kind == "scene":
+            from scene_db import SceneDBEnv
+            _env = SceneDBEnv(str((_prof or {}).get("db_path") or ""))
+        else:
+            # 本机原语注册成条目（origin=local / group=本机能力）——同构猫娘：
+            # 插件（能力来源）+ 猫爪总开关（这一组的开关）+ 开关下面的条目。
+            # 注册了才在执行层的抓手清单里出现；开关关掉就注入不到命名空间里。
+            try:
+                import actions as _act
+                _act.register_local(_scene_id, _scene_dir)
+                _act.register_net(_scene_id)
+            except Exception:
+                pass
+            # 远端 MCP 工具必须先挂上：复用配方时 `_ns_base` 只注入**注册表里已有**
+            # 的 mcp 条目，而它们在 learn 那边是 connect_all + expose 才注册的。
+            # consume 是新进程 —— 不接这一步，重放 `mcp_xxx` 就是 NameError
+            # （2026-10-20 实测：命中 3 条配方，3 条全 NameError → "用到 0 条技能"）。
+            mcp_ready = await _la.ensure_mcp_tools(_scene_id)
+        if _env is not None:
+            mcp_ready = {"skipped": "场景库形态（query_sql 只读本场景 duckdb），消费不接 MCP"}
         # ③a 复用优先（同构 Voyager：retrieve → 重放 → 取不到才写新代码）。
         # 只认「本机形态」的配方（代码里有 RESULT、能 run_saved 重放）；
         # VLML 的 SQL 配方在本机场景重放不了 —— 那是另一个数据源的东西，
@@ -689,6 +700,34 @@ async def consume(
         reuse_errors: list[str] = []
         for s in skills:
             sc = str(s.get("code") or "")
+            if _scene_kind == "scene":
+                # ---- 场景库形态的配方重放（SQL 配方，SceneDBEnv 只读执行）----
+                if not sc.strip().lower().startswith(("select", "with")):
+                    continue
+                import re as _re_lit
+                _lits = set(_re_lit.findall(r"\d+(?:\.\d+)?", sc))
+                _qnums = set(_re_lit.findall(r"\d+(?:\.\d+)?", question))
+                if _lits and len(_lits - _qnums) >= 2:
+                    # 计算式配方里的数字是**上一次那道题**的：对新数字重放
+                    # 必然算出旧题答案 —— 跳过，走 ③b 让模型按方法写新 SQL。
+                    reuse_errors.append(
+                        f"配方 {s.get('name')} 是带旧题数字的计算式"
+                        f"（{sorted(_lits)[:6]}），对本题重放必错 —— 改现场写")
+                    continue
+                _r = await _env.run_sql(sc)
+                if not _r.get("ok"):
+                    reuse_errors.append(
+                        f"重放 {s.get('name')} 执行失败："
+                        f"{str(_r.get('error') or '')[:120]}")
+                    continue
+                _d = _r.get("data") or {}
+                if not _d.get("rows"):
+                    reuse_errors.append(f"重放 {s.get('name')} 取到 0 行")
+                    continue
+                data, code, reused_skill = _d, sc, dict(s)
+                obs = [{"ok": True, "tool": "query_sql", "rows": _r.get("rows"),
+                        "data": _d, "data_sources": ["query_sql"]}]
+                break
             if "RESULT" not in sc:
                 continue
             try:
@@ -721,19 +760,30 @@ async def consume(
             # `+ skills`）：命中（HIGH_CONFIDENCE）的题尤其如此 —— 图谱里
             # 已经学过它，却还去"现场现做"，等于技能库白建（用户 2026-10-20
             # 「所有命中的题目都要用到已经学到的技能」）。
-            obs, code = await _la.solve(
-                question, _scene_dir, scene_id=_scene_id, skills=skills,
-                # 命中（HIGH/MEDIUM_CONFIDENCE）且库里有已学技能 → **必须用**。
-                # 不强制的话模型一律走最省事的路线：凭记忆直接写答案
-                # （2026-10-20 实测：给了可调用技能，它一条都没调）。
-                require_skills=(str(route_info.get("decision") or "")
-                                in ("HIGH_CONFIDENCE", "MEDIUM_CONFIDENCE"))
-                and bool(skills),
-                # 墙钟预算要跟着技能条数走（2026-10-21 Scene G 实测）：每条
-                # 技能都是一次真实联网/MCP 取数（一次 web_search 5~20s），
-                # 命中的题一次合成 5 条 → 30s 默认值把整次重放判死
-                # （trace 里 5 条技能全进了、一条都没跑回来 →"执行超时"）。
-                timeout=_consume_timeout(len(skills or [])))
+            if _scene_kind == "scene":
+                # 场景库形态的现场写：同一个 VLMLActionAgent（写 SQL prompt +
+                # 迭代修正），数据面只连场景自己的库（与学习侧 SceneDBEnv
+                # 同一环境，learn_orchestrate.py:583 同款）。
+                from voyager_vlml.agents.action import VLMLActionAgent
+                _agent = VLMLActionAgent(env=_env)
+                obs, code = await _agent.solve(
+                    question, skills=skills,
+                    hints=[str(s.get("need") or "") for s in
+                           ((route_info or {}).get("subtasks") or [])] or None)
+            else:
+                obs, code = await _la.solve(
+                    question, _scene_dir, scene_id=_scene_id, skills=skills,
+                    # 命中（HIGH/MEDIUM_CONFIDENCE）且库里有已学技能 → **必须用**。
+                    # 不强制的话模型一律走最省事的路线：凭记忆直接写答案
+                    # （2026-10-20 实测：给了可调用技能，它一条都没调）。
+                    require_skills=(str(route_info.get("decision") or "")
+                                    in ("HIGH_CONFIDENCE", "MEDIUM_CONFIDENCE"))
+                    and bool(skills),
+                    # 墙钟预算要跟着技能条数走（2026-10-21 Scene G 实测）：每条
+                    # 技能都是一次真实联网/MCP 取数（一次 web_search 5~20s），
+                    # 命中的题一次合成 5 条 → 30s 默认值把整次重放判死
+                    # （trace 里 5 条技能全进了、一条都没跑回来 →"执行超时"）。
+                    timeout=_consume_timeout(len(skills or [])))
             real = [o for o in obs if o.get("ok") and o.get("data") is not None]
             data = (real[-1].get("data") if real else None)
         # 没取到 → 还是没学会。同样**不自动后台学**（2026-10-19 用户改设计）：
@@ -779,7 +829,9 @@ async def consume(
                                    or learn_kick.get("reason") or ""),
             "miss_node": str(miss_info.get("node_id") or ""),
             "miss_node_created": bool(miss_info.get("node_created")),
-            "trajectory": (_mve_traj or (["local_python"] if code else [])),
+            "trajectory": (_mve_traj or
+                           (["query_sql"] if (_scene_kind == "scene" and code)
+                            else (["local_python"] if code else []))),
             "ok_tool_calls": (len(_mve_traj) if data is not None else 0),
             "tool_calls": len(_mve_traj),
             "facts": [], "facts_count": 0,
@@ -806,7 +858,10 @@ async def consume(
             "mcp_tools": mcp_ready,
             "judgment_result": "written" if data is not None else "fetched_empty",
             "skipped": ("" if data is not None else
-                        ("本机工作区里没有能回答它的数据（" + _scene_why + "）"
+                        (("场景数据源里没有能回答它的数据（" + _scene_why + "）"
+                          "—— 往场景目录里放数据 / 调整库内容后重试")
+                         if _scene_kind == "scene" else
+                         "本机工作区里没有能回答它的数据（" + _scene_why + "）"
                          "——「本机」= 应用跑在用户自己电脑上的那一档：只读应用"
                          "工作区/场景目录，不联网、也不翻操作者的私人文件；"
                          "这类问题需要外部数据源")),
@@ -1593,7 +1648,11 @@ _RECIPE_CALL = re.compile(
     r"\b(list_files|read_file|read_json|read_csv|query_sql"
     r"|web_search|web_fetch|http_get|fetch_url)\s*\("
     r"|\bmcp_[A-Za-z0-9_]+\s*\("
-    r"|\bSELECT\b[\s\S]{0,200}?\bFROM\b"
+    # SQL 配方：SELECT…FROM 之外，**纯计算式 SELECT**（`SELECT (6-2)/(3-1) AS k
+    # … LIMIT 1`，无 FROM —— 2026-10-22 数学场景实测被这条漏判成"知识型答案"
+    # 而拒绝入库，技能库 0 涨，闭环断在第一环）也是真取数：
+    # SceneDBEnv.run_sql 的合法形态。
+    r"|\bSELECT\b[\s\S]{0,400}?(?:\bFROM\b|\bLIMIT\b)"
     r"|\bduckdb\b",
     re.I,
 )
