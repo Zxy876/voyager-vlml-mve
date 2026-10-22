@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import os
+import pathlib
 import re
 import socket
 import urllib.request
@@ -28,8 +30,36 @@ from typing import Any
 _UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36")
 _TIMEOUT = 15
+_SEARCH_TIMEOUT = 10
 _MAX_BYTES = 200_000
 NET_GROUP = "联网能力"
+# 智谱 web-search-pro：搜索在**厂商侧**抓取+摘要，不受本机出口 IP 的信誉连累
+# （2026-10-22 实测：这台 VPS 上 DDG 连接超时、Bing 发降级页、维基 403、
+# Brave 429、搜狗/360 也开始拦 —— 免 key 的抓取式搜索全灭，只剩这条路）。
+ZHIPU_TOOLS_URL = "https://open.bigmodel.cn/api/paas/v4/tools"
+
+
+def _zhipu_key() -> str:
+    """智谱 key：环境变量优先，其次本地密钥文件（与 voyager_pilot 同源）。
+    没有就返回空 —— 调用方降级到 DDG，不报错（别的部署可能没有这个 key）。"""
+    k = os.getenv("ZHIPU_API_KEY", "").strip()
+    if k:
+        return k
+    for p in (pathlib.Path(__file__).with_name(".env"),
+              pathlib.Path("/root/.voyager_secret"),
+              pathlib.Path.home() / ".voyager_secret"):
+        try:
+            if not p.is_file():
+                continue
+            for line in p.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if line.startswith("ZHIPU_API_KEY="):
+                    v = line.split("=", 1)[1].strip().strip('"').strip("'")
+                    if v:
+                        return v
+        except Exception:
+            continue
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -68,20 +98,29 @@ def _http_get(url: str, timeout: int = _TIMEOUT) -> tuple[int, bytes]:
 # 原语
 # ---------------------------------------------------------------------------
 def web_search(query: str, max_results: int = 5) -> list[dict[str, Any]]:
-    """联网搜索（DuckDuckGo 公共端点，无需 API key）。
+    """联网搜索。返回 [{"title","url","snippet"}]，snippet 是**正文片段**。
 
-    返回 [{"title","url","snippet"}]；搜索不到/被限流就抛错（调用方如实报），
-    **不返回编造的结果**。
+    后端顺序：智谱 web-search-pro（厂商侧抓取，摘要即正文片段）→ DuckDuckGo
+    html/lite（免 key 兜底）。全失败就抛错（调用方如实报），**不返回编造的结果**。
     """
     q = str(query or "").strip()
     if not q:
         raise ValueError("搜索词是空的")
     n = max(1, min(int(max_results or 5), 10))
-    last_err = ""
+    # 1) 智谱：有 key 就走（快、稳、摘要带正文）
+    _zhipu_err = ""
+    try:
+        return _zhipu_search(q, n)
+    except _NoBackend:
+        pass
+    except Exception as e:
+        _zhipu_err = f"{type(e).__name__}: {str(e)[:120]}"
+    # 2) DuckDuckGo（免 key 兜底；多数被限流的机器上会是超时）
+    last_err = _zhipu_err
     for endpoint in (f"https://html.duckduckgo.com/html/?q={urllib.request.quote(q)}",
                      f"https://lite.duckduckgo.com/lite/?q={urllib.request.quote(q)}"):
         try:
-            _status, raw = _http_get(endpoint)
+            _status, raw = _http_get(endpoint, timeout=_SEARCH_TIMEOUT)
             html = raw.decode("utf-8", errors="replace")
             results = _parse_ddg(html)
             if results:
@@ -95,6 +134,45 @@ def web_search(query: str, max_results: int = 5) -> list[dict[str, Any]]:
                 last_err += ("（可能被搜索服务限流：换个更具体的关键词重试，"
                              "或稍后再试；不要用同一个关键词反复撞）")
     raise RuntimeError(f"联网搜索失败：{last_err} —— 取不到就如实说，不编造")
+
+
+class _NoBackend(Exception):
+    """没有配置任何搜索后端（例如没填 ZHIPU_API_KEY）。"""
+
+
+def _zhipu_search(q: str, n: int) -> list[dict[str, Any]]:
+    """智谱 web-search-pro：返回 [{title,url,snippet}]，snippet=智谱已抓的正文片段。
+
+    ⚠️ 它返回的是 `tool_calls` 里 type=search_result 的条目，**不是**普通 text；
+    取不到条目要如实抛错（否则会被上层当成"搜到了 0 条"静默跳过）。
+    """
+    key = _zhipu_key()
+    if not key:
+        raise _NoBackend()
+    body = json.dumps({"tool": "web-search-pro",
+                       "messages": [{"role": "user", "content": q}]}).encode()
+    req = urllib.request.Request(
+        ZHIPU_TOOLS_URL, data=body,
+        headers={"Authorization": f"Bearer {key}",
+                 "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        j = json.loads(resp.read().decode("utf-8", errors="replace"))
+    out: list[dict[str, Any]] = []
+    for c in ((j.get("choices") or [{}])[0].get("message") or {}
+              ).get("tool_calls") or []:
+        if c.get("type") != "search_result":
+            continue
+        for it in c.get("search_result") or []:
+            url = str(it.get("link") or it.get("url") or "").strip()
+            if not url.startswith("http"):
+                continue
+            out.append({"title": str(it.get("title") or "").strip()[:120],
+                        "url": url,
+                        "snippet": re.sub(r"\s+", " ",
+                                          str(it.get("content") or "")).strip()[:800]})
+    if not out:
+        raise RuntimeError("智谱 web-search-pro 没返回 search_result 条目")
+    return out[:n]
 
 
 def _parse_ddg(html: str) -> list[dict[str, Any]]:
@@ -152,7 +230,8 @@ def web_fetch(url: str, max_bytes: int = _MAX_BYTES) -> dict[str, Any]:
 PRIMITIVES: list[dict[str, Any]] = [
     {"name": "web_search",
      "fn": web_search,
-     "desc": "联网搜索（DuckDuckGo，无需 key），返回 [{title,url,snippet}]",
+     "desc": "联网搜索（智谱 web-search-pro，摘要即正文片段；DDG 兜底），"
+             "返回 [{title,url,snippet}]",
      "schema": {"type": "object", "properties": {
          "query": {"type": "string"}, "max_results": {"type": "integer"}},
          "required": ["query"]}},
