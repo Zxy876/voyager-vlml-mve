@@ -562,13 +562,16 @@ async def solve(question: str, scene_dir: str, *, llm=None,
             # 种子，正文才是证据）。2026-10-22 场景 B 实测根因：示例只有
             # `r = web_search(query)`，模型照抄 → 把空 snippet 当答案交上来
             # → 维度拿不到正文 → 闸门闭合不了（24 次失败里零次 web_fetch）。
-            _fx = next((n for n in _names if n == "web_fetch"
-                        or (n.startswith("web_") and "fetch" in n)), "")
+            # 2026-10-22 场景 B 实测：fetch 工具多是 MCP 挂载（mcp_ddg_fetch_content、
+            # mcp_fetch_fetch、mcp_neko_web_fetch），原先 startswith("web_") 的条件
+            # 一个都匹配不到 → 两步链示例整段没渲染，模型又拿回单步示例。
+            _fx = next((n for n in _names if "fetch" in n), "")
             if _fx:
                 _code_ex = (
                     f"hits = {_ex}(query=\"<本题关键词>\")\n"
-                    f"page = {_fx}(hits[0][\"url\"])   # 抓正文；抓不到就换 hits[1]\n"
-                    f"RESULT = {{\"answer\": <从 page[\"text\"] 提炼的答案>, "
+                    f"page = {_fx}(url=hits[0][\"url\"])   # 抓正文；抓不到就换 hits[1]"
+                    f"（参数名以{_fx}签名为准）\n"
+                    f"RESULT = {{\"answer\": <从 page 返回的正文里提炼的答案>, "
                     f"\"source\": hits[0][\"url\"]}}")
             else:
                 _code_ex = (
