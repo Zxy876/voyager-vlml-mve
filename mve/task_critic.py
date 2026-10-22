@@ -105,6 +105,41 @@ def _evidence_text(result: dict[str, Any], limit: int = 1600) -> str:
     return txt[:limit]
 
 
+def _error_payload(answer: str) -> str:
+    """答案是「报错/错误页」而不是内容 —— 返回原因，否则空串。
+
+    2026-10-22 场景 B 实测：模型 `web_search → mcp_ddg_fetch_content` 后把
+    `Client error '403 Forbidden' for url 'https://www.zhihu.com/...'` 原样
+    塞进 RESULT，闸门照样判「闭合」，差点把错误页写成技能（真空成功新形态：
+    有内容、但是报错文本）。原版 critic 的口径是 `onError → 不算成`，这里
+    在进 LLM 之前先挡一道 —— 必须**换下一个结果/换关键词重试**。
+    """
+    a = str(answer or "").strip()
+    if not a:
+        return ""
+    low = a.lower()
+    _marks = ("client error", "http error", "urlerror", "timed out",
+              "could not access", "could not resolve", "connection refused",
+              "name or service not known", "no search results",
+              "没有找到相关", "抓取失败", "请求失败")
+    hit = next((m for m in _marks if m in low), "")
+    # JSON 形态：{"error": ...} / {"answer": {"error": ...}}
+    try:
+        j = json.loads(a)
+        seen = json.dumps(j, ensure_ascii=False).lower()
+        if '"error"' in seen or "'error'" in seen:
+            hit = hit or "error 字段"
+    except Exception:
+        pass
+    if not hit:
+        return ""
+    # 报错里夹着正文的情况（长页面尾部带 error）：内容够多就不算纯报错
+    body = re.sub(r"https?://\S+", "", a)
+    body = re.sub(r"(?i)(client error|http error|forbidden|urlerror|"
+                  r"timed out|check:|more information)[^\n]{0,80}", "", body)
+    return hit if len(body.strip()) < 120 else ""
+
+
 def check_task_success(task: str, context: str, result: dict[str, Any], *,
                        llm=None, max_retries: int = 5,
                        dimensions: list[dict[str, Any]] | None = None
@@ -125,6 +160,10 @@ def check_task_success(task: str, context: str, result: dict[str, Any], *,
     # 执行层连答案都没产出（报错/空结果）才直接失败，不叫 LLM。
     if not answer and not real:
         return False, str(result.get("why") or "执行层没有产出答案（报错/空结果）")[:300]
+    _bad = _error_payload(answer)
+    if _bad:
+        return False, (f"取回的是报错（{_bad}），不是内容 —— 换搜索结果里的下一个"
+                       "URL，或换关键词重试；不要把错误当答案")[:300]
     if needs_data(task) and real <= 0:
         return False, ("这题要具体数据（文件/库/统计/时效），但一次数据源都没调、"
                        "没有真实取数 —— 不算完成")[:300]

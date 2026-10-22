@@ -570,10 +570,14 @@ async def solve(question: str, scene_dir: str, *, llm=None,
             if _fx:
                 _code_ex = (
                     f"hits = {_ex}(query=\"<本题关键词>\")\n"
-                    f"page = {_fx}(url=hits[0][\"url\"])   # 抓正文；抓不到就换 hits[1]"
-                    f"（参数名以{_fx}签名为准）\n"
-                    f"RESULT = {{\"answer\": <从 page 返回的正文里提炼的答案>, "
-                    f"\"source\": hits[0][\"url\"]}}")
+                    f"for h in hits[:3]:                 # 抓不到就换下一个\n"
+                    f"    page = {_fx}(url=h[\"url\"])    # 参数名以它的签名为准\n"
+                    f"    if page and \"error\" not in str(page).lower():\n"
+                    f"        RESULT = {{\"answer\": <从 page 正文提炼的答案>, "
+                    f"\"source\": h[\"url\"]}}\n"
+                    f"        break\n"
+                    f"else:\n"
+                    f"    RESULT = {{\"error\": \"3 个来源都没取到正文\"}}")
             else:
                 _code_ex = (
                     f"r = {_ex}(query=\"<本题关键词>\")\n"
@@ -584,7 +588,10 @@ async def solve(question: str, scene_dir: str, *, llm=None,
                 "过、也不会被记成能力。\n可用函数："
                 + "、".join(_names[:16]) + "\n"
                 + ("搜索结果只是摘要：够用就直接据实组织（标来源）；摘要不够就"
-                   "对最相关的 1~2 个结果抓**正文**再提炼。\n"
+                   "对最相关的 1~2 个结果抓**正文**再提炼。抓取返回值里带 "
+                   "`error`、`status>=400`（403/404 等）或有 Forbidden/Timeout "
+                   "字样，就算**失败**，必须换 `hits[1]`/`hits[2]` 再试（最多 3 "
+                   "个），不许把错误信息当答案交上来。\n"
                    if _fx else "")
                 + "代码必须长这样（先取证，再据实组织；参数照上面签名的名字传）：\n"
                 "```python\n" + _code_ex + "\n```\n")
