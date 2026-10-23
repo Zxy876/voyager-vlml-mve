@@ -451,3 +451,77 @@ critic 却给了成功判词「Global Esports 队获得了首杀」。这行 SQL
 - 出题器仍会复用节点里人写的错口径 examples（③ 的根），这一层要等"节点定义体检"，
   现在只在 critique 里如实暴露。
 
+
+---
+
+## 十一、入口统一到 `/mve/`：把面板本身变成这套代码（2026-10-23）
+
+### 11.1 用户指令与它否掉的做法
+
+验收线早就只有 CLI（`task_intake.py ask/retry/sub`、`voyager_vlml.loop`），人没法自己点。
+我先起了一个薄壳页 `/mve-ext/`（8779 + Caddy 前缀路由，见 `mve/ext_task_web.py`）。
+用户否掉：「**那你把 /mve/ 面板变成这套代码啊，不要再起页面**」。
+
+所以正确做法不是"再加一个入口"，而是**让主面板就是这套代码**。
+
+### 11.2 为什么是 merge，不是把服务指到 rebuild 目录
+
+两条分支在 `ac45d72` 分叉：rebuild 领先 12 个提交，主库 `feature/1-to-n-pluggable-scenes`
+领先 **115** 个提交（场景隔离、清库、猫爪开关、MCP 网关常驻、面板性能修复…）。
+`mve-panel.service` 的 `WorkingDirectory` 一改指 `/root/mve-rebuild`，那 115 个提交的能力
+在面板上全部消失。所以只能把 rebuild 合进主库。
+
+合并冲突只有 2 处（`git merge rebuild/fail-driven`）：
+
+| 文件 | 冲突性质 | 解法 |
+|---|---|---|
+| `voyager_vlml/agents/action.py` | 主库是**纯增量**（`render_grabs` + `grabs/focus_tables` 透传，2026-10-19 实测得来）；rebuild 整个文件重写过（原版 reset/step/rollout 移植 + 口径检验三级） | 取 rebuild 版为准，把 `render_grabs` 与 `grabs/focus_tables` 按新结构补回：存进实例（`reset(grabs=…)`），**每步重建 system 时一并带上**（同原版 tools/list 在整个 rollout 里恒可见） |
+| `.gitignore` | 两边各加一条 | 两条都留（场景本机数据 / 外部 task 账本） |
+
+判据/口径/技能/账本逻辑一行没重写 —— 合并只搬文件。
+
+### 11.3 面板里的入口长什么样
+
+- 页签：`TABS` 新增 `{id:'ext', label:'外部任务'}`，`PANELS` 新增 `pExt`。
+- 五个动作：`ask`（导入并试答）/ `learn`（学一轮）/ `retry`（重试这条）/ `sub`（看子目标）/ `list`（列账本）。
+- 账本表格直接从 `failed_tasks.json` 读（每 10s 跟一次），显示 task_id / 状态 / 次数 /
+  子目标 完成·共 / **可重试** / 问题 / 答案或上次失败原因。
+- 后端执行器：`mve/ext_task.py`，**起子进程**跑已有 CLI。
+
+为什么坚持子进程（这条踩过，写进代码注释了）：`task_intake` / `voyager_vlml.loop` 都自己
+`asyncio.run()` 并连 MCP 网关（进程级单例）。在 web 进程里直接 import 调，会把连接绑到 web
+的事件循环上 —— 实测「第一次点击能通，之后全部 60s 超时」。子进程各自一个干净环境，
+崩了也只崩那一次点击。
+
+### 11.4 撤掉的东西
+
+| 撤掉 | 怎么撤的 |
+|---|---|
+| `mve/ext_task_web.py`（薄壳页 HTTP 服务端） | `git rm`（同构逻辑整段搬成 `ext_task.py` 的库函数） |
+| `mve-ext.service`（172.18.0.1:8779） | `systemctl disable --now mve-ext` + 删 unit + `daemon-reload` |
+| Caddy `handle /mve-ext*` | 从 `/root/neko/Caddyfile` 删掉该段（留了 `Caddyfile.bak-*`），`docker exec neko-gateway caddy reload` |
+
+### 11.5 实测
+
+| 检查 | 结果 |
+|---|---|
+| 本地起面板（8799） | `/` 200 · `/api/ext/tasks` 200 · `run(list)` → job `done` 输出 `[]` |
+| 入参校验 | `action=nope` → 「不认识的动作」；`ask` 空问题 → 「先把问题填上」 |
+| 服务器 5 套测试 | `test_scene_backend` 110 过 / `test_learn_orchestrate` 30 过 / `test_critic_caliber` 13 过 / `test_action_loop` / `test_task_intake` 全过 |
+| 公网 `/mve/` | 200，页面含「外部任务」页签，`window.MVE_PREFIX="/mve"` |
+| 公网 `/mve/api/ext/tasks` | 200，返回迁移过来的账本（t745700 / t750467） |
+| 公网起一次 `list` | job `done` code=0，输出两条 task 的完整账 |
+| 旧地址 `/mve-ext/` | **404**（页面真的没了） |
+| 黑客松面板 `/mve-hackathon/` | 200（没被波及） |
+
+账本是运行数据，从 `/root/mve-rebuild/mve/failed_tasks.json` 拷到 `/root/mve/mve/`；
+技能库**没有**覆盖（`/root/mve` 自己那份是有真实积累的）。
+
+### 11.6 诚实边界
+
+- `ask` / `learn` / `retry` 的真实链路（LLM + MCP 取数）**没有由我跑**：那要几分钟一次、
+  且会改技能库。面板上的链路已证到「起进程 → 出输出 → 落账」，剩下的是人点。
+- `retry` 命中的是 **`/root/mve` 的技能库**（不是 rebuild 那个只有 1 条坏配方的库），
+  所以 `t745700` 说「已学 `vlml_first_blood`」，但这条配方在主库技能库里未必同名同内容 ——
+  第一次 retry 的结果要按真实表现看，别按账本推断。
+- `/root/mve-rebuild` 目录还在（没有服务、没有路由），留作对照；要清可以整个删掉。
