@@ -180,3 +180,18 @@ python mve/task_intake.py retry <task_id>
 `round_number=1`，全 `empty` 失败。
 修法：`write_sql(..., hints=)` 把要求渲染进 system（每一轮迭代都带着）。
 修完 `vlml_first_blood` 立刻转正，进度 0 → 1。
+
+### 7.5 第二刀已落：迭代回灌"上一轮实际取回的结果"
+
+§7.2 第 2 条（错口径入库）查下去，根因不在重试次数，在**重试的信息量**：
+
+- 原版每步回灌**整个观察**（`voyager_original/voyager/voyager.py:262-268`
+  `render_human_message(events=events)`：背包、位置、`Execution error:` 全给）；
+- 这边只回灌「取到几行 + 报错串」→ **SQL 报错能修，取错列但没报错就修不了**
+  （模型看不见自己取回了什么，critique 还说"方法跑通了"）。
+
+修法（`voyager_vlml/agents/action.py`）：新增 `_render_last_result(obs)`（列名 + 前 3 行，兼容
+`{columns,rows}` / 列表字典 / 空集 / 报告型 dict），`render_iteration_prompt(..., last_result=)`
+在「上一轮的 SQL」与「环境反馈」之间插入「**上一轮这条 SQL 实际取回的结果**」。
+
+完整对照（含 14 行逐步表、重试层次、解析失败计数）见 `docs/主循环对照-自修正与重试.md`。

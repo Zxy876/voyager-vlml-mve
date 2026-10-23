@@ -58,6 +58,78 @@ def _extract_sql(text: str) -> str:
     return ""
 
 
+def _render_last_result(obs: dict[str, Any], max_rows: int = 3,
+                        max_cols: int = 8) -> str:
+    """把上一轮**真的取回来的结果**渲染成文本（列名 + 前几行）。
+
+    为什么非要有这一块（2026-10-23，对齐原版 `voyager.py:262-268`）：
+      原版 `render_human_message(events=events)` 回灌的是**整个观察**
+      （背包、位置、附近方块……），模型能看见「我这一步到底改变了什么」。
+      这边原来只回灌 `critique`（= 行数 + 报错串），于是：
+        · SQL 报错 → 能修（错误串里有列名）；
+        · **SQL 没报错但取错了列/口径 → 修不了** —— 模型看不见返回了什么，
+          只能凭记忆重写一遍差不多的，或干脆换一个说法。
+      实测后果（见 docs/外部task闭环.md §7.2）：把 `round_number = 1` 当首血，
+      取到数、critic 判成功、错误配方进技能库 —— 因为「取到了数」这条判据
+      本身看不到口径，而模型也没有材料自查。
+    给出列名 + 样例值之后，模型才有机会自己发现「我这几列不是题干要的量」。
+    """
+    data = (obs or {}).get("data")
+    if data is None:
+        return ""
+    rows: list[Any] = []
+    cols: list[str] = []
+    saw_rows_key = False
+    if isinstance(data, dict):
+        for k in ("columns", "cols", "column_names"):
+            v = data.get(k)
+            if isinstance(v, list) and v and isinstance(v[0], str):
+                cols = [str(x) for x in v]
+                break
+        for k in ("rows", "data", "results", "records", "items"):
+            v = data.get(k)
+            if isinstance(v, list):
+                rows = v
+                saw_rows_key = True
+                break
+        # 有 rows 键但它是空列表 = 真空集（**不能**再把 dict 当一行，
+        # 否则会渲染出 `columns=['a']，rows=[]` 这种没用的文本）
+        if not saw_rows_key:
+            rows = [data]
+    elif isinstance(data, list):
+        rows = data
+    else:
+        rows = [data]
+    if not rows:
+        return "（结果为空集，0 行）"
+    out: list[str] = []
+    head = rows[0]
+    if isinstance(head, dict):
+        names = cols or [str(k) for k in head.keys()]
+        out.append("列：" + "、".join(names[:max_cols]))
+        for r in rows[:max_rows]:
+            if isinstance(r, dict):
+                out.append("行：" + "，".join(
+                    f"{k}={str(v)[:24]}" for k, v in list(r.items())[:max_cols]))
+            else:
+                out.append(f"行：{str(r)[:200]}")
+    elif isinstance(head, (list, tuple)):
+        if cols:
+            out.append("列：" + "、".join(cols[:max_cols]))
+        for r in rows[:max_rows]:
+            seq = list(r) if isinstance(r, (list, tuple)) else [r]
+            if cols and len(cols) >= len(seq):
+                out.append("行：" + "，".join(
+                    f"{cols[i]}={str(v)[:24]}" for i, v in enumerate(seq[:max_cols])))
+            else:
+                out.append("行：" + "，".join(str(v)[:24] for v in seq[:max_cols]))
+    else:
+        out.append("行：" + str(head)[:200])
+    if len(rows) > max_rows:
+        out.append(f"（共 {len(rows)} 行，只列前 {max_rows} 行）")
+    return "\n".join(out)
+
+
 class VLMLActionAgent:
     """在 VLML MCP 环境里执行取数动作（SQL）。"""
 
@@ -83,6 +155,7 @@ class VLMLActionAgent:
         schema: str = "",
         critique: str = "",
         last_sql: str = "",
+        last_result: str = "",
         skills: list[dict[str, Any]] | None = None,
         hints: list[str] | None = None,
     ) -> str:
@@ -110,6 +183,7 @@ class VLMLActionAgent:
             task=question,
             critique=critique or "（首轮，直接写一条 SELECT 回答这个问题）",
             last_sql=last_sql,
+            last_result=last_result,
         )
         text = chat(
             [{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -145,7 +219,9 @@ class VLMLActionAgent:
 
         observations: list[dict[str, Any]] = []
         sql = ""
+        prev_sql = ""
         critique = ""
+        last_result = ""
         n_skills = len(list(skills or []))
         # 同构原版 voyager.py:196-198 —— 打印注入了多少条已学会配方（原版只打印数量，
         # 不打印整条 system 消息：把 schema + 配方库全打出来会把日志淹没）。
@@ -153,7 +229,8 @@ class VLMLActionAgent:
         print(f"[Action Agent] 任务: {question[:140]}")
         for i in range(max_iters):
             sql = self.write_sql(
-                question, schema=schema, critique=critique, last_sql=sql,
+                question, schema=schema, critique=critique, last_sql=prev_sql,
+                last_result=last_result,
                 skills=list(skills or []), hints=list(hints or []),
             )
             if not sql:
@@ -164,6 +241,7 @@ class VLMLActionAgent:
                 print(f"  [第 {i + 1}/{max_iters} 次] 没产出 SELECT，重试")
                 critique = "上一轮没给出 SELECT。请只输出一条以 SELECT 开头的查询。"
                 continue
+            prev_sql = sql
             # 同构原版 voyager.py:218 —— 打印模型给出的动作（AI 消息）。
             print(f"  [第 {i + 1}/{max_iters} 次] 提案 SQL: {sql[:200]}")
             obs = await self.run_sql(sql)
@@ -176,9 +254,13 @@ class VLMLActionAgent:
                 print(f"  [第 {i + 1}/{max_iters} 次] 成功 -> 工具={obs.get('tool')} 行数={obs.get('rows')}")
                 print(f"[Action Agent] 任务在第 {i + 1} 次尝试成功")
                 break
+            # 下一轮要回灌「这一轮实际取回了什么」——不只是行数，是列名和值。
+            last_result = _render_last_result(obs)
             # 同构原版 voyager.py:293 / 274 —— 展示环境反馈 + critic 判决，然后重试。
             print(f"  [第 {i + 1}/{max_iters} 次] 失败 -> {str(obs.get('error') or '没取回数据')[:160]}")
             print(f"  [critic] {critique[:240]}")
+            if last_result:
+                print(f"  [回灌] 上一轮取回：{last_result.splitlines()[0][:160]}")
             print("  -> 重试！")
         else:
             print(f"[Action Agent] 任务在 {max_iters} 次尝试后失败（最后 critique: {critique[:240]}）")
@@ -235,15 +317,22 @@ class VLMLActionAgent:
         return base + "\n\n" + self._SKILL_USAGE + "\n\n" + "\n\n".join(blocks)
 
     def render_iteration_prompt(
-        self, *, task: str, critique: str, last_sql: str = ""
+        self, *, task: str, critique: str, last_sql: str = "",
+        last_result: str = ""
     ) -> str:
         """迭代修正 prompt：带着上一轮的 critique 重写 SQL（语言 = SQL，不给答案）。"""
         parts = [f"任务：{task}"]
         if last_sql:
             parts.append(f"上一轮你写的 SQL：\n{last_sql}")
+        if last_result:
+            # 同构原版 voyager.py:262-268 `render_human_message(events=events)`：
+            # 上一轮**真的取回来的东西**必须回灌，否则「没报错但取错列」修不了。
+            parts.append(f"上一轮这条 SQL 实际取回的结果：\n{last_result}")
         parts.append(f"上一轮的环境反馈：\n{critique}")
         parts.append(
             "请**只改 SQL**（表名/列名/过滤条件/聚合方式），重新给出一条能在当前库执行的 SELECT。"
+            "改之前先对照「任务」和「上一轮取回的结果」：如果取回的列不是题干要的那个量，"
+            "说明表的选法或口径错了，别再在原句子上微调。"
         )
         return "\n\n".join(parts)
 
