@@ -93,7 +93,7 @@ self.messages = [render_system_message(skills=new_skills),             # :256-26
 | `maieutic_open` | 拿维度清单是"下一步做什么"的前提 | **删**。维度由 curriculum 侧 `maieutic_scaffold` 出（`mve/maieutic_scaffold.py:181`），进 `task`/`context`，不进 step |
 | `maieutic_spec_submit` | 交计划 → 等判 → 再改计划，天然多回合 | **折叠进 program**：`examine` 返回 gaps，程序内 `for` 循环改 SPEC |
 | `maieutic_revise` | 承诺演进的载体 | **降级**为 `maieutic_note(kind="revision")`，一次函数调用 |
-| `maieutic_work_submit` | 交作答 → 等硬闸 | **就是 `RESULT`**。硬闸由 `task_critic` + SQL 实跑判，原版位置不动 |
+| `maieutic_work_submit` | 交作答 → 等硬闸 | **就是 `RESULT`**。硬闸由 `task_critic` 的真数判据判（`_has_real` → `critic.has_real_data`；**本期没有「每条 SQL 必须返回行」的闸**），原版位置不动 |
 | `maieutic_answer` | Phase 3 逐条解释偏离 | **降级为 critique 回灌**：追问进 `critique` 字段，下一 step 的 human message 自带 |
 | `maieutic_finalize` | 闭合后写技能 | **删**。`finalize` 与 `add_new_skill` 是同一件事，重复入口 |
 | `maieutic_research` | 取材料 | **保留**（执行域） |
@@ -398,7 +398,7 @@ actions.enabled_entries(scene)               # 关掉的组 → 条目不出现�
 | exercise | 人导入/自动生成的题（`tasks.infer_topic`） | — |
 | spec_gate_dimensions | 维度（`maieutic_scaffold.dimensions`，图谱 `kind=dimension`） | — |
 | student's spec | **program 里的 `SPEC` 变量** | `examine` 只判材料完备 |
-| code / finalCode | `RESULT` / SQL / 答案文本 | `task_critic` + 硬闸（SQL rows>0） |
+| code / finalCode | `RESULT` / SQL / 答案文本 | `task_critic` + 真数判据（`has_real_data`） |
 | revise(amendment, justification) | `maieutic_note("revision", …)` | 不判，只落盘 |
 | drift / revision / bug | `note.kind` + `pending_dimensions.json` | 教师侧（不进运行时判定） |
 | gaps_still_open | `examine.open` | `maieutic_gate`（在 critic 里）→ **唯一 `passed` 来源** |
