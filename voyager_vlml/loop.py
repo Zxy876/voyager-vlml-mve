@@ -244,7 +244,7 @@ def _retrieve_skills(
 
 
 async def _generate_new_task(curr: Any, env: Any, act: Any = None,
-                             max_tries: int = 3, max_iters: int = 3
+                             max_tries: int = 3, max_iters: int = 4
                              ) -> tuple[str, str, list[dict[str, Any]], str,
                                         list[str]]:
     """生成一个新任务，**并且先验证它真的能从库里取到数**。
@@ -372,7 +372,7 @@ async def run_one_round(
     scope: dict[str, Any] | None = None,
     topic_id: str | None = None,
     use_llm: bool = True,
-    max_iters: int = 3,
+    max_iters: int = 4,
     curr: Any = None,
     env: Any = None,
 ) -> dict[str, Any]:
@@ -578,7 +578,7 @@ async def run_rounds(
     *,
     scope: dict[str, Any] | None = None,
     use_llm: bool = True,
-    max_iters: int = 3,
+    max_iters: int = 4,
 ) -> list[dict[str, Any]]:
     """连跑 n 轮（共享 env 与课程状态）。
 

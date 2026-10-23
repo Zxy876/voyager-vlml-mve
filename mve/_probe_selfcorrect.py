@@ -20,7 +20,7 @@ HINTS = [
 async def main() -> None:
     env = VLMLMCPEnv()
     act = VLMLActionAgent(env=env)
-    obs, sql = await act.solve(Q, max_iters=3, hints=HINTS, skills=[])
+    obs, sql = await act.solve(Q, hints=HINTS, skills=[])
     print("\n==== 结果 ====")
     print("最终 SQL:", sql)
     for i, o in enumerate(obs, 1):

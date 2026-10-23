@@ -139,6 +139,40 @@ class VLMLMCPEnv:
         """执行一条 SQL（模型写的取数代码在这里跑）。"""
         return await self.call("query_sql", sql_query=sql)
 
+    async def table_row_counts(self) -> dict[str, int]:
+        """每张表的行数（一次 UNION ALL 查询）。
+
+        抽出来单独给两处用：`schema_block` 渲染要用，`action.solve` 校验
+        hints 有没有指向空表也要用 —— 以前这段只在 schema_block 内部，
+        算出来的行数只变成了字符串，别处拿不到结构化的。
+        """
+        obs = await self.run_sql(
+            "SELECT table_name FROM information_schema.columns "
+            "WHERE table_schema='main' GROUP BY table_name ORDER BY table_name"
+        )
+        if not obs.get("ok"):
+            return {}
+        data = obs.get("data") or {}
+        rows = data.get("rows") if isinstance(data, dict) else data
+        names = [str(r[0]) for r in (rows or []) if r]
+        if not names:
+            return {}
+        union = " UNION ALL ".join(
+            f"SELECT '{t}' AS t, COUNT(*) AS n FROM \"{t}\"" for t in names)
+        try:
+            obs2 = await self.run_sql(union)
+        except Exception:
+            return {}
+        if not obs2.get("ok"):
+            return {}
+        d2 = obs2.get("data") or {}
+        r2 = d2.get("rows") if isinstance(d2, dict) else d2
+        out: dict[str, int] = {}
+        for r in r2 or []:
+            if len(r) >= 2:
+                out[str(r[0])] = int(r[1] or 0)
+        return out
+
     async def schema_block(self, max_cols: int = 14, max_tables: int = 24) -> str:
         """实查当前库的表与列，渲染成给模型看的 schema 文本块。
 
@@ -168,21 +202,8 @@ class VLMLMCPEnv:
         #   agg_* 表名更"正规"就去查它 → 取回 0 行 → 报「没取到数」→
         #   人看到的是「Voyager 回答不出来」，而数据明明在隔壁表里。
         #   所以空表要**明写**出来：查它只会得 0 行，别去。
-        counts: dict[str, int] = {}
+        counts: dict[str, int] = await self.table_row_counts()
         names = [t for t, _ in list(cols.items())[:max_tables]]
-        if names:
-            union = " UNION ALL ".join(
-                f"SELECT '{t}' AS t, COUNT(*) AS n FROM \"{t}\"" for t in names)
-            try:
-                obs2 = await self.run_sql(union)
-                if obs2.get("ok"):
-                    d2 = obs2.get("data") or {}
-                    r2 = d2.get("rows") if isinstance(d2, dict) else d2
-                    for r in r2 or []:
-                        if len(r) >= 2:
-                            counts[str(r[0])] = int(r[1] or 0)
-            except Exception:
-                counts = {}
 
         # ⚠️ 必须给**一行真实数据**（2026-10-13 第 4 个坑）：
         #   只给列名，模型就会猜列里装的是什么值 —— 实测写出
@@ -219,6 +240,19 @@ class VLMLMCPEnv:
             head = "，".join(
                 f"{n}" + (f"::{ty[n]}" if n in ty else "") for n in c[:max_cols])
             n = counts.get(t)
+            if len(c) > max_cols and n != 0:
+                # ⚠️ 有数据的表：截断必须**自报家数并把列名补齐**（2026-10-23 实测的根因）。
+                #   `ext_player_round_stats` 有 18 列，max_cols=14 把
+                #   alive / first_kill / source / ingested_at 全截掉了，而 `first_kill`
+                #   是这张库里**唯一**的首血数据来源 → 模型看不见它，只能信 hints 里
+                #   那张 0 行的 agg 表 → 连跑 3 轮全空、被误判成"学不会"。
+                #   剩余列不给类型（省字符），但列名一个都不能少 —— 名字就是模型能查的东西。
+                head += (f"，…另有 {len(c) - max_cols} 列："
+                         + "、".join(c[max_cols:]))
+            elif len(c) > max_cols:
+                # 空表：列名全列出来没意义（又不会查它），只报总数。
+                # 实测 `agg_player_round_stats` 有 123 列，全列出来纯烧字符。
+                head += f"，…共 {len(c)} 列"
             if n is None:
                 base = f"- {t}: {head}"
             elif n == 0:
