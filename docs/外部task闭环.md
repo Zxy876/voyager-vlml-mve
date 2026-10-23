@@ -275,8 +275,12 @@ WHERE ext_player_round_stats.team_name = 'Karmine Corp'
   AND ext_player_round_stats.first_kill = TRUE
 ```
 
-`9 / 13` = **69.2%**，与手工核算一致 —— 口径也对（问"赢了多少比例"，它 JOIN 了
-`rounds.winning_team_name`，没有拿回合数充数）。
+`9 / 13` = **69.2%** 是这道题的**真值**（正确 JOIN：`game_id` + `round_number`）。
+
+⚠️ 但这条 SQL **没有**算出 9/13：它 `JOIN rounds ON ... game_id` 只连了 `game_id`，
+`rounds` 一行一回合 → 13 个回合被乘成 286 行，实际返回 **169/286 = 59.1%**。
+当时写成"与手工核算一致"是**归因错误** —— 手工核算的是正确的 9/13，模型算的是 169/286。
+详细纠正见 §9.4。
 
 **验收线至此通过**：人导入 task → 初始 fail（技能库空）→ 拆课 → 学 → 学不动的
 子目标被跳过而不是卡死 → retry 复用技能成功。
@@ -288,3 +292,88 @@ WHERE ext_player_round_stats.team_name = 'Karmine Corp'
 2. `vlml_fb_conversion` 被跳过后**不会自动复活**：`mastery.stale` 一旦置位就永久排除，
    除非调 `unstale()`（图表节点只有几十个，全 stale 后会走"生成新题"）。
    原版也没复活机制（`clean_up_tasks` 只在它变成功时剔除），这一点算同构，但要记着。
+
+---
+
+## 九 第二刀已落：成功判据加口径检验（原版 critic 的 LLM 判决移植）
+
+### 9.1 原版哪里在做这件事（取证）
+
+原版的"判成功"从来不是数行数，是**问模型**：
+
+| 位置 | 机制 |
+|---|---|
+| `agents/critic.py:26-28` | system = `prompts/critic.txt` |
+| `agents/critic.py:30-80` | human = 观察（末态：biome/背包/位置）+ `Task:` + `Context:` |
+| `agents/critic.py:94-117` | `ai_check_task_success`：LLM 回 JSON `{reasoning, success, critique}`，解析不了重试 `max_retries=5` |
+| `agents/critic.py:119-141` | `check_task_success`：组装两条消息，`mode=auto` 走 LLM |
+| `voyager.py:232-238` | **每一步**判一次，成功即停、critique 回灌下一轮 |
+| `prompts/critic.txt:3` | "Exceeding the task requirements is also considered a success while failing to meet them requires you to provide critique" |
+
+一句话：**原版判的是「任务要求有没有被满足」，不是「执行有没有报错」。**
+MVE 旧判据（`至少一次 ok` ∧ `rows≥1` ∧ `有真实值`）只覆盖"执行没报错"。
+
+### 9.2 改法：两级判据，第一级保留、第二级移植
+
+| 级 | 判什么 | 来源 |
+|---|---|---|
+| 第一级（保留） | 真的从库里取到数：ok 调用 + 行数达标 + 结果非真空 | SQL 特有补丁。原版没有这一级，因为 Minecraft 的观察不会出现"空表返回 1 行 (NULL,0)"这种骗局 |
+| 第二级（新增） | 任务要求满足了没有（口径） | 原版 `ai_check_task_success` 整段移植 |
+
+落点：`voyager_vlml/agents/critic.py`（`judge()` = 两级；`check_task_success()` 是兼容壳）、
+`voyager_vlml/prompts/critic.txt`（原版提示词的翻译 + 字段映射：背包→结果行列、
+代码→SQL；JSON 契约一字不改：`{reasoning, success, critique}`）。
+
+第二级**只给两样新东西**：
+- `SQL:` 字段（原版靠末态世界状态看"我做成了什么"，SQL 世界的末态只有几行数字，
+  过滤了哪个列只能从 SQL 本身看出来 —— 字段映射，不是新规则）；
+- `reasoning` 直接被当**答案句**（原版 JSON 里 reasoning 本来写的就是结论，
+  例子里 "2 oak + 2 spruce add up to 4"）。`mve/task_intake.py` 的 `answer`
+  优先取它，取不到才退回 SQL —— 这修掉了 §8.6 第 1 条：`answer` 以前恒为 SQL、`facts=0`。
+
+第二级跑不成（接口抖动 / JSON 重试用尽）时的行为：**接口抖动** → 退回第一级 + critique
+里明写"口径检验没跑成"（不把整轮判死）；**JSON 重试用尽** → 判失败（**同原版**返回 False）。
+
+代价：每一步多一次 LLM 调用（**原版 `voyager.py:232-238` 就是这样，每一步都判**）。
+要关掉时用环境变量 `MVE_CRITIC_LLM=0`（测试与离线冒烟用），默认开。
+
+### 9.3 实跑取证（2026-10-23，服务器 `/root/mve-rebuild`，rib，`mve/_probe_critic.py`）
+
+四条固定 SQL 直接喂 critic，不经过出题/写码模型（排除模型抖动）：
+
+| 例 | SQL | 真值 | critic 判决 | 说明 |
+|---|---|---|---|---|
+| A1 | `ext_player_round_stats` JOIN `rounds` ON **game_id + round_number** | 9/13 = 69.2% | ✅ 成功，reasoning：「赢了 9 场，总共 13 场，9/13 ≈ 69.2%」 | 数字读得准 |
+| A2 | 同上，但只连 `game_id` | **应 9/13**，算出 169/286 | ❌ **判成功**，reasoning：「169/286」 | **漏判**（见 9.4） |
+| B | `round_number=1` 当首血（历史坏配方） | 与题干无关 | ✅ 失败，critique：「地图应是 Sunset 不是 Split，且缺首血方赢下的回合数」 | 旧判据会放它过 |
+| C | `agg_first_blood_stats`（0 行） | 无 | ✅ 失败，`gate=vacuous`，**没调 LLM** | 第一级拦下 |
+
+B 就是 §7.2 第 2 条那个「第一回合当首血」的复现 —— 旧判据判成功并入库，新判据判失败并指出该看哪一列。
+`mve/test_critic_caliber.py` 10 条断言把两级判据、JSON 重试、抖动降级、critique 回灌、reasoning→answer 钉住。
+
+### 9.4 顺手纠正上一轮的一笔错账（重要）
+
+§8.5 写着"`9/13` = 69.2%，与手工核算一致 —— 口径也对"。**归因错了**：
+
+- 模型那条 SQL 是 `JOIN rounds ON ext_player_round_stats.game_id = rounds.game_id`，
+  **只连 game_id**；而 `rounds` 是**一行一回合**（`WHERE game_id='1058_game_1'` → 22 行 / 22 个 round_number），
+  于是 13 个首血回合被乘成 286 行，算出 **169/286 = 59.1%**。
+- 9/13 是**正确 JOIN（再加 `round_number`）**下的真值：实查 `13 回合 / 9 胜`。
+- 所以上一轮通过验收的那条答案，数值是错的；我们当时用"手工核算"给它背书，等于没核对模型那条 SQL 的 JOIN 键。
+
+教训与 §7.2 第 2 条同源：**「取到数 + 语义口径对」还不够，行数被放大看起来一样"合理"。**
+
+### 9.5 于是还剩一个洞（诚实，未修）
+
+**行放大（fan-out）LLM 判不出来**：A2 与 A1 在 critic 眼里长得一模一样 —— 都是 1 行两个数。
+判它的前提是知道"`rounds` 一行一回合、`ext_*` 一行一选手一回合"，即**表的粒度**。
+两个候选落法（都还没做）：
+
+1. **结构检测（不需要知识）**：对带 JOIN 的查询，比较「JOIN 后的行数」与「驱动表的行数」，
+   放大即报警。要拿到这两个数得把 SQL 拆成 FROM 段与 ON 段，或读 `EXPLAIN ANALYZE` 的算子基数。
+2. **粒度进图谱**：把"一行一回合 / 一行一选手"这类粒度写进节点（现在 `skills` 里已经有人写的一句
+   "`agg_first_blood_stats` 的粒度是 round_id"），JOIN 键对不上粒度就判失败。
+
+不选 `intent-diff` 那种"把题干承诺与 SQL 过滤逐项对齐"的写法 —— A2 的过滤条件与题干**完全一致**，
+错在 JOIN，逐项对齐查不出来。
+

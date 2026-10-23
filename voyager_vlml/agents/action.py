@@ -166,6 +166,11 @@ class VLMLActionAgent:
         # 原版有 recorder/self.last_events 存历史；这里同样存着，供上层记账。
         self.observations: list[dict[str, Any]] = []
         self.last_sql = ""
+        # critic 判成功时给出的结论句（原版 JSON 里的 reasoning 字段）——
+        # 上层拿它当 answer，而不是把 SQL 当答案（见 task_intake._answer_once）。
+        self.critic_reasoning = ""
+        self.answer = ""
+        self.last_success = False      # 最后一轮的判决（critic 两级都过）
 
     # ---------- 执行 ----------
     async def run_sql(self, sql: str) -> dict[str, Any]:
@@ -300,6 +305,9 @@ class VLMLActionAgent:
         self.hints = list(hints or [])
         self.observations = []
         self.last_sql = ""
+        self.critic_reasoning = ""
+        self.answer = ""
+        self.last_success = False
         try:
             self.schema = await self.env.schema_block()
         except Exception:
@@ -347,26 +355,40 @@ class VLMLActionAgent:
             ]
             print(f"  [第 {self.rollout_num_iter + 1}/{self.task_max_retries} 次] "
                   f"{'成功' if success else '失败'} · {self.summarize_chatlog(events)}")
+            if success and self.critic_reasoning:
+                print(f"    critic 判词：{self.critic_reasoning[:160]}")
         else:
             # :271-274 —— 解析失败：只打印 Trying again，**不重建消息、不加 critique**
             print(f"  [第 {self.rollout_num_iter + 1}/{self.task_max_retries} 次] "
                   f"没给出 SELECT · Trying again!")
 
         self.rollout_num_iter += 1                                 # :276
+        self.last_success = bool(success)
         done = (                                                   # :277-280
             self.rollout_num_iter >= self.task_max_retries or success
         )
         return events, done
 
     def critic_check(self, events: list[dict[str, Any]]) -> tuple[bool, str]:
+        """同构 `voyager.py:232-238`：每步判一次，成败 + critique 回灌下一轮。
+
+        判据两级（见 `agents/critic.py`）：先「真的取到数」，再让 LLM 按原版语义
+        判「任务要求满足了没有」（口径）。第二级的 reasoning 是结论句，存进 self.answer。
+        """
         if self.critic is None:
             from voyager_vlml.agents.critic import VLMLCriticAgent
 
             self.critic = VLMLCriticAgent()
-        return self.critic.check_task_success(
+        d = self.critic.judge(
             observations=events,
             task={"task": self.task, "hints": self.hints},
+            context=self.context,
+            sql=self.last_sql,
         )
+        self.critic_reasoning = str(d.get("reasoning") or "")
+        if d.get("success") and self.critic_reasoning:
+            self.answer = self.critic_reasoning
+        return bool(d.get("success")), str(d.get("critique") or "")
 
     # ---------- 同构 voyager.py:298-304 rollout ----------
     async def rollout(

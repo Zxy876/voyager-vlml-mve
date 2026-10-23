@@ -300,19 +300,29 @@ def _answer_once(question: str, *, topic_id: str = "",
                     "skipped": "技能库里没有与它相关的配方（还没学过）"}
 
     from voyager_vlml.agents.action import VLMLActionAgent
-    from voyager_vlml.agents.critic import VLMLCriticAgent
 
+    # ⚠️ 消费态**不传**图谱节点的 hints。试过传（口径提示走原版 Context 槽），
+    #    结果那条提示正好指着 0 行的 `agg_first_blood_stats`（"粒度是 round_id /
+    #    字段 fb_team"）→ 模型乖乖去查空表 → 纯聚合返回 1 行 (NULL,0) → 判真空失败。
+    #    hints 是"学的时候该往哪看"，不是"答的时候必须这么看"；答的时候靠 schema
+    #    （已标"0 行·别查"）+ 学到的配方，口径由 critic 判，不靠 hints 灌。
     act = VLMLActionAgent()
     obs, sql = asyncio.run(act.solve(question, max_iters=3, skills=skills))
-    ok, crit = VLMLCriticAgent().check_task_success(
-        observations=obs, task={"task": question, "hints": []})
+    # 成败与结论都用 **agent 自己那一趟的最后一轮判决**，不再另起一个 critic 重判：
+    # 重判既多烧一次 LLM，还可能跟前一步的 critic 意见相反（同一条结果两个判词）。
+    ok = bool(getattr(act, "last_success", False))
+    crit = str(getattr(getattr(act, "critic", None), "last_critique", "") or "")
+    reasoning = str(getattr(act, "answer", "") or "")
     return {
-        "ok": bool(ok),
+        "ok": ok,
         "trajectory": [str(o.get("tool") or "") for o in obs if o.get("ok")],
         "rows": sum(int(o.get("rows") or 0) for o in obs if o.get("ok")),
         "sql": sql,
         "skills": [{"name": s.get("key") or s.get("name") or ""} for s in skills],
-        "answer": sql[:400],
+        # 答案优先用 critic 的 reasoning（原版 JSON 的同一个字段，判成功时它写着结论句），
+        # 没有才退回 SQL —— 以前这里恒为 SQL，于是"取到 13 行"永远变不成"69.2%"这句话。
+        "answer": (reasoning or sql)[:400],
+        "answer_source": "critic_reasoning" if reasoning else "sql",
         "skipped": "" if ok else str(crit or "没取到数"),
     }
 

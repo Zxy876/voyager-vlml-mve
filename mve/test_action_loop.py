@@ -17,9 +17,14 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 from typing import Any
+
+# 这个测试只钉主循环的**控制流**，不钉判据；把第二级 LLM 口径检验关掉，
+# 否则每步都会真去打一次模型接口（口径检验本身在 test_critic_caliber.py 里测）。
+os.environ.setdefault("MVE_CRITIC_LLM", "0")
 
 _HERE = Path(__file__).resolve().parent
 _ROOT = _HERE.parent

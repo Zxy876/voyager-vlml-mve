@@ -343,7 +343,8 @@ async def _generate_new_task(curr: Any, env: Any, act: Any = None,
         obs, sql = await act.solve(
             question, max_iters=max_iters, hints=skills[:3], skills=gen_hits)
         ok, _why = crit.check_task_success(
-            observations=obs, task={"task": question, "hints": skills})
+            observations=obs, task={"task": question, "hints": skills},
+            sql=str(sql or ""))
         if ok:
             node = {
                 "id": tid,
@@ -469,11 +470,15 @@ async def run_one_round(
             skills=skill_hits,
         )
 
-    # ---- 判成败：是否真的从 DB 取到数 ----
+    # ---- 判成败：真的从 DB 取到数（第一级）+ 口径满足任务要求（第二级，原版 critic） ----
     success, critique = crit.check_task_success(
         observations=observations,
         task={"task": question, "hints": list(topic.get("skills") or [])[:3]},
+        sql=str(sql or ""),
     )
+    if crit.last_gate == "llm":
+        print(f"  critic（{ '成功' if success else '失败'}）："
+              f"{(crit.last_reasoning or critique)[:160]}")
 
     # ---- 计数：注入过的配方这轮有没有帮上忙 ----
     # 照原版：有效性低的技能会在 retrieve 的排序里自然沉底
@@ -510,7 +515,11 @@ async def run_one_round(
             "topic_id": tid,
             "success": success,
             "verdict": "ok" if success else "no_evidence",
-            "reason": "已从库取到数" if success else "未从库取到数（链路/口径问题）",
+            "reason": (
+                "已从库取到数，口径经 critic 确认" if success and crit.last_gate == "llm"
+                else "已从库取到数" if success
+                else "取到数但口径不满足（critic 判失败）" if crit.last_gate == "llm"
+                else "未从库取到数（链路/口径问题）"),
             "skill_key": skill_key,
         }
     )
