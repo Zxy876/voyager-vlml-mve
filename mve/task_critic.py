@@ -139,6 +139,25 @@ def check_task_success(task: str, context: str, result: dict[str, Any], *,
             return False, (f"一次都没取到内容（{why}）—— 换关键词或换来源重来；"
                            "不许拿报错或记忆当答案")[:300]
     if needs_data(task) and real <= 0:
+        # 区分「一次都没调」与「调了但全是空值」——这两件事要模型改的方向完全不同。
+        # 2026-10-23 工资场景实测：4 次调用各返回 1 行、SUM 全是 NULL（LEFT JOIN
+        # 没匹配 + `+ al.amount` 让 NULL 传染），判词却写「一次数据源都没调」，
+        # 模型拿着这句反馈无从下手，4 轮原地打转。原版 critic 的职责是
+        # 「失败必须给能改进的 critique」（prompts/critic.txt），所以这里要说真话。
+        calls = int(ex.get("calls") or 0)
+        rows = int(ex.get("rows") or 0)
+        if calls > 0:
+            errs = [str(o.get("error") or "").strip()[:80]
+                    for o in (result.get("observations") or [])
+                    if not o.get("ok")]
+            tail = ("；报错：" + "；".join(e for e in errs if e)[:120]) if errs else ""
+            return False, (
+                f"确实调了 {calls} 次数据源、取回 {rows} 行，但**每一行都是空值"
+                f"（NULL/0）**，所以不算取到数{tail}。"
+                "常见原因：LEFT JOIN 没匹配上；或对可能为 NULL 的列直接做加法/SUM"
+                "（NULL 会传染整行）。先 `SELECT * FROM 表 LIMIT 1` 看清列与值，"
+                "再对可空的列套 COALESCE，或把右表先按键聚合成一行再 join。"
+            )[:400]
         return False, ("这题要具体数据（文件/库/统计/时效），但一次数据源都没调、"
                        "没有真实取数 —— 不算完成")[:300]
     if dimensions:

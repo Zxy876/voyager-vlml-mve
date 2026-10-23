@@ -993,8 +993,13 @@ async def _start_learning_impl(
                 except Exception:
                     _needs = True
                 if _needs:
+                    _c = int(out["execution"].get("calls") or 0)
+                    _r = int(out["execution"].get("rows") or 0)
+                    # 说清楚是「没调」还是「调了但全空」—— 后者模型能改，前者要换路子。
+                    _what = (f"调了 {_c} 次、取回 {_r} 行，但每行都是空值（NULL/0）"
+                             if _c else "一次数据源都没调")
                     out.update(status="no_data",
-                               why="执行层跑通了但没取到真数（空表/真空值）——"
+                               why=f"执行层没拿到真数：{_what} —— "
                                    "原版铁律：失败不写技能库，不结晶不建点")
                     _record(out)
                     return out
