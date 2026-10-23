@@ -4,6 +4,9 @@
 > `open → spec_submit → answer → finalize`），那是照人类学习者画的：人在会话里会等，Voyager 不会。
 > 这版按你的硬约束重写——**学习主循环不能断，也不能被干预**——回到原版
 > `voyager_original/voyager/voyager.py` 解剖，先定死"哪些位置不许动"，再谈 maieutic 挂哪儿。
+>
+> 配套：`评审对照-v4原型.md` —— 本期哪几段真点得动、哪些是裁剪/没做、可见边界规则、
+> 「当时怎么答/被追问什么」的账记在哪。评审看那份，不看这份。
 
 ## 结论（五句话）
 
@@ -227,7 +230,7 @@ local_agent.solve(critique=crit1)                  learn_orchestrate.py:755-758
 |---|---|
 | 对应原版 | `spec-examiner.ts`（`passed ⟺ gaps_still_open 为空`） |
 | 返回 | `{"addressed":[…], "open":[…], "emergent":[…], "questions":[…≤3], "complete":bool}` |
-| 关键 | ① **无 `passed` 字段**；② `emergent` **不阻塞** `complete`（原版口径）；③ `questions` ≤3 条、是追问不是答案；④ 材料为空 → 全部维度算没答到 |
+| 关键 | ① **无 `passed` 字段**（字段级白名单见 `评审对照-v4原型.md` §2.2）；② `emergent` **不阻塞** `complete`（原版口径）；③ `questions` ≤3 条、是追问不是答案；④ 材料为空 → 全部维度算没答到 |
 
 ### 5.3 `maieutic_diagnose(trace="", *, window=5)`
 
