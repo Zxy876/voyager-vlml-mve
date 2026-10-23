@@ -58,3 +58,6 @@ mve/entity_catalog.json
 mve/subjects.json
 vlml/data/raw_events/
 vlml/data/vlml_vlr.duckdb
+
+# 外部 task 账本（运行时产物）
+mve/failed_tasks.json

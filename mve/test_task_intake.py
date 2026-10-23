@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""外部 task 闭环的离线自测（不烧 LLM、不连库）。
+
+跑法：`python mve/test_task_intake.py`
+全部 PASS 才说明「导入 → 记失败账 → 拆子目标 → 课程围着它 → 子目标全完成 → 重试成功」
+这条链在**结构与记账**上成立（真取数与模型行为要上服务器接 rib 才测得到）。
+"""
+
+from __future__ import annotations
+
+import sys
+import tempfile
+from pathlib import Path
+
+_HERE = Path(__file__).resolve().parent
+_ROOT = _HERE.parent
+for _p in (str(_ROOT), str(_HERE)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import task_intake as T  # noqa: E402
+
+
+def _tmp_ledger():
+    """换一个临时账本，别污染真的 failed_tasks.json。"""
+    f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False,
+                                    encoding="utf-8")
+    f.write("[]")
+    f.close()
+    T.TASKS_PATH = Path(f.name)
+
+
+Q = "Cloud9 在 Corrode 上首血率多少"
+
+
+def test_ask_fail_records_and_splits() -> None:
+    _tmp_ledger()
+    T._answer_once = lambda q, voyager=True: {          # type: ignore[assignment]
+        "trajectory": [], "facts": [],
+        "skipped": "没有取到任何数据", "topic_id": "vlml_first_blood",
+    }
+    out = T.ask(Q, voyager=True)
+    assert out["ok"] is False, out
+    assert out["task_id"], out
+    assert out["subtopics"], f"没拆出子目标：{out}"
+    rows = T.list_tasks()
+    assert len(rows) == 1 and rows[0]["status"] == "pending", rows
+    assert rows[0]["tries"] == 1
+    print(f"PASS  ask 失败 → 记账 + 拆课（{len(out['subtopics'])} 条子目标）")
+
+
+def test_next_focus_and_curriculum() -> None:
+    focus = T.next_focus()
+    assert focus and focus["topic_id"], focus
+    # 课程规划必须看得见它（否则"学什么由失败信号决定"就是空话）
+    from voyager_vlml.agents.curriculum import VLMLCurriculumAgent
+    nxt = VLMLCurriculumAgent().propose_next_task()
+    assert nxt["reason"] == "external_task", nxt
+    assert nxt["topic_id"] == focus["topic_id"], (nxt, focus)
+    assert "人导入的任务" in nxt["context"], nxt["context"][:200]
+    print(f"PASS  课程围着外部 task 选：{nxt['reason']} · {nxt['topic_id']}")
+
+
+def test_subtopics_done_then_retry() -> None:
+    row = T.list_tasks()[0]
+    for tid in row["subtopics"]:
+        T.mark_subtopic_done(tid)
+    rows = T.list_tasks()
+    assert rows[0]["ready_for_retry"] is True, rows[0]
+    assert T.next_focus() is None, "子目标全学完就不该再围着它出课"
+
+    T._answer_once = lambda q, voyager=True: {          # type: ignore[assignment]
+        "trajectory": ["query_sql"], "facts": [{"value": 1}],
+        "topic_id": "vlml_first_blood", "answer": "0.62",
+        "voyager_context": {"skills": [{"name": "vlml_first_blood"}]},
+    }
+    out = T.retry(row["task_id"])
+    assert out["ok"] is True, out
+    assert out["reused_skills"] == ["vlml_first_blood"], out
+    rows = T.list_tasks()
+    assert rows[0]["status"] == "solved", rows[0]
+    assert rows[0]["tries"] == 2
+    print(f"PASS  子目标全完成 → 重试成功（第 {rows[0]['tries']} 次），"
+          f"复用技能 {out['reused_skills']}")
+
+
+def test_vacuous_answer_is_not_success() -> None:
+    _tmp_ledger()
+    # 调了工具但没事实 / 有事实但没调工具，两种都不算成功（同学习循环的尺子）
+    T._answer_once = lambda q, voyager=True: {          # type: ignore[assignment]
+        "trajectory": ["query_sql"], "facts": [], "topic_id": "",
+    }
+    assert T.ask(Q)["ok"] is False
+    T._answer_once = lambda q, voyager=True: {          # type: ignore[assignment]
+        "trajectory": [], "facts": [{"value": 1}], "topic_id": "",
+    }
+    assert T.ask(Q)["ok"] is False
+    print("PASS  真空成功被挡住（只有轨迹没事实 / 只有事实没轨迹 都算失败）")
+
+
+def test_no_datasource_learns_nothing() -> None:
+    """数据源缺失时学习循环学不到东西 —— 这条是「必须带数据源」的机制证据。"""
+    _tmp_ledger()
+    T._answer_once = lambda q, voyager=True: {          # type: ignore[assignment]
+        "trajectory": [], "facts": [], "skipped": "库里没有这张表",
+        "topic_id": "vlml_first_blood",
+    }
+    out = T.ask(Q)
+    assert out["ok"] is False and out["subtopics"], out
+    # 每轮都取不到数 → 没有任何子目标会被 mark 完成 → ready_for_retry 永远不为真
+    assert T.list_tasks()[0].get("ready_for_retry") in (None, False)
+    print("PASS  无数据源：task 永远 pending（学不动，如实记账）")
+
+
+def main() -> int:
+    test_ask_fail_records_and_splits()
+    test_next_focus_and_curriculum()
+    test_subtopics_done_then_retry()
+    test_vacuous_answer_is_not_success()
+    test_no_datasource_learns_nothing()
+    print("\n全部通过（离线部分）。真取数与复用要接 rib 跑："
+          "ask → loop.py --rounds N → retry")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -240,6 +240,30 @@ class VLMLCurriculumAgent:
             mt = {}
         seed = mt.get("seed") or ""
 
+        # ---- 外部 task 优先（同构原版 curriculum.txt:22-23 的 Failed tasks 清单）----
+        # 人导入的 task 没答出来 → 它拆出的子目标就是**这一轮的课程**。
+        # 顺序上有意放在种子**之前**：种子（MC 的 "Mine 1 wood log"）是 VLML 世界的
+        # 出生地握手，泛化世界没有种子；而外部 task 是给定目标，必须最先被照顾。
+        # 没有外部 task（或子目标全学完）时 `next_focus()` 返回 None，行为与本改造前一致。
+        try:
+            import task_intake
+            focus = task_intake.next_focus()
+        except Exception:  # pragma: no cover  模块缺失/账本损坏 → 退回原课程
+            focus = None
+        if focus and str(focus.get("topic_id") or ""):
+            ftid = str(focus["topic_id"])
+            ftopic = self.graph.topics.get(ftid) or {}
+            return {
+                "task": f"为外部任务补子目标 {ftid}"
+                        f"（{(ftopic or {}).get('name') or ftid}）",
+                "context": (f"人导入的任务：{focus.get('question') or ''}\n"
+                            f"（{focus.get('why') or ''}）\n"
+                            + self._topic_context(ftid)),
+                "topic_id": ftid,
+                "exhausted": False,
+                "reason": "external_task",
+            }
+
         if self.progress == 0 and seed:
             topic = self.graph.topics.get(seed) or {}
             return {
@@ -300,6 +324,13 @@ class VLMLCurriculumAgent:
                 skill_key = str(info.get("skill_key") or "")
                 if skill_key:
                     self.mastery.add_skill(tid, skill_key)
+                # 外部 task 账：这条子目标算学会了（同构 `clean_up_tasks` 把已完成
+                # 的从 failed 里剔除 —— 但**不自动判 task 成功**，成功只由 retry 证明）。
+                try:
+                    import task_intake
+                    task_intake.mark_subtopic_done(tid)
+                except Exception:  # pragma: no cover
+                    pass
             else:
                 self.mastery.add_failure(
                     tid,
