@@ -26,8 +26,9 @@
 
 3. **唯一真正的卡口不是「没代码块」，是「没取证」**：`local_agent.py:640-647` 的真空判据在
    学习环节恒生效（`require_tools=True` `learn_orchestrate.py:765` + `_can_fetch` `local_agent.py:468`
-   恒真）→ **元认知类追问（「你为什么选这张表」）必被判失败**。所以追问必须**可取证化**，
-   这不是新增约束，而是 maieutic 原本的形态（详见 §4.3 判定表）。
+   恒真）→ **元认知类追问（「你为什么选这张表」）必被判失败**。但这不是"必须让它说话"的理由，
+   而是"必须给它配可调用的检验"的理由——maieutic 的 phase 2 已经给了三件（sympy 符号等价 /
+   spec↔代码 diff / 执行器分发），只是 MVE 一件都没移植（详见 §4.5）。
 
 4. **缺口只有一个：`_dims` 是静态的。** MVE 现在已经是「一条维度一次 rollout」的子目标制
    （`learn_orchestrate.py:671`，注释自己就引了 `voyager.py:403-421`），但维度来自
@@ -249,12 +250,75 @@ if (not err and res.get("ok") and data is not None and not tracer
 产出 `questions`，`maieutic_gate.py:172`）加一条**改写规则**：元认知/定义类追问一律改写为
 「去哪张表/哪份文档找出什么」。这是追问器的责任，不是循环结构的改动。
 
-### 4.4 如果一定要收元认知类（本期不做）
+### 4.4 如果一定要收元认知类（不靠开闸，见 §4.5）
 
-唯一改法：那一轮 `require_tools=False`（`learn_orchestrate.py:765` 单轮开口子）。
+唯一"直接"改法：那一轮 `require_tools=False`（`learn_orchestrate.py:765` 单轮开口子）。
 **但代价必须写死**：该轮产物**不入** `progress.codes`、不 `add_new_skill`、不 `close_one_dimension`，
 只落一条文本轨迹（`run_log`）。
-不建议本期做——它会让「闭合」和「入技能库」脱钩，而这条耦合正是 P5 的地基。
+**不建议这么做**——它会让「闭合」和「入技能库」脱钩，而这条耦合正是 P5 的地基。
+正解见 §4.5：**给它配一个可调用的检验原语**，而不是给纯文本开口子。
+
+### 4.5 追问的取证：能调 maieutic 的哪几件（逐件核实）
+
+**先纠正一处误引：原版 maieutic 没有联网调研。**
+`~/ maieutic_fork/maieutic` 全仓（排除 `node_modules`）`grep -rl "research"` **零命中**，
+`src/lib` 下也没有任何 search/fetch 模块（只有 `run-python.ts` / `run-java.ts` /
+`run-symbolic-math.ts` / `run-exercise-code.ts`）。
+`双MCP架构方案.md` §5.1 那句「对应原版 `research/agent.ts`」是 v3 设计稿的遗留想象，已改。
+**MVE 里真正的联网取证是 `actions.register_net` 注册的动作**（`web_search` / `mcp_*_fetch`），
+它已经是动作 → 天然进 `tracer`。
+
+maieutic 真正给的是 **phase 2 的执行器三件套 + phase 3 的偏离分类**：
+
+| 原件 | 干什么 | 判据 | 出处 |
+| --- | --- | --- | --- |
+| `run-exercise-code.ts` | 按 `targetLanguage` 分发执行器 | — | `src/lib/run-exercise-code.ts:7-44` |
+| `run-python.ts` | 浏览器 Pyodide（Web Worker + COOP/COEP）跑 Python | stdout / stderr | `src/lib/run-python.ts:1-8` |
+| `run-symbolic-math.ts` | 预载 sympy；`verifyMathExpression(expr, expected)` | **`simplify(a-b) == 0`**（符号等价，不是字符串比对） | `src/lib/run-symbolic-math.ts:16-42`、`:46-77` |
+| `intent-diff.ts`（Phase 3） | spec ↔ `finalCode` 偏离分类 | drift/revision/bug + **中性追问（不许泄露分类）** | `src/lib/opus/prompts/intent-diff.ts:1-45` |
+
+→ 能当"取证"的是**三种**，而且**只有第一种走 `tracer`**。§4.3 的判定表据此升级：
+
+| 追问问的是 | 取证手段 | 判据落在哪 | MVE 现状 |
+| --- | --- | --- | --- |
+| 数是多少 | SQL / 读文件 / 联网 | `tracer` 非空（`local_agent.py:640`） | ✅ 现成（`query_sql` / `web_search` / `mcp_*_fetch`） |
+| 这个数学结论对不对 | sympy 符号等价 | `check_math(expr, expected)` 返 True + 化简式 | ❌ 零移植；且 `_run_restricted` 禁 `import`（`:242-246`）→ 只能做成**原语动作** |
+| 你说的和你写的对不对 | spec ↔ 代码 diff | 逐条 divergence（**不要求 tracer**） | ❌ 零移植（只有事前 `expected_drifts` 预测，`maieutic_scaffold.py:68-91`） |
+
+**三条落点，全部用现成机制，不开口子：**
+
+1. **`check_math` 做成原语动作**（`actions.register(..., group="本机能力")`）。
+   - 一被调用就进 `tracer` → `local_agent.py:640` 的真空判据**自动满足，判据本身不用改**；
+   - 返回值（`True/False` + `simplify` 结果）就是材料 → 进 `_ev1` → `maieutic_gate._material_block`
+     （`:92-104`）能列出来，闸门"以材料为准"那一条也过得去；
+   - 这同时给出待拍板项「场景 B 硬闸用 SQL 还是 sympy」的答案：**sympy**，且原版已给实现。
+   - **为什么必须做成动作、不能让模型自己 `import sympy`**：`_run_restricted` 的 ns 没有 builtins，
+     `import` 直接 ImportError（`:242-246` 那段错误文案就是为这件事写的）。
+
+2. **`intent-diff` 移植成第二道闸**（不替代 `maieutic_gate`，两道分工）。
+   - 输入：`_d`（维度 = spec 里的一条承诺）+ `code1`（`learn_orchestrate.py:824` 落盘的那份）
+   - 时机：`ok1` 判完、`dim_codes.append` 之前
+   - 用途两条：
+     a. `ok1=True` 但 diff 判 drift（代码比承诺少做）→ **不该闭合成技能** —— 这是「跑通 ≠ 口径对」
+        的机器化判据，比 `RESULT.rows > 0` 强；
+     b. `ok1=False` → diff 出的中性追问**比 `crit1` 准**。根因：`crit1` 只看「答案文本 + 材料」，
+        **看不见代码**，而 Voyager 的产物主体就是代码。
+   - 纪律照抄原版：`classification` **不进学生面**（`intent-diff.ts:16-18`
+     "The question must NOT reveal the classification"），只进 `run_log` / 教师面 ——
+     这与 `评审对照-v4原型.md` §二 的可见边界规则是同一口径，不是自创。
+
+3. **联网调研归位到第 2 步，不放进追问。**
+   - `maieutic_scaffold.render_material`（`:154-178`）现在注入的是「已学节点 + 实体 + 数据源」，
+     **没有联网**；要"调 maieutic 的联网调研"，落点在这里（`extras` 或新增一段），
+     产物进 `material_note` / 缓存 json；
+   - 不建议放进追问：追问的取证靠执行层（Voyager 自己查）更准，且追问里联网会吃光
+     `EXEC_TIMEOUT=90`（`learn_orchestrate.py:178`）的预算。
+
+**净结论**：这句判断成立——取证确实可以调 maieutic，但要调的是 **phase 2 的执行器 + phase 3 的
+`intent-diff`**，不是"联网调研"（原版没有）。
+而 §4.4「元认知追问必挂」也随之有解：**不是放行纯文本，而是给追问配一个可调用的检验原语**
+（`check_math`）**或换一道看得见代码的闸**（`intent-diff`）。这样 §4.4 那个"本期不做"的开口子
+就不需要了。
 
 ---
 
@@ -269,6 +333,9 @@ if (not err and res.get("ok") and data is not None and not tracer
 | 5 | **追问升格为新维度 + 重规划**（**外层**） | maieutic | `scaffold(extras=history, use_cache=False, rnd=n)` → 新 `_d` 追加进 `_dims` | `ckpt_maieutic/<scene>/<hash>_r<n>.json` | **新做（小）** |
 | 6 | 闭合 → 一条维度一条技能 | Voyager | `learn_milestone_skills`（`:210`）→ `skill_store.add(..., exact_only=True)` | `skill_store.json` 一条技能，`name=dim.id` | 现成 |
 | 7 | 落 db（问题 / 表列角色 / 配方） | maieutic + Voyager | 见 `建模表与技能落库-可行性.md` §四 的三张表 | `problem` / `plan_ref` / `recipe` | 待做 |
+
+**取证插在第 3、4 步之间（§4.5）**：`intent-diff` 在 `ok1` 判完、`dim_codes.append`（`:824`）之前跑一次，
+`check_math` 是维度可以调用的原语动作（谁调谁进 `tracer`）。两者都不新增循环。
 
 ### 5.1 第 6 步为什么能「入 db」：技能名就是关联的问题
 
@@ -301,14 +368,15 @@ if (not err and res.get("ok") and data is not None and not tracer
 | --- | --- | --- | --- |
 | 1 | 重规划覆盖缓存 | 旧维度 id 失联 → `progress.codes` 成孤儿账，续学丢成果 | 缓存按轮次分文件（§3.3） |
 | 2 | 去重上相似度 | 合法新维度被当成已完成，重规划变空转（用户已踩过 5 次） | 只用 `dim.id` 精确比对 |
-| 3 | 追问不可取证化 | 追问退化成「再答一遍」，4 轮全撞 `:640` → 维度永不闭合 | `maieutic_gate` 出追问时强制改写为「去哪找什么」 |
+| 3 | 追问不可取证化 | 追问退化成「再答一遍」，4 轮全撞 `:640` → 维度永不闭合 | 两条：出追问时改写为「去哪找什么」（`maieutic_gate`），并给它配可调用的检验原语 `check_math` / 第二道闸 `intent-diff`（§4.5） |
 
 第 3 条是本架构成败的关键，且**它是质量风险不是结构风险**——结构上追问通道是通的，
-通不通取决于追问写得够不够「有动作」。
+通不通取决于两件事：追问写得够不够「有动作」（`maieutic_gate` 的责任），
+以及这类追问有没有对应的**可调用检验**（`check_math` / `intent-diff` 的责任，§4.5）。
 
 ---
 
-## 七 验收线（可跑断言，4 条）
+## 七 验收线（可跑断言，6 条）
 
 1. **「追问能进来」**：构造一次 `solve(critique="去 plan_ref 里找 fb_team_won 的 role 再重算")`，
    断言最终 `user` 文本里出现该句（`local_agent.py:609` 的 `上一轮没通过 critic 检查…`）。
@@ -319,6 +387,12 @@ if (not err and res.get("ok") and data is not None and not tracer
    （或已被 `render_material` 的「已学过节点」排除）。
 4. **「闭合即入技能」**：`milestone_state()` 由 `achieved=False` 变 `True` 后，
    `skill_store` 里出现 `name == dim.id` 的条目，`source == "learn"`。
+5. **「`check_math` 能顶替纯文本」**（§4.5 落点 1）：数学型维度只调 `check_math("diff(x**2,x)", "2*x")`
+   并写 `RESULT = {"answer": "2x"}`、不碰任何数据源，断言 `ok == True` —— 因为这次调用的
+   函数名出现在 `obs["data_sources"]` 里（`local_agent.py:659`），`tracer` 非空，`:640` 不触发。
+6. **「`intent-diff` 拦住漂移」**（§4.5 落点 2）：构造 `ok1=True` 但代码少做一条承诺的样例，
+   断言不调 `learn_milestone_skills`、`dim_codes` 里该维度不落 `code`，且 `run_log` 里留下
+   `classification`（drift），而面板学生面**看不到** `drift` 这个词。
 
 ---
 

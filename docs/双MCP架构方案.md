@@ -219,7 +219,7 @@ local_agent.solve(critique=crit1)                  learn_orchestrate.py:755-758
 
 | 项 | 内容 |
 |---|---|
-| 对应原版 | `research/agent.ts` 的 plan→gather（v3 的 `maieutic_research`） |
+| 对应原版 | **原版无此能力**（`~/ maieutic_fork/maieutic` 全仓 `grep -rl "research"` 零命中，`src/lib` 下无任何 search/fetch 模块）。此处是 v3 设计稿的遗留想象，落地只能依赖 MVE 自己的联网动作（`actions.register_net` → `web_search` / `mcp_*_fetch`） |
 | 返回 | `{"gathered":[{"source","chars","digest","ok":true}], "report":[{"source","status":"failed","why"}], "answer":"…"}` |
 | 关键 | **两本账**：失败项进 `report` 不进 `gathered`（同构 `agent.ts` 的 `if (result.ok && result.text) gathered.push(...) else report.push(...)`）。正文不出进程，只回 digest |
 | 为什么同步 | 内部 `net_tools` + LLM，单次 5~20s；一次 program 最多调 2 次，落在 90s 预算内 |
