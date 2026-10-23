@@ -346,17 +346,17 @@ actions.enabled_entries(scene)               # 关掉的组 → 条目不出现�
 | 8 | `mve/maieutic_gate.py` | prompt 加一段"材料为空 = 全部没答到"（已有，`GATE_SYSTEM:47-49`），补 `emergent` 不阻塞用例 |
 | 9 | `mve/skill_store.py` | 条目附 `notes`（revision 理由），同名覆盖改**追加历史版本**（冻结旧版） |
 
-### MVP-3 · 卡住识别与提示梯度
+### MVP-3 · 卡住识别与提示梯度（本期**移出范围**，见 `评审对照-v4原型.md` §七）
 
 | # | 文件 | 改动 |
 |---|---|---|
-| 10 | `mve/maieutic_tools.stuck()` | 纯规则：>5min 无变化 / 同 gap 3+ 轮 → `hint_depth` |
-| 11 | `mve/learn_orchestrate.py:751-810` | L2 重试按 `hint_depth` 换提示（现在是同一段 critique 重试 4 次） |
+| 10 | `mve/maieutic_tools.stuck()` | 纯规则：`_t>=2`（同一次学习内第 3 次未闭合）→ `hint_depth`。**计数器用 L2 的 `_t`**（`learn_orchestrate.py:751`），**不用** `progress.iterations.rounds`（它不区分 passed、跨次累加、永不归零） |
+| 11 | `mve/learn_orchestrate.py:751-810` | 按 `hint_depth` **展开成不同的提示文本**（first/deeper/scaffold/micro，枚举名不进 prompt）；`pilot.log` 打一行 `· 卡住：…`；整轮 `run_log` 的 `hint` 字段写 `scaffold@3`（字段已存在，`:1174`，不动白名单） |
 | 12 | `mve/maieutic_scaffold.py` | 预判偏离补 `recovery_policy{first,deeper,scaffold,micro}` |
 
 ---
 
-## 十一、验收线（8 条，前 3 条是"没打断"的硬判据）
+## 十一、验收线（9 条，前 3 条是"没打断"的硬判据）
 
 | # | 验收项 | 判据 |
 |---|---|---|
@@ -368,6 +368,11 @@ actions.enabled_entries(scene)               # 关掉的组 → 条目不出现�
 | 6 | **消费期物理无助产** | `set_switch(scene,"助产士",False)` 后重放同题：`_tools_in_code` 里 `maieutic_*` 计数 0，`audit_skill_replay.py` 仍 `OK / 坏 0` |
 | 7 | **学习信号冻结** | 同名技能重做后，旧条目 `answers / notes / classification` 逐字节未变 |
 | 8 | **面板没新按钮** | 入口仍是「交给 Voyager 回答」；只加状态条（v2 起就是这条，v4 不变） |
+| 9 | **stuck 本期未接线（反向项）** | 同一维度第 4 次 exec 的 prompt 与第 1 次**逐字相同**；`pilot.log` 无 `卡住` 行；该轮 `run_log` 的 `hint` 为空。三条同时成立 = 确认移出范围、无半截实现（正向项见 §十 MVP-3） |
+
+> 第 9 条是 v3 第 6 条（`hint_depth=scaffoldHint`）的**替代物**，不是补充：stuck 本期归
+> **移出范围**（不是裁剪——`progress.iterations.rounds` 是为追问回灌存的，不能当承载点），
+> 定论与"若要做时用哪个计数器"见 `评审对照-v4原型.md` §七。
 
 ---
 
