@@ -91,6 +91,14 @@ def main() -> int:
     got = consume.generalize_sql_recipe(struct, "q")
     check("纯结构查询原样返回", got == struct)
 
+    # 槽位塞进列别名（glm-4-flash 实测踩过 `AS total_:kind`）→ 原样返回
+    bad_alias = ("SELECT SUM(CASE WHEN a.kind = :subsidy_type THEN a.amount "
+                 "ELSE 0 END) AS total_:subsidy_type FROM allowances a")
+    calls.clear()
+    consume.chat_json = _stub_chat_json({"sql": bad_alias, "slots": ["subsidy_type"]}, calls)
+    got = consume.generalize_sql_recipe(sql, "q")
+    check("槽位出现在标识符旁（列别名）→ 原样返回", got == sql)
+
     print("== ② learn_milestone_skills：入库前泛化 ==")
     import skill_store
     import learn_orchestrate as lo

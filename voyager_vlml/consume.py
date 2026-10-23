@@ -278,10 +278,16 @@ _GENERALIZE_SYSTEM = """你是数据取数方法整理员。手里有一条为�
    表名、列名、聚合方式（COUNT/SUM/AVG）、JOIN 结构、GROUP BY 的列
    都是**方法本身**，一个字都不许动。
 2. 槽位写成 `:语义名`（小写蛇形，如 :dept、:month、:team）。
-3. 输出第一条 SQL 注释逐个槽位写明「该填什么、从问句哪里取」，例如：
-   -- slots: dept=部门名，取问句里点名的部门（如"技术"）; month=年月（如"2026-09"）
-4. 输出必须是单条 SELECT 或 WITH 开头的语句，不许 INSERT/UPDATE/DROP。
-5. 这条 SQL 里若没有题目专属的实体值（纯结构查询），原样返回，slots 给空数组。
+   ⚠️ 槽位只许出现在**值的位置**（与列比较的右侧 / IN 的元素 / LIMIT 的数字）。
+   实测踩过：把槽位塞进列别名（`AS total_:kind`）或写成拼接表达式
+   （`hire_date < :month + '01'`）—— 别名坏了输出列名就变了，日期要整体
+   一个槽位（`hire_date < :cutoff_date`），不许拆开拼。
+3. 列别名（AS 后面的名字）**原样保留**，哪怕它含旧题的词 —— 别名只是输出
+   列名，不是筛选值。
+4. 输出第一条 SQL 注释逐个槽位写明「该填什么、从问句哪里取」，例如：
+   -- slots: dept=部门名，取问句里点名的部门（如"技术"）; cutoff_date=统计截止日（如"2026-10-01"）
+5. 输出必须是单条 SELECT 或 WITH 开头的语句，不许 INSERT/UPDATE/DROP。
+6. 这条 SQL 里若没有题目专属的实体值（纯结构查询），原样返回，slots 给空数组。
 
 只返回一个 JSON：{"sql": "模板化后的 SQL", "slots": ["dept"],
 "note": "一句话说明把哪些值换成了槽位（没有就说原样返回）"}"""
@@ -322,6 +328,14 @@ def generalize_sql_recipe(code: str, question: str) -> str:
                       if not ln.strip().startswith("--")).strip()
     if not _body.lower().startswith(("select", "with")):
         return code
+    # 槽位只许出现在**值的位置**：`:slot` 前面紧贴标识符字符（实测
+    # glm-4-flash 写出 `AS total_:kind` 把槽位塞进列别名）= 方法被改坏，
+    # 原样返回 —— 坏模板比重放旧值更危险（张冠李戴）。
+    import re as _re
+    for _m in _re.finditer(r":([a-z_][a-z0-9_]*)", _body, _re.I):
+        _i = _m.start()
+        if _i > 0 and (_body[_i - 1].isalnum() or _body[_i - 1] == "_"):
+            return code
     return sql
 
 
