@@ -10,7 +10,8 @@
 本模块补的就是这一环，且只补这一环：
 
     人导入 task
-        ↓  coach.explain(voyager=True)   ← 复用已学技能先答一次（消费态）
+        ↓  Voyager 用自己的技能库答一次（消费态；`VLMLActionAgent.solve`，
+           技能库空 → 直接判失败，不烧调用）
     成功 → 结束（能力已够，不用学）
     失败 → 记进 failed_tasks.json + 拆子目标
         ↓  VLMLCurriculumAgent.propose_next_task() 读它（同构原版把
@@ -179,6 +180,21 @@ def next_focus() -> dict[str, Any] | None:
             continue
         subs = pending_subtopics(task)
         if subs:
+            # 先学「没试过的 / 更简单的」：子目标失败一次就排到后面，
+            # 别死磕同一条（原版 curriculum.txt:29 "The next task should not be
+            # too hard since I may not have learned enough skills"，以及
+            # `:332-347` 失败即记 failed 换下一个的行为）。
+            try:
+                g = _graph()
+                subs = sorted(
+                    subs,
+                    key=lambda t: (
+                        int((g.mastery.get(t) or {}).get("attempts") or 0),
+                        float((g.topics.get(t) or {}).get("difficulty") or 1.0),
+                        int((g.topics.get(t) or {}).get("depth") or 99),
+                    ))
+            except Exception:
+                pass
             return {"task_id": str(task.get("task_id") or ""),
                     "topic_id": subs[0],
                     "question": str(task.get("question") or ""),
@@ -187,19 +203,60 @@ def next_focus() -> dict[str, Any] | None:
 
 
 # ---------------------------------------------------------------- 记账
-def _answer_once(question: str, *, voyager: bool = True) -> dict[str, Any]:
-    """消费态答一次：**用已经学到的东西**答，不触发学习。"""
-    import coach
-    return asyncio.run(coach.explain(question, voyager=voyager))
+def _answer_once(question: str, *, topic_id: str = "",
+                 use_skills: bool = True) -> dict[str, Any]:
+    """消费态答一次：**用 Voyager 自己的技能库**答（不是让 VLML 专家代答）。
+
+    为什么不用 `coach.explain`
+    --------------------------
+    `coach.explain` 走的是 VLML 编排（外部专家）：库里有的数它都能取，几乎不会失败。
+    而这条闭环要证明的是「**Voyager 学会了**」，不是「VLML 会查」。所以消费态必须是
+    Voyager 自己写 SQL —— 它答不出，才是学习信号。
+
+    技能库为空时**直接判失败、不烧一次调用**：一条配方都没有，写出来的 SQL 只能是
+    现场凭记忆编的（那正是这套学习要消灭的东西）。这条也正是验收线「初始 task 必 fail」
+    的机制来源：新场景技能库是空的。
+    """
+    skills: list[dict[str, Any]] = []
+    if use_skills:
+        try:
+            import skill_store
+            skills = skill_store.retrieve(topic_id or "", question, top_k=4)
+        except Exception:
+            skills = []
+        if not skills:
+            return {"ok": False, "trajectory": [], "rows": 0, "sql": "",
+                    "skills": [],
+                    "skipped": "技能库里没有与它相关的配方（还没学过）"}
+
+    from voyager_vlml.agents.action import VLMLActionAgent
+    from voyager_vlml.agents.critic import VLMLCriticAgent
+
+    act = VLMLActionAgent()
+    obs, sql = asyncio.run(act.solve(question, max_iters=3, skills=skills))
+    ok, crit = VLMLCriticAgent().check_task_success(
+        observations=obs, task={"task": question, "hints": []})
+    return {
+        "ok": bool(ok),
+        "trajectory": [str(o.get("tool") or "") for o in obs if o.get("ok")],
+        "rows": sum(int(o.get("rows") or 0) for o in obs if o.get("ok")),
+        "sql": sql,
+        "skills": [{"name": s.get("key") or s.get("name") or ""} for s in skills],
+        "answer": sql[:400],
+        "skipped": "" if ok else str(crit or "没取到数"),
+    }
 
 
 def _ok(res: dict[str, Any]) -> tuple[bool, str]:
-    """成功判据：真取到数（有工具轨迹 + 有事实）。
+    """成功判据：真取到数。
 
     ⚠️ 与学习循环同一条尺子（`voyager_vlml/loop.py:472-476` 的
     "成败 = 有没有真的从 DB 取到数"）：不能只看 answer 非空 —— 没有工具轨迹
     的"回答"是模型凭记忆写的，那种成功会把失败信号吃掉，课程就永远不会启动。
     """
+    if "ok" in res:                      # Voyager 通路（critic 已经判过）
+        return bool(res.get("ok")), str(res.get("skipped") or "")
+    # 兼容 coach.explain 的返回（有轨迹 + 有事实才算）
     traj = res.get("trajectory") or []
     facts = res.get("facts") or []
     if not traj:
@@ -209,7 +266,7 @@ def _ok(res: dict[str, Any]) -> tuple[bool, str]:
     return True, ""
 
 
-def ask(question: str, *, voyager: bool = True,
+def ask(question: str, *, use_skills: bool = True,
         topic_id: str = "") -> dict[str, Any]:
     """人导入一条 task，先答一次；答不出就记账并拆课。
 
@@ -218,7 +275,7 @@ def ask(question: str, *, voyager: bool = True,
     q = str(question or "").strip()
     if not q:
         return {"ok": False, "reason": "空问题", "task_id": "", "subtopics": []}
-    res = _answer_once(q, voyager=voyager)
+    res = _answer_once(q, topic_id=topic_id or "", use_skills=use_skills)
     ok, why = _ok(res)
     # 用 explain 归题/生成后的 topic_id 拆课：泛化场景的问题常落在图谱之外，
     # explain 会先把它种成节点，这里才拆得出子目标。
@@ -274,7 +331,7 @@ def mark_subtopic_done(topic_id: str) -> int:
     return n
 
 
-def retry(task_id: str, *, voyager: bool = True) -> dict[str, Any]:
+def retry(task_id: str, *, use_skills: bool = True) -> dict[str, Any]:
     """重试一条（失败的）task —— 验收点：这次用的是**学会的技能**。"""
     rows = _load()
     row = next((r for r in rows
@@ -282,15 +339,15 @@ def retry(task_id: str, *, voyager: bool = True) -> dict[str, Any]:
     if row is None:
         return {"ok": False, "reason": f"没有这条 task：{task_id}"}
     q = str(row.get("question") or "")
-    res = _answer_once(q, voyager=voyager)
+    res = _answer_once(q, topic_id=str(row.get("topic_id") or ""),
+                       use_skills=use_skills)
     ok, why = _ok(res)
     row["tries"] = int(row.get("tries") or 0) + 1
     row["updated_at"] = _now()
     row["status"] = "solved" if ok else "pending"
     row["last_reason"] = "" if ok else why
     row["answer"] = str(res.get("answer") or row.get("answer") or "")[:2000]
-    vctx = res.get("voyager_context") or {}
-    row["reused_skills"] = [s.get("name", "") for s in (vctx.get("skills") or [])]
+    row["reused_skills"] = [str(s.get("name") or "") for s in (res.get("skills") or [])]
     _save(rows)
     return {"task_id": task_id, "ok": ok, "reason": why, "tries": row["tries"],
             "reused_skills": row["reused_skills"],
@@ -309,8 +366,8 @@ def _main() -> int:
 
     a = sub.add_parser("ask", help="人导入一条 task，先答一次（失败就记账拆课）")
     a.add_argument("question", nargs="+")
-    a.add_argument("--no-voyager", action="store_true",
-                   help="只用 VLML 编排答（默认用 Voyager 已积累的技能）")
+    a.add_argument("--no-skills", action="store_true",
+                   help="不要求复用技能库（现场写 SQL，等于让专家代答一次）")
 
     r = sub.add_parser("retry", help="重试一条失败 task（验收用）")
     r.add_argument("task_id")
@@ -323,7 +380,7 @@ def _main() -> int:
 
     args = ap.parse_args()
     if args.cmd == "ask":
-        _print(ask(" ".join(args.question), voyager=not args.no_voyager))
+        _print(ask(" ".join(args.question), use_skills=not args.no_skills))
     elif args.cmd == "retry":
         _print(retry(args.task_id))
     elif args.cmd == "list":

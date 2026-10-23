@@ -138,3 +138,45 @@ python mve/task_intake.py retry <task_id>
 ```
 
 通过判据：`retry` 输出 `ok=true` 且 `reused_skills` 非空（说明用的是学会的配方，不是现编）。
+
+---
+
+## 七 首次联机实跑（2026-10-23，rib 库）
+
+### 7.1 已成立的（真跑，不是设计）
+
+| 环节 | 实测 |
+| --- | --- |
+| 导入即失败 | `ask` → `ok=false`，`reason="技能库里没有与它相关的配方（还没学过）"`，直接记账不烧调用 |
+| 拆子目标 | `subtopics=["vlml_fb_conversion","vlml_first_blood"]`（先前置后目标） |
+| 课程围着失败信号 | 连跑 3 轮全是 `reason=external_task`，不是原来的里程碑课程序 |
+| 学会一条 | `done_subtopics` 从 `[]` → `["vlml_first_blood"]`，`skill_store` 从 0 → 1 条 |
+| 失败后换子目标 | 加了 `attempts → difficulty → depth` 排序，失败过的子目标排到后面 |
+
+### 7.2 卡住的（诚实）
+
+1. **`retry` 不可能成功**：目标子目标 `vlml_fb_conversion` 依赖 `agg_first_blood_stats`，
+   实查该表 **21 列都在、行数 = 0**（`SELECT COUNT(*)` → 0）。空表 → 每轮都取不到数 →
+   永远学不完 → `ready_for_retry` 永不置真。
+   这不是代码 bug，是**这个库里首血数据是空的**——正好印证「数据源必须有，且必须有数据」。
+2. **学到的配方口径是错的**：`vlml_first_blood` 那条成功配方写的是
+   `WHERE map_name='Split' AND round_number=1`（把"第一回合"当"首血"），取自
+   `ext_player_round_stats`（2850 行）→ 取到数 → 判成功入库。
+   **「跑通 ≠ 口径对」原样复现**：判据只看"取到数"，看不出口径错了。
+
+### 7.3 两条下一刀（按性价比排序）
+
+| # | 改什么 | 为什么 |
+| --- | --- | --- |
+| 1 | 学习前预检"表有没有行"：空表节点直接标 `db_unreachable` 并跳过 | 现在空表要烧 3 轮 SQL + 3 次 LLM，还会把它写进 failed 账把课程堵死 |
+| 2 | 成功判据加一道"口径检验"（`intent-diff`：SQL 的过滤/聚合 vs 题干与节点 skills 的承诺） | 否则"第一回合"会被当成"首血"永久入库，下次复用即错 |
+
+### 7.4 顺手修掉的一个真 bug
+
+`hints`（节点 skills 里的取数要求，如"`agg_first_blood_stats` 的粒度是 round_id / 字段
+`fb_team` 与 `fb_team_won`"）以前**只传给 critic、没有进写码 prompt**
+（`voyager_vlml/agents/action.py` 的 `solve` 收了 `hints` 却只在 `check_task_success` 用它）。
+后果是模型全程瞎猜列名：连跑 3 轮都在 `ext_player_round_stats` 上写 `event_type` /
+`round_number=1`，全 `empty` 失败。
+修法：`write_sql(..., hints=)` 把要求渲染进 system（每一轮迭代都带着）。
+修完 `vlml_first_blood` 立刻转正，进度 0 → 1。

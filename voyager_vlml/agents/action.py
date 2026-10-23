@@ -84,6 +84,7 @@ class VLMLActionAgent:
         critique: str = "",
         last_sql: str = "",
         skills: list[dict[str, Any]] | None = None,
+        hints: list[str] | None = None,
     ) -> str:
         """让模型按题面写一条 SELECT；迭代修正时带上一轮的 critique 与 SQL 重写。
 
@@ -92,6 +93,14 @@ class VLMLActionAgent:
         from voyager_vlml.llm import chat
 
         system = self.render_system_message(skills=list(skills or []))
+        # 知识点自带的取数要求（表名/字段/口径）必须进 prompt。
+        # 2026-10-23 实测：只把它传给 critic、不传给写码那一步 → 模型在
+        # `ext_player_round_stats` 上猜 `event_type` 并拿 `round_number=1` 当首血，
+        # 连跑 3 轮全 empty；而节点 skills 里明明写着 "agg_first_blood_stats 的
+        # 粒度是 round_id / 字段 fb_team 与 fb_team_won"。
+        if hints:
+            system += ("\n\n【这个知识点的取数要求（照它选表选字段，别自己另起一套）】\n"
+                       + "\n".join(f"- {h}" for h in list(hints)[:5]))
         if schema:
             system += (
                 "\n\n【当前库真实 schema（只能用这里的表名/列名，不要编造）】\n"
@@ -145,7 +154,7 @@ class VLMLActionAgent:
         for i in range(max_iters):
             sql = self.write_sql(
                 question, schema=schema, critique=critique, last_sql=sql,
-                skills=list(skills or []),
+                skills=list(skills or []), hints=list(hints or []),
             )
             if not sql:
                 observations.append(

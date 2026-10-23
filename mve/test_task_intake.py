@@ -35,11 +35,11 @@ Q = "Cloud9 在 Corrode 上首血率多少"
 
 def test_ask_fail_records_and_splits() -> None:
     _tmp_ledger()
-    T._answer_once = lambda q, voyager=True: {          # type: ignore[assignment]
-        "trajectory": [], "facts": [],
-        "skipped": "没有取到任何数据", "topic_id": "vlml_first_blood",
+    T._answer_once = lambda q, **kw: {                  # type: ignore[assignment]
+        "ok": False, "trajectory": [], "rows": 0, "skills": [],
+        "skipped": "技能库里没有与它相关的配方（还没学过）",
     }
-    out = T.ask(Q, voyager=True)
+    out = T.ask(Q, topic_id="vlml_first_blood")
     assert out["ok"] is False, out
     assert out["task_id"], out
     assert out["subtopics"], f"没拆出子目标：{out}"
@@ -69,10 +69,9 @@ def test_subtopics_done_then_retry() -> None:
     assert rows[0]["ready_for_retry"] is True, rows[0]
     assert T.next_focus() is None, "子目标全学完就不该再围着它出课"
 
-    T._answer_once = lambda q, voyager=True: {          # type: ignore[assignment]
-        "trajectory": ["query_sql"], "facts": [{"value": 1}],
-        "topic_id": "vlml_first_blood", "answer": "0.62",
-        "voyager_context": {"skills": [{"name": "vlml_first_blood"}]},
+    T._answer_once = lambda q, **kw: {                  # type: ignore[assignment]
+        "ok": True, "trajectory": ["query_sql"], "rows": 12, "sql": "SELECT 1",
+        "skills": [{"name": "vlml_first_blood"}], "answer": "SELECT 1",
     }
     out = T.retry(row["task_id"])
     assert out["ok"] is True, out
@@ -87,12 +86,12 @@ def test_subtopics_done_then_retry() -> None:
 def test_vacuous_answer_is_not_success() -> None:
     _tmp_ledger()
     # 调了工具但没事实 / 有事实但没调工具，两种都不算成功（同学习循环的尺子）
-    T._answer_once = lambda q, voyager=True: {          # type: ignore[assignment]
-        "trajectory": ["query_sql"], "facts": [], "topic_id": "",
+    T._answer_once = lambda q, **kw: {                  # type: ignore[assignment]
+        "trajectory": ["query_sql"], "facts": [],          # 旧 coach 通路结构
     }
     assert T.ask(Q)["ok"] is False
-    T._answer_once = lambda q, voyager=True: {          # type: ignore[assignment]
-        "trajectory": [], "facts": [{"value": 1}], "topic_id": "",
+    T._answer_once = lambda q, **kw: {                  # type: ignore[assignment]
+        "trajectory": [], "facts": [{"value": 1}],
     }
     assert T.ask(Q)["ok"] is False
     print("PASS  真空成功被挡住（只有轨迹没事实 / 只有事实没轨迹 都算失败）")
@@ -101,9 +100,9 @@ def test_vacuous_answer_is_not_success() -> None:
 def test_no_datasource_learns_nothing() -> None:
     """数据源缺失时学习循环学不到东西 —— 这条是「必须带数据源」的机制证据。"""
     _tmp_ledger()
-    T._answer_once = lambda q, voyager=True: {          # type: ignore[assignment]
-        "trajectory": [], "facts": [], "skipped": "库里没有这张表",
-        "topic_id": "vlml_first_blood",
+    T._answer_once = lambda q, **kw: {                  # type: ignore[assignment]
+        "ok": False, "trajectory": [], "rows": 0, "skills": [],
+        "skipped": "库里没有这张表",
     }
     out = T.ask(Q)
     assert out["ok"] is False and out["subtopics"], out
