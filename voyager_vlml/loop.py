@@ -605,6 +605,7 @@ async def run_rounds(
     scope: dict[str, Any] | None = None,
     use_llm: bool = True,
     max_iters: int = 4,
+    env: Any = None,
 ) -> list[dict[str, Any]]:
     """连跑 n 轮（共享 env 与课程状态）。
 
@@ -621,7 +622,7 @@ async def run_rounds(
     停止是**优雅停**：收到信号后把手头这道题跑完再退出（照原版
     "exiting learn loop after current task"），不硬杀 —— 技能已按任务落盘。
     """
-    env = VLMLMCPEnv()
+    env = env or VLMLMCPEnv()
     curr = VLMLCurriculumAgent(scope=scope)
     # 把上次运行期生成的节点装回内存图谱 —— 它们已经落盘且多半已标记完成，
     # 装回来才能「不重复规划」；不装的话每次重开都要重新生成、重新验一遍。
@@ -721,7 +722,25 @@ def _main() -> int:
                     help="不停模式下的总题数上限（0 = 不限；原版 --max-iterations 默认 160）")
     ap.add_argument("--unstale", nargs="?", const="__all__", default="",
                     help="清掉「放弃换题」标记并重置 attempts（不给值=全清，给值=清这一题）")
+    ap.add_argument("--scene", default="",
+                    help="按哪个场景的数据源学（空=当前场景；判定见 mve/scene_env.py）")
     a = ap.parse_args()
+
+    # 场景隔离：这一轮读**哪个库**先定死。以前这里写死 VLMLMCPEnv() = 全局 rib，
+    # 于是"在工资场景学工资"实际是在学 Valorant（学错了还以为是它不会）。
+    env = None
+    if a.scene:
+        try:
+            import scene_env
+            env, prof, why = scene_env.env_for_scene(a.scene)
+            print(f"（场景 {a.scene} → 数据源 {prof.get('kind')}"
+                  f"{' · ' + str(prof.get('db_path')) if prof.get('db_path') else ''}）")
+            if env is None:
+                print(f"✗ 这个场景没有可用的 SQL 数据源 —— {why}")
+                return 2
+        except Exception as e:  # noqa: BLE001
+            print(f"✗ 场景判定失败：{type(e).__name__}: {e}")
+            return 2
 
     # 不停模式必须装信号处理器：面板「停止」发的是 SIGTERM，
     # 我们要的是「跑完当前这道题再退」，不是被硬杀在半路。
@@ -745,7 +764,7 @@ def _main() -> int:
     #    —— 正是「三轮就结束了」那一类问题的入口版本。
     if a.rounds != 1:
         rs = asyncio.run(
-            run_rounds(a.rounds, use_llm=not a.no_llm, max_iters=a.iters)
+            run_rounds(a.rounds, use_llm=not a.no_llm, max_iters=a.iters, env=env)
         )
         ok = sum(1 for r in rs if r.get("success"))
         gen = sum(1 for r in rs if r.get("generated"))
@@ -767,7 +786,8 @@ def _main() -> int:
 
     r = asyncio.run(
         run_one_round(
-            topic_id=a.topic or None, use_llm=not a.no_llm, max_iters=a.iters
+            topic_id=a.topic or None, use_llm=not a.no_llm, max_iters=a.iters,
+            env=env,
         )
     )
     print("=== 一轮闭环（自己出题取数）===")

@@ -47,26 +47,51 @@ def _env() -> dict[str, str]:
 
 
 # ---------------------------------------------------------------- 命令映射
-def _cmd_ask(q: str, _iters: int) -> list[str]:
-    return [PY, "mve/task_intake.py", "ask", q]
+def _scene_flag(scene: str) -> list[str]:
+    """按场景取数（空 = 当前场景）。判定在 mve/scene_env.py，这里只透传。"""
+    return ["--scene", str(scene)] if str(scene or "").strip() else []
 
 
-def _cmd_retry(tid: str, _iters: int) -> list[str]:
-    return [PY, "mve/task_intake.py", "retry", tid]
+def _cmd_ask(q: str, _iters: int, scene: str = "") -> list[str]:
+    return [PY, "mve/task_intake.py", "ask", q] + _scene_flag(scene)
 
 
-def _cmd_learn(iters: int, topic: str = "") -> list[str]:
+def _cmd_retry(tid: str, _iters: int, scene: str = "") -> list[str]:
+    return [PY, "mve/task_intake.py", "retry", tid] + _scene_flag(scene)
+
+
+def _cmd_learn(iters: int, scene: str = "", question: str = "") -> list[str]:
+    """学一轮。**按场景分两条路**：
+
+    · Scene A（VLML 数据域）→ `voyager_vlml.loop`（原版课程/技能库/图谱那套）
+    · 其它场景（自带 duckdb / 本机）→ `mve/scene_learn.py --question …`，
+      即 `learn_orchestrate.start_learning`：围着**这条失败的题**拆课、补缺口、
+      取数、入库。不能走 loop —— 它的课程来自 VLML 的 topic_graph，
+      在工资场景会出电竞题（学了半天与工资无关）。
+    """
+    sc = str(scene or "").strip()
+    if sc:
+        try:
+            import scene_env
+            kind = scene_env.kind_of(sc)
+        except Exception:
+            kind = ""
+        if kind and kind != "vlml":
+            cmd = [PY, "mve/scene_learn.py", "--scene", sc,
+                   "--max-iterations", "1", "--max-retries", str(max(1, int(iters or 4))),
+                   "--curriculum", "queue"]
+            if str(question or "").strip():
+                cmd += ["--question", str(question).strip()]
+            return cmd
     cmd = [PY, "-m", "voyager_vlml.loop", "--rounds", "1", "--iters", str(iters)]
-    if topic:
-        cmd += ["--topic", topic]
-    return cmd
+    return cmd + _scene_flag(sc)
 
 
-def _cmd_sub(tid: str, _iters: int) -> list[str]:
+def _cmd_sub(tid: str, _iters: int, scene: str = "") -> list[str]:
     return [PY, "mve/task_intake.py", "sub", tid]
 
 
-def _cmd_list(_iters: int) -> list[str]:
+def _cmd_list(_iters: int, scene: str = "") -> list[str]:
     return [PY, "mve/task_intake.py", "list"]
 
 
@@ -80,7 +105,8 @@ ACTIONS: dict[str, tuple] = {
 }
 
 
-def start(action: str, *, q: str = "", tid: str = "", iters: int = 4) -> dict[str, Any]:
+def start(action: str, *, q: str = "", tid: str = "", iters: int = 4,
+          scene: str = "") -> dict[str, Any]:
     """起一个后台子进程。返回 {id,title,cmd} 或 {error}。"""
     if action not in ACTIONS:
         return {"error": f"不认识的动作：{action}"}
@@ -89,18 +115,20 @@ def start(action: str, *, q: str = "", tid: str = "", iters: int = 4) -> dict[st
         return {"error": "先把问题填上"}
     if need == "tid" and not str(tid).strip():
         return {"error": "先把 task_id 填上"}
+    sc = str(scene or "").strip()
     if action == "ask":
-        cmd = build(str(q).strip(), iters)
+        cmd = build(str(q).strip(), iters, sc)
     elif action in ("retry", "sub"):
-        cmd = build(str(tid).strip(), iters)
+        cmd = build(str(tid).strip(), iters, sc)
     elif action == "learn":
-        cmd = build(int(iters or 4))
-    else:
-        cmd = build(int(iters or 4))
+        # 非 VLML 场景要围着**当前待学的那条题**学，所以把问题带下去。
+        cmd = build(int(iters or 4), sc, str(q or "").strip() or _focus_question())
+    else:                       # list
+        cmd = build(int(iters or 4), sc)
 
     jid = uuid.uuid4().hex[:12]
     with _lock:
-        _jobs[jid] = {"id": jid, "action": action, "title": label,
+        _jobs[jid] = {"id": jid, "action": action, "title": label, "scene": sc,
                       "status": "running", "output": "", "code": None,
                       "started": time.time(), "done_at": None}
 
@@ -122,6 +150,14 @@ def start(action: str, *, q: str = "", tid: str = "", iters: int = 4) -> dict[st
     threading.Thread(target=run, daemon=True).start()
     return {"id": jid, "title": label,
             "cmd": " ".join(cmd[-3:])}
+
+
+def _focus_question() -> str:
+    """账本里第一条还没答出的题（学一轮时围着它学）。没有就返回空。"""
+    for t in tasks(limit=50):
+        if str(t.get("status")) != "solved":
+            return str(t.get("question") or "")
+    return ""
 
 
 def job(jid: str) -> dict[str, Any] | None:

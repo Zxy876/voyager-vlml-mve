@@ -262,7 +262,7 @@ def next_focus() -> dict[str, Any] | None:
 # ---------------------------------------------------------------- 记账
 def _answer_once(question: str, *, topic_id: str = "",
                  subtopics: list[str] | None = None,
-                 use_skills: bool = True) -> dict[str, Any]:
+                 use_skills: bool = True, scene: str = "") -> dict[str, Any]:
     """消费态答一次：**用 Voyager 自己的技能库**答（不是让 VLML 专家代答）。
 
     为什么不用 `coach.explain`
@@ -280,14 +280,36 @@ def _answer_once(question: str, *, topic_id: str = "",
     现场凭记忆编的（那正是这套学习要消灭的东西）。这条也正是验收线「初始 task 必 fail」
     的机制来源：新场景技能库是空的。
     """
+    # 场景隔离：这一趟读**哪个库**先定死（判定唯一入口 scene_env → scene_profile）。
+    # 以前这里直接 VLMLActionAgent() = 全局 rib：在工资场景问工资题，它去查
+    # Valorant 的表 → 必然失败，而账会记成"它学不会"（错在取数侧，账落在学习侧）。
+    env = None
+    kind = ""
+    try:
+        import scene_env
+        env, _prof, _why = scene_env.env_for_scene(scene)
+        kind = str(_prof.get("kind") or "")
+    except Exception as e:  # noqa: BLE001
+        _prof, _why = {}, f"场景判定失败：{type(e).__name__}: {e}"
+    if env is None:
+        return {"ok": False, "trajectory": [], "rows": 0, "sql": "",
+                "skills": [], "answer": "", "answer_source": "",
+                "skipped": f"这个场景没有可用的 SQL 数据源 —— {_why}"}
+
     skills: list[dict[str, Any]] = []
     if use_skills:
         try:
             import skill_store
-            keys = [topic_id] + [str(t) for t in (subtopics or [])]
+            # 检索键：VLML 场景按「归题 + 子目标」（技能按学它的节点存）；
+            # 非 VLML 场景**只按问句相似度** —— 那里的技能键是维度 id，与
+            # VLML 的 topic_id 不同源，拿 topic_id 去检索必然 0 命中
+            # （表现是"明明学过却判还没学过"）。
+            keys = ([topic_id] + [str(t) for t in (subtopics or [])]
+                    if kind in ("", "vlml") else [])
             seen: set[str] = set()
-            for t in dict.fromkeys([k for k in keys if k]):
-                for s in skill_store.retrieve(t, question, top_k=4):
+            for t in dict.fromkeys([k for k in keys if k]) or [""]:
+                for s in skill_store.retrieve(t, question, top_k=4,
+                                              scene_id=str(scene or "")):
                     k = str(s.get("key") or "")
                     if k and k not in seen:
                         seen.add(k)
@@ -306,7 +328,7 @@ def _answer_once(question: str, *, topic_id: str = "",
     #    字段 fb_team"）→ 模型乖乖去查空表 → 纯聚合返回 1 行 (NULL,0) → 判真空失败。
     #    hints 是"学的时候该往哪看"，不是"答的时候必须这么看"；答的时候靠 schema
     #    （已标"0 行·别查"）+ 学到的配方，口径由 critic 判，不靠 hints 灌。
-    act = VLMLActionAgent()
+    act = VLMLActionAgent(env=env)
     obs, sql = asyncio.run(act.solve(question, max_iters=3, skills=skills))
     # 成败与结论都用 **agent 自己那一趟的最后一轮判决**，不再另起一个 critic 重判：
     # 重判既多烧一次 LLM，还可能跟前一步的 critic 意见相反（同一条结果两个判词）。
@@ -325,6 +347,49 @@ def _answer_once(question: str, *, topic_id: str = "",
         "answer_source": "critic_reasoning" if reasoning else "sql",
         "skipped": "" if ok else str(crit or "没取到数"),
     }
+
+
+def _record_consume(task_id: str, question: str, ok: bool,
+                    res: dict[str, Any], *, scene: str = "",
+                    kind: str = "") -> None:
+    """把这一次「人导入 / 重试」记进消费侧账（`coach_log.jsonl`）。
+
+    为什么必须记：能力曲线（`panel_data._consume_curve`）**只读**
+    `mode=voyager_consume` 的记录。外部 task 闭环原来一条都不写，于是
+    「学会了、重试成功了」在曲线上一动也不动 —— 用户第 7 步验收（曲线上升）
+    就永远等不到。这里写的就是同一把尺子的记录，不新造口径。
+
+    失败也记（mastered=False）：曲线要能看见"第一次失败 → 学会后成功"这条折线。
+    """
+    try:
+        import coach as _coach
+        used = [str(s.get("name") or "") for s in (res.get("skills") or [])]
+        rec = {
+            "question": question,
+            "mode": "voyager_consume",
+            "source": "ext_task",
+            # 非 VLML 场景归题用的是 VLML 题库，拿它当 topic 会让多道题挤成一条
+            # 能力项（曲线永远是 1）。改用 task:<id>：一句一题，涨的是"会做几道"。
+            "topic_id": (str(task_id) and (f"task:{task_id}" if kind and kind != "vlml"
+                                           else "")) or "",
+            "topic_matched": False,
+            "root_scene": str(scene or ""),
+            "scene_kind": str(kind or ""),
+            "answer": str(res.get("answer") or "")[:1200],
+            "sql": str(res.get("sql") or "")[:4000],
+            "rows": int(res.get("rows") or 0),
+            "ok_tool_calls": len([t for t in (res.get("trajectory") or []) if t]),
+            "trajectory": list(res.get("trajectory") or [])[:8],
+            "reused": bool(used),
+            "used_skills": used,
+            "reuse_note": ("复用 " + "、".join(used[:3])) if used else "现写（技能库没有可用配方）",
+            "mastered": bool(ok),
+            "skipped": "" if ok else str(res.get("skipped") or "")[:300],
+            "comparable": False,          # 外部 task 没有 rubric，不参与"与专家比"
+        }
+        _coach._log_import(rec)
+    except Exception as e:  # noqa: BLE001
+        print(f"（消费记录没写进去：{type(e).__name__}: {e}）")
 
 
 def _ok(res: dict[str, Any]) -> tuple[bool, str]:
@@ -347,9 +412,10 @@ def _ok(res: dict[str, Any]) -> tuple[bool, str]:
 
 
 def ask(question: str, *, use_skills: bool = True,
-        topic_id: str = "") -> dict[str, Any]:
+        topic_id: str = "", scene: str = "") -> dict[str, Any]:
     """人导入一条 task，先答一次；答不出就记账并拆课。
 
+    `scene` = 按哪个场景的数据源取数（空 = 当前场景，判定见 `scene_env`）。
     返回 {"task_id","ok","reason","subtopics","answer","status"}。
     """
     q = str(question or "").strip()
@@ -358,7 +424,20 @@ def ask(question: str, *, use_skills: bool = True,
     # 先归题再答：归题结果既是技能检索的键，也是拆课的依据（拆课本身不烧 LLM）。
     tid = resolve_topic(q, topic_id)
     subs = subtopics_of(q, tid)
-    res = _answer_once(q, topic_id=tid, subtopics=subs, use_skills=use_skills)
+    # 非 VLML 场景：subtopics_of 走的是 VLML 的 topic_graph，拆出来的是电竞维度，
+    # 在工资场景留这种账等于**伪造课程**。这里的空不是"没拆出课"，而是
+    # 「课程由场景学习环（learn_orchestrate 的 Maieutic 骨架）规划」——
+    # 账上写明来源，别让下一个人以为它没学会就完事了。
+    try:
+        import scene_env as _se
+        _kind = _se.kind_of(scene)
+    except Exception:
+        _kind = ""
+    subs_source = "vlml_graph"
+    if _kind and _kind != "vlml":
+        subs, subs_source = [], "scene_orchestrator"
+    res = _answer_once(q, topic_id=tid, subtopics=subs,
+                       use_skills=use_skills, scene=scene)
     ok, why = _ok(res)
     if ok:
         subs = []          # 答出来了就不用学，别留一份"待学"账
@@ -366,11 +445,13 @@ def ask(question: str, *, use_skills: bool = True,
         "task_id": _new_id(),
         "question": q,
         "topic_id": tid,
+        "scene": str(scene or ""),
         "created_at": _now(),
         "updated_at": _now(),
         "tries": 1,
         "status": "solved" if ok else "pending",
         "subtopics": subs,
+        "subtopics_source": subs_source,
         "done_subtopics": [],
         # 拆不出子目标 = 没有能学的了，直接交给人重试（原版：学不了就跳过）
         "ready_for_retry": not subs,
@@ -380,8 +461,10 @@ def ask(question: str, *, use_skills: bool = True,
     rows = _load()
     rows.append(row)
     _save(rows)
+    _record_consume(row["task_id"], q, ok, res, scene=scene, kind=_kind)
     return {"task_id": row["task_id"], "ok": ok, "reason": why,
-            "subtopics": subs, "answer": row["answer"], "status": row["status"],
+            "subtopics": subs, "subtopics_source": subs_source,
+            "answer": row["answer"], "status": row["status"],
             "facts": len(res.get("facts") or []),
             "trajectory": list(res.get("trajectory") or [])[:6]}
 
@@ -441,17 +524,28 @@ def mark_subtopic_done(topic_id: str) -> int:
     return note_subtopic_result(topic_id, True)
 
 
-def retry(task_id: str, *, use_skills: bool = True) -> dict[str, Any]:
-    """重试一条（失败的）task —— 验收点：这次用的是**学会的技能**。"""
+def retry(task_id: str, *, use_skills: bool = True,
+          scene: str = "") -> dict[str, Any]:
+    """重试一条（失败的）task —— 验收点：这次用的是**学会的技能**。
+
+    `scene` 空 = 沿用这条 task 导入时记的场景（`row["scene"]`），避免"导入在工资场景、
+    重试却回 rib"的错配。
+    """
     rows = _load()
     row = next((r for r in rows
                 if str(r.get("task_id")) == str(task_id)), None)
     if row is None:
         return {"ok": False, "reason": f"没有这条 task：{task_id}"}
     q = str(row.get("question") or "")
+    sc = str(scene or row.get("scene") or "")
+    try:
+        import scene_env as _se
+        kind = _se.kind_of(sc)
+    except Exception:
+        kind = ""
     res = _answer_once(q, topic_id=str(row.get("topic_id") or ""),
                        subtopics=list(row.get("subtopics") or []),
-                       use_skills=use_skills)
+                       use_skills=use_skills, scene=sc)
     ok, why = _ok(res)
     row["tries"] = int(row.get("tries") or 0) + 1
     row["updated_at"] = _now()
@@ -460,6 +554,7 @@ def retry(task_id: str, *, use_skills: bool = True) -> dict[str, Any]:
     row["answer"] = str(res.get("answer") or row.get("answer") or "")[:2000]
     row["reused_skills"] = [str(s.get("name") or "") for s in (res.get("skills") or [])]
     _save(rows)
+    _record_consume(task_id, q, ok, res, scene=sc, kind=kind)
     return {"task_id": task_id, "ok": ok, "reason": why, "tries": row["tries"],
             "reused_skills": row["reused_skills"],
             "answer": row["answer"], "facts": len(res.get("facts") or []),
@@ -479,9 +574,12 @@ def _main() -> int:
     a.add_argument("question", nargs="+")
     a.add_argument("--no-skills", action="store_true",
                    help="不要求复用技能库（现场写 SQL，等于让专家代答一次）")
+    a.add_argument("--scene", default="",
+                   help="按哪个场景的数据源取数（空=当前场景）")
 
     r = sub.add_parser("retry", help="重试一条失败 task（验收用）")
     r.add_argument("task_id")
+    r.add_argument("--scene", default="", help="按哪个场景的数据源取数（空=当前场景）")
 
     ls = sub.add_parser("list", help="列出账本")
     ls.add_argument("--status", default="")
@@ -491,9 +589,10 @@ def _main() -> int:
 
     args = ap.parse_args()
     if args.cmd == "ask":
-        _print(ask(" ".join(args.question), use_skills=not args.no_skills))
+        _print(ask(" ".join(args.question), use_skills=not args.no_skills,
+                   scene=getattr(args, "scene", "")))
     elif args.cmd == "retry":
-        _print(retry(args.task_id))
+        _print(retry(args.task_id, scene=getattr(args, "scene", "")))
     elif args.cmd == "list":
         rows = list_tasks(args.status)
         _print([{k: r.get(k) for k in

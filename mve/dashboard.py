@@ -2093,6 +2093,12 @@ function pExt(s){
       每个按钮起一个后端子进程跑已有 CLI（<code>task_intake.py</code> / <code>voyager_vlml.loop</code>），
       输出原样回显在下面。
     </div>
+    <div class="legend">
+      取数按<b>当前场景</b>（顶部场景栏切换）的数据源：
+      场景 A → VLML 库；场景目录里有 <code>.duckdb</code> → 只读那个库（工资场景就是这样）；
+      都没有 → 如实报「没有可用的 SQL 数据源」，不会悄悄去查别的场景。
+      <b>当前场景：${ESC((s.scene||{}).name||'—')}</b>
+    </div>
     <div class="imp">
       <div style="font-size:12.5px;color:var(--muted);margin-bottom:8px">
         <b>① 导入一条外部问题</b>（数据源里真能取数的那种，答案要能落成 1 个数或 1 行）
@@ -2167,7 +2173,8 @@ async function extRun(action){
   try{
     const r=await fetch('/api/ext/run',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({action:action, q:q, tid:tid, iters:iters})});
+      body:JSON.stringify({action:action, q:q, tid:tid, iters:iters,
+                           scene:window.__SCENE||''})});
     const d=await r.json();
     if(d.error){ window.__EXT.status='出错：'+d.error; extPaint(); return; }
     window.__EXT.out='（已启动：'+d.title+' —— 输出会在下面滚动，长任务要几分钟）';
@@ -2780,6 +2787,9 @@ async function voyagerClear(which, label){
 
 /* ---------------- 主渲染 ---------------- */
 function render(s){
+  // 外部任务页签要按**当前场景**的数据源取数（scene_env 判定），所以场景 id 存全局。
+  window.__SCENE = ((s.scene||{}).id)||'';
+  window.__SCENE_NAME = ((s.scene||{}).name)||'';
   window.__lastRec = s.recommend || {};
   window.__pilot   = s.pilot || {};
   window.__voyager = s.voyager || {};
@@ -3166,7 +3176,8 @@ class Handler(BaseHTTPRequestHandler):
                 r = ext_task.start(str(payload.get("action") or ""),
                                    q=str(payload.get("q") or ""),
                                    tid=str(payload.get("tid") or ""),
-                                   iters=int(payload.get("iters") or 4))
+                                   iters=int(payload.get("iters") or 4),
+                                   scene=str(payload.get("scene") or ""))
             except Exception as e:  # noqa: BLE001
                 r = {"error": f"{type(e).__name__}: {e}"[:200]}
             self._json(200, r)
