@@ -863,7 +863,11 @@ async def consume(
             "reuse_errors": reuse_errors,
             # 远端工具接入情况（exposed = 这次能用上的 mcp_*；没连上如实带原因）
             "mcp_tools": mcp_ready,
-            "judgment_result": "written" if data is not None else "fetched_empty",
+            # 有行 ≠ 答出来：叙事层 answered=false（"资料答不了这个问题"）
+            # 同样判 fetched_empty，不许 written（2026-10-23 Scene P 实测教训）。
+            "judgment_result": (
+                "written" if (data is not None and nar.get("answered", True))
+                else "fetched_empty"),
             "skipped": ("" if data is not None else
                         (("场景数据源里没有能回答它的数据（" + _scene_why + "）"
                           "—— 往场景目录里放数据 / 调整库内容后重试")
@@ -884,7 +888,9 @@ async def consume(
         # 实测（2026-10-19）：只在「现场新写」时调 `_absorb`，命中复用那条
         # 路径的 mastered 永远是 False —— 面板上「掌握度」怎么答都不涨。
         abs_info: dict[str, Any] = {}
-        if data is not None:
+        # answered=false（叙事层判"这些资料答不了问题"）同样不进能力库 ——
+        # 有行 ≠ 答出来（2026-10-23 Scene P：fail 的 task 却录入了技能）。
+        if data is not None and nar.get("answered", True):
             try:
                 # 只把**本次真正复用的那一条**记成"用过且有效"（used_keys）。
                 # 不传的话 _absorb 会按 topic 前缀扫出同题下全部技能集体 +1，
@@ -1160,7 +1166,14 @@ async def consume(
     # 答案是一张表时压不进 facts，但那也是答出来了，照样进能力库。
     # ⚠️ "取到数"同样只认真数：真空结果上的"答完了"是假象，把它沉淀进能力库
     #   等于把坏配方洗成技能（实测 fb_conversion_analysis 就是这么来的）。
-    absorbed = _absorb(question, sql, topic_id) if (answer and real_calls) else {}
+    # ⚠️ 2026-10-23 再补一刀（Scene P 实测：fail 的 task 却录入了技能）：
+    #   叙事模型看着取回的 4 行错语义数据（SUM(a.amount+base_salary)，dept='技术部'
+    #   根本查不到），自己回答「找到的资料里没有…具体金额」—— answer 非空、
+    #   real_calls 非空，老判据就把它判成"答出来了" → 坏配方入库 + 假解锁。
+    #   铁律「没取到真数不写技能库」的完整语义是**取到的数要真能回答问题**；
+    #   叙事层的 answered=false（"这些资料答不了这个问题"）就是这句话的机器可读形式。
+    absorbed = (_absorb(question, sql, topic_id)
+                if (answer and real_calls and nar.get("answered", True)) else {})
     m_tot = int(absorbed.get("mastered_total") or 0)
     a_tot = int(absorbed.get("ability_total") or 0)
     if absorbed.get("mastered") and not topic_id:
@@ -1252,8 +1265,11 @@ async def consume(
         #   insufficient_evidence —— 冷启动单次证据（节点 cold_start_guess，待巩固）
         #   fetched_empty        —— 取到真空结果，未写图（= neko no_data）
         #   failed               —— 答完但写图/标掌握失败
+        # ⚠️ 2026-10-23：叙事层 answered=false（"取到的行答不了这个问题"）按
+        #   fetched_empty 处理 —— 有行 ≠ 答出来，这句话不能假解锁。
         "judgment_result": (
-            "fetched_empty" if not real_calls else
+            "fetched_empty" if (not real_calls
+                                or not nar.get("answered", True)) else
             ("insufficient_evidence"
              if (absorbed.get("mastered")
                  and absorbed.get("node_status") == "cold_start_guess")
