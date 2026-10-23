@@ -97,6 +97,15 @@ class SceneDBEnv:
             except Exception:
                 pass
 
+    def data_source(self) -> str:
+        """本环境的数据来源（自报）。`learn_orchestrate` 用它填观察的
+        `data_sources` —— 不报的话，取到真数也会被判成「知识型：一次数据源
+        都没调」（2026-10-23 实测：工资题取到 3 行，库里写 evidence=knowledge）。"""
+        try:
+            return f"scene_db:{Path(self.db_path).name}"
+        except Exception:
+            return "scene_db"
+
     async def schema_block(self, max_cols: int = 20,
                            max_tables: int = 40) -> str:
         """表 → 列（+ 行数），实查该场景库。形状照 VLMLMCPEnv.schema_block。"""

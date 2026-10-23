@@ -926,6 +926,26 @@ async def _start_learning_impl(
                 observations, sql = await agent.solve(
                     question, skills=skills, grabs=grabs, focus_tables=focus,
                     hints=[str(s.get("need") or "") for s in plan["subtasks"]])
+            # 执行环境自报数据来源：SceneDBEnv / VLMLMCPEnv 都有 data_source()，
+            # 但它们的观察里**不带** data_sources（那是 local_agent 的 MCP 工具才
+            # 填的字段）→ 于是真取到数也会算成 real_calls=0 / evidence=knowledge，
+            # 判据跟着走「知识型」分支，critic 拿不到"确实取到数"这件事。
+            # 这里按 env 补一次，判据口径不变（仍然是"真的取到数才算"）。
+            _env_src: list[str] = []
+            try:
+                _ds_fn = getattr(getattr(agent, "env", None), "data_source", None)
+                if callable(_ds_fn):
+                    _v = str(_ds_fn() or "").strip()
+                    if _v:
+                        _env_src = [_v]
+            except Exception:
+                _env_src = []
+            if _env_src and observations:
+                observations = [
+                    dict(o, data_sources=list(o.get("data_sources") or (
+                        _env_src if o.get("ok") else [])))
+                    for o in observations]
+
             real = _has_real(list(observations or []))
             out["execution"] = {
                 "ok": real, "sql": sql,
