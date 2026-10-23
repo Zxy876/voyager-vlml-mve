@@ -250,6 +250,17 @@ def learn_milestone_skills(scene_id: str, topic_id: str, question: str,
         if not _looks_like_recipe(code):
             out["skipped"].append(did)      # 没调取数动作 = 不是配方，如实跳过
             continue
+        # 技能存**算法**不存数值（用户 2026-10-23「不要把数值写死，而是把
+        # 算法积累成技能」）：SQL 配方入库前泛化成槽位模板 —— 表/列/聚合/
+        # JOIN 结构是方法，上一题的实体值（部门名/月份…）换成 :slot，头部
+        # 注释写明每个槽位填什么。原版同构：原版技能是带参数的函数，实体值
+        # 在调用时传入。泛化失败（LLM 挂/产出不像 SQL）就原样入库 —— 泛化
+        # 是增强不是闸门，不阻塞学习闭环。
+        try:
+            from voyager_vlml.consume import generalize_sql_recipe as _gen
+            code = _gen(code, str(item.get("question") or question))
+        except Exception:
+            pass
         try:
             _act, key = skill_store.add(
                 # key = f"{topic}::{name}"（skill_store._key），所以 name 直接用

@@ -225,7 +225,10 @@ _REFILL_SYSTEM = """你是 Valorant 电竞数据分析师。你手里有**以前
 2. 把**当前这句话里的实体值**（队伍名 / 图名 / 赛事 / 选手）填进配方对应的位置。
    配方里写死的字面量要换成当前这句话指的那个值。
 3. 当前这句话没给实体（比如问"哪支队伍最高"）→ 保留配方的分组结构，别自己造一个值。
-4. 只输出一条 SELECT。不要 INSERT/UPDATE/DROP，不要多语句。
+4. 配方可能是**槽位模板**（入库时泛化过的）：`:dept`、`:month` 这种占位符，
+   配方头部注释逐个说明了每个槽位该填什么 —— 把每个槽位换成当前这句话指的值，
+   注释行可以删掉。
+5. 只输出一条 SELECT。不要 INSERT/UPDATE/DROP，不要多语句。
 
 只返回一个 JSON：{"sql": "你的 SELECT", "reused": true/false,
 "note": "一句话说明你复用了配方的哪部分、把什么值填了进去（没复用就说明为什么用不上）"}"""
@@ -258,6 +261,68 @@ def _refill_sql(question: str, skills: list[dict[str, Any]], schema: str) -> dic
         "reused": bool(out.get("reused")) and bool(sql),
         "note": str(out.get("note") or ""),
     }
+
+
+# ---------------------------------------------------------------------------
+# ③' 配方泛化：入库前把「上一题的取数 SQL」改写成**槽位模板**
+#     （用户 2026-10-23 定：「不要把数值写死，而是把算法积累成技能」）
+# ---------------------------------------------------------------------------
+
+_GENERALIZE_SYSTEM = """你是数据取数方法整理员。手里有一条为某道旧题写好的 SQL 配方，
+要把它改写成**可复用的取数方法模板**：把题目专属的实体值替换成命名槽位，
+下次换一道同方法的题，只要把新值填进槽位就能用。
+
+规则：
+1. 只把**来自题目的实体值**换成槽位：WHERE 里的筛选值（部门名/月份/队伍/
+   选手/图名）、比较阈值这类「这次算的是哪个范围」。
+   表名、列名、聚合方式（COUNT/SUM/AVG）、JOIN 结构、GROUP BY 的列
+   都是**方法本身**，一个字都不许动。
+2. 槽位写成 `:语义名`（小写蛇形，如 :dept、:month、:team）。
+3. 输出第一条 SQL 注释逐个槽位写明「该填什么、从问句哪里取」，例如：
+   -- slots: dept=部门名，取问句里点名的部门（如"技术"）; month=年月（如"2026-09"）
+4. 输出必须是单条 SELECT 或 WITH 开头的语句，不许 INSERT/UPDATE/DROP。
+5. 这条 SQL 里若没有题目专属的实体值（纯结构查询），原样返回，slots 给空数组。
+
+只返回一个 JSON：{"sql": "模板化后的 SQL", "slots": ["dept"],
+"note": "一句话说明把哪些值换成了槽位（没有就说原样返回）"}"""
+
+
+def generalize_sql_recipe(code: str, question: str) -> str:
+    """SQL 配方入库前泛化成槽位模板 —— **技能存算法，不存上一题的数值**。
+
+    原版同构：原版技能是**带参数的函数**（skill.py 的 programs 注入执行域，
+    实体值由新代码在调用时传入），从不把某次任务的实体写死在技能体里。
+    MVE 的 SQL 配方是为单题写的查询，天然带着旧题的筛选值 —— 原样重放就是
+    旧题的答案（2026-10-23 实测 consume_f4e54ccd 带 ['09','2026']，对
+    「技术部门请假总天数」重放必错）。入库时把实体值换成 :slot，消费侧
+    `_refill_sql` 按当前问句填槽实例化（槽位规则见 _REFILL_SYSTEM 规则 4）。
+
+    任何失败（LLM 挂 / 产出不像 SQL）都**原样返回**：泛化是增强不是闸门，
+    不许它阻塞学习闭环 —— 入库铁律（成功 rollout 才入库）不受影响。
+    """
+    sc = str(code or "").strip()
+    if not sc.lower().startswith(("select", "with")):
+        return code            # 非 SQL（本机 Python 配方）不归这里管
+    try:
+        out = chat_json(
+            [
+                {"role": "system", "content": _GENERALIZE_SYSTEM},
+                {"role": "user",
+                 "content": f"这条配方对应的旧题：\n{str(question or '')[:300]}\n\n"
+                            f"SQL：\n{sc[:3000]}"},
+            ],
+            temperature=0.2,
+        )
+    except Exception:
+        return code
+    sql = str(out.get("sql") or "").strip()
+    # 模板按规则带 `-- slots: …` 注释头 —— 校验前先剥掉注释行，
+    # 否则合格的模板会被这里的 startswith 拒掉、每次都静默回退原样。
+    _body = "\n".join(ln for ln in sql.splitlines()
+                      if not ln.strip().startswith("--")).strip()
+    if not _body.lower().startswith(("select", "with")):
+        return code
+    return sql
 
 
 # ---------------------------------------------------------------------------
@@ -698,62 +763,70 @@ async def consume(
         obs: list[dict[str, Any]] = []
         reused_skill: dict[str, Any] | None = None
         reuse_errors: list[str] = []
-        for s in skills:
-            sc = str(s.get("code") or "")
-            if _scene_kind == "scene":
-                # ---- 场景库形态的配方重放（SQL 配方，SceneDBEnv 只读执行）----
-                if not sc.strip().lower().startswith(("select", "with")):
-                    continue
-                import re as _re_lit
-                _lits = set(_re_lit.findall(r"\d+(?:\.\d+)?", sc))
-                _qnums = set(_re_lit.findall(r"\d+(?:\.\d+)?", question))
-                if _lits and len(_lits - _qnums) >= 2:
-                    # 计算式配方里的数字是**上一次那道题**的：对新数字重放
-                    # 必然算出旧题答案 —— 跳过，走 ③b 让模型按方法写新 SQL。
-                    reuse_errors.append(
-                        f"配方 {s.get('name')} 是带旧题数字的计算式"
-                        f"（{sorted(_lits)[:6]}），对本题重放必错 —— 改现场写")
-                    continue
-                _r = await _env.run_sql(sc)
-                if not _r.get("ok"):
-                    reuse_errors.append(
-                        f"重放 {s.get('name')} 执行失败："
-                        f"{str(_r.get('error') or '')[:120]}")
-                    continue
-                _d = _r.get("data") or {}
-                if not _d.get("rows"):
-                    reuse_errors.append(f"重放 {s.get('name')} 取到 0 行")
-                    continue
-                data, code, reused_skill = _d, sc, dict(s)
-                obs = [{"ok": True, "tool": "query_sql", "rows": _r.get("rows"),
-                        "data": _d, "data_sources": ["query_sql"]}]
-                break
-            if "RESULT" not in sc:
-                continue
+        if _scene_kind == "scene":
+            # ---- 场景库形态的配方复用：**回填**，不原样重放（2026-10-23 用户
+            # 定「不要把数值写死，把算法积累成技能」）----
+            # 原版同构：技能是带参数的函数，实体值是**调用时**传的（skill.py
+            # programs 注入执行域）。之前这里直接重放配方原文，配方里带着
+            # 上一题的筛选值（实测 consume_f4e54ccd 带 ['09','2026']），重放
+            # 出来的就是旧题答案，只能再打「字面量检测」补丁拦 —— 补丁只认
+            # 数字，字符串实体（'技术'→'财务'）照样漏。现在统一走 _refill_sql：
+            # 模型按当前问句把方法实例化成新 SQL，规则 0 还会拒掉「不是同一个
+            # 量」的张冠李戴；与 VLML 分支（本文件 :1060 附近）同一结构。
+            _schema = ""
             try:
-                # 必须走 async 版：同步 run_saved 会在事件循环线程里阻塞等
-                # 自己提交给同一 loop 的 MCP 调用 → 60s 超时 → 配方被误判失效
-                # （2026-10-20 实测：明明命中 3 条配方，却"用到 0 条技能"）。
-                # 墙钟同样要给足：单条技能 = 一次真实联网取数（2026-10-21）。
-                val = await _la.run_saved_async(
-                    sc, _scene_dir, scene_id=_scene_id,
-                    timeout=_consume_timeout(1))
-            except Exception as e:
-                reuse_errors.append(f"重放 {s.get('name')} 抛错：{e}")
-                continue
-            # ⚠️ 重放结果必须过真空判据：`{"error": ...}` / 空值**不算答出来**。
-            # 实测（2026-10-19 截图「命中 1 · 有效率 0%」）：命中后复用一条
-            # 历史错误配方，它把 RESULT=error 当答案交了上去 —— 命中了、
-            # 掌握度也有了、就是没回答问题。所以这里与 critic 同一口径：
-            # error/空 → 这条配方当失败，换下一条；全失败就现场重写。
-            data_try, err_try = _la._payload(val)
-            if data_try is None:
-                reuse_errors.append(f"重放 {s.get('name')} 没取到数：{err_try}")
-                continue
-            data, code, reused_skill = data_try, sc, dict(s)
-            obs = [{"ok": True, "tool": "local_python", "rows": 1,
-                    "data": data_try}]
-            break
+                _schema = await _env.schema_block()
+            except Exception:
+                _schema = ""
+            if skills:
+                _r = _refill_sql(question, skills, _schema)
+                if _r["reused"] and _r["sql"]:
+                    _rr = await _env.run_sql(_r["sql"])
+                    _d = _rr.get("data") or {}
+                    if _rr.get("ok") and _d.get("rows"):
+                        data, code = _d, _r["sql"]
+                        reused_skill = {**dict(skills[0]),
+                                        "refill_note": _r["note"]}
+                        obs = [{"ok": True, "tool": "query_sql",
+                                "rows": _rr.get("rows"), "data": _d,
+                                "data_sources": ["query_sql"]}]
+                    else:
+                        reuse_errors.append(
+                            "配方回填后没取到真数："
+                            f"{str(_rr.get('error') or '0 行')[:120]}")
+                else:
+                    reuse_errors.append(
+                        f"配方与这句话对不上，没复用：{str(_r['note'])[:120]}")
+        else:
+            for s in skills:
+                sc = str(s.get("code") or "")
+                if "RESULT" not in sc:
+                    continue
+                try:
+                    # 必须走 async 版：同步 run_saved 会在事件循环线程里阻塞等
+                    # 自己提交给同一 loop 的 MCP 调用 → 60s 超时 → 配方被误判失效
+                    # （2026-10-20 实测：明明命中 3 条配方，却"用到 0 条技能"）。
+                    # 墙钟同样要给足：单条技能 = 一次真实联网取数（2026-10-21）。
+                    val = await _la.run_saved_async(
+                        sc, _scene_dir, scene_id=_scene_id,
+                        timeout=_consume_timeout(1))
+                except Exception as e:
+                    reuse_errors.append(f"重放 {s.get('name')} 抛错：{e}")
+                    continue
+                # ⚠️ 重放结果必须过真空判据：`{"error": ...}` / 空值**不算答出来**。
+                # 实测（2026-10-19 截图「命中 1 · 有效率 0%」）：命中后复用一条
+                # 历史错误配方，它把 RESULT=error 当答案交了上去 —— 命中了、
+                # 掌握度也有了、就是没回答问题。所以这里与 critic 同一口径：
+                # error/空 → 这条配方当失败，换下一条；全失败就现场重写。
+                data_try, err_try = _la._payload(val)
+                if data_try is None:
+                    reuse_errors.append(
+                        f"重放 {s.get('name')} 没取到数：{err_try}")
+                    continue
+                data, code, reused_skill = data_try, sc, dict(s)
+                obs = [{"ok": True, "tool": "local_python", "rows": 1,
+                        "data": data_try}]
+                break
         # ③b 没有可复用的配方 → 现场写
         if reused_skill is None:
             # 已学技能**必须进执行层让模型调用合成**（原版 action.py:94
@@ -1840,6 +1913,12 @@ def _absorb(question: str, sql: str, topic_id: str,
             out["skill_action"] = ("已有配方，标记为用过且有效"
                                    + ("" if used_keys else "（按同题全量记账）"))
         else:
+            # 入库的同样是**方法**不是数值（用户 2026-10-23）：泛化成槽位模板
+            # 再入库，失败原样入库。消费复用走 _refill_sql 按当前问句实例化。
+            try:
+                sql = generalize_sql_recipe(sql, question)
+            except Exception:
+                pass
             _, key = skill_store.add(
                 tid, tid,
                 f"消费时答出来的取数方法：{question[:60]}",
