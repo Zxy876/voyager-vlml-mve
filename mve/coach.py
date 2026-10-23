@@ -194,6 +194,10 @@ def _log_import(result: dict[str, Any]) -> None:
         "ability_total": result.get("ability_total"),
         "skill_action": result.get("skill_action", ""),
         "mastery": result.get("mastery"),
+        # 原版 critic 的判词（2026-10-23）：判没答出来时 critique 必须落盘，
+        # 面板能看到"为什么取到了 4 行还不算答出来" —— 不然又是黑箱
+        # （记忆里 _log_import 白名单惯犯教训：新字段不加白名单 = 永远看不见）。
+        "critic_note": result.get("critic_note", ""),
         # —— 方法与做法的比对（消费侧主尺子，2026-10-13 定的判法）——
         # 判分不再靠"两边各自整理成事实再按键比对"，而是直接比两边的 SQL 与做法。
         # 这几项就是那次比对的结论，面板要原样给出来（人得看见"凭什么判这个分"）。

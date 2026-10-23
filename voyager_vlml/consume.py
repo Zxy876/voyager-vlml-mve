@@ -822,6 +822,24 @@ async def consume(
                 answer = str(nar["answer"])
         # 这段代码到底调了哪些抓手（披露用；不含纯计算，见 `_tools_in_code`）
         _mve_traj = _tools_in_code(code, _scene_id)
+        # 原版 critic 语义（同主路径，2026-10-23）：判「任务要求满足了没有」，
+        # 有行 ≠ 答出来 —— 错语义数据（字面量匹配不到、口径不对）必须拦在
+        # 入库/解锁之前，叙事层自检（answered）拦不住 glm-4-flash。
+        critic_ok, critic_why = True, ""
+        try:
+            import task_critic as _tc
+            critic_ok, critic_why = _tc.check_task_success(question, "", {
+                "execution": {"real_calls": 1 if data is not None else 0,
+                              "calls": len(obs or []),
+                              "rows": sum(int(o.get("rows") or 0)
+                                          for o in (obs or []) if o.get("ok"))},
+                "answer": answer,
+                "observations": obs,
+            })
+            if not critic_ok:
+                print(f"  · critic 判没答出来：{str(critic_why)[:120]}")
+        except Exception as e:  # pragma: no cover
+            critic_ok, critic_why = False, f"critic 判定不可用：{type(e).__name__}: {e}"
         base = {
             "question": question, "mode": "voyager_consume",
             "topic_id": topic_id, "topic_hit": hit,
@@ -863,10 +881,12 @@ async def consume(
             "reuse_errors": reuse_errors,
             # 远端工具接入情况（exposed = 这次能用上的 mcp_*；没连上如实带原因）
             "mcp_tools": mcp_ready,
-            # 有行 ≠ 答出来：叙事层 answered=false（"资料答不了这个问题"）
-            # 同样判 fetched_empty，不许 written（2026-10-23 Scene P 实测教训）。
+            # 有行 ≠ 答出来：critic 判没答出来（含叙事层 answered=false 的情形）
+            # 一律 fetched_empty —— 错语义数据不能假解锁（2026-10-23 Scene P）。
+            "critic_note": "" if critic_ok else str(critic_why or "")[:300],
             "judgment_result": (
-                "written" if (data is not None and nar.get("answered", True))
+                "written" if (data is not None and critic_ok
+                              and nar.get("answered", True))
                 else "fetched_empty"),
             "skipped": ("" if data is not None else
                         (("场景数据源里没有能回答它的数据（" + _scene_why + "）"
@@ -888,9 +908,9 @@ async def consume(
         # 实测（2026-10-19）：只在「现场新写」时调 `_absorb`，命中复用那条
         # 路径的 mastered 永远是 False —— 面板上「掌握度」怎么答都不涨。
         abs_info: dict[str, Any] = {}
-        # answered=false（叙事层判"这些资料答不了问题"）同样不进能力库 ——
+        # critic 判没答出来 / answered=false（叙事层自检）→ 不进能力库 ——
         # 有行 ≠ 答出来（2026-10-23 Scene P：fail 的 task 却录入了技能）。
-        if data is not None and nar.get("answered", True):
+        if data is not None and critic_ok and nar.get("answered", True):
             try:
                 # 只把**本次真正复用的那一条**记成"用过且有效"（used_keys）。
                 # 不传的话 _absorb 会按 topic 前缀扫出同题下全部技能集体 +1，
@@ -1161,19 +1181,39 @@ async def consume(
         except Exception as e:  # pragma: no cover
             print(f"  （生成新题失败：{type(e).__name__}: {e}）")
 
+    # ---- 原版 critic 语义（根源修复，2026-10-23 两次实测）------------------
+    # 完成判定 = **LLM 看执行观察判「任务要求满足了没有」**（原版
+    # critic.py:112-135 `ai_check_task_success`），不是"有没有取到行"。
+    # Scene P 两次事故同一根因：错语义 SQL（dept='技术部' 在库里 0 匹配）取回
+    # 4 行错数据 → 老判据"answer 非空 + real_calls 非空"判 written → 坏配方
+    # 入库 + 假解锁；叙事层自检（answered）也拦不住（glm-4-flash 把错数据
+    # 讲成了"技术部应发工资合计 32600 元"）。
+    # 学习侧 judge=True 早就在走这把尺子（task_critic.check_task_success，
+    # 原版 critic 的同构）—— 消费侧现在接上**同一把**，一套判据两条链，
+    # 不发明新规则。
+    critic_ok, critic_why = True, ""
+    try:
+        import task_critic as _tc
+        critic_ok, critic_why = _tc.check_task_success(question, "", {
+            "execution": {"real_calls": len(real_calls),
+                          "calls": len(observations or []),
+                          "rows": real_rows},
+            "answer": answer,
+            "observations": observations,
+        })
+        if not critic_ok:
+            print(f"  · critic 判没答出来：{str(critic_why)[:120]}")
+    except Exception as e:  # pragma: no cover
+        # 原版 critic 挂了 → (False, "")：判不了就不算成功（铁律方向）。
+        critic_ok, critic_why = False, f"critic 判定不可用：{type(e).__name__}: {e}"
+
     # ---- 答完了 → 这题进能力库 → 掌握（判据是"答没答出来"，不是覆盖率）----
-    # 判据是"答没答出来"（取到数 + 给出了回答），**不是**有没有整理成结构化事实 ——
-    # 答案是一张表时压不进 facts，但那也是答出来了，照样进能力库。
+    # 判据是"答没答出来"（取到数 + 给出了回答 + **critic 判过**），**不是**有没有
+    # 整理成结构化事实 —— 答案是一张表时压不进 facts，但那也是答出来了，照样进能力库。
     # ⚠️ "取到数"同样只认真数：真空结果上的"答完了"是假象，把它沉淀进能力库
     #   等于把坏配方洗成技能（实测 fb_conversion_analysis 就是这么来的）。
-    # ⚠️ 2026-10-23 再补一刀（Scene P 实测：fail 的 task 却录入了技能）：
-    #   叙事模型看着取回的 4 行错语义数据（SUM(a.amount+base_salary)，dept='技术部'
-    #   根本查不到），自己回答「找到的资料里没有…具体金额」—— answer 非空、
-    #   real_calls 非空，老判据就把它判成"答出来了" → 坏配方入库 + 假解锁。
-    #   铁律「没取到真数不写技能库」的完整语义是**取到的数要真能回答问题**；
-    #   叙事层的 answered=false（"这些资料答不了这个问题"）就是这句话的机器可读形式。
     absorbed = (_absorb(question, sql, topic_id)
-                if (answer and real_calls and nar.get("answered", True)) else {})
+                if (answer and real_calls and critic_ok) else {})
     m_tot = int(absorbed.get("mastered_total") or 0)
     a_tot = int(absorbed.get("ability_total") or 0)
     if absorbed.get("mastered") and not topic_id:
@@ -1265,11 +1305,12 @@ async def consume(
         #   insufficient_evidence —— 冷启动单次证据（节点 cold_start_guess，待巩固）
         #   fetched_empty        —— 取到真空结果，未写图（= neko no_data）
         #   failed               —— 答完但写图/标掌握失败
-        # ⚠️ 2026-10-23：叙事层 answered=false（"取到的行答不了这个问题"）按
-        #   fetched_empty 处理 —— 有行 ≠ 答出来，这句话不能假解锁。
+        # ⚠️ 2026-10-23：critic 判没答出来（数据与问题对不上 / 空值 / 答非所问）
+        #   按 fetched_empty 处理 —— 有行 ≠ 答出来，这句话不能假解锁。
+        #   critique 落盘（critic_note），面板能看到"为什么不算答出来"。
+        "critic_note": "" if critic_ok else str(critic_why or "")[:300],
         "judgment_result": (
-            "fetched_empty" if (not real_calls
-                                or not nar.get("answered", True)) else
+            "fetched_empty" if (not real_calls or not critic_ok) else
             ("insufficient_evidence"
              if (absorbed.get("mastered")
                  and absorbed.get("node_status") == "cold_start_guess")
