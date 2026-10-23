@@ -1,16 +1,30 @@
-"""VLML 同构的 action（对应原版 voyager/agents/action.py）。
+"""VLML 同构的 action（对应原版 voyager/agents/action.py + voyager.py 的 step/rollout）。
 
 原版：模型照 control_primitives/*.js 写 **JS 代码** → mineflayer 执行 → 观察原样回灌。
-这里：模型照 control_primitives 的 **SQL 原语** 写 **SQL** → VLML MCP 环境执行
-（DB / RIB / VLGG）→ 观察原样回灌 {ok, tool, rows, error, data}。
+这里：模型照 schema 写 **SQL** → VLML MCP 执行 → 观察原样回灌（行列）。
 
-用户指令②「把 js 代码指定 sql」+ ④「迭代修正机制 prompt 里的语言改为 sql」。
+⚠️ 本文件是原版循环的**移植**，不是改写。逐段对应：
+
+    voyager_original/voyager/voyager.py:176-209  reset()
+    voyager_original/voyager/voyager.py:214-296  step()
+    voyager_original/voyager/voyager.py:298-304  rollout()
+    voyager_original/voyager/agents/action.py:78-103   render_system_message
+    voyager_original/voyager/agents/action.py:105-202  render_human_message
+    voyager_original/voyager/agents/action.py:204-…    process_ai_message
+
+只有三处替换，控制流一行不多：
+
+    JS 代码          → SQL
+    env.step(code)   → env.run_sql(sql)
+    背包/位置/方块    → 行列/错误
+
+没有额外的分类器、没有额外的 prompt 段落、没有额外的重试规则 ——
+原版怎么转，这里就怎么转。
 """
 
 from __future__ import annotations
 
 import json
-import os
 import re
 import sys
 from pathlib import Path
@@ -58,24 +72,143 @@ def _extract_sql(text: str) -> str:
     return ""
 
 
+def _render_rows(data: Any, max_rows: int = 3, max_cols: int = 12) -> str:
+    """把一次执行的返回渲染成"观察"文本（列名 + 前几行）。
+
+    同构原版 `render_human_message` 里渲染 `inventory` / `voxels` / `position`
+    的那几段：模型必须看见**自己这一步到底返回了什么**，否则只能靠记忆重写。
+
+    兼容几种返回形态：{columns,rows} / 列表字典 / 空集 / 报告型 dict。
+    """
+    if data is None:
+        return "None"
+    rows: list[Any] = []
+    cols: list[str] = []
+    saw_rows_key = False
+    if isinstance(data, dict):
+        for k in ("columns", "cols", "column_names"):
+            v = data.get(k)
+            if isinstance(v, list) and v and isinstance(v[0], str):
+                cols = [str(x) for x in v]
+                break
+        for k in ("rows", "data", "results", "records", "items"):
+            v = data.get(k)
+            if isinstance(v, list):
+                rows = v
+                saw_rows_key = True
+                break
+        if not saw_rows_key:
+            rows = [data]
+    elif isinstance(data, list):
+        rows = data
+    else:
+        rows = [data]
+    if not rows:
+        return "（0 行 / 空集）"
+    out: list[str] = []
+    head = rows[0]
+    if isinstance(head, dict):
+        names = cols or [str(k) for k in head.keys()]
+        out.append("列：" + "、".join(names[:max_cols]))
+        for r in rows[:max_rows]:
+            if isinstance(r, dict):
+                out.append("行：" + "，".join(
+                    f"{k}={str(v)[:24]}" for k, v in list(r.items())[:max_cols]))
+            else:
+                out.append(f"行：{str(r)[:200]}")
+    elif isinstance(head, (list, tuple)):
+        if cols:
+            out.append("列：" + "、".join(cols[:max_cols]))
+        for r in rows[:max_rows]:
+            seq = list(r) if isinstance(r, (list, tuple)) else [r]
+            if cols and len(cols) >= len(seq):
+                out.append("行：" + "，".join(
+                    f"{cols[i]}={str(v)[:24]}" for i, v in enumerate(seq[:max_cols])))
+            else:
+                out.append("行：" + "，".join(str(v)[:24] for v in seq[:max_cols]))
+    else:
+        out.append("行：" + str(head)[:200])
+    if len(rows) > max_rows:
+        out.append(f"（共 {len(rows)} 行，只列前 {max_rows} 行）")
+    return "\n".join(out)
+
+
+def _render_grain(g: dict[str, Any]) -> str:
+    """把行放大实测渲染成一句话（给模型看，也给 critic 看）。"""
+    n, d = g.get("rows"), g.get("distinct")
+    if n is None or d is None:
+        return ""
+    if d and int(n) > int(d):
+        ratio = g.get("ratio") or round(int(n) / int(d), 2)
+        return (f"Grain check: JOIN 之后 {n} 行，驱动表 `{g.get('driver')}` 只有 {d} 行不同"
+                f"（放大 {ratio}×）—— 关联键没有唯一定位右表，行被乘起来了。")
+    return f"Grain check: JOIN 之后 {n} 行 = 驱动表 `{g.get('driver')}` 的 {d} 行（无放大）。"
+
+
 class VLMLActionAgent:
-    """在 VLML MCP 环境里执行取数动作（SQL）。"""
+    """原版的 action agent + 主循环，环境换成 SQL。
 
-    def __init__(self, env: VLMLMCPEnv | None = None) -> None:
+    用法与原版一致：
+        await agent.reset(task=..., context=...)   # 出第一版两条消息
+        while True:
+            events, done = await agent.step()      # 写码→执行→判→重建消息
+            if done: break
+    或者直接 `await agent.rollout(task=..., context=...)`。
+    """
+
+    def __init__(
+        self,
+        env: VLMLMCPEnv | None = None,
+        *,
+        task_max_retries: int = 4,      # 同构原版 voyager.py:30 的默认 4
+        temperature: float = 0.3,       # 原版 action_agent_temperature=0，这里留一点抖动
+    ) -> None:
         self.env = env or VLMLMCPEnv()
+        self.task_max_retries = max(1, int(task_max_retries))
+        self.temperature = temperature
+        self.critic = None              # 懒加载，避免循环 import
 
+        self.messages: list[dict[str, str]] = []
+        self.rollout_num_iter = -1      # 原版用 -1 表示"还没 reset"（voyager.py:215）
+        self.task = ""
+        self.context = ""
+        self.topic_id = ""
+        self.hints: list[str] = []
+        self.schema = ""
+        # 原版有 recorder/self.last_events 存历史；这里同样存着，供上层记账。
+        self.observations: list[dict[str, Any]] = []
+        self.last_sql = ""
+        # critic 判成功时给出的结论句（原版 JSON 里的 reasoning 字段）——
+        # 上层拿它当 answer，而不是把 SQL 当答案（见 task_intake._answer_once）。
+        self.critic_reasoning = ""
+        self.answer = ""
+        self.last_success = False      # 最后一轮的判决（critic 两级都过）
+        # 执行层的工具可达性：本场景抓手条目 + 本题候选表（见 render_grabs）。
+        self.grabs: list[dict[str, Any]] = []
+        self.focus_tables: list[str] = []
+
+    # ---------- 执行 ----------
     async def run_sql(self, sql: str) -> dict[str, Any]:
-        """执行一条 SQL，回一份可枚举观察。"""
+        """执行一条 SQL，回一份可枚举观察（等价原版 env.step）。"""
         return await self.env.run_sql(sql)
 
+    async def observe_grain(self, sql: str) -> dict[str, Any] | None:
+        """行放大实测（只在有 JOIN 时做）。环境不支持就返回 None。"""
+        fn = getattr(self.env, "check_grain", None)
+        if fn is None or "join" not in sql.lower():
+            return None
+        try:
+            return await fn(sql)
+        except Exception:
+            return None
+
     async def run_calls(self, calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """按序执行多个取数动作（call = {name, args}），回观察列表。"""
         out: list[dict[str, Any]] = []
         for c in calls:
             out.append(await self.env.call(str(c.get("name")), **(c.get("args") or {})))
         return out
 
-    # ---------- LLM 写 SQL（用户指令：让闭环真正自己出题取数） ----------
+    # ---------- 抓手条目渲染（主库 feature 分支的增量，2026-10-19 实测得来） ----------
     @staticmethod
     def render_grabs(grabs: list[dict[str, Any]] | None,
                      focus_tables: list[str] | None = None) -> str:
@@ -118,198 +251,301 @@ class VLMLActionAgent:
                 "**不要编造队伍名/赛事号这类字面量**——题目没给的就不筛它。")
         return out
 
-    def write_sql(
-        self,
-        question: str,
-        *,
-        schema: str = "",
-        critique: str = "",
-        last_sql: str = "",
-        skills: list[dict[str, Any]] | None = None,
-        grabs: list[dict[str, Any]] | None = None,
-        focus_tables: list[str] | None = None,
-    ) -> str:
-        """让模型按题面写一条 SELECT；迭代修正时带上一轮的 critique 与 SQL 重写。
-
-        只收 SELECT（不接受其它语句），拿不到就返回空串由调用方判失败。
-        """
-        from voyager_vlml.llm import chat
-
-        system = self.render_system_message(skills=list(skills or []))
-        system += self.render_grabs(grabs, focus_tables)
-        if schema:
-            system += (
-                "\n\n【当前库真实 schema（只能用这里的表名/列名，不要编造）】\n"
-                f"{schema}\n"
-            )
-        user = self.render_iteration_prompt(
-            task=question,
-            critique=critique or "（首轮，直接写一条 SELECT 回答这个问题）",
-            last_sql=last_sql,
-        )
-        text = chat(
-            [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            temperature=0.3,
-        )
-        sql = _extract_sql(text)
-        if not sql.lower().startswith("select"):
-            return ""
-        return sql
-
-    async def solve(
-        self,
-        question: str,
-        *,
-        max_iters: int = 3,
-        hints: list[str] | None = None,
-        skills: list[dict[str, Any]] | None = None,
-        grabs: list[dict[str, Any]] | None = None,
-        focus_tables: list[str] | None = None,
-    ) -> tuple[list[dict[str, Any]], str]:
-        """出题之后真正取数：写 SQL → VLML MCP 执行 → 失败带 critique 重写（迭代修正）。
-
-        `skills` = 检索到的已学会配方（照原版 voyager.py:195 先 retrieve 再跑）。
-        它进 system 区块，所以**迭代的每一轮都带着**，不是只在第一轮给。
-
-        `grabs` = 当前场景的抓手条目（`actions.entries(scene)`）。同构 MCP 的
-        tools/list：不把工具清单交给模型，模型就只能凭 schema 瞎猜 join 键
-        （2026-10-19 服务器实测，见 `render_grabs` 注释）。
-
-        返回 (观察列表, 最后一条 SQL)。观察是**可枚举的**：工具成败 + 取到几行。
-        """
-        from voyager_vlml.agents.critic import VLMLCriticAgent
-
-        critic = VLMLCriticAgent()
-        try:
-            schema = await self.env.schema_block()
-        except Exception:
-            schema = ""
-
-        observations: list[dict[str, Any]] = []
-        sql = ""
-        critique = ""
-        n_skills = len(list(skills or []))
-        # 同构原版 voyager.py:196-198 —— 打印注入了多少条已学会配方（原版只打印数量，
-        # 不打印整条 system 消息：把 schema + 配方库全打出来会把日志淹没）。
-        print(f"[Action Agent] 用 {n_skills} 条已学会配方渲染 system 消息")
-        print(f"[Action Agent] 任务: {question[:140]}")
-        for i in range(max_iters):
-            sql = self.write_sql(
-                question, schema=schema, critique=critique, last_sql=sql,
-                skills=list(skills or []), grabs=list(grabs or []),
-                focus_tables=list(focus_tables or []),
-            )
-            if not sql:
-                observations.append(
-                    {"ok": False, "tool": "write_sql", "rows": 0,
-                     "error": "模型没给出 SELECT 语句"}
-                )
-                print(f"  [第 {i + 1}/{max_iters} 次] 没产出 SELECT，重试")
-                critique = "上一轮没给出 SELECT。请只输出一条以 SELECT 开头的查询。"
-                continue
-            # 同构原版 voyager.py:218 —— 打印模型给出的动作（AI 消息）。
-            print(f"  [第 {i + 1}/{max_iters} 次] 提案 SQL: {sql[:200]}")
-            obs = await self.run_sql(sql)
-            observations.append(obs)
-            ok, critique = critic.check_task_success(
-                observations=[obs],
-                task={"task": question, "hints": list(hints or [])},
-            )
-            if ok:
-                print(f"  [第 {i + 1}/{max_iters} 次] 成功 -> 工具={obs.get('tool')} 行数={obs.get('rows')}")
-                print(f"[Action Agent] 任务在第 {i + 1} 次尝试成功")
-                break
-            # 同构原版 voyager.py:293 / 274 —— 展示环境反馈 + critic 判决，然后重试。
-            print(f"  [第 {i + 1}/{max_iters} 次] 失败 -> {str(obs.get('error') or '没取回数据')[:160]}")
-            print(f"  [critic] {critique[:240]}")
-            print("  -> 重试！")
-        else:
-            print(f"[Action Agent] 任务在 {max_iters} 次尝试后失败（最后 critique: {critique[:240]}）")
-        return observations, sql
-
-    # ---------- 迭代修正的 prompt（语言 = SQL） ----------
-
-    # 已学会的技能（可复用 SQL）怎么用的说明。
-    #
-    # 照原版 `render_system_message(skills=...)`：原版把技能 code 直接拼在
-    # control_primitives 后面（`action.py:94` 的 `+ skills`），**一句解释都没有**。
-    # 这里必须多这一段，因为两边技能形态不同：
-    #   原版技能 = **带参数的函数**（`async function mineBlock(bot, name, count)`），
-    #     复用天然就是"换参数调用"，不需要教；
-    #   我们的技能 = **一整条写死了字面量的 SQL**（`team_name = 'NRG'`），
-    #     是实例不是函数。不写这段，模型会把上次的值原样抄过来，
-    #     取到的就是上一题那一队的数 —— 看着像复用，其实是记答案。
-    _SKILL_USAGE = """【已学会的取数配方】下面是你以前跑通过、已经存进技能库的 SQL。
-
-怎么用（这几条就是复用的判据）：
-1. 复用的是配方的**计算方法** —— 用了哪些表、怎么 join、怎么聚合、怎么筛选。
-2. **配方里写死的实体字面量（队伍名 / 图名 / 赛事号 / 选手名）是上一次的值，
-   必须换成当前这道题指的那个值。** 抄上一次算出来的数是记答案，不是复用。
-3. 当前这道题没指定实体（比如问"哪支队伍最高"）→ 保留配方的分组结构，别自己造值。
-4. 配方算的量与当前这道题问的量**不是同一个量** → **不要用**，照题面从零写。
-   换队伍名算复用；换个完全不同的量（K/D 比 → 连败数）不算，那是张冠李戴。
-5. 只输出一条 SELECT。"""
-
+    # ---------- 同构 agents/action.py:78-103 render_system_message ----------
     def render_system_message(
         self, *, skills: list[dict[str, Any]] | None = None
     ) -> str:
-        """写码阶段的 system：取数原语 + 已学会的配方。
+        """system = 原语 + 库结构 + 已学会技能（+ 本场景抓手条目）。
 
-        同构原版 `action.py:94`：技能拼在原语后面，占同一个 system 区块，
-        迭代修正的每一轮都带着（不是只带第一轮）。
+        原版 `action.py:94` 是 `load_control_primitives_context(...) + skills`，
+        一句解释都没有。这里同样不加解释段。
+
+        抓手条目由 `reset(grabs=..., focus_tables=...)` 存进实例，
+        每步重建 system 时一并带上（同原版 tools/list 在整个 rollout 里恒可见）。
         """
         base = (
-            "你是在 VLML 电竞数据库里取数的分析 agent。用下面的原语写 **SQL** 完成任务。"
+            f"你是在 {self._data_source_label()} 里取数的分析 agent。"
+            "用下面的原语写 **SQL** 完成任务。"
             "\n\n"
-            + render_primitives()
+            + render_primitives(available=self._available_tools())
         )
-        blocks: list[str] = []
-        for i, s in enumerate(list(skills or [])[:5]):
-            code = str(s.get("code") or "").strip()
-            if not code:
-                continue
-            blocks.append(
-                f"-- 配方 {i + 1}｜topic={s.get('topic') or ''}\n"
-                f"-- 上次用它做的是：{str(s.get('text') or '')[:160]}\n"
-                f"{code[:1200]}"
+        base += self.render_grabs(
+            getattr(self, "grabs", None), getattr(self, "focus_tables", None))
+        if self.schema:
+            base += (
+                "\n\n【当前库真实 schema（只能用这里的表名/列名，不要编造）】\n"
+                f"{self.schema}\n"
             )
-        if not blocks:
-            return base
-        return base + "\n\n" + self._SKILL_USAGE + "\n\n" + "\n\n".join(blocks)
+        blocks: list[str] = []
+        for s in list(skills or [])[:5]:
+            code = str(s.get("code") or "").strip()
+            if code:
+                blocks.append(code[:1200])
+        if blocks:
+            base += "\n\n" + "\n\n".join(blocks)
+        return base
 
-    def render_iteration_prompt(
-        self, *, task: str, critique: str, last_sql: str = ""
+    # ---------- 同构 agents/action.py:105-202 render_human_message ----------
+    def render_human_message(
+        self, *, events: list[dict[str, Any]], code: str = "",
+        task: str = "", context: str = "", critique: str = ""
     ) -> str:
-        """迭代修正 prompt：带着上一轮的 critique 重写 SQL（语言 = SQL，不给答案）。"""
-        parts = [f"任务：{task}"]
-        if last_sql:
-            parts.append(f"上一轮你写的 SQL：\n{last_sql}")
-        parts.append(f"上一轮的环境反馈：\n{critique}")
-        parts.append(
-            "请**只改 SQL**（表名/列名/过滤条件/聚合方式），重新给出一条能在当前库执行的 SELECT。"
+        """human = 上一轮代码 + 执行错误 + 观察 + 任务 + 上下文 + 批评。
+
+        字段顺序照 `action.py:133-200`：Code from the last round → Execution error
+        → 观察 → Task → Context → Critique。
+        """
+        observation = ""
+        if code:
+            observation += f"Code from the last round:\n{code}\n\n"
+        else:
+            observation += "Code from the last round: No code in the first round\n\n"
+
+        error_messages = [
+            str(e.get("error") or "") for e in events if not e.get("ok")
+        ]
+        if error_messages:
+            observation += "Execution error:\n" + "\n".join(error_messages) + "\n\n"
+        else:
+            observation += "Execution error: No error\n\n"
+
+        ok_events = [e for e in events if e.get("ok")]
+        if ok_events:
+            for e in ok_events:
+                observation += (
+                    f"Observation from {e.get('tool')} "
+                    f"({e.get('rows')} rows):\n{_render_rows(e.get('data'))}\n\n"
+                )
+                g = _render_grain(e.get("grain") or {})
+                if g:
+                    observation += g + "\n\n"
+        else:
+            observation += "Observation: None\n\n"
+
+        observation += f"Task: {task}\n\n"
+        observation += f"Context: {context}\n\n" if context else "Context: None\n\n"
+        observation += f"Critique: {critique}\n\n" if critique else "Critique: None\n\n"
+        return observation
+
+    # ---------- 同构 agents/action.py:204-… process_ai_message ----------
+    def process_ai_message(self, message: str) -> str:
+        """原版用 babel 解析 JS 抽 program_code；这里从模型输出里抽一条 SELECT。"""
+        sql = _extract_sql(message)
+        return sql if sql.lower().startswith("select") else ""
+
+    def llm(self, messages: list[dict[str, str]]) -> str:
+        """同构原版 `self.action_agent.llm(self.messages)`（voyager.py:217）。"""
+        from voyager_vlml.llm import chat
+
+        return chat(messages, temperature=self.temperature)
+
+    # ---------- 同构 voyager.py:195 / :256 skill_manager.retrieve_skills ----------
+    def retrieve_skills(self, *, query: str) -> list[dict[str, Any]]:
+        try:
+            import skill_store
+
+            if not (skill_store._load_raw().get("skills") or {}):
+                return []
+            got = skill_store.retrieve(
+                self.topic_id, query, top_k=skill_store.RETRIEVAL_TOP_K)
+            keys = [str(s.get("key") or "") for s in got]
+            if keys:
+                skill_store.mark_used(keys)
+            return got
+        except Exception as e:  # pragma: no cover
+            print(f"（检索技能库失败：{type(e).__name__}: {e}）")
+            return []
+
+    # ---------- 同构 agents/action.py 的 summarize_chatlog ----------
+    @staticmethod
+    def summarize_chatlog(events: list[dict[str, Any]]) -> str:
+        """原版把 chat log 摘要成一句；这里摘要"本轮执行成了什么"。"""
+        lines: list[str] = []
+        for e in events:
+            if e.get("ok"):
+                lines.append(f"{e.get('tool')} 取到 {e.get('rows')} 行")
+            else:
+                lines.append(f"{e.get('tool')} 失败：{str(e.get('error') or '')[:120]}")
+        return "；".join(lines) or "无执行"
+
+    # ---------- 同构 voyager.py:176-209 reset ----------
+    async def reset(
+        self, *, task: str, context: str = "",
+        skills: list[dict[str, Any]] | None = None, topic_id: str = "",
+        hints: list[str] | None = None,
+        grabs: list[dict[str, Any]] | None = None,
+        focus_tables: list[str] | None = None,
+    ) -> None:
+        self.rollout_num_iter = 0
+        self.task = task
+        self.context = context
+        self.topic_id = topic_id
+        self.hints = list(hints or [])
+        self.grabs = list(grabs or [])
+        self.focus_tables = [str(t) for t in (focus_tables or []) if str(t).strip()]
+        self.observations = []
+        self.last_sql = ""
+        self.critic_reasoning = ""
+        self.answer = ""
+        self.last_success = False
+        try:
+            self.schema = await self.env.schema_block()
+        except Exception:
+            self.schema = ""
+
+        # voyager.py:195 —— 开跑前先检索一次技能
+        init_skills = skills if skills is not None else self.retrieve_skills(query=context)
+        print(f"[Action Agent] 用 {len(list(init_skills or []))} 条已学会配方渲染 system 消息")
+        print(f"[Action Agent] 任务: {task[:140]}")
+
+        system_message = self.render_system_message(skills=list(init_skills or []))
+        human_message = self.render_human_message(
+            events=[], code="", task=task, context=context, critique="")
+        self.messages = [
+            {"role": "system", "content": system_message},
+            {"role": "user", "content": human_message},
+        ]
+
+    # ---------- 同构 voyager.py:214-296 step ----------
+    async def step(self) -> tuple[list[dict[str, Any]], bool]:
+        if self.rollout_num_iter < 0:
+            raise ValueError("Agent must be reset before stepping")
+
+        ai_message = self.llm(self.messages)                       # :217
+        sql = self.process_ai_message(ai_message)                  # :222
+        events: list[dict[str, Any]] = []
+        success = False
+
+        if sql:
+            self.last_sql = sql
+            obs = await self.run_sql(sql)                          # :226 env.step
+            if obs.get("ok"):
+                grain = await self.observe_grain(sql)
+                if grain:
+                    # 把「行数有没有被 JOIN 乘起来」并进观察 —— 原版 critic 的观察里，
+                    # 末态本身就是答案面（背包里几个木头一目了然）；SQL 世界的对应
+                    # 证据只能实测，不给就判不出来（见 vlml_mcp.check_grain）。
+                    obs = dict(obs, grain=grain)
+            events = [obs]
+            self.observations.extend(events)                       # :230 recorder.record
+            success, critique = self.critic_check(events)          # :232-238
+            # :256-270 —— **每步**按本轮执行摘要重检索技能，再重建两条消息
+            new_skills = self.retrieve_skills(
+                query=self.task + "\n\n" + self.summarize_chatlog(events))
+            self.messages = [
+                {"role": "system",
+                 "content": self.render_system_message(skills=new_skills)},
+                {"role": "user",
+                 "content": self.render_human_message(
+                     events=events, code=sql, task=self.task,
+                     context=self.context, critique=critique)},
+            ]
+            print(f"  [第 {self.rollout_num_iter + 1}/{self.task_max_retries} 次] "
+                  f"{'成功' if success else '失败'} · {self.summarize_chatlog(events)}")
+            if success and self.critic_reasoning:
+                print(f"    critic 判词：{self.critic_reasoning[:160]}")
+        else:
+            # :271-274 —— 解析失败：只打印 Trying again，**不重建消息、不加 critique**
+            print(f"  [第 {self.rollout_num_iter + 1}/{self.task_max_retries} 次] "
+                  f"没给出 SELECT · Trying again!")
+
+        self.rollout_num_iter += 1                                 # :276
+        self.last_success = bool(success)
+        done = (                                                   # :277-280
+            self.rollout_num_iter >= self.task_max_retries or success
         )
-        return "\n\n".join(parts)
+        return events, done
+
+    def critic_check(self, events: list[dict[str, Any]]) -> tuple[bool, str]:
+        """同构 `voyager.py:232-238`：每步判一次，成败 + critique 回灌下一轮。
+
+        判据两级（见 `agents/critic.py`）：先「真的取到数」，再让 LLM 按原版语义
+        判「任务要求满足了没有」（口径）。第二级的 reasoning 是结论句，存进 self.answer。
+        """
+        if self.critic is None:
+            from voyager_vlml.agents.critic import VLMLCriticAgent
+
+            self.critic = VLMLCriticAgent()
+        d = self.critic.judge(
+            observations=events,
+            task={"task": self.task, "hints": self.hints},
+            context=self.context,
+            sql=self.last_sql,
+        )
+        self.critic_reasoning = str(d.get("reasoning") or "")
+        if d.get("success") and self.critic_reasoning:
+            self.answer = self.critic_reasoning
+        return bool(d.get("success")), str(d.get("critique") or "")
+
+    # ---------- 同构 voyager.py:298-304 rollout ----------
+    async def rollout(
+        self, *, task: str, context: str = "",
+        skills: list[dict[str, Any]] | None = None, topic_id: str = "",
+        hints: list[str] | None = None,
+        grabs: list[dict[str, Any]] | None = None,
+        focus_tables: list[str] | None = None,
+    ) -> tuple[list[dict[str, Any]], str]:
+        await self.reset(task=task, context=context, skills=skills,
+                         topic_id=topic_id, hints=hints,
+                         grabs=grabs, focus_tables=focus_tables)
+        while True:
+            _events, done = await self.step()
+            if done:
+                break
+        return self.observations, self.last_sql
+
+    # ---------- 兼容壳（loop.py / consume.py / task_intake.py 按这个签名调） ----------
+    async def solve(
+        self, question: str, *, max_iters: int = 4,
+        hints: list[str] | None = None, skills: list[dict[str, Any]] | None = None,
+        topic_id: str = "",
+        grabs: list[dict[str, Any]] | None = None,
+        focus_tables: list[str] | None = None,
+    ) -> tuple[list[dict[str, Any]], str]:
+        """= 原版 `voyager.inference(sub_goals=[…])` 里那一步：reset → rollout。
+
+        `hints` 不是新通道，它就是原版的 `context`（人给的补充说明），
+        走 human message 的 `Context:` 槽。
+        `grabs` / `focus_tables` = 本场景抓手条目与本题候选表（见 render_grabs）。
+        """
+        self.task_max_retries = max(1, int(max_iters))
+        ctx = "\n".join(str(h) for h in (hints or []) if str(h or "").strip())
+        return await self.rollout(
+            task=question, context=ctx, skills=skills,
+            topic_id=topic_id, hints=hints,
+            grabs=grabs, focus_tables=focus_tables)
+
+    # ---------- 环境自述 ----------
+    def _available_tools(self) -> set[str] | None:
+        """当前库真的装载成功的工具名（报告工具按它过滤，不硬编码）。"""
+        try:
+            names = getattr(self.env, "tool_names", None)
+            return set(names) if names else None
+        except Exception:
+            return None
+
+    def _data_source_label(self) -> str:
+        try:
+            name = self.env.data_source()
+            return str(name) if name else "当前数据库"
+        except Exception:
+            return "当前数据库"
 
 
 def _main() -> int:
-    """冒烟：在真实库上跑一条 SQL，看观察与迭代 prompt。"""
+    """冒烟：跑一条 SQL → 看观察与 human message 长什么样。"""
     import asyncio
 
     agent = VLMLActionAgent()
-    sql = "SELECT COUNT(*) AS n FROM games"
 
     async def go() -> None:
-        obs = await agent.run_sql(sql)
+        obs = await agent.run_sql("SELECT COUNT(*) AS n FROM rounds")
         print("观察:", {k: obs[k] for k in ("ok", "tool", "rows", "error")})
         print("数据:", str(obs.get("data"))[:150])
-        print("--- 迭代 prompt（SQL 语言）---")
-        print(
-            agent.render_iteration_prompt(
-                task="数一下有几张图",
-                critique="  ✗ query_sql：no such column: map",
-                last_sql="SELECT COUNT(*) FROM games WHERE map='Lotus'",
-            )[:400]
-        )
+        print("\n--- human message 片段 ---")
+        print(agent.render_human_message(
+            events=[obs], code="SELECT COUNT(*) AS n FROM rounds",
+            task="数回合", context="", critique="已从库里取到 1 行")[:900])
 
     asyncio.run(go())
     return 0

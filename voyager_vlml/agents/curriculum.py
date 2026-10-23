@@ -240,6 +240,30 @@ class VLMLCurriculumAgent:
             mt = {}
         seed = mt.get("seed") or ""
 
+        # ---- 外部 task 优先（同构原版 curriculum.txt:22-23 的 Failed tasks 清单）----
+        # 人导入的 task 没答出来 → 它拆出的子目标就是**这一轮的课程**。
+        # 顺序上有意放在种子**之前**：种子（MC 的 "Mine 1 wood log"）是 VLML 世界的
+        # 出生地握手，泛化世界没有种子；而外部 task 是给定目标，必须最先被照顾。
+        # 没有外部 task（或子目标全学完）时 `next_focus()` 返回 None，行为与本改造前一致。
+        try:
+            import task_intake
+            focus = task_intake.next_focus()
+        except Exception:  # pragma: no cover  模块缺失/账本损坏 → 退回原课程
+            focus = None
+        if focus and str(focus.get("topic_id") or ""):
+            ftid = str(focus["topic_id"])
+            ftopic = self.graph.topics.get(ftid) or {}
+            return {
+                "task": f"为外部任务补子目标 {ftid}"
+                        f"（{(ftopic or {}).get('name') or ftid}）",
+                "context": (f"人导入的任务：{focus.get('question') or ''}\n"
+                            f"（{focus.get('why') or ''}）\n"
+                            + self._topic_context(ftid)),
+                "topic_id": ftid,
+                "exhausted": False,
+                "reason": "external_task",
+            }
+
         if self.progress == 0 and seed:
             topic = self.graph.topics.get(seed) or {}
             return {
@@ -315,6 +339,19 @@ class VLMLCurriculumAgent:
                         f"重试 {int((self.mastery.get(tid) or {}).get('attempts', 0))} "
                         f"次仍未跑通 → 放弃换题：{info.get('reason') or ''}",
                     )
+
+            # 外部 task 账：**成功失败都要回写**。
+            # 同构原版 `learn()`（voyager.py:372）每轮结束无条件调
+            # `update_exploration_progress(info)` —— 成功 append completed_tasks，
+            # 失败 append failed_tasks。这里失败不另记一份账（`mastery.attempts`
+            # 就是那份账，练够次数据 stale），但**必须重算 ready_for_retry**：
+            # 一条学不动的子目标不该把整条外部 task 永久钉死在 pending
+            # （原版学不动就 "Skipping to next task"，从不等所有任务成功）。
+            try:
+                import task_intake
+                task_intake.note_subtopic_result(tid, bool(info.get("success")))
+            except Exception:  # pragma: no cover
+                pass
         except Exception as e:  # pragma: no cover
             print(f"（课程 Agent 改写图谱失败：{type(e).__name__}: {e}）")
 

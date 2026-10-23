@@ -244,7 +244,7 @@ def _retrieve_skills(
 
 
 async def _generate_new_task(curr: Any, env: Any, act: Any = None,
-                             max_tries: int = 3, max_iters: int = 3
+                             max_tries: int = 3, max_iters: int = 4
                              ) -> tuple[str, str, list[dict[str, Any]], str,
                                         list[str]]:
     """生成一个新任务，**并且先验证它真的能从库里取到数**。
@@ -297,7 +297,11 @@ async def _generate_new_task(curr: Any, env: Any, act: Any = None,
                         "表名与列名，不许凭印象编表名/列名（实测编过 `weapon_types`、"
                         "`team_score_before`，题面看着合理但库里根本没有）。\n"
                         "只返回 JSON：{\"name\": \"知识点名（含粒度，如 回合粒度（rounds））\","
-                        " \"question\": \"一个具体题面\", \"skills\": [\"一两条取数要点\"]}"
+                        " \"question\": \"一个具体题面\", \"context\": \"这题怎么算做出来"
+                        "（分子分母各自的取数口径 / 计数单位，不写数值）\","
+                        " \"skills\": [\"一两条取数要点\"]}\n"
+                        "⚠️ 题面必须唯一确定答案：不要出「哪一支队伍 / 哪一场」这种库里"
+                        "有多行答案的问法，除非题面自带把答案钉死的条件。"
                     ),
                 },
                 {
@@ -317,6 +321,10 @@ async def _generate_new_task(curr: Any, env: Any, act: Any = None,
         name = str(out.get("name") or "").strip() or "运行期新任务"
         question = str(out.get("question") or "").strip()
         skills = [str(s) for s in (out.get("skills") or [])][:2]
+        # 口径说明排最前：写进 node["skills"] 一起落盘，下次选到同一个节点它还带着 ——
+        # 这就是"口径随知识点沉淀"，不另开一份账。
+        ctx = str(out.get("context") or "").strip()
+        hints = ([ctx] if ctx else []) + skills
         if not question:
             continue
 
@@ -341,9 +349,10 @@ async def _generate_new_task(curr: Any, env: Any, act: Any = None,
         gen_hits = _retrieve_skills(tid, question)
         gen_keys = [str(s.get("key") or "") for s in gen_hits]
         obs, sql = await act.solve(
-            question, max_iters=max_iters, hints=skills[:3], skills=gen_hits)
+            question, max_iters=max_iters, hints=hints[:3], skills=gen_hits)
         ok, _why = crit.check_task_success(
-            observations=obs, task={"task": question, "hints": skills})
+            observations=obs, task={"task": question, "hints": hints[:3]},
+            sql=str(sql or ""))
         if ok:
             node = {
                 "id": tid,
@@ -351,7 +360,7 @@ async def _generate_new_task(curr: Any, env: Any, act: Any = None,
                 "chapter": "运行期生成",
                 "depth": 9,          # 排在种子之后
                 "difficulty": 0.5,
-                "skills": skills,
+                "skills": hints[:3],
                 "examples": [{"prompt": question}],
                 "prerequisites": [],  # 无前置 → 立即可选
                 "source": "practice",
@@ -372,7 +381,7 @@ async def run_one_round(
     scope: dict[str, Any] | None = None,
     topic_id: str | None = None,
     use_llm: bool = True,
-    max_iters: int = 3,
+    max_iters: int = 4,
     curr: Any = None,
     env: Any = None,
 ) -> dict[str, Any]:
@@ -426,9 +435,12 @@ async def run_one_round(
     # ⚠️ 运行期新题是**生成时就带着题面一起来的**，且已经验过能从库里取到数，
     #    不再走出题器（出了反而可能把验过的题面换成另一个取不到数的说法）。
     question = gen_question
+    gen_context = ""      # 出题器给的口径说明（= 原版 propose_next_task 的 context）
     if not question and use_llm:
         try:
-            question = await VLMLQuestionAgent(env=env).generate(topic) or ""
+            made = await VLMLQuestionAgent(env=env).generate(topic) or {}
+            question = str(made.get("question") or "").strip()
+            gen_context = str(made.get("context") or "").strip()
         except Exception as e:
             print(f"  （出题失败：{type(e).__name__}: {e}）")
     if not question:
@@ -453,6 +465,12 @@ async def run_one_round(
     #    **不要两边都检索** —— 否则同一题同一次注入会被记两次 hit。
     injected_keys: list[str] = []
 
+    # 口径说明 = 出题器刚给的那句（原版 `propose_next_task` 的 context）排最前，
+    # 后面才是节点 skills 里的取数要求。两者都走原版的 `Context:` 槽 ——
+    # 原版 critic 判"任务要求满足了没有"就是靠它（`critic.py:74-77`）。
+    hints = [h for h in ([gen_context] if gen_context else [])][:1] \
+        + list(topic.get("skills") or [])[:3]
+
     # 验题那一趟已经取到数了 → 直接复用，不重复烧一次 LLM + DB。
     if pre_obs:
         observations, sql = pre_obs, pre_sql
@@ -465,15 +483,19 @@ async def run_one_round(
         print(f"开始任务 {tid}（reason={reason}，最多尝试 {max_iters} 次）")
         observations, sql = await act.solve(
             question, max_iters=max_iters,
-            hints=list(topic.get("skills") or [])[:3],
+            hints=hints,
             skills=skill_hits,
         )
 
-    # ---- 判成败：是否真的从 DB 取到数 ----
+    # ---- 判成败：真的从 DB 取到数（第一级）+ 口径满足任务要求（第二级，原版 critic） ----
     success, critique = crit.check_task_success(
         observations=observations,
-        task={"task": question, "hints": list(topic.get("skills") or [])[:3]},
+        task={"task": question, "hints": hints},
+        sql=str(sql or ""),
     )
+    if crit.last_gate == "llm":
+        print(f"  critic（{ '成功' if success else '失败'}）："
+              f"{(crit.last_reasoning or critique)[:160]}")
 
     # ---- 计数：注入过的配方这轮有没有帮上忙 ----
     # 照原版：有效性低的技能会在 retrieve 的排序里自然沉底
@@ -510,7 +532,11 @@ async def run_one_round(
             "topic_id": tid,
             "success": success,
             "verdict": "ok" if success else "no_evidence",
-            "reason": "已从库取到数" if success else "未从库取到数（链路/口径问题）",
+            "reason": (
+                "已从库取到数，口径经 critic 确认" if success and crit.last_gate == "llm"
+                else "已从库取到数" if success
+                else "取到数但口径不满足（critic 判失败）" if crit.last_gate == "llm"
+                else "未从库取到数（链路/口径问题）"),
             "skill_key": skill_key,
         }
     )
@@ -578,7 +604,7 @@ async def run_rounds(
     *,
     scope: dict[str, Any] | None = None,
     use_llm: bool = True,
-    max_iters: int = 3,
+    max_iters: int = 4,
 ) -> list[dict[str, Any]]:
     """连跑 n 轮（共享 env 与课程状态）。
 

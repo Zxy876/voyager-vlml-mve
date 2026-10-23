@@ -30,11 +30,11 @@ PRIMITIVES: list[Primitive] = [
         kind="sql",
         signature="query_sql(sql_query: str)",
         description="在当前库上执行一条只读 SELECT，返回行与列。**主要取数手段**。",
-        example="SELECT COUNT(*) AS n FROM rounds WHERE series_id = '2843069'",
+        example="SELECT COUNT(*) AS n FROM <schema 里真有的表>",
         notes=[
-            "只能 SELECT；表名列名必须来自库里真实存在的（见 schema 清单）",
-            "数回合用 COUNT(*)，不要用 SUM(round_number)",
-            "地图列叫 map_name；没有 teams 表",
+            "只能 SELECT；表名列名**只能来自下面 schema 清单里出现过的**，不许凭印象编",
+            "不知道该用哪张表/哪一列时，先探查再写正式查询（见下面【探查】三条）",
+            "口径不确定时先看样例值：布尔列别当字符串比",
         ],
     ),
     Primitive(
@@ -49,42 +49,42 @@ PRIMITIVES: list[Primitive] = [
         kind="report",
         signature="match_summary_report(series_id: str)",
         description="系列赛概览（队伍、地图、比分）。系列赛级问题的入口。",
-        example="match_summary_report(series_id='2843069')",
+        example="match_summary_report(series_id='<schema 样例里那种 id>')",
     ),
     Primitive(
         name="match_rounds_report",
         kind="report",
         signature="match_rounds_report(series_id: str)",
         description="系列赛逐回合明细。回合级问题优先用它。",
-        example="match_rounds_report(series_id='2843069')",
+        example="match_rounds_report(series_id='<当前库的系列赛 id>')",
     ),
     Primitive(
         name="match_players_report",
         kind="report",
         signature="match_players_report(series_id: str)",
         description="系列赛选手统计。选手级问题优先用它。",
-        example="match_players_report(series_id='2843069')",
+        example="match_players_report(series_id='<当前库的系列赛 id>')",
     ),
     Primitive(
         name="match_economy_report",
         kind="report",
         signature="match_economy_report(series_id: str)",
         description="系列赛经济局数据（买枪/装备净值）。经济类问题用它。",
-        example="match_economy_report(series_id='2843069')",
+        example="match_economy_report(series_id='<当前库的系列赛 id>')",
     ),
     Primitive(
         name="scouting_report",
         kind="report",
         signature="scouting_report(team_name: str)",
         description="队伍侦察报告（回合/图/队伍层分析）。",
-        example="scouting_report(team_name='NRG')",
+        example="scouting_report(team_name='<当前库里的队伍名>')",
     ),
     Primitive(
         name="player_profile_report",
         kind="report",
         signature="player_profile_report(player_name: str)",
         description="选手画像报告。",
-        example="player_profile_report(player_name='OXY')",
+        example="player_profile_report(player_name='<当前库里的选手名>')",
     ),
     Primitive(
         name="pattern_detection_report",
@@ -95,10 +95,18 @@ PRIMITIVES: list[Primitive] = [
 ]
 
 
-def render_primitives() -> str:
-    """渲染成给模型 prompt 用的文本块（同构原版把 JS 源码拼进 prompt 那一手）。"""
+def render_primitives(available: set[str] | None = None) -> str:
+    """渲染成给模型 prompt 用的文本块（同构原版把 JS 源码拼进 prompt 那一手）。
+
+    `available` = 当前库里**真的装载成功**的工具名集合。报告工具是 VLML 建模层
+    的东西（match_*_report / scouting_report …），换成没有建模层的库就跑不起来；
+    不按 available 过滤，模型会照着清单去调一个根本不存在的能力，白烧一轮
+    （`env.call` 只会回"未装载的工具"）。传 None = 不过滤（老行为）。
+    """
     lines = ["【可用取数原语（写 SQL 时照这些来）】"]
     for p in PRIMITIVES:
+        if available is not None and p.kind == "report" and p.name not in available:
+            continue
         lines.append(f"- {p.signature}  [{p.kind}]")
         lines.append(f"    {p.description}")
         if p.example:

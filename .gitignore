@@ -64,3 +64,6 @@ vlml/data/vlml_vlr.duckdb
 # 场景本机数据（普通用户的数据源：csv/json/duckdb 丢进来即可，属运行数据）
 scene_data/*/
 !scene_data/README.md
+
+# 外部 task 账本（运行时产物）
+mve/failed_tasks.json

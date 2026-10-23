@@ -57,7 +57,8 @@ check("ok + rows 键在 data 外层（query_sql 形态）",
       has_real_data({"ok": True, "rows": 1, "data": {"rows": [[7]]}}), True)
 
 print("== check_task_success（判据级） ==")
-c = VLMLCriticAgent()
+# 只测第一级（真空闸门）：关掉第二级 LLM 口径检验，否则这几条会真去打接口。
+c = VLMLCriticAgent(use_llm=False)
 # 坏技能现场：agg 表 0 行，纯聚合骗回 1 行 (NULL, 0)
 ok, critique = c.check_task_success(
     observations=[{"ok": True, "rows": 1, "data": [[None, 0]],

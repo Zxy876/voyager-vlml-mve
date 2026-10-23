@@ -1,29 +1,43 @@
-"""VLML 同构的 critic（对应原版 voyager/agents/critic.py）。
+"""VLML 同构的 critic（对应原版 `voyager/agents/critic.py`）。
 
-原版 critic 做什么：把「观察 + Task + Context」给 LLM，让它判 success + 出 critique，
-critique 回灌下一轮迭代修正（iterative prompting）。
+原版 critic 做什么（`voyager_original/voyager/agents/critic.py`）：
+    · `render_system_message`   :26-28  ← `prompts/critic.txt`
+    · `render_human_message`    :30-80  ← 观察（末态）+ Task + Context
+    · `ai_check_task_success`   :94-117 ← LLM → JSON {reasoning, success, critique}
+                                          解析失败重试 max_retries=5 次
+    · `check_task_success`      :119-141← 组装两条消息，auto 走 LLM
+    · `voyager.py:232-238`              ← **每一步**判一次，成功即停
+    · `prompts/critic.txt:3`            ← "Exceeding the task requirements is also
+                                          considered a success while failing to meet
+                                          them requires you to provide critique"
+  一句话：原版判的是**「任务要求有没有被满足」**（语义 + 口径），不是「执行有没有报错」。
 
-⚠️ 本文件的关键纠正（用户反复强调，也是旧后端最大的问题）：
-  旧实现用 `evaluate_vs_referee` 把 Voyager 的事实集去**比对 VLML0 裁判算出的标准
-  答案**，产出的 verdict / covered / missing / score / coverage 全部喂回 Voyager 让它学
-  —— 那是「拿 VLML 跑通的答案标准给 voyager 反馈」，违反设计。
+⚠️ 旧实现只判「取到数」，判不出口径（2026-10-22 实测）：
+   `vlml_first_blood` 那条成功配方写的是 `WHERE map_name='Split' AND round_number=1`
+   ——把「第一回合」当「首血」，取自 2850 行的 `ext_player_round_stats`，取到数 →
+   判成功 → 入库。下次复用即错。**「跑通 ≠ 口径对」原样复现。**
 
-  这里改成你说的：**成败由 DB 取数结果来给**
-    · 成功 ⇔ 你的方法真的去库里取到了数（至少一次工具调用成功 且 取到行 > 0）
-    · 失败 ⇔ 没调通 / 取到空集
-  VLML 跑一遍得到的判决、得分、覆盖率 → **只在面板**，不进这里、不进 Voyager。
+现在两级（2026-10-23）：
+    第一级 确定性闸门：真的从库里取到数（ok 调用 + 行数达标 + 结果非真空）。
+            ← 原版没有这一级，因为 Minecraft 的观察里不存在"空表返回 1 行 (NULL,0)"
+              这种形态；这是 SQL 独有的骗局，必须留（见 is_vacuous 的说明）。
+    第二级 LLM 口径检验：把「SQL + 报错 + 结果行 + Task + Context」交给模型，
+           问原版同一个问题 —— 任务要求满足了没有。返回 reasoning / success / critique。
+    两级都过才算成功。第二级跑不成（网络/解析全失败）→ 退回第一级并如实标注，
+    不让一次接口抖动把整轮判死。
 
-critique 语言：改成 **SQL 口径**（哪张表、哪个列、口径对不对、SQL 报什么错），
+critique 语言：仍是 **SQL 口径**（哪张表、哪个列、口径对不对、SQL 报什么错），
 不含参考值、不含覆盖率、不含"标准答案是多少"。
 """
 
 from __future__ import annotations
 
+import os
 from typing import Any, Iterator
 
 
 # ---------------------------------------------------------------------------
-# 真空结果检测：聚合查询会「假装取到了数据」
+# 第一级：真空结果检测（聚合查询会「假装取到了数据」）
 # ---------------------------------------------------------------------------
 #
 # 2026-10-14 实测踩的坑（用户报「练习线能学会、消费线答不出」的那道题）：
@@ -34,11 +48,8 @@ from typing import Any, Iterator
 #   练习线记 success=True → 坏配方被固化进技能库；消费线复用它 →
 #   回答「胜率 0%、样本量 0」（真实答案：100%、样本量 7）。
 #
-# 原版 Voyager 为什么没这个坑：它的 critic 是 **LLM 看 events 判「任务到底
-# 做成没有」**（`critic.py` 的 check_task_success 收 events 让模型判）。
-# 我们这边 critic 刻意不用 LLM（可枚举反馈），就必须把「取到数」的定义
-# 从「工具 ok 且返回行数 ≥ 1」收紧到「**至少有一个真实值**」——
-# 全 NULL、或除了 0 之外全 NULL 的结果，等于没取到数。
+# 这一级是 SQL 特有的补丁（原版没有：Minecraft 的观察不会"假装"成功）。
+# 它只判「有没有数」，判「数对不对」交给第二级 LLM（原版就是 LLM 判的）。
 
 def _iter_value_rows(data: Any) -> Iterator[list[Any]]:
     """从工具返回里尽量取出「行」（每行是值序列）。兼容几种返回形态。"""
@@ -108,32 +119,177 @@ def has_real_data(observation: dict[str, Any]) -> bool:
 
 
 class VLMLCriticAgent:
-    """VLML 版 critic：以 DB 取证为成败判据，critique 用 SQL 语言。"""
+    """VLML 版 critic：先确定性闸门，再按原版语义让 LLM 判口径。
 
-    def __init__(self, min_rows: int = 1) -> None:
+    用法与原版一致：
+        success, critique = critic.check_task_success(observations=..., task={...})
+    需要拿到「结论句」时用 `judge()`，它多回一个 reasoning（原版 JSON 的同一个字段）。
+    """
+
+    def __init__(
+        self,
+        min_rows: int = 1,
+        *,
+        mode: str = "auto",
+        use_llm: bool | None = None,
+        max_retries: int = 5,       # 同构原版 `critic.py:94` 的 max_retries=5
+    ) -> None:
+        if mode != "auto":
+            # 原版还有 manual（人在终端敲 y/n，`critic.py:82-92`）；MVE 是无人值守
+            # 学习循环，没人给它敲键盘 —— 如实不支持，不假装支持。
+            raise ValueError(f"MVE 只支持 auto 模式（原版 manual 要人敲键盘）：{mode}")
         self.min_rows = max(1, int(min_rows))
+        self.mode = mode
+        if use_llm is None:
+            use_llm = os.getenv("MVE_CRITIC_LLM", "1").strip() != "0"
+        self.use_llm = bool(use_llm)
+        self.max_retries = max(0, int(max_retries))
+        # 最近一次的判决细节（给上层取"结论句"、给日志看走了哪一级）
+        self.last_gate = ""
+        self.last_reasoning = ""
+        self.last_critique = ""
 
-    # ---------- 成败判据：DB 取证，不比标准答案 ----------
-    def check_task_success(
-        self, *, observations: list[dict[str, Any]], task: dict[str, Any] | None = None
-    ) -> tuple[bool, str]:
-        """(success, critique)。
+    # ---------- 第一级：确定性闸门 ----------
+    def gate(self, observations: list[dict[str, Any]]) -> tuple[bool, str]:
+        """(是否够格进第二级, 闸门名)。
 
-        success = 至少一次工具调用成功 且 取到行数 >= min_rows 且 **取到了真实值**。
-        理由：设计说「不把记住数值当作成功，而是从用方法取出数值的过程开始存技能」——
-        判据是**方法有没有真的从 DB 取到数**，不是取到的数等不等于某个标准答案。
-
-        ⚠️ 第三条「真实值」是 2026-10-14 补的：纯聚合 SQL 在空表上返回
-        1 行 (NULL, 0)，行数判据会被它骗过（详见 is_vacuous 的 docstring）。
+        闸门名：no_call（没调用）/ no_rows（0 行）/ vacuous（全空值）/ pass
         """
         obs = list(observations or [])
         ok_calls = [o for o in obs if o.get("ok")]
+        if not obs:
+            return False, "no_call"
+        if not ok_calls:
+            return False, "no_call"
         rows = sum(int(o.get("rows") or 0) for o in ok_calls)
-        real = any(has_real_data(o) for o in ok_calls)
-        success = bool(ok_calls) and rows >= self.min_rows and real
-        return success, self.render_critique(observations=obs, task=task or {})
+        if rows < self.min_rows:
+            return False, "no_rows"
+        if not any(has_real_data(o) for o in ok_calls):
+            return False, "vacuous"
+        return True, "pass"
 
-    # ---------- critique：SQL 语言的可枚举反馈 ----------
+    # ---------- 同构 agents/critic.py:26-28 render_system_message ----------
+    def render_system_message(self) -> str:
+        from voyager_vlml.prompts import load_prompt
+
+        return load_prompt("critic")
+
+    # ---------- 同构 agents/critic.py:30-80 render_human_message ----------
+    def render_human_message(
+        self, *, events: list[dict[str, Any]], task: str,
+        context: str = "", sql: str = "",
+    ) -> str:
+        """观察 + SQL + Task + Context。
+
+        原版这段给的是 Minecraft 的末态（biome/背包/血量…）：那些就是"我做成了什么"的
+        全部证据。SQL 世界的末态只有几行数字，**口径只能从 SQL 本身看出来**
+        （过滤了哪个列、按什么分组）—— 所以这里比原版多给一段 `SQL:`。
+        这是字段映射（背包 → 行列、代码 → SQL），不是新增规则。
+        """
+        from voyager_vlml.agents.action import _render_grain, _render_rows  # 懒加载，避免循环 import
+
+        lines: list[str] = []
+        lines.append(f"SQL: {sql.strip() or '（本轮没有执行 SQL）'}\n")
+        errs = [str(e.get("error") or "调用失败") for e in events if not e.get("ok")]
+        lines.append("Execution error: " + ("\n".join(errs) if errs else "No error") + "\n")
+        ok_events = [e for e in events if e.get("ok")]
+        if ok_events:
+            for e in ok_events:
+                lines.append(
+                    f"Result ({e.get('rows')} rows):\n{_render_rows(e.get('data'))}\n")
+                g = _render_grain(e.get("grain") or {})
+                if g:
+                    lines.append(g + "\n")
+        else:
+            lines.append("Result: None\n")
+        lines.append(f"Task: {task}\n")
+        lines.append(f"Context: {context}\n" if context else "Context: None\n")
+        return "\n".join(lines)
+
+    # ---------- 同构 agents/critic.py:94-117 ai_check_task_success ----------
+    def ai_check_task_success(
+        self, messages: list[dict[str, str]], max_retries: int | None = None
+    ) -> tuple[bool, str, str]:
+        """(success, critique, reasoning)。解析不了就重来，最多 max_retries 次。
+
+        原版靠 `fix_and_parse_json` 宽容解析 + 递归重试；这里用 `llm.chat_json`
+        （同样是「剥围栏 + 取最外层大括号」的宽容解析）+ 同一个重试次数。
+        """
+        n = self.max_retries if max_retries is None else int(max_retries)
+        if n == 0:
+            print("Critic：回复解析不了的次数用尽 —— 判失败（同原版返回 False）。")
+            return False, "", ""
+
+        from voyager_vlml.llm import chat_json
+
+        obj = chat_json(messages, temperature=0)
+        if not isinstance(obj, dict) or obj.get("success") not in (True, False):
+            # 原版这里 `assert response["success"] in [True, False]` 失败 → 递归重试
+            print("Critic：回复不是 {reasoning, success, critique} 形状 · Trying again!")
+            return self.ai_check_task_success(messages, n - 1)
+        return (
+            bool(obj["success"]),
+            str(obj.get("critique") or ""),
+            str(obj.get("reasoning") or ""),
+        )
+
+    # ---------- 同构 agents/critic.py:119-141 check_task_success（两级） ----------
+    def judge(
+        self, *, observations: list[dict[str, Any]], task: dict[str, Any] | None = None,
+        context: str = "", sql: str = "",
+    ) -> dict[str, Any]:
+        """返回 {"success","critique","reasoning","gate"}。
+
+        gate：no_call / no_rows / vacuous（第一级拦下）
+              llm（两级都过）/ llm_failed（第二级没跑成，退回第一级）
+              llm_off（关掉了第二级，等价旧行为）
+        """
+        task = task or {}
+        task_text = str(task.get("task") or "")
+        ctx = context or "\n".join(str(h) for h in (task.get("hints") or []) if h)
+
+        passed, gate = self.gate(observations)
+        self.last_gate = gate
+        if not passed:
+            crit = self.render_critique(observations=observations, task=task)
+            self.last_critique, self.last_reasoning = crit, ""
+            return {"success": False, "critique": crit, "reasoning": "", "gate": gate}
+
+        if not self.use_llm:
+            crit = self.render_critique(observations=observations, task=task)
+            self.last_gate, self.last_critique = "llm_off", crit
+            return {"success": True, "critique": crit, "reasoning": "", "gate": "llm_off"}
+
+        messages = [
+            {"role": "system", "content": self.render_system_message()},
+            {"role": "user", "content": self.render_human_message(
+                events=observations, task=task_text, context=ctx, sql=sql)},
+        ]
+        try:
+            ok, critique, reasoning = self.ai_check_task_success(messages)
+        except Exception as e:      # 接口抖动不该把整轮判死
+            print(f"Critic：口径检验没跑成（{type(e).__name__}: {e}）→ 退回第一级判据")
+            crit = self.render_critique(observations=observations, task=task)
+            note = f"（口径检验没跑成：{type(e).__name__}；这次只按「取到数」判）"
+            self.last_gate, self.last_critique = "llm_failed", note + crit
+            return {"success": True, "critique": note + crit, "reasoning": "",
+                    "gate": "llm_failed"}
+
+        self.last_gate = "llm"
+        self.last_reasoning = reasoning
+        self.last_critique = critique
+        return {"success": bool(ok), "critique": critique, "reasoning": reasoning,
+                "gate": "llm"}
+
+    def check_task_success(
+        self, *, observations: list[dict[str, Any]], task: dict[str, Any] | None = None,
+        sql: str = "",
+    ) -> tuple[bool, str]:
+        """兼容壳：(success, critique)。需要结论句时用 `judge()`。"""
+        d = self.judge(observations=observations, task=task, sql=sql)
+        return bool(d["success"]), str(d["critique"])
+
+    # ---------- critique：SQL 语言的可枚举反馈（第一级拦下时用） ----------
     def render_critique(
         self, *, observations: list[dict[str, Any]], task: dict[str, Any]
     ) -> str:
@@ -184,15 +340,16 @@ class VLMLCriticAgent:
 
 def _main() -> int:
     """冒烟：三种情形的判据（全失败 / 空集 / 取到数）。"""
-    c = VLMLCriticAgent()
+    c = VLMLCriticAgent(use_llm=False)
     cases = {
         "全失败": [{"ok": False, "tool": "query_sql", "rows": 0, "error": "no such column"}],
         "空集": [{"ok": True, "tool": "query_sql", "rows": 0, "error": ""}],
-        "取到数": [{"ok": True, "tool": "query_sql", "rows": 3, "error": ""}],
+        "取到数": [{"ok": True, "tool": "query_sql", "rows": 3, "error": "",
+                    "data": {"columns": ["n"], "rows": [[3]]}}],
     }
     for name, obs in cases.items():
         ok, critique = c.check_task_success(observations=obs, task={"task": "数回合"})
-        print(f"--- {name} → success={ok}")
+        print(f"--- {name} → success={ok} gate={c.last_gate}")
         print(critique)
     return 0
 
