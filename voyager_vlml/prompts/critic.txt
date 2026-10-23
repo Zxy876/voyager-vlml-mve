@@ -8,6 +8,8 @@
 SQL: 我上一轮执行的 SQL。
 Execution error: SQL 的报错（No error 表示跑通了）。
 Result (n rows): SQL 返回的行（只列前几行）。
+Grain check: 实测的行数校验（只有 JOIN 查询才有）。它给出「JOIN 之后多少行」与
+             「驱动表有多少行不同」；两者不等就是行被关联乘起来了。
 Task: 我要完成的目标。
 Context: 任务的背景与口径要求。
 
@@ -19,7 +21,8 @@ Context: 任务的背景与口径要求。
    - 过滤条件用错了列，或用错了取值（拿一个量当另一个量）；
    - 分组粒度不对（该按回合算的按场算、该按人算的按队算）；
    - 聚合方式不对（要比例却只给了计数，要总数却给了平均）；
-   - JOIN 丢掉行或乘了行（结果行数明显对不上口径）；
+   - JOIN 丢掉行或乘了行 —— **Grain check 里出现「放大 N×」就是这个**：
+     分母被放大了 N 倍，算出来的比例一定是错的，无论结果看着多合理；
    - 结果为空、全 NULL、或只有一个 0 而没有任何别的值。
 3. 判成功时，`reasoning` 里要写出**结论本身**（带上真实数字），上层会把它当答案；
    `critique` 留空串。判失败时，`reasoning` 说明为什么不满足，`critique` 说明下一步
@@ -84,6 +87,24 @@ RESPONSE:
     "reasoning": "13 个回合里赢了 9 个，比例 9/13 ≈ 69.2%。",
     "success": true,
     "critique": ""
+}
+
+INPUT:
+SQL: SELECT COUNT(CASE WHEN r.winning_team_name = 'X' THEN 1 END) AS wins, COUNT(*) AS total FROM stats s JOIN rounds r ON s.game_id = r.game_id WHERE s.team_name = 'X' AND s.first_kill = TRUE
+Execution error: No error
+Result (1 rows):
+列：wins、total
+行：wins=169，total=286
+Grain check: JOIN 之后 286 行，驱动表 `s` 只有 13 行不同（放大 22×）—— 关联键没有唯一定位右表，行被乘起来了。
+
+Task: X 队先拿到首杀的回合里赢了多少比例？
+Context: 一场比赛有很多回合，回合表是按回合一行的。
+
+RESPONSE:
+{
+    "reasoning": "Grain check 说 13 行被乘成了 286 行，分母被放大了 22 倍，169/286 不是这 13 个回合的胜率。",
+    "success": false,
+    "critique": "JOIN 只连了 game_id；回合表一行一回合，必须把回合号也连上（ON a.game_id = b.game_id AND a.round_number = b.round_number），否则回合数被乘成 22 倍。"
 }
 
 INPUT:

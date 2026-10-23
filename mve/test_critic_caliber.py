@@ -208,7 +208,71 @@ def test_llm_down_falls_back_to_gate() -> None:
     print("PASS  LLM 挂了 → 退回第一级 + 如实标注")
 
 
-# ---------------------------------------------------------------- 接进主循环
+# ---------------------------------------------------------------- 行放大证据
+def test_split_from_parsing() -> None:
+    """check_grain 的探针要拿到「驱动表别名 + FROM…WHERE 段」。"""
+    from voyager_vlml.env.vlml_mcp import _split_from
+
+    alias, tail = _split_from(
+        "SELECT 1 FROM ext_player_round_stats e JOIN rounds r "
+        "ON e.game_id = r.game_id WHERE e.map_name = 'Sunset' ORDER BY 1 LIMIT 5")
+    assert alias == "e", alias
+    assert tail.lower().startswith("from ext_player_round_stats e"), tail
+    assert "where" in tail.lower() and "order by" not in tail.lower(), tail
+
+    alias, _t = _split_from("SELECT 1 FROM rounds WHERE x = 1")
+    assert alias == "rounds", "没别名时用表名"
+    assert _split_from("SELECT 1") is None
+    assert _split_from("WITH t AS (SELECT 1) SELECT * FROM t JOIN u USING(k)") is None
+    assert _split_from("SELECT * FROM (SELECT 1) s JOIN u ON s.a = u.a") is None
+    print("PASS  _split_from：别名/无别名/CTE/子查询 都按预期")
+
+
+def test_grain_evidence_reaches_critic_and_action() -> None:
+    obs = _obs([[169, 286]], ["wins", "total"])
+    obs["grain"] = {"driver": "e", "rows": 286, "distinct": 13, "ratio": 22.0}
+    c = VLMLCriticAgent(use_llm=False)
+    msg = c.render_human_message(
+        events=[obs], task="X 队首杀后胜率", sql="SELECT ... JOIN rounds r ON ...")
+    assert "Grain check" in msg, msg
+    assert "286 行" in msg and "13 行不同" in msg and "22.0×" in msg, msg
+
+    a = VLMLActionAgent(env=FakeEnv([]))  # type: ignore[arg-type]
+    human = a.render_human_message(
+        events=[obs], code="SELECT ...", task="X 队首杀后胜率")
+    assert "Grain check" in human and "放大" in human, human
+
+    # 没放大时不喊"放大"，只报实测
+    obs2 = _obs([[13, 13]], ["wins", "total"])
+    obs2["grain"] = {"driver": "e", "rows": 13, "distinct": 13, "ratio": 1.0}
+    msg2 = c.render_human_message(events=[obs2], task="t", sql="s")
+    assert "无放大" in msg2 and "放大 1" not in msg2, msg2
+    print("PASS  行放大实测进两边观察（放大时写明倍数，无放大如实报）")
+
+
+def test_observe_grain_only_on_join() -> None:
+    """没有 JOIN 的 SQL 不该多打一次库（省一次往返）。"""
+    calls: list[str] = []
+
+    class EnvWithGrain(FakeEnv):
+        async def check_grain(self, sql: str) -> dict:
+            calls.append(sql)
+            return {"driver": "a", "rows": 2, "distinct": 1, "ratio": 2.0}
+
+    a = VLMLActionAgent(env=EnvWithGrain([_obs([[1]])]))  # type: ignore[arg-type]
+    a.critic = VLMLCriticAgent(use_llm=False)   # 这条只验探针，不烧接口
+    _script_action(a, ["SELECT 1 FROM rounds"])
+
+    async def go() -> None:
+        await a.reset(task="t")
+        await a.step()
+
+    asyncio.run(go())
+    assert calls == [], "无 JOIN 不该测粒度"
+    print("PASS  无 JOIN 不测粒度（不多打一次库）")
+
+
+
 class FakeEnv:
     def __init__(self, results: list[dict[str, Any]]) -> None:
         self.results = list(results)
@@ -274,8 +338,11 @@ def main() -> int:
     test_bad_json_retries_like_original()
     test_bad_json_then_good()
     test_llm_down_falls_back_to_gate()
+    test_split_from_parsing()
+    test_grain_evidence_reaches_critic_and_action()
+    test_observe_grain_only_on_join()
     test_critique_feeds_next_iteration_and_answer()
-    print("\n全部通过：critic = 真空闸门 + 原版口径检验（LLM）")
+    print("\n全部通过：critic = 真空闸门 + 原版口径检验（LLM）+ 行放大实测证据")
     return 0
 
 

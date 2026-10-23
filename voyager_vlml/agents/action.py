@@ -133,6 +133,18 @@ def _render_rows(data: Any, max_rows: int = 3, max_cols: int = 12) -> str:
     return "\n".join(out)
 
 
+def _render_grain(g: dict[str, Any]) -> str:
+    """把行放大实测渲染成一句话（给模型看，也给 critic 看）。"""
+    n, d = g.get("rows"), g.get("distinct")
+    if n is None or d is None:
+        return ""
+    if d and int(n) > int(d):
+        ratio = g.get("ratio") or round(int(n) / int(d), 2)
+        return (f"Grain check: JOIN 之后 {n} 行，驱动表 `{g.get('driver')}` 只有 {d} 行不同"
+                f"（放大 {ratio}×）—— 关联键没有唯一定位右表，行被乘起来了。")
+    return f"Grain check: JOIN 之后 {n} 行 = 驱动表 `{g.get('driver')}` 的 {d} 行（无放大）。"
+
+
 class VLMLActionAgent:
     """原版的 action agent + 主循环，环境换成 SQL。
 
@@ -176,6 +188,16 @@ class VLMLActionAgent:
     async def run_sql(self, sql: str) -> dict[str, Any]:
         """执行一条 SQL，回一份可枚举观察（等价原版 env.step）。"""
         return await self.env.run_sql(sql)
+
+    async def observe_grain(self, sql: str) -> dict[str, Any] | None:
+        """行放大实测（只在有 JOIN 时做）。环境不支持就返回 None。"""
+        fn = getattr(self.env, "check_grain", None)
+        if fn is None or "join" not in sql.lower():
+            return None
+        try:
+            return await fn(sql)
+        except Exception:
+            return None
 
     async def run_calls(self, calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -243,6 +265,9 @@ class VLMLActionAgent:
                     f"Observation from {e.get('tool')} "
                     f"({e.get('rows')} rows):\n{_render_rows(e.get('data'))}\n\n"
                 )
+                g = _render_grain(e.get("grain") or {})
+                if g:
+                    observation += g + "\n\n"
         else:
             observation += "Observation: None\n\n"
 
@@ -339,6 +364,13 @@ class VLMLActionAgent:
         if sql:
             self.last_sql = sql
             obs = await self.run_sql(sql)                          # :226 env.step
+            if obs.get("ok"):
+                grain = await self.observe_grain(sql)
+                if grain:
+                    # 把「行数有没有被 JOIN 乘起来」并进观察 —— 原版 critic 的观察里，
+                    # 末态本身就是答案面（背包里几个木头一目了然）；SQL 世界的对应
+                    # 证据只能实测，不给就判不出来（见 vlml_mcp.check_grain）。
+                    obs = dict(obs, grain=grain)
             events = [obs]
             self.observations.extend(events)                       # :230 recorder.record
             success, critique = self.critic_check(events)          # :232-238

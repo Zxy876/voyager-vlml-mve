@@ -391,16 +391,63 @@ critic 却给了成功判词「Global Esports 队获得了首杀」。这行 SQL
 源头是图谱节点的 examples/hints 里就是这么写的。critic 判的是"SQL 满足不满足题干"，
 **不判题干对不对** —— 这一层的责任在节点定义与出题器，不在 critic。
 
-三个候选落法（都还没做）：
-
-1. **结构检测（不需要领域知识）**：对带 JOIN 的查询，比较「JOIN 后的行数」与「驱动表的行数」，
-   放大即报警。要拿到这两个数得把 SQL 拆成 FROM 段与 ON 段，或读 `EXPLAIN ANALYZE` 的算子基数。
-2. **答案唯一性检测**：题干问"哪一支/多少"时，结果必须收敛到 1 行**且**不是靠 `LIMIT` 截出来的
-   （比对"去掉 LIMIT 的行数"与"有没有 LIMIT"）。
-3. **粒度进图谱**：把"一行一回合 / 一行一选手"这类粒度写进节点（现在 `skills` 里已经有人写了一句
-   "`agg_first_blood_stats` 的粒度是 round_id"），JOIN 键对不上粒度就判失败；同时把出题器的
-   examples 也按粒度校一遍（治 ③）。
+> ①②③ 的补法见 §十：不是加判据，是照原版把口径治在**出题**和**观察**两层。
 
 不选 `intent-diff` 那种"把题干承诺与 SQL 过滤逐项对齐"的写法 —— A2 的过滤条件与题干**完全一致**，
-错在 JOIN，逐项对齐查不出来。
+错在 JOIN，逐项对齐查不出来。补法见 §十。
+
+---
+
+## 十 口径漏洞：原版治在哪一层，我们同构到哪一层（2026-10-23）
+
+### 10.1 原版取证：它根本没有"口径判据"
+
+把原版翻遍，没有任何一处做"SQL/动作与题干口径逐项对齐"的检查。口径是在**四个位置**管的：
+
+| 位置 | 原版怎么做的 | 治的是哪个洞 |
+|---|---|---|
+| `prompts/curriculum.txt:33` | "Tasks that require information beyond the player's status to verify should be avoided. For instance, *Placing 4 torches* and *Dig a 2x1x2 hole* are not ideal since they require visual confirmation from the screen." → **只出「观察面能验」的任务** | ③ 题干不可验 |
+| `prompts/curriculum.txt:28` | 题面固定成 "Mine [quantity] [block]" / "Craft [quantity] [item]" 这种**带数量、单动作、一句话**的格式 → 答案唯一、判据就是一个数 | ② 多答案 / ① 分母不明 |
+| `curriculum.py:305-318` + `get_task_context()` | 出题后**再给一段 context**：这题怎么做、什么算成功（如 deposit 任务写明 "After depositing, your inventory should only have 20 occupied slots"） | ③ 口径没写明 |
+| `critic.py:30-80` + `prompts/critic.txt` | critic 看的是**完整末态**（背包/装备/血量/附近方块/箱子）+ Task + Context，提示词里 6 个例子教的全是"怎么把末态读数翻译成任务语义"（挖 iron_ore 得 raw_iron、吃东西看 hunger=20、种植看 nearby blocks） | ① 读数与语义的对应关系 |
+
+一句话：**原版把口径治在"出题"和"给证据"两端，判据本身保持极简（LLM 判）。**
+它没有"行放大检测"，因为 Minecraft 里不存在"同一份末态被复制 22 遍"这种事 —— 那是 SQL 世界独有的。
+
+### 10.2 我们的同构落点（三处，一一对应）
+
+| 洞 | 原版对应物 | 我们照做什么 |
+|---|---|---|
+| ③ 题干口径错/不可验 | `curriculum.txt:33` | `agents/question.py` 的 system 加三条硬约束：**可验**（只要结果里能直接看出来的数或行）、**唯一答案**（不要"哪一支/哪一场"，除非题面自带钉死条件）、**写明口径**（比例必须写分子/分母各自的取数口径，计数必须写单位） |
+| ③ 口径没写进任务 | `get_task_context()` → critic 的 `Context:` | 出题 JSON 多要一个 `context` 字段（"这题怎么算做出来"），随题面一起进 ActionAgent 的 `Context:` 槽、进 critic 的 `Context:` 槽、并写进节点 `skills` 落盘（口径随知识点沉淀，不另开账） |
+| ① 行放大 | critic 的观察里"背包有几个木头"就是一目了然的证据 | 给 critic 补同类证据：`env.check_grain(sql)` 实查「JOIN 之后多少行 / 驱动表多少行不同」，渲染成 `Grain check: …放大 22×`，同时进 action 的观察（模型下一轮能改）和 critic 的观察（判有据） |
+
+`check_grain` 的做法（不需要任何领域知识）：把 SELECT 列表换成
+`COUNT(*)` 与 `COUNT(DISTINCT 驱动表别名)`，其余 FROM/WHERE 原样保留，跑一次；
+`distinct < rows` 就是放大，倍数 = rows/distinct。CTE / 子查询驱动表 / 解析不出来 → 返回 None
+（如实说"这次没测"，不假装测过）。
+
+**判还是 LLM 判**，没有新增确定性闸门 —— 这一步是刻意的：原版的判据就是 LLM，
+我们只把"它判不出来的原因（缺证据）"补上。
+
+### 10.3 实测（服务器 rib，`mve/_probe_critic.py` 四例）
+
+| 例 | Grain check | 判决 | 判词 |
+|---|---|---|---|
+| A1 正确 JOIN | 13 行 = 13 行不同（无放大） | ✅ 成功 | 「赢了 9 场，总共 13 场，9/13 ≈ 69.2%」 |
+| A2 只连 game_id | **286 行 / 13 行不同（放大 22×）** | ✅ **失败**（补证据前是成功） | 「Grain check 显示…行被错误地关联了 22 倍…」critique 直接给出 `e.round_number = r.round_number` |
+| B 第一回合当首血 | 30 行 = 30 行不同 | ✅ 失败 | 点名地图应是 Sunset、要算首血方赢下的回合数 |
+| C agg 空表 | 0 行 | ✅ 失败（`gate=vacuous`，不调 LLM） | 真空提示 |
+
+补证据前后 A2 从"成功"变"失败"，判词还直接给出该补哪个键 —— 这就是"证据给足，LLM 自己会判"。
+
+### 10.4 还没证的（诚实）
+
+- **出题侧三条约束是 prompt 级的**，只证了"能跑、会返回 `context`"，还没统计过"题面唯一答案"的执行率
+  （同一晚又出过一道「在所有比赛中，哪支队伍获得的首血次数最多？」—— 这道勉强算唯一，
+  但库里 `base_events.is_first_blood` 取回 0 行，那轮失败在选表，不在口径）。
+- `check_grain` 只测**驱动表**方向；若右表是驱动表、左表被放大（`FROM rounds r JOIN stats s`），
+  检测到的是右表行数，仍能发现放大（因为驱动行 d 会小于总行数 n），但"哪张表被乘"要靠 critic 读 SQL。
+- 出题器仍会复用节点里人写的错口径 examples（③ 的根），这一层要等"节点定义体检"，
+  现在只在 critique 里如实暴露。
 

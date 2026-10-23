@@ -68,13 +68,21 @@ WHERE map_name = 'Sunset' AND fb_team = 'Karmine Corp'"""
 
 
 async def _run(env: VLMLMCPEnv, sql: str) -> dict:
-    return await env.run_sql(sql)
+    """执行 + 行放大实测（同 action.step 的做法：JOIN 才测）。"""
+    obs = await env.run_sql(sql)
+    if obs.get("ok"):
+        g = await env.check_grain(sql)
+        if g:
+            obs = dict(obs, grain=g)
+    return obs
 
 
 def _show(tag: str, sql: str, obs: dict, d: dict) -> None:
     print(f"\n===== {tag} =====")
     print("SQL:", " ".join(sql.split())[:150])
     print(f"取数: ok={obs.get('ok')} rows={obs.get('rows')} err={str(obs.get('error') or '')[:90]}")
+    g = obs.get("grain")
+    print(f"粒度: {g}" if g else "粒度: （无 JOIN / 没测到）")
     print(f"判决: success={d['success']} gate={d['gate']}")
     print(f"reasoning: {d['reasoning'][:220]}")
     print(f"critique : {d['critique'][:220]}")

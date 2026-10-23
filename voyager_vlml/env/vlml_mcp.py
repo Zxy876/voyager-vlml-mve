@@ -139,6 +139,56 @@ class VLMLMCPEnv:
         """执行一条 SQL（模型写的取数代码在这里跑）。"""
         return await self.call("query_sql", sql_query=sql)
 
+    async def check_grain(self, sql: str) -> dict[str, Any] | None:
+        """实查「这条 JOIN 有没有把驱动表的行放大」（fan-out）。
+
+        为什么需要它（2026-10-23 实测）：`JOIN rounds ON e.game_id = r.game_id`
+        只连 game_id，而 `rounds` 是**一行一回合**（一个 series 22 回合），
+        13 个首血回合被乘成 286 行 → 算出 169/286，真值是 9/13。
+        critic 只看到「1 行两个数」，分不出哪个对 —— 它缺的不是判断力，是**证据**。
+        原版 critic 的观察里，末态本身就是答案面（背包里几个木头一目了然）；
+        SQL 世界的对应物就是"行数有没有被 JOIN 乘起来"，只能实测。
+
+        做法不需要任何领域知识：把 SELECT 列表换成
+            COUNT(*)              → n（JOIN 之后的行数）
+            COUNT(DISTINCT 别名)   → d（驱动表里不同的行数；DuckDB 允许对别名整体去重）
+        其余 FROM/WHERE 原样保留，跑一次即可。d < n 就是放大，倍数 n/d。
+
+        不加 JOIN / 以 WITH 开头（驱动表可能是 CTE，别名出作用域）/ 解析不出来
+        → 返回 None（如实说"这次没测"，不假装测过）。
+        """
+        parsed = _split_from(sql)
+        if parsed is None:
+            return None
+        alias, tail = parsed
+        probes = (
+            # 首选：整行去重（DuckDB 支持 COUNT(DISTINCT 别名)）
+            f"SELECT COUNT(*) AS n, COUNT(DISTINCT {alias}) AS d " + tail,
+            # 退回：子查询去重（不支持整行去重的引擎走这条）
+            f"SELECT (SELECT COUNT(*) {tail}) AS n, "
+            f"(SELECT COUNT(*) FROM (SELECT DISTINCT {alias}.* {tail})) AS d",
+        )
+        for probe in probes:
+            obs = await self.run_sql(probe)
+            if not obs.get("ok"):
+                continue
+            data = obs.get("data") or {}
+            rows = data.get("rows") if isinstance(data, dict) else data
+            if not rows:
+                continue
+            try:
+                n, d = int(rows[0][0]), int(rows[0][1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            return {
+                "driver": alias,
+                "rows": n,
+                "distinct": d,
+                "ratio": round(n / d, 2) if d else None,
+                "probe": probe,
+            }
+        return None
+
     async def table_row_counts(self) -> dict[str, int]:
         """每张表的行数（一次 UNION ALL 查询）。
 
@@ -267,6 +317,93 @@ class VLMLMCPEnv:
         # （它们字母序靠后，不排序就会被先截掉）。
         ordered = sorted(cols.items(), key=lambda kv: -(counts.get(kv[0]) or 0))
         return "\n".join(_line(t, c) for t, c in ordered[:max_tables])
+
+
+_TOP_STOP = ("group by", "order by", "having", "qualify", "limit", "union")
+_NOT_ALIAS = {
+    "join", "left", "right", "inner", "full", "cross", "on", "where", "group",
+    "order", "limit", "having", "qualify", "union", "as", "using", "window",
+}
+
+
+def _scan_top(low: str, needles: tuple[str, ...], start: int = 0) -> tuple[int, str] | None:
+    """在括号外、引号外找第一个出现的关键词，返回 (下标, 关键词)。"""
+    depth, quote, i, n = 0, False, start, len(low)
+    while i < n:
+        ch = low[i]
+        if quote:
+            if ch == "'":
+                quote = False
+            i += 1
+            continue
+        if ch == "'":
+            quote = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            for kw in needles:
+                if not low.startswith(kw, i):
+                    continue
+                before_ok = i == 0 or not (low[i - 1].isalnum() or low[i - 1] == "_")
+                j = i + len(kw)
+                after_ok = j >= n or not (low[j].isalnum() or low[j] == "_")
+                if before_ok and after_ok:
+                    return i, kw
+        i += 1
+    return None
+
+
+def _split_from(sql: str) -> tuple[str, str] | None:
+    """拆出「驱动表别名」与「FROM … 到 GROUP BY/ORDER BY/LIMIT 之前」这段。
+
+    `check_grain` 用它构造 `COUNT(*)` vs `COUNT(DISTINCT 别名.*)` 的探针。
+    拆不出来就返回 None（不猜）。
+    """
+    s = str(sql or "")
+    low = s.lower()
+    if not s.strip() or low.lstrip().startswith("with"):
+        return None    # CTE 里的驱动表别名出了作用域，探针跑不了
+    hit = _scan_top(low, ("from",))
+    if hit is None:
+        return None
+    i = hit[0]
+    j = i + 4
+    while j < len(s) and s[j] in " \t\r\n":
+        j += 1
+    if j >= len(s) or s[j] == "(":
+        return None    # 驱动表是子查询：拿不到稳定的别名
+    if s[j] == '"':
+        k = s.find('"', j + 1)
+        if k < 0:
+            return None
+        table, j = s[j : k + 1], k + 1
+    else:
+        k = j
+        while k < len(s) and (s[k].isalnum() or s[k] in "_$."):
+            k += 1
+        table, j = s[j:k], k
+    if not table:
+        return None
+    alias = table
+    m = j
+    while m < len(s) and s[m] in " \t\r\n":
+        m += 1
+    if m < len(s):
+        if s[m] == '"':
+            k = s.find('"', m + 1)
+            cand, end = (s[m : k + 1], k + 1) if k > 0 else ("", m)
+        else:
+            k = m
+            while k < len(s) and (s[k].isalnum() or s[k] == "_"):
+                k += 1
+            cand, end = s[m:k], k
+        if cand and cand.lower() not in _NOT_ALIAS:
+            alias = cand          # 有别名就用别名（`FROM t e` → e）
+    stop = _scan_top(low, _TOP_STOP, start=i)
+    tail = s[i : stop[0] if stop else len(s)]
+    return alias, tail.strip().rstrip(";").strip()
 
 
 def _short_type(t: str) -> str:

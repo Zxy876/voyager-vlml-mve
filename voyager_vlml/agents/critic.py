@@ -186,7 +186,7 @@ class VLMLCriticAgent:
         （过滤了哪个列、按什么分组）—— 所以这里比原版多给一段 `SQL:`。
         这是字段映射（背包 → 行列、代码 → SQL），不是新增规则。
         """
-        from voyager_vlml.agents.action import _render_rows   # 懒加载，避免循环 import
+        from voyager_vlml.agents.action import _render_grain, _render_rows  # 懒加载，避免循环 import
 
         lines: list[str] = []
         lines.append(f"SQL: {sql.strip() or '（本轮没有执行 SQL）'}\n")
@@ -197,6 +197,9 @@ class VLMLCriticAgent:
             for e in ok_events:
                 lines.append(
                     f"Result ({e.get('rows')} rows):\n{_render_rows(e.get('data'))}\n")
+                g = _render_grain(e.get("grain") or {})
+                if g:
+                    lines.append(g + "\n")
         else:
             lines.append("Result: None\n")
         lines.append(f"Task: {task}\n")
