@@ -923,9 +923,20 @@ async def _start_learning_impl(
                         evidence=_ev3)
                     _answer_override = ""
             else:
+                # ⚠️ 出题器的 Context（口径说明：哪张表、字面量用哪个真实值）
+                # 必须跟题一起进执行层的 Context 槽 —— 原版 voyager.py:419-424
+                # `rollout(task=next_task, context=get_task_context(next_task))`
+                # 就是一路传的。2026-10-23 实测（Scene P）：课程出的题面是
+                # 「技术部有哪些在职员工？」、Context 明说 dept='技术'，但这儿
+                # 只把子目标 need 当 hints，Context 被丢掉 → 执行层按常识写
+                # dept='技术部' → 0 行 → 连败。`solve(hints=...)` 就是原版
+                # context 槽（见 action.py:507），所以把 context 拼在最前。
+                _hint_ctx = [str(x).strip() for x in (str(context or ""), str(critique or ""))
+                             if str(x or "").strip()]
                 observations, sql = await agent.solve(
                     question, skills=skills, grabs=grabs, focus_tables=focus,
-                    hints=[str(s.get("need") or "") for s in plan["subtasks"]])
+                    hints=_hint_ctx
+                    + [str(s.get("need") or "") for s in plan["subtasks"]])
             # 执行环境自报数据来源：SceneDBEnv / VLMLMCPEnv 都有 data_source()，
             # 但它们的观察里**不带** data_sources（那是 local_agent 的 MCP 工具才
             # 填的字段）→ 于是真取到数也会算成 real_calls=0 / evidence=knowledge，
