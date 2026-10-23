@@ -1,5 +1,7 @@
 # MVE：让 Voyager 在 VLML 上学会「取数编排」
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23599419.svg)](https://doi.org/10.5281/zenodo.23599419)
+
 > **线上面板**：<https://43.161.203.50:8443/mve/>（腾讯云，无鉴权，任何设备直接打开）
 > **仓库**：<https://github.com/Zxy876/voyager-vlml-mve>
 > **最后更新**：2026-10-13（后端已换成 `voyager_vlml/`，消费线 `consume.py` 通了）
