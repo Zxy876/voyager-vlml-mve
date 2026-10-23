@@ -786,6 +786,13 @@ async def consume(
                     timeout=_consume_timeout(len(skills or [])))
             real = [o for o in obs if o.get("ok") and o.get("data") is not None]
             data = (real[-1].get("data") if real else None)
+            if _scene_kind == "scene" and data is not None:
+                # 场景库形态的真空防线（与 local 分支 _payload 同口径）：
+                # 0 行的查询也返回 {rows: []} —— 不挡的话「0 行 + 模型一段
+                # 文字」会判 written，还把 `WHERE 表达式='y=2x-1'` 这种把
+                # 答案字面量当查询条件的坏配方写进技能库（2026-10-22 K 实测）。
+                if not (data.get("rows") if isinstance(data, dict) else data):
+                    data = None
         # 没取到 → 还是没学会。同样**不自动后台学**（2026-10-19 用户改设计）：
         # 这条问题已在场景学习账上（coach_log 判读 = 没答出来），人点驾驶舱
         # 「▶ 启动 Voyager」时 scene_learn.py 会排到它 —— 每轮落 run_log 可见。

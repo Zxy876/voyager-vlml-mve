@@ -13,9 +13,12 @@
   报错  —— 技能代码本身抛异常（缺名字、语法、工具崩）
 
 用法：
-  python mve/audit_skills.py                     # 体检当前场景，只报告
-  python mve/audit_skills.py --scene B --limit 20
-  python mve/audit_skills.py --scene B --fix     # 删掉真空/报错的条目（先备份）
+  python mve/audit_skill_replay.py                     # 体检当前场景，只报告
+  python mve/audit_skill_replay.py --scene B --limit 20
+  python mve/audit_skill_replay.py --scene B --fix     # 删掉真空/报错的条目（先备份）
+
+（与根目录 `audit_skills.py` 分工：那个审 **SQL 配方在当前库上是否真空**，
+这里审 **技能代码重放后还取不取得到真内容**，判据都是材料账。）
 """
 from __future__ import annotations
 
