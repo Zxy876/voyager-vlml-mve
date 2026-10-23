@@ -200,3 +200,91 @@ render_human_message / process_ai_message`，只把 JS 换成 SQL、`env.step` �
 
 完整对照（含 14 行逐步表、重试层次、解析失败计数、对"无建模表"验收线的影响）见
 `docs/主循环对照-自修正与重试.md`。
+
+---
+
+## 八 第一刀已落：学不动的子目标按原版语义「跳过」（2026-10-23）
+
+### 8.1 原版是怎么处理"太难"的（取证）
+
+不是"跳过某个节点"——原版没有节点。它只有两个清单 + 一句话：
+
+| 位置 | 机制 |
+|---|---|
+| `agents/curriculum.py:332-347` | `update_exploration_progress(info)`：成功 → `completed_tasks.append`；失败 → `failed_tasks.append` **+ 打印 "Skipping to next task"** |
+| `agents/curriculum.py:349-370` | `clean_up_tasks`：去重、把已完成的从 `failed_tasks` 里剔除（**只在变成功时剔除**） |
+| `prompts/curriculum.txt:22-23` | 每轮把两个清单塞进 curriculum 的输入：`Completed tasks so far:` / `Failed tasks that are too hard:` |
+| `prompts/curriculum.txt:29` | `The next task should not be too hard since I may not have the necessary resources or have learned enough skills` |
+| `voyager.py:326-385` | `learn()` 的 `while True`：**失败不阻塞**，记完账就进下一轮；从不等所有任务成功 |
+
+一句话：**原版的"跳过"= 记一笔"太难"账 + 下一轮换个别的，"完成"不是继续的条件。**
+
+### 8.2 MVE 原来的偏差
+
+`ready_for_retry` 用的是「`subtopics` 全都在 `done_subtopics` 里」。而一条学不动的
+子目标（练够 `MAX_ATTEMPTS_PER_TOPIC=3` 次 → `stale`）永远不会进 `done` →
+`pending_subtopics` 已经把它排除了，`ready_for_retry` 却永远是 false。
+实测 `vlml_fb_conversion` 就卡在这儿：`pending=[]`，`ready_for_retry=false`。
+
+### 8.3 改法（三处，全部是把原版的账搬到图谱上）
+
+| 改了什么 | 对应原版 |
+|---|---|
+| `_ready_now(row)` = `not pending_subtopics(row)` —— 门槛是"没有还能学的了"，不是"全做完" | `learn()` 从不等全部成功；失败即 "Skipping to next task" |
+| `skipped_subtopics(row)`：**反查** `mastery.stale`，不另存账；`next_focus` 的 `why` 带上"已放弃 N 条" | `failed_tasks` + curriculum 输入里的 `Failed tasks that are too hard:` |
+| `note_subtopic_result(tid, success)`：无论成败都回写 | `:372` 每轮无条件调 `update_exploration_progress(info)` |
+| `ready_for_retry` 改成**读时现算** | 状态反查，不重复记账（两本账必然对不上） |
+| `next_focus` 改用 `graph.curriculum_key`（从 `select_next` 抽出的同一个键），删掉上一轮自造的 `attempts/difficulty` 排序 | 「下一题」只有一套顺序，两条线不能各排一套 |
+
+### 8.4 顺手修掉的复用断点（不修 retry 永远"还没学过"）
+
+技能是按「学它的那个节点」存的，`skill_store.retrieve` 只有 `topic` **完全相等**才给
+同题分；跨题靠词面相似度过 `CROSS_TOPIC_MIN_SIM=0.12` 的门槛。
+
+实测这条 task：`sim=0.021` → 传空 topic、传 `vlml_fb_conversion` 都召回不到，
+只有传 `vlml_first_blood` 才拿到。而账本里 `topic_id` 是空串 → retry 直接判"还没学过"。
+
+改：`ask` 先 `resolve_topic` 再答，把归题结果写进账本；`_answer_once` 按
+「归题结果 + 该 task 的子目标」逐个检索再合并（子目标就是"这题需要哪些知识点"）。
+
+### 8.5 服务器实测（真实账本 `t745700`，rib）
+
+```
+$ python mve/task_intake.py sub t745700
+  subtopics       : [vlml_fb_conversion, vlml_first_blood]
+  done            : [vlml_first_blood]
+  skipped         : [vlml_fb_conversion]     ← 0 行表上练不动，反查 stale
+  pending         : []                       ← 没有能学的了
+  ready_for_retry : true                     ← 以前恒 false
+
+$ python mve/task_intake.py retry t745700
+  ok=true  tries=3  reused_skills=[vlml_first_blood::vlml_first_blood]
+  [第 1/3 次] 失败 · query_sql 取到 1 行
+  [第 2/3 次] 成功 · query_sql 取到 1 行
+```
+
+它自己写出来的（第 2 轮，复用那条学过的配方后改的）：
+
+```sql
+SELECT COUNT(CASE WHEN winning_team_name = 'Karmine Corp' THEN 1 END) AS wins,
+       COUNT(*) AS total_first_blood_rounds
+FROM ext_player_round_stats
+JOIN rounds ON ext_player_round_stats.game_id = rounds.game_id
+WHERE ext_player_round_stats.team_name = 'Karmine Corp'
+  AND ext_player_round_stats.map_name = 'Sunset'
+  AND ext_player_round_stats.first_kill = TRUE
+```
+
+`9 / 13` = **69.2%**，与手工核算一致 —— 口径也对（问"赢了多少比例"，它 JOIN 了
+`rounds.winning_team_name`，没有拿回合数充数）。
+
+**验收线至此通过**：人导入 task → 初始 fail（技能库空）→ 拆课 → 学 → 学不动的
+子目标被跳过而不是卡死 → retry 复用技能成功。
+
+### 8.6 仍然没解决的（诚实）
+
+1. **判据只认"取到数"，不认"答案是结论"**。上面 retry 返回的 `answer` 是那条 SQL，
+   `facts: 0` —— 库里取到了 13 行，但没人把它变成"69.2%"这句话。口径这一维还是靠人看。
+2. `vlml_fb_conversion` 被跳过后**不会自动复活**：`mastery.stale` 一旦置位就永久排除，
+   除非调 `unstale()`（图表节点只有几十个，全 stale 后会走"生成新题"）。
+   原版也没复活机制（`clean_up_tasks` 只在它变成功时剔除），这一点算同构，但要记着。
