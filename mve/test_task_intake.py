@@ -111,12 +111,50 @@ def test_no_datasource_learns_nothing() -> None:
     print("PASS  无数据源：task 永远 pending（学不动，如实记账）")
 
 
+def test_stuck_subtopic_is_skipped_not_blocking_retry() -> None:
+    """学不动的子目标要被「跳过」，不能把整条 task 钉死。
+
+    同构原版 `learn()`：任务失败 → `failed_tasks.append` + "Skipping to next task"
+    （`curriculum.py:340-344`），学习继续；**原版从不等所有任务成功**。
+    所以门槛只能是"没有还能学的子目标了"，不能是"所有子目标都 done"。
+    """
+    _tmp_ledger()
+    T._answer_once = lambda q, **kw: {                  # type: ignore[assignment]
+        "ok": False, "trajectory": [], "rows": 0, "skills": [],
+        "skipped": "技能库里没有与它相关的配方（还没学过）",
+    }
+    out = T.ask(Q, topic_id="vlml_first_blood")
+    subs = T.list_tasks()[0]["subtopics"]
+    assert subs, out
+
+    g = T._graph()
+    try:
+        for tid in subs:
+            # 练 3 次仍没跑通 → stale（= 原版 failed_tasks 的等价物）
+            for _ in range(3):
+                g.mastery.update(tid, score=0.0, commit=False)
+            T.note_subtopic_result(tid, False)          # 课程失败分支每轮都会调它
+
+        row = T.list_tasks()[0]
+        assert row["done_subtopics"] == [], row
+        assert T.pending_subtopics(row) == [], row
+        assert sorted(T.skipped_subtopics(row)) == sorted(subs), row
+        assert row["ready_for_retry"] is True, f"学不动了就该交给人重试：{row}"
+        assert T.next_focus() is None, "已放弃的不该再围着它出课"
+        print(f"PASS  子目标全部 stale → 记进「太难」账（{len(subs)} 条）→ "
+              f"不再出课、ready_for_retry=True")
+    finally:
+        # 清掉 stale，别污染后面的用例（commit=False：不写盘）
+        g.mastery.unstale(commit=False)
+
+
 def main() -> int:
     test_ask_fail_records_and_splits()
     test_next_focus_and_curriculum()
     test_subtopics_done_then_retry()
     test_vacuous_answer_is_not_success()
     test_no_datasource_learns_nothing()
+    test_stuck_subtopic_is_skipped_not_blocking_retry()
     print("\n全部通过（离线部分）。真取数与复用要接 rib 跑："
           "ask → loop.py --rounds N → retry")
     return 0

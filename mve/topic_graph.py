@@ -540,6 +540,23 @@ class TopicGraph:
         return self._chapter_order.get(str(topic.get("chapter") or ""), 999)
 
     # ---- 核心：选下一题（Voyager 课程驱动）----
+    def curriculum_key(self, t: dict[str, Any], *,
+                       milestones: set[str] | None = None,
+                       ext_blocked: set[str] | None = None) -> tuple:
+        """有序课程的排序键：树干（里程碑）优先 × 章节顺序 × 深度。
+
+        抽成方法是为了**只有一套课程序**：`select_next` 用它挑下一题，
+        `task_intake.next_focus` 也用它挑外部 task 的子目标。
+        两边各写一套排序就会选出不同的"下一题"，外部 task 的课程就跟着跑偏。
+        """
+        if milestones is None:
+            milestones = self.trunk_milestones()
+        ms = set(milestones or ())
+        trunk_pen = 0 if t["id"] in ms else 1
+        ext_pen = 1 if t["id"] in (ext_blocked or set()) else 0
+        return (trunk_pen, ext_pen, self._chapter_rank(t),
+                int(t.get("depth", 1)), t["id"])
+
     def select_next(
         self, *, scope: dict[str, Any] | None = None, explicit: str | None = None,
         ext_available: bool | None = None,
@@ -607,10 +624,8 @@ class TopicGraph:
                        if (not ext_available) and t["id"] in EXT_TOPICS}
 
         def key(t: dict[str, Any]) -> tuple:
-            trunk_pen = 0 if t["id"] in milestones else 1
-            ext_pen = 1 if t["id"] in ext_blocked else 0
-            return (trunk_pen, ext_pen, self._chapter_rank(t),
-                    int(t.get("depth", 1)), t["id"])
+            return self.curriculum_key(t, milestones=milestones,
+                                       ext_blocked=ext_blocked)
 
         chosen = min(selectable, key=key)
         cid = chosen["id"]

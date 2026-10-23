@@ -324,13 +324,6 @@ class VLMLCurriculumAgent:
                 skill_key = str(info.get("skill_key") or "")
                 if skill_key:
                     self.mastery.add_skill(tid, skill_key)
-                # 外部 task 账：这条子目标算学会了（同构 `clean_up_tasks` 把已完成
-                # 的从 failed 里剔除 —— 但**不自动判 task 成功**，成功只由 retry 证明）。
-                try:
-                    import task_intake
-                    task_intake.mark_subtopic_done(tid)
-                except Exception:  # pragma: no cover
-                    pass
             else:
                 self.mastery.add_failure(
                     tid,
@@ -346,6 +339,19 @@ class VLMLCurriculumAgent:
                         f"重试 {int((self.mastery.get(tid) or {}).get('attempts', 0))} "
                         f"次仍未跑通 → 放弃换题：{info.get('reason') or ''}",
                     )
+
+            # 外部 task 账：**成功失败都要回写**。
+            # 同构原版 `learn()`（voyager.py:372）每轮结束无条件调
+            # `update_exploration_progress(info)` —— 成功 append completed_tasks，
+            # 失败 append failed_tasks。这里失败不另记一份账（`mastery.attempts`
+            # 就是那份账，练够次数据 stale），但**必须重算 ready_for_retry**：
+            # 一条学不动的子目标不该把整条外部 task 永久钉死在 pending
+            # （原版学不动就 "Skipping to next task"，从不等所有任务成功）。
+            try:
+                import task_intake
+                task_intake.note_subtopic_result(tid, bool(info.get("success")))
+            except Exception:  # pragma: no cover
+                pass
         except Exception as e:  # pragma: no cover
             print(f"（课程 Agent 改写图谱失败：{type(e).__name__}: {e}）")
 

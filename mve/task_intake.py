@@ -46,8 +46,12 @@ from pathlib import Path
 from typing import Any
 
 _HERE = Path(__file__).resolve().parent
-if str(_HERE) not in sys.path:
-    sys.path.insert(0, str(_HERE))
+_ROOT = _HERE.parent
+# 两个都要：`mve/` 给 topic_graph/skill_store，仓库根给 voyager_vlml。
+# 只加 `_HERE` 时，当 CLI 直接跑会 ModuleNotFoundError: voyager_vlml。
+for _p in (str(_ROOT), str(_HERE)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 TASKS_PATH = _HERE / "failed_tasks.json"
 MAX_SUBTOPICS = 6
@@ -78,7 +82,17 @@ def _new_id() -> str:
 
 
 def list_tasks(status: str = "") -> list[dict[str, Any]]:
+    """列出账本。`ready_for_retry` **读时现算**，不用账本里的快照。
+
+    为什么现算：它取决于"还有没有能学的子目标"，而那是 mastery 的实时状态
+    （练够次数 → stale → 该子目标自动退出 pending）。写进账本就会和 mastery
+    对不上 —— 实测旧账本里存的是 false，可实际 pending 已经空了、就该重试了。
+    项目铁律：状态一律反查，不重复记账。
+    """
     rows = _load()
+    for r in rows:
+        if str(r.get("status")) == "pending":
+            r["ready_for_retry"] = _ready_now(r)
     if status:
         rows = [r for r in rows if str(r.get("status")) == status]
     return rows
@@ -88,6 +102,25 @@ def list_tasks(status: str = "") -> list[dict[str, Any]]:
 def _graph():
     import topic_graph
     return topic_graph.get_graph()
+
+
+def resolve_topic(question: str, topic_id: str = "") -> str:
+    """这条题归到哪个知识点（= 技能检索的键）。
+
+    ⚠️ 检索键必须是**本题的归题结果**：`skill_store.retrieve(topic, …)` 里
+    `topic` 完全相等才给 3.0 的同题分；跨题只靠词面相似度过 0.12 的门槛。
+    实测这道题：`sim=0.021` → 传空串/传别的 topic 都召回不到，只有传
+    `vlml_first_blood` 才拿得到那条配方。所以归题结果必须落到账本上。
+    """
+    tid = str(topic_id or "")
+    if tid:
+        return tid
+    try:
+        from tasks import infer_topic
+        tid, _ = infer_topic(question)
+    except Exception:
+        tid = ""
+    return str(tid or "")
 
 
 def subtopics_of(question: str, topic_id: str = "") -> list[str]:
@@ -110,13 +143,7 @@ def subtopics_of(question: str, topic_id: str = "") -> list[str]:
         return []
     ids: list[str] = []
 
-    tid = str(topic_id or "")
-    if not tid:
-        try:
-            from tasks import infer_topic
-            tid, _ = infer_topic(question)
-        except Exception:
-            tid = ""
+    tid = resolve_topic(question, topic_id)
 
     if tid and tid in g.topics:
         for p in (g.topics[tid].get("prerequisites") or []):
@@ -168,42 +195,73 @@ def pending_subtopics(task: dict[str, Any]) -> list[str]:
     return out
 
 
+def skipped_subtopics(task: dict[str, Any]) -> list[str]:
+    """这条 task 里**当前学不动**的子目标（= 原版 failed_tasks 的等价物）。
+
+    原版 `update_exploration_progress`（`curriculum.py:340-344`）失败就把任务塞进
+    `failed_tasks`，并打印 "Skipping to next task"；下一轮 curriculum 的 human message
+    里带着 `Failed tasks that are too hard: …`（`curriculum.txt:23`），选课器据此避开。
+
+    这里**不另存一份账**：直接从 mastery 反查 `stale`（练够 MAX_ATTEMPTS_PER_TOPIC 次
+    仍没跑通）。项目铁律：状态一律反查，不重复记账（两本账必然对不上）。
+    """
+    try:
+        g = _graph()
+    except Exception:
+        return []
+    done = set(task.get("done_subtopics") or [])
+    out: list[str] = []
+    for tid in (task.get("subtopics") or []):
+        if tid in done or tid not in g.topics:
+            continue
+        if g.mastery.is_completed(tid):
+            continue
+        if g.mastery.is_stale(tid):
+            out.append(tid)
+    return out
+
+
 def next_focus() -> dict[str, Any] | None:
     """给课程规划用：最早一条 pending task 的第一个可学子目标。
 
     返回 {"task_id", "topic_id", "question", "why"} 或 None。
     同构原版 curriculum prompt 里的 `Failed tasks that are too hard: ...`
     —— 规划时看得见失败清单，才会围着它出下一个任务。
+
+    挑哪一条：用**图谱那套课程序**（`graph.curriculum_key`，与 `select_next` 同一个键），
+    不另造排序。学不动的（stale）已被 `pending_subtopics` 排除，自然换下一条 ——
+    这正是原版 `update_exploration_progress` 失败即 "Skipping to next task" 的行为。
     """
     for task in _load():
         if str(task.get("status")) != "pending":
             continue
         subs = pending_subtopics(task)
-        if subs:
-            # 先学「没试过的 / 更简单的」：子目标失败一次就排到后面，
-            # 别死磕同一条（原版 curriculum.txt:29 "The next task should not be
-            # too hard since I may not have learned enough skills"，以及
-            # `:332-347` 失败即记 failed 换下一个的行为）。
-            try:
-                g = _graph()
-                subs = sorted(
-                    subs,
-                    key=lambda t: (
-                        int((g.mastery.get(t) or {}).get("attempts") or 0),
-                        float((g.topics.get(t) or {}).get("difficulty") or 1.0),
-                        int((g.topics.get(t) or {}).get("depth") or 99),
-                    ))
-            except Exception:
-                pass
-            return {"task_id": str(task.get("task_id") or ""),
-                    "topic_id": subs[0],
-                    "question": str(task.get("question") or ""),
-                    "why": f"外部 task 未解决（{len(subs)} 条子目标待学）"}
+        if not subs:
+            continue
+        try:
+            g = _graph()
+            ms = g.trunk_milestones()
+            subs = sorted(
+                subs,
+                key=lambda tid: g.curriculum_key(
+                    g.topics.get(tid) or {"id": tid}, milestones=ms))
+        except Exception:
+            pass
+        why = f"外部 task 未解决（{len(subs)} 条子目标待学"
+        skipped = skipped_subtopics(task)
+        if skipped:
+            why += f"，已放弃 {len(skipped)} 条太难：{'、'.join(skipped[:3])}"
+        why += "）"
+        return {"task_id": str(task.get("task_id") or ""),
+                "topic_id": subs[0],
+                "question": str(task.get("question") or ""),
+                "why": why}
     return None
 
 
 # ---------------------------------------------------------------- 记账
 def _answer_once(question: str, *, topic_id: str = "",
+                 subtopics: list[str] | None = None,
                  use_skills: bool = True) -> dict[str, Any]:
     """消费态答一次：**用 Voyager 自己的技能库**答（不是让 VLML 专家代答）。
 
@@ -213,6 +271,11 @@ def _answer_once(question: str, *, topic_id: str = "",
     而这条闭环要证明的是「**Voyager 学会了**」，不是「VLML 会查」。所以消费态必须是
     Voyager 自己写 SQL —— 它答不出，才是学习信号。
 
+    检索范围 = 本题的归题结果 + 它的子目标。
+    为什么不能只用一个 topic：技能是按「学它的那个节点」存的，而一条外部 task 要的
+    往往是几个节点（子目标）合起来。实测：传空 topic 时 `sim=0.021 < 0.12` 门槛，
+    库里明明有那条配方也召回不到 → retry 直接判"还没学过"，复用链等于断的。
+
     技能库为空时**直接判失败、不烧一次调用**：一条配方都没有，写出来的 SQL 只能是
     现场凭记忆编的（那正是这套学习要消灭的东西）。这条也正是验收线「初始 task 必 fail」
     的机制来源：新场景技能库是空的。
@@ -221,7 +284,14 @@ def _answer_once(question: str, *, topic_id: str = "",
     if use_skills:
         try:
             import skill_store
-            skills = skill_store.retrieve(topic_id or "", question, top_k=4)
+            keys = [topic_id] + [str(t) for t in (subtopics or [])]
+            seen: set[str] = set()
+            for t in dict.fromkeys([k for k in keys if k]):
+                for s in skill_store.retrieve(t, question, top_k=4):
+                    k = str(s.get("key") or "")
+                    if k and k not in seen:
+                        seen.add(k)
+                        skills.append(s)
         except Exception:
             skills = []
         if not skills:
@@ -275,21 +345,25 @@ def ask(question: str, *, use_skills: bool = True,
     q = str(question or "").strip()
     if not q:
         return {"ok": False, "reason": "空问题", "task_id": "", "subtopics": []}
-    res = _answer_once(q, topic_id=topic_id or "", use_skills=use_skills)
+    # 先归题再答：归题结果既是技能检索的键，也是拆课的依据（拆课本身不烧 LLM）。
+    tid = resolve_topic(q, topic_id)
+    subs = subtopics_of(q, tid)
+    res = _answer_once(q, topic_id=tid, subtopics=subs, use_skills=use_skills)
     ok, why = _ok(res)
-    # 用 explain 归题/生成后的 topic_id 拆课：泛化场景的问题常落在图谱之外，
-    # explain 会先把它种成节点，这里才拆得出子目标。
-    subs = [] if ok else subtopics_of(q, str(res.get("topic_id") or topic_id or ""))
+    if ok:
+        subs = []          # 答出来了就不用学，别留一份"待学"账
     row = {
         "task_id": _new_id(),
         "question": q,
-        "topic_id": str(res.get("topic_id") or topic_id or ""),
+        "topic_id": tid,
         "created_at": _now(),
         "updated_at": _now(),
         "tries": 1,
         "status": "solved" if ok else "pending",
         "subtopics": subs,
         "done_subtopics": [],
+        # 拆不出子目标 = 没有能学的了，直接交给人重试（原版：学不了就跳过）
+        "ready_for_retry": not subs,
         "last_reason": "" if ok else why,
         "answer": str(res.get("answer") or "")[:2000],
     }
@@ -302,11 +376,32 @@ def ask(question: str, *, use_skills: bool = True,
             "trajectory": list(res.get("trajectory") or [])[:6]}
 
 
-def mark_subtopic_done(topic_id: str) -> int:
-    """子目标跑通后回写（由 `update_exploration_progress` 调）。
+def _ready_now(row: dict[str, Any]) -> bool:
+    """「没有还能学的子目标了」→ 该交给人去 retry。
 
-    返回被更新的 task 条数；某条 task 的子目标全完成 → `ready_for_retry=True`
-    （**不自动置 solved**：成功必须由 retry 真的答出来证明）。
+    同构原版 `learn()`（`voyager.py:326-385`）：**它从不等所有任务成功**。
+    某个任务失败就 `failed_tasks.append` + 打印 "Skipping to next task"（`:340-344`），
+    学习继续往下走 —— 原版根本不存在"必须全部 completed 才允许继续"这道门。
+
+    所以这里的门槛是「pending 为空」，不是「subtopics 全在 done 里」。
+    后者会让一条学不动的子目标（stale）把整条外部 task 永久钉死在 pending：
+    实测 `vlml_fb_conversion` 挂在 0 行的 `agg_first_blood_stats` 上，
+    学 3 次 stale 后再也不被选中，但 `done` 里没有它 → `retry` 永远不可达。
+    """
+    return not pending_subtopics(row)
+
+
+def note_subtopic_result(topic_id: str, success: bool) -> int:
+    """子目标跑完一轮后记账 —— 同构原版 `update_exploration_progress`（`:332-347`）。
+
+    成功 → 记进 `done_subtopics`（原版 `completed_tasks.append`）；
+    失败 → **不写任何"失败账"**：失败本身就是 `mastery.attempts+1`（原版
+           `failed_tasks.append` 的等价物），练够次数据就 stale，
+           `pending_subtopics` 自然把它排除 —— 那就是"跳过"。
+    两条路都要重算 `ready_for_retry`，否则"全失败的 task"永远等不到人重试
+    （原版每轮结束都无条件调 `update_exploration_progress(info)`，成功失败都记账）。
+
+    返回被更新的 task 条数。
     """
     tid = str(topic_id or "")
     if not tid:
@@ -318,17 +413,22 @@ def mark_subtopic_done(topic_id: str) -> int:
             continue
         if tid not in (r.get("subtopics") or []):
             continue
-        done = [x for x in (r.get("done_subtopics") or [])]
-        if tid not in done:
-            done.append(tid)
-        r["done_subtopics"] = done
-        left = [x for x in (r.get("subtopics") or []) if x not in done]
-        r["ready_for_retry"] = not left
+        if success:
+            done = list(r.get("done_subtopics") or [])
+            if tid not in done:
+                done.append(tid)
+            r["done_subtopics"] = done
+        r["ready_for_retry"] = _ready_now(r)
         r["updated_at"] = _now()
         n += 1
     if n:
         _save(rows)
     return n
+
+
+def mark_subtopic_done(topic_id: str) -> int:
+    """兼容壳：子目标跑通后回写（等价 `note_subtopic_result(tid, True)`）。"""
+    return note_subtopic_result(topic_id, True)
 
 
 def retry(task_id: str, *, use_skills: bool = True) -> dict[str, Any]:
@@ -340,6 +440,7 @@ def retry(task_id: str, *, use_skills: bool = True) -> dict[str, Any]:
         return {"ok": False, "reason": f"没有这条 task：{task_id}"}
     q = str(row.get("question") or "")
     res = _answer_once(q, topic_id=str(row.get("topic_id") or ""),
+                       subtopics=list(row.get("subtopics") or []),
                        use_skills=use_skills)
     ok, why = _ok(res)
     row["tries"] = int(row.get("tries") or 0) + 1
@@ -397,7 +498,9 @@ def _main() -> int:
             _print({"task_id": args.task_id,
                     "subtopics": row.get("subtopics") or [],
                     "done": row.get("done_subtopics") or [],
-                    "pending": pending_subtopics(row)})
+                    "skipped": skipped_subtopics(row),
+                    "pending": pending_subtopics(row),
+                    "ready_for_retry": _ready_now(row)})
     return 0
 
 
