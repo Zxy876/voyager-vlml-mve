@@ -51,18 +51,27 @@ STATE_DIR = Path(__file__).resolve().parent / "ckpt_curriculum"
 
 _SYSTEM = """你是 Voyager 式自动课程规划器（Minecraft 版 Voyager 的 curriculum agent 的本机同构）。
 
-环境：一个本机工作区（用户自己的文件），不是任何在线数据库。
-你要做的：根据「工作区里现有的文件」+「已完成任务」+「失败过的任务（太难/没数据）」，
+环境：一个本机工作区（用户自己的文件）或一个场景自己的 SQL 库。
+你要做的：根据「数据源的真实结构」+「已完成任务」+「失败过的任务及其原因」，
 规划**下一个**任务（一句自然语言问题），让一个只能读文件/查本地 duckdb 的助手去完成。
 
 硬约束（照原版：任务必须"当前可完成"）：
-1. 任务必须能从下面列出的文件真取数回答（读文件、数数、排序、求和、求平均、对比……）；
-   不要时效性题（最新/今年），不要文件里没有的外部知识；
-2. 已完成的任务不要再出；失败过的任务说明「太难或没数据」，换一个更简单/不同的角度；
-3. 任务要具体（点明文件与数据范围），要有可判定的完成标准；
+1. 任务必须能从数据源真取数回答（读文件、数数、排序、求和、求平均、对比……）；
+   不要时效性题（最新/今年），不要数据源里没有的外部知识；
+2. 已完成的任务不要再出；失败过的任务换一个更简单/不同的角度；
+3. 任务要具体（点明表/文件与数据范围），要有可判定的完成标准；
 4. 严格按格式输出两行（原版 parse_ai_message 只认 Task: 行）：
 Task: <任务，一句话，不要句号结尾>
-Context: <一句话说明：用哪个文件、算什么、完成标准是什么>
+Context: <一句话说明：用哪个文件/表、算什么、完成标准是什么>
+
+重新规划的规则（2026-10-23 用户实测「同一道必败题反复出」之后加）：
+5. 失败过的题是**里程碑**：它值得学，但当前水平达不到。你的职责不是原样或换个
+   说法再出它 —— 是规划它**前置的、现在就能做对**的子任务（一次只查一张表、
+   只算一个数），学会了再逐步逼近。看「为什么失败」：缺哪块能力，就先补哪块。
+6. 题里的字面量（部门名、月份、类型、人名……）必须**逐字**取自观察里列出的
+   「真实取值」；清单里没有的说法不要用（写了也查不到，必然 0 行）。
+7. 已学会的技能还很少时（看「已学会的技能」计数），只出**单步题**：
+   一张表、一个数或一行 —— 原版 "Mine [quantity] [block]" 的同构。
 """
 
 
@@ -89,9 +98,17 @@ class CurriculumAgent:
     """原版 CurriculumAgent 的本机场景同构版（只做课程规划，不管执行）。"""
 
     def __init__(self, scene_id: str, *, scene_dir: str = "",
+                 db_path: str = "",
                  llm=None, state_dir: str | Path | None = None) -> None:
         self.scene_id = str(scene_id)
         self.scene_dir = str(scene_dir or "")
+        # 场景自有 SQL 库（kind=scene 时非空）。2026-10-23 实测（Scene P 反复出
+        # 「技术部应发工资」这道必败题）的根因之一：出题器的观察面里**没有库的
+        # 真实结构** —— 它只看到"工作区有一个 payroll.duckdb 文件"，既不知道有
+        # 哪些表，也不知道 dept 的真实取值是「技术」不是「技术部」。原版出题器
+        # 的观察面是**完整末态**（背包/附近方块），我们至少要给它 schema + 枚举值。
+        self.db_path = str(db_path or "")
+        self._db_obs_cache: str | None = None
         self._llm = llm
         self._dir = Path(state_dir) if state_dir else (STATE_DIR / self.scene_id)
         self._dir.mkdir(parents=True, exist_ok=True)
@@ -170,49 +187,120 @@ class CurriculumAgent:
         import local_agent
         local_ok = self.local_enabled()
         net_ok = self.net_enabled()
-        inv = (local_agent.inventory(self.scene_dir, limit=12)
-               if (self.scene_dir and local_ok) else [])
-        if inv:
-            lines = []
-            for r in inv:
-                if r.get("kind") == "dir":
-                    lines.append(f"- {r['name']}/（目录）")
-                    continue
-                lines.append(f"- {r['name']}（{r.get('size', 0)} 字节）")
-                if r.get("preview"):
-                    pv = str(r["preview"]).replace("\n", " ")
-                    lines.append(f"    开头内容（结构预览）：{pv[:300]}")
-            files = "\n".join(lines)
-        elif not local_ok:
-            files = ("None（本机能力已被关掉读不到文件，而且工作区里本来也没有"
-                     "任何文件 —— 不要出需要读本机文件的题，也**绝对不要编造"
-                     "文件名**）")
+        # kind=scene（场景自有 duckdb）→ 观察面给**实查的表结构 + 枚举值**，
+        # 不给文件清单（那只会让模型把 .duckdb 当文本文件编）。这是原版
+        # "nearby_blocks 能看到附近有什么"的同构：出题器必须看得见数据长什么样。
+        if self.db_path and local_ok:
+            db_obs = self._db_observation()
+            if db_obs:
+                files = ("这个场景的数据源是一个 SQL 库，实查结构如下"
+                         "（表/列/取值全部真实，题里的字面量必须逐字来自「真实取值」）：\n"
+                         + db_obs)
+            else:
+                files = ("这个场景的数据源是一个 SQL 库，但本次实查失败（库打不开？）。"
+                         "不要编造表名或列名。")
+        elif self.db_path and not local_ok:
+            files = ("None（本机取数能力已被关掉，SQL 库读不了 —— 不要出需要查库的题）")
         else:
-            files = ("None（这个场景的工作区里没有任何文件 —— **绝对不要编造"
-                     "文件名**）")
+            inv = (local_agent.inventory(self.scene_dir, limit=12)
+                   if (self.scene_dir and local_ok) else [])
+            if inv:
+                lines = []
+                for r in inv:
+                    if r.get("kind") == "dir":
+                        lines.append(f"- {r['name']}/（目录）")
+                        continue
+                    lines.append(f"- {r['name']}（{r.get('size', 0)} 字节）")
+                    if r.get("preview"):
+                        pv = str(r["preview"]).replace("\n", " ")
+                        lines.append(f"    开头内容（结构预览）：{pv[:300]}")
+                files = "工作区文件:\n" + "\n".join(lines)
+            elif not local_ok:
+                files = ("None（本机能力已被关掉读不到文件，而且工作区里本来也没有"
+                         "任何文件 —— 不要出需要读本机文件的题，也**绝对不要编造"
+                         "文件名**）")
+            else:
+                files = ("None（这个场景的工作区里没有任何文件 —— **绝对不要编造"
+                         "文件名**）")
         done = "；".join(self.completed_tasks[-20:]) if self.completed_tasks else "None"
         failed = "；".join(self.failed_tasks[-20:]) if self.failed_tasks else "None"
-        wo = "；".join(f"{k}（{v[:60]}）" for k, v in list(self._failed_why.items())[-8:])
+        wo = "；".join(f"{k[:40]}（{v[:80]}）" for k, v in list(self._failed_why.items())[-8:])
         return {
             # 原版 biome 只说「这是什么地形」（plains / forest），**不报路径**。
             # 我上一版写成 "数据源: 本机工作区 /root/mve/scene_data/D"，
             # 实测模型据此编出 room_data.txt（空目录里根本没这个文件），
             # 连出 3 道必失败的题。环境描述只给类别，不给可被脑补成文件名的路径。
             "biome": self._biome_text(local_ok, net_ok) + "\n\n",
-            "nearby_blocks": f"工作区文件:\n{files}\n\n",
+            "nearby_blocks": f"{files}\n\n",
             "chests": f"已学会的技能（可复用配方）: {self._skill_count()} 条\n\n",
             "completed_tasks": f"Completed tasks so far: {done}\n\n",
-            "failed_tasks": (f"Failed tasks that are too hard: {failed}\n\n"
-                             + (f"为什么失败: {wo}\n\n" if wo else "")),
+            "failed_tasks": (
+                f"Failed tasks that are too hard: {failed}\n\n"
+                + (f"为什么失败: {wo}\n\n" if wo else "")
+                + ("（这些失败题多半是人导入的目标，是**里程碑**。按规则 5："
+                   "围绕它出**前置的、现在就能做对**的子任务，不要原样重出。）\n\n"
+                   if self.failed_tasks else "")),
         }
 
     def _biome_text(self, local_ok: bool, net_ok: bool = True) -> str:
         if not local_ok and not net_ok:
             return "数据源: 本机取数能力与联网能力**都已被关掉** —— 这个场景现在没有任何可用的取数手段。"
+        if self.db_path:
+            if local_ok:
+                return ("数据源: 这个场景自己的 SQL 库（只读，连接由执行层负责）。"
+                        "出题范围就是下面实查列出的表和列。")
+            return "数据源: 场景 SQL 库存在，但本机取数能力已被关掉，读不了。"
         if not local_ok:
             return ("数据源: 本机取数能力已被关掉；联网检索可用。"
                     "只能出由联网检索回答的知识型问题，不要碰本机文件。")
         return "数据源: 本机工作区（应用工作区 + 场景目录），只读；联网检索也可用"
+
+    def _db_observation(self) -> str:
+        """实查场景库：表 → 行数 → 列 → 低基数字符串/布尔列的真实取值。
+
+        只用 DuckDB 标准语句，不需要任何领域知识；打不开/查不动就返回空串
+        （上层如实说"实查失败"，不编造）。缓存到实例 —— 一次进程里枚举值
+        不会变，不必每轮出题都连库。
+        """
+        if getattr(self, "_db_obs_cache", None) is not None:
+            return self._db_obs_cache
+        out = ""
+        try:
+            import duckdb
+            con = duckdb.connect(self.db_path, read_only=True)
+            try:
+                tables = [r[0] for r in con.execute("show tables").fetchall()]
+                lines: list[str] = []
+                for t in tables:
+                    try:
+                        cnt = con.execute(f'select count(*) from "{t}"').fetchone()[0]
+                        cols = con.execute(f'describe "{t}"').fetchall()
+                    except Exception:
+                        continue
+                    names = ", ".join(c[0] for c in cols)
+                    lines.append(f"- 表 {t}（{cnt} 行）：{names}")
+                    for c in cols:
+                        cname, ctype = str(c[0]), str(c[1]).upper()
+                        if ctype not in ("VARCHAR", "TEXT", "STRING", "BOOLEAN"):
+                            continue
+                        try:
+                            vals = [r[0] for r in con.execute(
+                                f'select distinct "{cname}" from "{t}" '
+                                f'limit 13').fetchall()]
+                        except Exception:
+                            continue
+                        vals = [v for v in vals if v is not None]
+                        if vals and len(vals) <= 12:
+                            lines.append(
+                                f"    · {t}.{cname} 真实取值: "
+                                + "、".join(str(v) for v in vals))
+                out = "\n".join(lines)
+            finally:
+                con.close()
+        except Exception:
+            out = ""
+        self._db_obs_cache = out
+        return out
 
     def _skill_count(self) -> int:
         try:
@@ -380,6 +468,7 @@ def agent_for(scene_id: str, *, llm=None) -> CurriculumAgent:
     prof = scene_profile.profile(scene_id)
     return CurriculumAgent(scene_id,
                            scene_dir=str(prof.get("scene_dir") or ""),
+                           db_path=str(prof.get("db_path") or ""),
                            llm=llm)
 
 
