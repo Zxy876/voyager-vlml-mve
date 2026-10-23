@@ -8,9 +8,14 @@
    render_human_message(观测) + HumanMessage("Final task: {task}") →
    LLM → `fix_and_parse_json(response)`。
 2. `voyager_original/voyager/prompts/curriculum_task_decomposition.txt`：输出
-   必须是**可 json.loads 的子目标列表**，动宾简洁格式，并且
+   必须是**可 json.loads 的子目标列表**，判据 2 是**单动作 + 带数量**的固定格式
+   （"Mine [quantity] [block]" / "Craft [quantity] [item]"），判据 3 是
    **"Include each level of necessary tools as a subgoal"** ——
    前置依赖（工具等级链）也要拆成子目标。
+   ⚠️ 2026-10-23：这两条是原版**唯一**的"粒度控制"，原版没有"口径"这个概念
+   （全仓 grep `caliber|口径|denominator|numerator` 零命中，prompts 里连 SELECT 都没有）。
+   同构时判据 2 曾被写成 "Filter [condition]" 这类**不出答案**的动宾，导致一条 SQL
+   能全取、子目标→技能一一对应是虚的；已收回"单动作、答案是一个数或一行"。
 3. `voyager_original/voyager/voyager.py:403-421` `inference()`：没有 sub_goals
    就先拆分，然后 `while progress < len(sub_goals):
    next_task = sub_goals[progress]` —— 子目标**按序**一个一个完成。
@@ -48,7 +53,7 @@ import re
 from typing import Any, Callable
 
 # 原版 curriculum_task_decomposition.txt 的 MVE 同构版。
-# 逐条对应原版三条 criteria（JSON 列表 / 动宾简洁 / 前置依赖也拆），
+# 逐条对应原版三条 criteria（JSON 列表 / **单动作 + 带数量** / 前置依赖也拆），
 # 把"工具等级"换成"取数原语与数据表"——这是 MVE 的"工具"。
 DECOMPOSE_SYSTEM = """You are a helpful assistant that decomposes a data question into an ordered list of subgoals.
 
@@ -56,7 +61,7 @@ I'll give you a final question and the current state of the scene (knowledge gra
 
 You must follow the following criteria:
 1) Return a Python list of subgoals that can be completed in order to answer the specified question.
-2) Each subgoal should follow a concise format, such as "Get [entity] [metric]", "Filter [condition]", "Aggregate [metric] by [group]", "Rank by [metric]".
+2) Each subgoal should follow a concise format, such as "Get [metric] of [scope]" — one retrieval action whose answer is ONE number or ONE row. The SQL counterpart of the original "Mine [quantity] [block]" is "Get overtime_hours of employee E01 in 2026-09": a single SELECT, a single value you can read straight off the result. Do NOT put several metrics, or several steps of arithmetic, into one subgoal (that is several tasks at the same time); do NOT use a bare "Filter ..." subgoal, a filter alone returns no answer.
 3) Include each prerequisite as a subgoal: if answering needs an entity value or a base metric first, make it its own subgoal.
 
 You should only respond in JSON format as described below:
@@ -197,7 +202,8 @@ def _rule_decompose(task: str, obs: dict[str, Any]) -> list[str]:
     flat = [v for vals in ents.values() for v in vals]
     if flat:
         goals.append(f"Get {flat[0]}")
-    goals.append(f"Get metrics for: {task[:60]}")
+    # 一个子目标 = 一个数（同 LLM 路径的判据 2），不是"把整道题一次取完"
+    goals.append(f"Get the single value answering: {task[:60]}")
     if len(flat) > 1:
         goals.append(f"Filter by {flat[1]}")
     return goals

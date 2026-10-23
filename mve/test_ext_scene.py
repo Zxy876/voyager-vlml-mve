@@ -4,9 +4,11 @@
 只验接线，不烧 LLM、不连 MCP：
   · scene_profile 认不认「场景目录里的 duckdb」这条判定；
   · scene_env.env_for_scene 三种 kind 各自给出什么（vlml / scene / local）；
-  · task_intake 在「没有可用 SQL 数据源」时如实拒绝，而不是回退 rib；
-  · ext_task 的学一轮在非 VLML 场景走 scene_learn（围着失败的题学），
-    VLML 场景仍走 voyager_vlml.loop（课程来自 VLML 图谱）。
+  · task_intake 在「没有可用 SQL 数据源」时如实拒绝，而不是回退 rib。
+
+（原来还测过 `ext_task` 的学一轮分流。2026-10-23 用户否掉了「外部任务」那一层：
+"导入统一走人导入，相关度低就建新场景、绑新数据源"，`mve/ext_task.py` 已删，
+所以那几条断言跟着删 —— 分流本身仍在 `scene_learn.py --scene`。）
 
 跑法：python mve/test_ext_scene.py
 """
@@ -100,31 +102,6 @@ def main() -> int:
         scene_profile._scene = orig_scene
         scene_profile._default_scene_id = orig_default
         scene_profile.SCENE_DATA_DIR = orig_dir
-
-    # ---- ④ ext_task：学一轮按 kind 分流 ----
-    import ext_task
-
-    kinds = {"P": "scene", "A": "vlml"}
-    orig_kind = scene_env.kind_of
-    scene_env.kind_of = lambda sid="": kinds.get(str(sid), "local")
-    try:
-        cmd_scene = ext_task._cmd_learn(4, "P", "技术部 2026-09 应发合计多少")
-        ok("mve/scene_learn.py" in cmd_scene[1], "非 VLML 场景 → scene_learn",
-           " ".join(cmd_scene[1:4]))
-        ok("--question" in cmd_scene and "技术部" in " ".join(cmd_scene),
-           "把失败的题带下去（围着它学）")
-        ok("--scene" in cmd_scene and "P" in cmd_scene, "带 --scene P")
-
-        cmd_vlml = ext_task._cmd_learn(4, "A", "随便")
-        ok("-m" in cmd_vlml and "voyager_vlml.loop" in cmd_vlml,
-           "VLML 场景 → voyager_vlml.loop（课程来自 VLML 图谱）", " ".join(cmd_vlml[1:3]))
-
-        cmd_ask = ext_task._cmd_ask("问题", 4, "P")
-        ok("--scene" in cmd_ask and cmd_ask[-1] == "P", "ask 带 --scene")
-        cmd_ask0 = ext_task._cmd_ask("问题", 4, "")
-        ok("--scene" not in cmd_ask0, "空场景不加 --scene（走当前场景）")
-    finally:
-        scene_env.kind_of = orig_kind
 
     # ---- ⑤ task_intake：没有 SQL 数据源时拒绝，不回退 rib ----
     import task_intake

@@ -81,15 +81,27 @@ def _new_id() -> str:
     return f"t{int(time.time()) % 1000000:06d}"
 
 
-def list_tasks(status: str = "") -> list[dict[str, Any]]:
+def list_tasks(status: str = "", scene: str = "") -> list[dict[str, Any]]:
     """列出账本。`ready_for_retry` **读时现算**，不用账本里的快照。
 
     为什么现算：它取决于"还有没有能学的子目标"，而那是 mastery 的实时状态
     （练够次数 → stale → 该子目标自动退出 pending）。写进账本就会和 mastery
     对不上 —— 实测旧账本里存的是 false，可实际 pending 已经空了、就该重试了。
     项目铁律：状态一律反查，不重复记账。
+
+    `scene` 非空则只列该场景的（外部 task 的归属 = 导入时所在场景；
+    旧记录无 `scene` 字段 → 归默认场景，与 panel_data 的既有约定一致）。
     """
     rows = _load()
+    want = str(scene or "").strip()
+    if want:
+        _dft = "A"
+        try:
+            import scene_profile
+            _dft = str(scene_profile._default_scene_id() or "A")
+        except Exception:
+            pass
+        rows = [r for r in rows if str(r.get("scene") or _dft) == want]
     for r in rows:
         if str(r.get("status")) == "pending":
             r["ready_for_retry"] = _ready_now(r)
@@ -583,6 +595,8 @@ def _main() -> int:
 
     ls = sub.add_parser("list", help="列出账本")
     ls.add_argument("--status", default="")
+    ls.add_argument("--scene", default="",
+                    help="只列这个场景导入的 task（空=全部场景）")
 
     s = sub.add_parser("sub", help="看一条 task 拆出的子目标")
     s.add_argument("task_id")
@@ -594,10 +608,11 @@ def _main() -> int:
     elif args.cmd == "retry":
         _print(retry(args.task_id, scene=getattr(args, "scene", "")))
     elif args.cmd == "list":
-        rows = list_tasks(args.status)
+        rows = list_tasks(args.status, scene=getattr(args, "scene", ""))
         _print([{k: r.get(k) for k in
-                 ("task_id", "status", "tries", "question", "ready_for_retry",
-                  "done_subtopics", "subtopics", "last_reason")} for r in rows])
+                 ("task_id", "scene", "status", "tries", "question",
+                  "ready_for_retry", "done_subtopics", "subtopics",
+                  "last_reason")} for r in rows])
     elif args.cmd == "sub":
         row = next((r for r in _load()
                     if str(r.get("task_id")) == args.task_id), None)

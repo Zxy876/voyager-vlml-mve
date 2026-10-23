@@ -607,14 +607,10 @@ const TABS = [
      return cc.length?('会做 '+(cc[cc.length-1].mastered_total||0)+' 道'):'判据区 / 学习曲线';}},
   {id:'practice', icon:'🎯', label:'练习',   status:s=>s.topic_id||'—'},
   {id:'import',   icon:'✍️', label:'人导入', status:s=>(s.imports||[]).length+' 条导入'},
-  // 外部 task 闭环（2026-10-23 并入主面板）：验收线是「导入 → 必然失败 → 自己学
-  // → 重试同一条」。它的代码在两条分支上合不起来之前只有 CLI，人没法自己点，
-  // 于是起过一个 /mve-ext/ 薄壳页 —— 用户否掉了：「把 /mve/ 面板变成这套代码，
-  // 不要再起页面」。所以入口就是这一格，后端只调已有的 task_intake / loop。
-  {id:'ext',      icon:'🧪', label:'外部任务',
-   status:s=>{const e=window.__EXT||{}; const n=(e.tasks||[]).length;
-     const run=(e.jobStatus&&e.jobStatus==='running');
-     return run?'运行中':(n?n+' 条账本':'导入 → 学 → 重试');}},
+  // 2026-10-23 用户否掉「外部任务」这一层：「没必要做外部 task，导入统一走人导入，
+  // 相关度低就建新场景、绑新数据源」。它本来只是一条动作链（导入 → 学 → 重试），
+  // 而导入/学习/重试在「人导入」和驾驶舱里都已经有入口 —— 再开一个页签就是重复。
+  // 现在数据源边界只由**场景**决定（scene_profile 唯一定义），任务不再自成一套账。
   {id:'trace',    icon:'🧭', label:'轨迹',   status:s=>s.total_rounds+' 轮'},
   {id:'skill',    icon:'🧠', label:'技能 · 因果', status:s=>(s.skill_stats&&s.skill_stats.skills||0)+' 条技能'},
   {id:'graph',    icon:'🕸', label:'知识图谱',
@@ -2057,135 +2053,7 @@ function oqReveal(){
   if(g){ g.style.display='block'; g.innerHTML=window.__oqGradeHTML; }
 }
 
-/* ---------------- 外部任务页签 ----------------
-   验收线（用户原话）：有数据源（rib/vlgg）无建模表（vlml），考的是它自己能不能
-   学会完成外部任务、把学到的东西变成技能库里的配方 —— 再导入同一句就该答得出。
-   三动作各自是一个后台子进程（mve/ext_task.py），这里只管点与显示。 */
-window.__EXT = window.__EXT || {tasks:[], status:'', out:'', jobStatus:''};
-
-function extRowsHtml(){
-  const rows=window.__EXT.tasks||[];
-  if(!rows.length)
-    return '<div class="legend">账本还是空的：先在上面「导入并试答」一条问题。</div>';
-  const body=rows.map(t=>`<tr>
-    <td><code>${ESC(t.task_id)}</code></td>
-    <td>${t.status==='solved'?'<b>已答出</b>':ESC(t.status||'pending')}</td>
-    <td>${t.tries||0}</td>
-    <td>${(t.done||0)}/${(t.subtopics||0)}</td>
-    <td>${t.ready_for_retry?'✓':'·'}</td>
-    <td>${ESC(t.question)}</td>
-    <td>${ESC(t.answer||t.last_reason||'')}</td></tr>`).join('');
-  return `<table class="tbl"><tr><th>task_id</th><th>状态</th><th>次数</th>
-    <th>子目标 完成/共</th><th>可重试</th><th>问题</th><th>答案 / 上次失败原因</th></tr>
-    ${body}</table>
-    <div class="legend">「可重试」= 没有还能学的子目标了（学不动的按原版跳过语义记进 too_hard，不再钉死整条 task）。</div>`;
-}
-
-function pExt(s){
-  const e=window.__EXT||{};
-  return `<div class="panel">
-    <div class="panel__head"><h2>外部任务 · 它自己学得会吗</h2>
-      <span class="hint">导入 → 必然失败 → 自己拆课学 → 重试同一条</span></div>
-    <div class="legend">
-      这一段考的不是模型多聪明，是<b>积累</b>：技能库空的时候它答不出；
-      让它自己学一轮（课程围着失败信号选），学会的配方进技能库；
-      再重试同一条，<b>用的必须是它自己学到的技能</b>。
-      每个按钮起一个后端子进程跑已有 CLI（<code>task_intake.py</code> / <code>voyager_vlml.loop</code>），
-      输出原样回显在下面。
-    </div>
-    <div class="legend">
-      取数按<b>当前场景</b>（顶部场景栏切换）的数据源：
-      场景 A → VLML 库；场景目录里有 <code>.duckdb</code> → 只读那个库（工资场景就是这样）；
-      都没有 → 如实报「没有可用的 SQL 数据源」，不会悄悄去查别的场景。
-      <b>当前场景：${ESC((s.scene||{}).name||'—')}</b>
-    </div>
-    <div class="imp">
-      <div style="font-size:12.5px;color:var(--muted);margin-bottom:8px">
-        <b>① 导入一条外部问题</b>（数据源里真能取数的那种，答案要能落成 1 个数或 1 行）
-      </div>
-      <textarea id="extQ" placeholder="例：Karmine Corp 在 Sunset 上先拿到首杀的回合里赢了多少比例"></textarea>
-      <div class="imp-row">
-        <select id="extIters">
-          <option value="4">每题最多改 4 次 SQL</option>
-          <option value="2">改 2 次（快）</option>
-          <option value="6">改 6 次（慢）</option>
-        </select>
-        <button class="btn btn-primary" id="extAsk">导入并试答</button>
-        <span class="legend" style="margin:0">首次几乎必失败 —— 那正是验收线的起点</span>
-      </div>
-      <div class="imp-row" style="margin-top:12px">
-        <button class="btn btn-secondary" id="extLearn">② 让它学一轮</button>
-        <input id="extTid" placeholder="task_id（从下面账本抄）" style="max-width:240px">
-        <button class="btn btn-secondary" id="extRetry">③ 重试这条</button>
-        <button class="btn btn-secondary" id="extSub">看子目标</button>
-        <button class="btn btn-secondary" id="extList">列账本</button>
-      </div>
-      <div class="hit" id="extSt">状态：${ESC(e.status||'空闲')}</div>
-      <pre id="extOut" style="max-height:44vh;overflow:auto;white-space:pre-wrap;
-        word-break:break-word;font-size:12.5px;background:rgba(31,41,36,.04);
-        border:1px solid var(--line);border-radius:var(--radius-sm);padding:12px">${ESC(e.out||'（还没有输出）')}</pre>
-    </div>
-    <h3>外部 task 账本（最近 20 条）</h3>
-    <div id="extTasks">${extRowsHtml()}</div>
-  </div>`;
-}
-
-function extPaint(){
-  const st=document.getElementById('extSt');
-  if(st) st.innerHTML='状态：<b>'+ESC(window.__EXT.status||'空闲')+'</b>';
-  const o=document.getElementById('extOut');
-  if(o) o.textContent=window.__EXT.out||'（还没有输出）';
-  const t=document.getElementById('extTasks');
-  if(t) t.innerHTML=extRowsHtml();
-}
-
-async function extLoadTasks(){
-  try{
-    const r=await fetch('/api/ext/tasks');
-    const d=await r.json();
-    window.__EXT.tasks=d.tasks||[];
-  }catch(err){ }
-  extPaint();
-}
-
-async function extPoll(id){
-  const t0=Date.now();
-  while(true){
-    let j={};
-    try{ const r=await fetch('/api/ext/job/'+id); j=await r.json(); }catch(err){ }
-    if(j.output!==undefined) window.__EXT.out=j.output||'（运行中…）';
-    window.__EXT.jobStatus=j.status||'';
-    window.__EXT.status=(j.title||'')+' · '+(j.status||'?')+' · '
-      +Math.round((Date.now()-t0)/1000)+'s';
-    extPaint();
-    if(j.status && j.status!=='running'){ await extLoadTasks(); return; }
-    await new Promise(s=>setTimeout(s,1500));
-  }
-}
-
-async function extRun(action){
-  const q=((document.getElementById('extQ')||{}).value||'').trim();
-  const tid=((document.getElementById('extTid')||{}).value||'').trim();
-  const iters=+((document.getElementById('extIters')||{}).value||4);
-  if(action==='ask' && !q){ alert('先把问题填上'); return; }
-  if((action==='retry'||action==='sub') && !tid){ alert('先填 task_id（账本里抄）'); return; }
-  window.__EXT.status='提交中…'; extPaint();
-  try{
-    const r=await fetch('/api/ext/run',{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({action:action, q:q, tid:tid, iters:iters,
-                           scene:window.__SCENE||''})});
-    const d=await r.json();
-    if(d.error){ window.__EXT.status='出错：'+d.error; extPaint(); return; }
-    window.__EXT.out='（已启动：'+d.title+' —— 输出会在下面滚动，长任务要几分钟）';
-    window.__EXT.jobStatus='running';
-    window.__EXT.status=d.title+' · running';
-    extPaint();
-    await extPoll(d.id);
-  }catch(err){ window.__EXT.status='出错：'+err; extPaint(); }
-}
-
-const PANELS={overview:pOverview,practice:pPractice,import:pImport,ext:pExt,trace:pTrace,skill:pSkill,graph:pGraph,voyager:pVoyager,adaptive:pAdaptive,console:pConsole};
+const PANELS={overview:pOverview,practice:pPractice,import:pImport,trace:pTrace,skill:pSkill,graph:pGraph,voyager:pVoyager,adaptive:pAdaptive,console:pConsole};
 
 /* ---------------- 人导入（只在 import 分区里挂事件） ---------------- */
 function fillTopics(s){
@@ -2613,7 +2481,7 @@ async function submitImport(){
 /* ---------------- 界面交互埋点 ----------------
    用户要求导出的 md「一定要具体到界面交互（按了什么键，然后选了什么难度）」。
    所以每一次按键、每一个下拉选择都落盘成 ui_events.jsonl，导出时排在最前。 */
-const TAB_LABEL = {overview:'概览', practice:'练习', import:'人导入', ext:'外部任务',
+const TAB_LABEL = {overview:'概览', practice:'练习', import:'人导入',
                    trace:'轨迹', skill:'技能·因果', graph:'知识图谱', voyager:'MC 真实学习', adaptive:'自适应练习', console:'运行日志'};
 function uiEvent(kind, detail, result){
   try{
@@ -2787,7 +2655,8 @@ async function voyagerClear(which, label){
 
 /* ---------------- 主渲染 ---------------- */
 function render(s){
-  // 外部任务页签要按**当前场景**的数据源取数（scene_env 判定），所以场景 id 存全局。
+  // 当前场景 id 存全局：取数一律按场景（scene_profile 唯一定义），
+  // 前端不再有第二个"数据源选择器"。
   window.__SCENE = ((s.scene||{}).id)||'';
   window.__SCENE_NAME = ((s.scene||{}).name)||'';
   window.__lastRec = s.recommend || {};
@@ -2879,12 +2748,6 @@ function render(s){
     transfer:+((document.getElementById('learnTransfer')||{}).value||0)});
   const bes=document.getElementById('btnExamStop'); if(bes) bes.onclick=pilotStop;
   const rn=document.getElementById('refreshNow'); if(rn) rn.onclick=load;
-  // 外部任务页签（按钮只在该页签存在，用 if 守卫，每次 render 都绑）
-  const ea=document.getElementById('extAsk');   if(ea) ea.onclick=()=>extRun('ask');
-  const el2=document.getElementById('extLearn'); if(el2) el2.onclick=()=>extRun('learn');
-  const er=document.getElementById('extRetry'); if(er) er.onclick=()=>extRun('retry');
-  const es=document.getElementById('extSub');   if(es) es.onclick=()=>extRun('sub');
-  const eli=document.getElementById('extList'); if(eli) eli.onclick=()=>extRun('list');
   const ex=document.getElementById('btnExport'); if(ex) ex.onclick=exportMd;
   const dp=document.getElementById('dbProbe'); if(dp) dp.onclick=dbProbe;
   const ds=document.getElementById('dbSwitch');
@@ -2994,8 +2857,6 @@ load();
 setInterval(load, 4000);
 loadSceneBar();                       // 场景栏：一次性拉齐 + 之后 8s 跟一次（与 /api/scenes 同频）
 setInterval(loadSceneBar, 8000);
-extLoadTasks();                       // 外部 task 账本：一次性 + 之后 10s 跟一次
-setInterval(extLoadTasks, 10000);
 </script>
 </body>
 </html>
@@ -3120,27 +2981,6 @@ class Handler(BaseHTTPRequestHandler):
             # 1→n 泛化：场景命名空间视图（列表 + 当前 + 每场景专属节点数）
             body = json.dumps(panel_data.scenes_view(), ensure_ascii=False).encode("utf-8")
             ctype = "application/json; charset=utf-8"
-        elif path == "/api/ext/tasks":
-            # 外部 task 账本（外部任务页签）：直接读 failed_tasks.json，不起子进程。
-            try:
-                import ext_task
-                body = json.dumps({"ok": True, "tasks": ext_task.tasks()},
-                                  ensure_ascii=False).encode("utf-8")
-                ctype = "application/json; charset=utf-8"
-            except Exception as e:
-                self._json(500, {"error": f"{type(e).__name__}: {e}"[:200]})
-                return
-        elif path.startswith("/api/ext/job/"):
-            # 后台子进程的实时输出（前端 1.5s 轮询一次）。
-            try:
-                import ext_task
-                j = ext_task.job(path.rsplit("/", 1)[-1])
-                body = json.dumps(j or {"error": "没有这个任务", "status": "gone"},
-                                  ensure_ascii=False).encode("utf-8")
-                ctype = "application/json; charset=utf-8"
-            except Exception as e:
-                self._json(500, {"error": f"{type(e).__name__}: {e}"[:200]})
-                return
         elif path == "/api/teaching-graph":
             # 教学图谱（伴学 29 知识点种子 + 前置门控 + 掌握度叠加）。
             # 与 /api/graph（判分侧维度图谱）并存：一个管"下一步学什么"，
@@ -3166,22 +3006,6 @@ class Handler(BaseHTTPRequestHandler):
         """
         path = _strip_prefix(self.path.split("?")[0])
         payload = self._payload()
-
-        if path == "/api/ext/run":
-            # 外部任务页签的三个按钮：ask / learn / retry / sub / list。
-            # 只起子进程，不在本进程 import task_intake / loop（会把 MCP 网关
-            # 连接绑到 web 的事件循环上 —— 实测第二次点击起全部超时）。
-            try:
-                import ext_task
-                r = ext_task.start(str(payload.get("action") or ""),
-                                   q=str(payload.get("q") or ""),
-                                   tid=str(payload.get("tid") or ""),
-                                   iters=int(payload.get("iters") or 4),
-                                   scene=str(payload.get("scene") or ""))
-            except Exception as e:  # noqa: BLE001
-                r = {"error": f"{type(e).__name__}: {e}"[:200]}
-            self._json(200, r)
-            return
 
         if path == "/api/preview":
             try:

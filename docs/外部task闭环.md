@@ -400,6 +400,20 @@ critic 却给了成功判词「Global Esports 队获得了首杀」。这行 SQL
 
 ## 十 口径漏洞：原版治在哪一层，我们同构到哪一层（2026-10-23）
 
+### 10.0 先纠正用词：原版没有"口径"这个概念
+
+"口径"是**我们借来的词**（来自前面 VLML 电竞数据那套语境），不是原版术语。取证：
+
+| 查什么 | 结果 |
+|---|---|
+| 全仓 `grep -i "caliber\|口径\|denominator\|numerator"` | **0 命中**；`prompts/*.txt` 里连 `SELECT` 都没有 |
+| `prompts/critic.txt:3` | "evaluate if I have met the **task requirements**" —— 判的是任务要求 |
+| `prompts/critic.txt:7-17` | 观察面只有末态读数（Biome/Time/Nearby blocks/Health/Hunger/Position/Equipment/Inventory/Chests + Task + Context） |
+| `agents/curriculum.py:420-437` | `get_task_context()` 的 Context = `How to <task> in Minecraft?` 的**世界知识问答**，不规定分子分母 |
+
+原版从来没"判口径"这一步，它是**不让会出错的任务出出来**（判据 3 单动作带数量、判据 8 只出观察面能验的）。
+下文沿用"口径"二字只是为了接住前面章节的上下文，读到时应理解成"任务要求 / 取数粒度"。
+
 ### 10.1 原版取证：它根本没有"口径判据"
 
 把原版翻遍，没有任何一处做"SQL/动作与题干口径逐项对齐"的检查。口径是在**四个位置**管的：
@@ -451,10 +465,64 @@ critic 却给了成功判词「Global Esports 队获得了首杀」。这行 SQL
 - 出题器仍会复用节点里人写的错口径 examples（③ 的根），这一层要等"节点定义体检"，
   现在只在 critique 里如实暴露。
 
+### 10.5 顺着"原版有没有口径"查出来的一处真缺口：数据型场景没有逐子目标 rollout（2026-10-23）
+
+原版 `voyager.py:403-421`：
+
+```python
+while progress < len(sub_goals):
+    next_task = sub_goals[progress]
+    ...  # 一次 rollout + critic 判 success，成功才 progress += 1
+```
+
+**一条子目标一次 rollout，成功了才做下一条。** 我们数据型路径不是。硬证据：
+
+| 位置 | 事实 |
+|---|---|
+| `learn_orchestrate.py:465` / `:496` | `plan["subgoals"]` 全仓**仅有的两处引用**，只用来判空、判"全不可达" |
+| `learn_orchestrate.py:671` `for _d in _dims:` | 逐条 rollout 的循环只吃 `plan["dimensions"]` |
+| `learn_orchestrate.py:458` | `dimensions` 只在「本机 + 知识型」时由 Maieutic 骨架生成 |
+| `learn_orchestrate.py:926` | 于是 scene 场景（P）走的是 `agent.solve(question)` —— **整题一次** |
+
+后果可直接观察：工资题拆出 10 条子目标，执行层一条都没单独跑过，它是被要求"一次完成整条动作链"，
+2026-10-23 实测 4 轮都在写同一个嵌套聚合 → Binder Error → `no_data`。
+
+**这不是口径问题，是没有照原版的主循环跑。** 修法是把 `plan["subgoals"]` 接进已有的
+`for _d in _dims` 循环（`_dims` 为空时用子目标顶上），复用 `close_one_dimension` /
+`milestone_state` / `learn_milestone_skills` —— 不新造机制。
+
+顺带：`task_decompose.DECOMPOSE_SYSTEM` 的判据 2 已按原版 `curriculum_task_decomposition.txt:2`
+收回成"单动作、答案是一个数或一行、禁止 bare Filter"，但实测 glm-4-flash 仍出 10 条、
+仍有 `Filter active employees` —— **prompt 治不了，必须改循环结构**。
 
 ---
 
-## 十一、入口统一到 `/mve/`：把面板本身变成这套代码（2026-10-23）
+## 十一、入口：做多过两次，最终回到「人导入」（2026-10-23）
+
+### 11.0 勘误：独立的「外部任务」入口已撤
+
+这一节记录的是 2026-10-23 白天把外部 task 闭环并进 `/mve/` 的过程。**当晚用户又否掉了它**：
+
+> 「而且你没必要做这个外部 task，导入统一走人导入，相关度低就建新的场景，绑新的数据源。多出来这些真的很奇怪。」
+
+判断是对的：外部 task 不是新能力，只是一条**动作链**（导入 → 学 → 重试），而三段的入口都已存在 ——
+导入就是「人导入」页签（`/api/coach`，未命中就 kick 学习）、学习是驾驶舱「跑学习单元」、
+重试就是再导入同一条。另外，「外部任务」页签还带了**第二个场景归属概念**（任务自己记账），
+而数据源边界本来只由**场景**定义（`scene_profile` 唯一定义）—— 这就是"多出来"的那层。
+
+已删（不留后门）：
+
+| 删掉 | 说明 |
+|---|---|
+| `TABS` 里的 `{id:'ext', label:'外部任务'}` + `PANELS.ext` + `TAB_LABEL.ext` | 第 614-617 行那一格 |
+| `pExt` / `extRowsHtml` / `extPaint` / `extLoadTasks` / `extPoll` / `extRun` | 约 130 行前端 |
+| `GET /api/ext/tasks`、`GET /api/ext/job/<id>`、`POST /api/ext/run` | 三条路由 |
+| `mve/ext_task.py` | 整个文件（起子进程 + 内存 job 表 + 账本读取） |
+
+保留下来的都是**服务层**，与 UI 无关：`task_intake.py --scene`、`scene_learn.py --scene`、
+`scene_env`、`scene_profile`。`task_intake.list` 新增 `--scene`（账本按场景过滤，旧记录归默认场景）。
+
+下面 11.1–11.6 是当天的过程记录，留着是为了**不再犯同一个错**（把"一条动作链"做成"一层产品"）。
 
 ### 11.1 用户指令与它否掉的做法
 
@@ -480,7 +548,7 @@ critic 却给了成功判词「Global Esports 队获得了首杀」。这行 SQL
 
 判据/口径/技能/账本逻辑一行没重写 —— 合并只搬文件。
 
-### 11.3 面板里的入口长什么样
+### 11.3 面板里的入口长什么样（⚠️ 已撤，见 11.0）
 
 - 页签：`TABS` 新增 `{id:'ext', label:'外部任务'}`，`PANELS` 新增 `pExt`。
 - 五个动作：`ask`（导入并试答）/ `learn`（学一轮）/ `retry`（重试这条）/ `sub`（看子目标）/ `list`（列账本）。
