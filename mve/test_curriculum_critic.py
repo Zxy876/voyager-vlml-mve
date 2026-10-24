@@ -52,7 +52,10 @@ def test_two_books() -> None:
 
 
 def test_queue_priority_and_retry() -> None:
-    """人导入优先；失败过的题不再出；LLM 出题解析失败会重试（原版 max_retries=5）。"""
+    """人导入优先；失败过的人导入题**仍要重试**（2026-10-24 机制修复：原版
+    failed 账约束的是自动课程 "skipping to next task"，不是 manual 的人给题
+    ——否则「导入→学→重试」闭环第 3 步永远走不通）；LLM 出题解析失败会重试
+    （原版 max_retries=5）。重试节奏（沉底/防死循环）由 scene_learn 管。"""
     import curriculum_auto as C
     d = Path(tempfile.mkdtemp())
     (d / "projects.json").write_text('{"projects":[{"name":"a","stars_2026":3}]}',
@@ -69,11 +72,14 @@ def test_queue_priority_and_retry() -> None:
     # 队列优先（人导入 = 原版 manual 模式）
     t, c = a.propose_next_task(queue=["人导入的问题"], max_retries=5)
     assert t == "人导入的问题", t
-    # 队列里的题已失败 → 跳过它，走 LLM 出题（且第一次解析失败要重试）
+    # 队列里的题已失败 → **仍返回它**（人给的题不因失败记录被拉黑）
     a.update_exploration_progress({"task": "人导入的问题", "success": False,
                                    "critique": "没数据"})
     t2, _ = a.propose_next_task(queue=["人导入的问题"], max_retries=5)
-    assert t2 == "projects.json 里有几个项目？", t2
+    assert t2 == "人导入的问题", t2
+    # 队列空 → LLM 出题（且第一次解析失败要重试）
+    t3, _ = a.propose_next_task(queue=[], max_retries=5)
+    assert t3 == "projects.json 里有几个项目？", t3
     assert len(calls) == 2, f"应重试一次（第一次没有 Task: 行），实际调用 {len(calls)} 次"
     print("PASS  test_queue_priority_and_retry")
 

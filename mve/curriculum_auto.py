@@ -354,7 +354,14 @@ class CurriculumAgent:
         """
         for q in (queue or []):
             q = str(q or "").strip()
-            if q and q not in self.completed_tasks and q not in self.failed_tasks:
+            # ⚠️ 这里只查 completed，**不查 failed**（2026-10-24 机制修复）：
+            #   queue 是 scene_learn 从 coach_log 待学账里筛出来的人导入题
+            #   （原版 manual 的人给题对应物）。原版 failed 账约束的是**自动
+            #   课程**别再提太难的题（:330-345 skipping to next task）；
+            #   人给的题不该被它上一次的失败记录永久拉黑——否则「导入→学→
+            #   重试」闭环第 3 步永远走不通（实测工资题就是这样被屏蔽的）。
+            #   失败题的重试节奏（沉底、防单轮死循环）由 scene_learn 管。
+            if q and q not in self.completed_tasks:
                 return q, "人导入的待学问题（原版 manual 模式对应物）"
         # 原版 :264-291 在交给 LLM 之前先走硬编码分支（inventory 满 → 固定任务）。
         # MVE 的对应物就是这条：先看**有没有任何可用的取数手段**。

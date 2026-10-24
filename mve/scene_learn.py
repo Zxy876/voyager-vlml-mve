@@ -215,7 +215,7 @@ def _log_learning_detail(r: dict[str, Any]) -> None:
 
 
 def _run_one(q: str, scene: str, *, context: str = "",
-             max_retries: int = 4) -> dict[str, Any]:
+             max_retries: int = 4, critique: str = "") -> dict[str, Any]:
     """一次 rollout（原版 voyager.py:298-301）+ 内层重试（voyager.py:214-295）。
 
     原版机制照抄：
@@ -226,7 +226,7 @@ def _run_one(q: str, scene: str, *, context: str = "",
         "Skipping to next task"），**不会原地无限重试**。
     """
     _log(f"\n----- 场景学习 · Scene {scene} · {q} -----")
-    critique = ""
+    critique = str(critique or "")   # 重试题带入上次的失败评语（迭代提示初值）
     info: dict[str, Any] = {"task": q, "success": False, "critique": "",
                             "attempts": 0, "result": {}}
     for i in range(max(1, int(max_retries))):
@@ -306,6 +306,7 @@ def main() -> int:
          f" / 失败 {len(cur.failed_tasks)}；任务上限 {max_iter}，单任务重试 {max_retries}）"
          f" · {time.strftime('%Y-%m-%d %H:%M:%S')}")
     iteration = 0
+    tried_this_run: set[str] = set()   # 单次启动内防死循环：同一题无论成败只重学一次
     while True:
         if _asked_to_stop():
             _log("\n[场景学习] 收到停止信号（人在驾驶舱点了停止），当前任务已结束，退出。")
@@ -315,36 +316,63 @@ def main() -> int:
                  "已完成 " + str(len(cur.completed_tasks)) + "，失败 "
                  + str(len(cur.failed_tasks)) + "。")
             break
-        # 队列 = 人导入的题（原版 manual 模式的对应物）；两本账里的不再出
-        queued = [t for t in scene_questions(scene)[:units]
-                  if t["question"] not in cur.completed_tasks
-                  and t["question"] not in cur.failed_tasks]
-        if not queued and args.curriculum != "auto":
+        # 队列 = 人导入的题（原版 manual 模式的对应物）。
+        # ⚠️ 2026-10-24 机制修复：failed 的题**不再被永久屏蔽**——原版 failed
+        #   账（curriculum.py:330-345 "Skipping to next task"）约束的是自动
+        #   课程别原地打转；人导入的题是 manual 语义，人明确要它学会，失败
+        #   过的下一轮要**沉底重试**（新鲜题优先），否则「导入→学→重试」
+        #   闭环第 3 步永远走不通（实测工资题失败一次后就此消失）。
+        #   单次启动内同一题只重学一次（tried_this_run），不无限打转。
+        _qs = [t["question"] for t in scene_questions(scene)]
+        fresh = [q for q in _qs
+                 if q not in cur.completed_tasks and q not in cur.failed_tasks]
+        retries = [q for q in _qs
+                   if q in cur.failed_tasks and q not in cur.completed_tasks]
+        queued = ([q for q in fresh if q not in tried_this_run]
+                  + [q for q in retries if q not in tried_this_run])[:units]
+        if not queued and args.curriculum != "queue":
+            # 人导入队列空了 → 自动出题（auto 模式，原版 while True 的本义）。
+            queued = []
+        elif not queued and args.curriculum == "queue":
             _log("[场景学习] 队列空了（queue 模式：只学人导入的题），退出。"
                  "要原版那种不停出题，用 --curriculum auto。")
             break
         try:
             task, context = cur.propose_next_task(
-                queue=[t["question"] for t in queued], max_retries=5)
+                queue=[t for t in queued], max_retries=5)
         except Exception as e:
             if "Max retries reached" in str(e):
                 # 原版在这里也是 raise（curriculum.py:294-296）；它不是故障，是
                 # "当前数据被学完了、模型提不出不重复的题"。日志要说人话。
                 _log("[场景学习] 自动课程连续 5 次提不出可用的新题（"
                      + str(e) + "）—— 这个场景现有数据大概已经学完了"
-                     f"（已完成 {len(cur.completed_tasks)} 条）。"
-                     "放新数据 / 导入新问题 / 改写问题后再启动，不是故障。")
+                    f"（已完成 {len(cur.completed_tasks)} 条）。"
+                    "放新数据 / 导入新问题 / 改写问题后再启动，不是故障。")
             else:
                 _log(f"[场景学习] 课程规划失败：{type(e).__name__}: {e} —— 退出。")
             break
         if not task:
-            _log("[场景学习] 课程提不出下一个任务"
-                 + (f"：{context}" if context else
-                    "（工作区没数据 / LLM 不可用 / 连续 5 次解析失败）")
-                 + " —— 如实退出，不硬凑。")
-            break
+            # queue 里的题都被账本挡住（理论上不该发生）→ 落到自动出题。
+            task, context = cur.propose_next_task(max_retries=5)
+            if not task:
+                _log("[场景学习] 课程提不出下一个任务"
+                     + (f"：{context}" if context else
+                        "（工作区没数据 / LLM 不可用 / 连续 5 次解析失败）")
+                     + " —— 如实退出，不硬凑。")
+                break
+        tried_this_run.add(task)
+        # 重试题把上次的失败评语带回去当 critique 初值（原版把 critique 拼进
+        # 下一次 rollout 的同一条通路）。
+        retry_critique = ""
+        if task in cur.failed_tasks:
+            retry_critique = str(
+                (getattr(cur, "_failed_why", {}) or {}).get(task) or "")[:300]
+            if retry_critique:
+                _log(f"[场景学习] 「{task[:36]}」上次失败过（沉底重试），"
+                     f"带着上次的评语重学：{retry_critique[:120]}")
         iteration += 1
-        info = _run_one(task, scene, context=context, max_retries=max_retries)
+        info = _run_one(task, scene, context=context, max_retries=max_retries,
+                        critique=retry_critique)
         # 原版 curriculum.update_exploration_progress：成功进 completed、失败进 failed
         cur.update_exploration_progress(info)
         _log(f"[场景学习] 进度 {iteration}/{max_iter}：已完成 "
