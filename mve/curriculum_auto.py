@@ -72,7 +72,64 @@ Context: <一句话说明：用哪个文件/表、算什么、完成标准是什
    「真实取值」；清单里没有的说法不要用（写了也查不到，必然 0 行）。
 7. 已学会的技能还很少时（看「已学会的技能」计数），只出**单步题**：
    一张表、一个数或一行 —— 原版 "Mine [quantity] [block]" 的同构。
+8. 题目只能引用观察里 schema 实查出现的**表名和列名**；数据源里不存在的
+   业务参数（费率、汇率、税率、政策比例……）**不许假设** —— 出了这种题，
+   助手只能编一个数（实测 2026-10-24：编出"每小时加班费率 150 元"还入库成
+   了技能）。库里没有的参数，要么不出这类题，要么把「数据源缺少 X，
+   无法计算」本身作为任务。
 """
+
+
+def db_observation(db_path: str) -> str:
+    """实查场景库：表 → 行数 → 列 → 低基数字符串/布尔列的真实取值。
+
+    为什么提成模块级（2026-10-24 用户定「用原 voyager 看环境的方法来抄」）：
+    原版所有 agent（curriculum / action / critic）看到的是**同一份实查渲染的
+    环境末态**（背包物品×数量、附近方块）—— critic 之所以能验证「挖到铁矿」，
+    是因为末态清单里看得见 `iron_ore ×1`。SQL 场景的同构物就是这份清单：
+    出题器拿它保证「只出观察面能验证的题」，critic 拿它指认「任务假设的
+    表/列/业务参数是否真的存在」（实测 2026-10-24：模型编出"每小时加班费率
+    150 元"，critic 没有环境清单可对照，把幻觉当判据放行了）。
+
+    只用 DuckDB 标准语句，不需要任何领域知识；打不开/查不动就返回空串
+    （上层如实说"实查失败"，不编造）。
+    """
+    out = ""
+    try:
+        import duckdb
+        con = duckdb.connect(str(db_path or ""), read_only=True)
+        try:
+            tables = [r[0] for r in con.execute("show tables").fetchall()]
+            lines: list[str] = []
+            for t in tables:
+                try:
+                    cnt = con.execute(f'select count(*) from "{t}"').fetchone()[0]
+                    cols = con.execute(f'describe "{t}"').fetchall()
+                except Exception:
+                    continue
+                names = ", ".join(c[0] for c in cols)
+                lines.append(f"- 表 {t}（{cnt} 行）：{names}")
+                for c in cols:
+                    cname, ctype = str(c[0]), str(c[1]).upper()
+                    if ctype not in ("VARCHAR", "TEXT", "STRING", "BOOLEAN"):
+                        continue
+                    try:
+                        vals = [r[0] for r in con.execute(
+                            f'select distinct "{cname}" from "{t}" '
+                            f'limit 13').fetchall()]
+                    except Exception:
+                        continue
+                    vals = [v for v in vals if v is not None]
+                    if vals and len(vals) <= 12:
+                        lines.append(
+                            f"    · {t}.{cname} 真实取值: "
+                            + "、".join(str(v) for v in vals))
+            out = "\n".join(lines)
+        finally:
+            con.close()
+    except Exception:
+        out = ""
+    return out
 
 
 def _norm(q: str) -> str:
@@ -262,45 +319,9 @@ class CurriculumAgent:
         （上层如实说"实查失败"，不编造）。缓存到实例 —— 一次进程里枚举值
         不会变，不必每轮出题都连库。
         """
-        if getattr(self, "_db_obs_cache", None) is not None:
-            return self._db_obs_cache
-        out = ""
-        try:
-            import duckdb
-            con = duckdb.connect(self.db_path, read_only=True)
-            try:
-                tables = [r[0] for r in con.execute("show tables").fetchall()]
-                lines: list[str] = []
-                for t in tables:
-                    try:
-                        cnt = con.execute(f'select count(*) from "{t}"').fetchone()[0]
-                        cols = con.execute(f'describe "{t}"').fetchall()
-                    except Exception:
-                        continue
-                    names = ", ".join(c[0] for c in cols)
-                    lines.append(f"- 表 {t}（{cnt} 行）：{names}")
-                    for c in cols:
-                        cname, ctype = str(c[0]), str(c[1]).upper()
-                        if ctype not in ("VARCHAR", "TEXT", "STRING", "BOOLEAN"):
-                            continue
-                        try:
-                            vals = [r[0] for r in con.execute(
-                                f'select distinct "{cname}" from "{t}" '
-                                f'limit 13').fetchall()]
-                        except Exception:
-                            continue
-                        vals = [v for v in vals if v is not None]
-                        if vals and len(vals) <= 12:
-                            lines.append(
-                                f"    · {t}.{cname} 真实取值: "
-                                + "、".join(str(v) for v in vals))
-                out = "\n".join(lines)
-            finally:
-                con.close()
-        except Exception:
-            out = ""
-        self._db_obs_cache = out
-        return out
+        if getattr(self, "_db_obs_cache", None) is None:
+            self._db_obs_cache = db_observation(self.db_path)
+        return self._db_obs_cache
 
     def _skill_count(self) -> int:
         try:

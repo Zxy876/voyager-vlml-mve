@@ -99,6 +99,30 @@ def main() -> int:
     got = consume.generalize_sql_recipe(sql, "q")
     check("槽位出现在标识符旁（列别名）→ 原样返回", got == sql)
 
+    # 2026-10-24 Scene P 实测的两种坏泛化 → 原样返回
+    bad_select = ("SELECT SUM(:base_salary + :amount) AS total_salary "
+                  "FROM employees e JOIN allowance a ON e.emp_id = a.emp_id "
+                  "WHERE a.month = :month AND e.active = 1")
+    consume.chat_json = _stub_chat_json({"sql": bad_select, "slots": ["base_salary"]}, [])
+    got = consume.generalize_sql_recipe(sql, "q")
+    check("SELECT 列表里的列名被换成槽位 → 原样返回", got == sql)
+
+    bad_group = ("SELECT :emp_id, e.base_salary AS overtime_rate, "
+                 "SUM(a.overtime_hours) AS t FROM attendance a "
+                 "JOIN employees e ON a.emp_id = e.emp_id "
+                 "WHERE a.month = :month GROUP BY :emp_id, e.base_salary")
+    consume.chat_json = _stub_chat_json({"sql": bad_group, "slots": ["emp_id"]}, [])
+    got = consume.generalize_sql_recipe(sql, "q")
+    check("GROUP BY 分组列被换成槽位 → 原样返回", got == sql)
+
+    # 合法模板（槽位只在 WHERE）→ 通过
+    good = ("SELECT SUM(e.base_salary + a.amount) AS total_salary "
+            "FROM employees e JOIN allowance a ON e.emp_id = a.emp_id "
+            "WHERE a.month = :month")
+    consume.chat_json = _stub_chat_json({"sql": good, "slots": ["month"]}, [])
+    got = consume.generalize_sql_recipe(sql, "q")
+    check("槽位只在 WHERE → 模板通过", got == good)
+
     print("== ② learn_milestone_skills：入库前泛化 ==")
     import skill_store
     import learn_orchestrate as lo

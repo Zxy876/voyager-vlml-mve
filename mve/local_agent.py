@@ -1065,6 +1065,18 @@ def _ns_base(scene_dir: str, scene_id: str = "",
             actions.register_net(scene_id)
             names = {str(e.get("name")) for e in actions.enabled_entries(scene_id)
                      if str(e.get("origin") or "") in allowed_origins} & set(full)
+            # 场景自带数据源不受猫爪门控（2026-10-24 用户实测：「只有开了猫爪才能
+            # 学到东西」）。.duckdb 是场景契约的**硬拒绝项**（scene_profile 唯一
+            # 定义的数据源），不是「外来能力」—— 猫爪同构 neko，管的是插件/外来
+            # 工具（web_search、mcp_* 这些抓手）；把它关掉不该连场景自己绑定的
+            # 库一起关（那等于整个场景没数据，学习必败）。原语表里 query_sql
+            # 只在场景目录真有 .duckdb 时才有意义，照实判。
+            try:
+                if any(f.endswith(".duckdb")
+                       for f in os.listdir(str(scene_dir) or ".")):
+                    names.add("query_sql")
+            except Exception:
+                pass
         except Exception:
             names = set(full)
     ns: dict[str, Any] = {k: v for k, v in full.items() if k in names}

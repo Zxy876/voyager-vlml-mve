@@ -336,6 +336,24 @@ def generalize_sql_recipe(code: str, question: str) -> str:
         _i = _m.start()
         if _i > 0 and (_body[_i - 1].isalnum() or _body[_i - 1] == "_"):
             return code
+    # 子句级守卫：槽位只许出现在 **WHERE / JOIN ON 的值位置**。
+    # 实测（2026-10-24 Scene P）glm-4-flash 会把 SELECT 列表里的列名
+    # （`SUM(:base_salary + :amount)`）和 GROUP BY 的分组列（`GROUP BY :emp_id`）
+    # 也换成槽位 —— 那是方法本体，换掉等于把算法改坏。粗切子句边界：
+    # 第一个顶层 FROM 之前 = SELECT 列表；GROUP BY 起（含 HAVING/ORDER BY）
+    # 一概拒绝 —— 保守方向是「不泛化原样入库」，不是「入库坏模板」。
+    _slots = list(_re.finditer(r":[a-z_][a-z0-9_]*", _body, _re.I))
+    if _slots:
+        _up = _body.upper()
+
+        def _pos(m: Any) -> int:
+            return m.start() if m else len(_body)
+
+        _from = _pos(_re.search(r"\bFROM\b", _up))
+        _group = _pos(_re.search(r"\bGROUP\s+BY\b", _up))
+        for _m in _slots:
+            if _m.start() < _from or _m.start() >= _group:
+                return code
     return sql
 
 

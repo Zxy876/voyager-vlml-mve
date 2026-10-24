@@ -606,6 +606,12 @@ async def _start_learning_impl(
                 grabs = [{"name": e.get("name", ""),
                           "description": str(e.get("description") or "")}
                          for e in _act.enabled_entries(scene)]
+                # 场景自带数据源不受猫爪门控（同 local_agent._ns_base 的修法）：
+                # 有库就必须把 query_sql 列进抓手，否则猫爪一关规划器就判
+                # 「没有数据源可达」，学习整段趴窝（2026-10-24 用户实测）。
+                if db_path and "query_sql" not in {g["name"] for g in grabs}:
+                    grabs.append({"name": "query_sql",
+                                  "description": "查场景目录里的 .duckdb（只读）"})
             except Exception:
                 grabs = []
             out["grabs_offered"] = len(grabs)
@@ -1056,8 +1062,26 @@ async def _start_learning_impl(
         else:
             try:
                 import task_critic
-                _ok, _crit = task_critic.check_task_success(
-                    question, str(context or ""), out)
+                # 原版同构（2026-10-24 用户定「用原 voyager 看环境的方法来抄」）：
+                # 原版 critic 看到的是**环境末态**（背包/附近方块），所以能验证
+                # "挖到铁矿" —— 观察里看得见。SQL 场景的同构物 = 库的实查清单
+                # （表/列/真实取值）随 context 交给 critic：任务假设的表/列/业务
+                # 参数（费率/汇率…）必须能在这份清单里指认，指认不了 = 不可答，
+                # 不许把编造的参数当已验证（实测 150 元费率幻觉就是这样放行的）。
+                _ctx = str(context or "")
+                try:
+                    if str(db_path or "").strip():
+                        from curriculum_auto import db_observation as _dbobs
+                        _obs = _dbobs(db_path)
+                        if _obs:
+                            _ctx += ("\n\n[环境实查（数据源真实的表/列/取值）：任务"
+                                     "假设的任何表、列、业务参数（费率/汇率/税率/"
+                                     "政策数值…）都必须能在这里指认；指认不了的 = "
+                                     "任务在数据源上不可答，判未完成，并明说缺什么]：\n"
+                                     + _obs)
+                except Exception:
+                    pass
+                _ok, _crit = task_critic.check_task_success(question, _ctx, out)
             except Exception as e:
                 _ok, _crit = bool(real), f"critic 异常：{type(e).__name__}: {e}"
             out["critic"] = {"success": bool(_ok), "critique": str(_crit or ""),
