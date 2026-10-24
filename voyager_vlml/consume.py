@@ -982,6 +982,13 @@ async def consume(
                 print(f"  · critic 判没答出来：{str(critic_why)[:120]}")
         except Exception as e:  # pragma: no cover
             critic_ok, critic_why = False, f"critic 判定不可用：{type(e).__name__}: {e}"
+        # 判未完成 → 答案不许以确定句示人（2026-10-24 用户拍板）：
+        # 130600 事故三次同款——账面上 fetched_empty、面板上却是自信数字，
+        # 展示层必须跟账本一致：判没答出来就明说「未验证、数字不可信」。
+        if answer and not (data is not None and critic_ok
+                           and nar.get("answered", True)):
+            answer = (str(answer).rstrip()
+                      + "（⚠️ 未验证：本轮未通过 critic 判定，此数字不可信）")
         base = {
             "question": question, "mode": "voyager_consume",
             "topic_id": topic_id, "topic_hit": hit,
@@ -1355,6 +1362,10 @@ async def consume(
     except Exception as e:  # pragma: no cover
         # 原版 critic 挂了 → (False, "")：判不了就不算成功（铁律方向）。
         critic_ok, critic_why = False, f"critic 判定不可用：{type(e).__name__}: {e}"
+    # 判未完成 → 答案标注未验证（与场景分支同款，2026-10-24 用户拍板）。
+    if answer and not critic_ok:
+        answer = (str(answer).rstrip()
+                  + "（⚠️ 未验证：本轮未通过 critic 判定，此数字不可信）")
 
     # ---- 答完了 → 这题进能力库 → 掌握（判据是"答没答出来"，不是覆盖率）----
     # 判据是"答没答出来"（取到数 + 给出了回答 + **critic 判过**），**不是**有没有
