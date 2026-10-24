@@ -120,6 +120,16 @@ def _cache_path(scene_id: str, question: str, db_path: str = "") -> Path:
     h = hashlib.md5(str(question or "").strip().encode("utf-8")).hexdigest()[:12]
     # db_path 进缓存键：场景换了库 / 首次加 schema 观察面，旧骨架（可能编了不存在
     # 的参数）不能继续命中，必须重拆。知识型场景 db_path="" 不影响旧键。
+    if not db_path:
+        # 进度/追问历史的读写常省略 db_path；但它们必须与 scaffold 写出的缓存文件
+        # 同把钥匙，否则数据场景（db_path 非空）的进度会被写到一个不存在的文件、
+        # 被 save_progress 的「读不到就静默返回」吞掉 —— 断点续学与里程碑「全闭合
+        # 解锁」对数据场景名存实亡。这里回退到场景规范 db_path，和 scaffold 对齐。
+        try:
+            import scene_profile as _sp
+            db_path = str((_sp.profile(str(scene_id or "A")) or {}).get("db_path") or "")
+        except Exception:
+            db_path = ""
     dh = hashlib.md5(str(db_path or "").encode("utf-8")).hexdigest()[:8]
     return CKPT / str(scene_id or "A") / f"{h}_{dh}.json"
 
