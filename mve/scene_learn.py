@@ -215,7 +215,8 @@ def _log_learning_detail(r: dict[str, Any]) -> None:
 
 
 def _run_one(q: str, scene: str, *, context: str = "",
-             max_retries: int = 1, critique: str = "") -> dict[str, Any]:
+             max_retries: int = 1, critique: str = "",
+             preset_dimension: dict | None = None) -> dict[str, Any]:
     """一次外层 rollout（原版 voyager.py:298-301，默认**只跑 1 次**）。
 
     同构修正（2026-10-24）：原版每轮课程对每个任务只 rollout 一次
@@ -237,7 +238,8 @@ def _run_one(q: str, scene: str, *, context: str = "",
         t0 = time.time()
         try:
             r = asyncio.run(learn_orchestrate.start_learning(
-                q, scene, critique=critique, judge=True, context=context))
+                q, scene, critique=critique, judge=True, context=context,
+                preset_dimension=preset_dimension))
         except Exception as e:
             r = {"status": "failed", "why": f"{type(e).__name__}: {e}"}
         status = str(r.get("status") or "")
@@ -324,6 +326,44 @@ def main() -> int:
                  "已完成 " + str(len(cur.completed_tasks)) + "，失败 "
                  + str(len(cur.failed_tasks)) + "。")
             break
+        # ⚠️ 里程碑维度优先（用户 2026-10-24）：场景有未完成里程碑时，选题源
+        # 从「LLM 自由出题」改成「该里程碑的未闭合维度」，逐维度 solve→落技能
+        # →全闭合解锁；全部完成后才降级回下面的自由出题。这样自动学习精准长
+        # 在目标的前置阶梯上，不再散点（之前跑出「李娜出勤」「销售出勤」这类
+        # 与目标「求出九月份总工资」完全无关的题，就是因为驾驶舱从没看过里程碑）。
+        try:
+            import maieutic_scaffold as _ms
+            import scene_profile as _sp
+            _tgt = _ms.current_target(scene)
+            if _tgt:
+                _dbp = str((_sp.profile(scene) or {}).get("db_path") or "")
+                _unclosed = _ms.milestone_unclosed(scene, _tgt, db_path=_dbp)
+                if _unclosed:
+                    _log(f"\n[场景学习] 当前里程碑「{_tgt[:42]}」有 {len(_unclosed)}"
+                         f" 个未闭合维度 → 驾驶舱优先闭合它们"
+                         f"（而不是自由出题）")
+                    for _d in _unclosed:
+                        if _asked_to_stop():
+                            break
+                        iteration += 1
+                        tried_this_run.add(_tgt)
+                        _log(f"\n----- 场景学习 · Scene {scene} · 里程碑维度："
+                             f"{str(_d.get('question') or '')[:50]} -----")
+                        t0 = time.time()
+                        info = _run_one(_tgt, scene, max_retries=max_retries,
+                                        preset_dimension=_d)
+                        _r0 = info.get("result", {}) or {}
+                        _log(f"[场景学习] 里程碑维度闭合 → status="
+                             f"{_r0.get('status')}（{time.time() - t0:.0f}s）")
+                        _log_learning_detail(_r0)
+                        # 里程碑维度不进 cur.failed_tasks（那是自由课程的账）；
+                        # 进度由 maieutic_scaffold.save_progress 记，断点续学认得。
+                    # 这一批发完回到循环顶部重算：若已全部闭合则 _unclosed 为空，
+                    # 自然落到下面的自由出题（降级）。
+                    continue
+        except Exception as e:
+            _log(f"[场景学习] 里程碑锚点检查失败（降级回自由出题）："
+                 f"{type(e).__name__}: {e}")
         # 队列 = 人导入的题（原版 manual 模式的对应物）。
         # ⚠️ 2026-10-24 机制修复：failed 的题**不再被永久屏蔽**——原版 failed
         #   账（curriculum.py:330-345 "Skipping to next task"）约束的是自动

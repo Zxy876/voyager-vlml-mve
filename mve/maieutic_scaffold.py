@@ -643,3 +643,101 @@ def imports_of(scene_id: str, topic_id: str, dim_id: str, *,
                     "label": str(getattr(node, "label", "") or ""),
                     "node": src})
     return out
+
+
+# ---------------------------------------------------------------------------
+# 当前里程碑目标（驾驶舱选题锚点）
+# ---------------------------------------------------------------------------
+# 用户 2026-10-24 定的驾驶舱行为：「场景有未完成里程碑时，驾驶舱的选题源从
+# 『LLM 自由出题』改成『该里程碑的未闭合维度』，逐维度 solve→落技能→全闭合
+# 解锁；全部完成后才降级回自由出题」。这条登记就是「当前要优先闭合哪个里程碑」。
+#
+# 写入时机：① 人在面板点「启动 Voyager / 导入学习」时就把它设为当前目标
+# （见 dashboard.py /api/learn/start）—— 人导入的意图天然是"我要学会这个"；
+# ② 也提供显式 set/clear 给面板「设为当前目标」按钮用。
+# 读取时机：scene_learn.py 每轮循环开头，优先于自由出题。
+def _current_target_path(scene_id: str) -> Path:
+    return CKPT / str(scene_id or "A") / "_current_target.json"
+
+
+def set_current_target(scene_id: str, question: str) -> None:
+    """把某句问句设为该场景的当前里程碑目标（人导入/手动指定时调用）。"""
+    q = str(question or "").strip()
+    if not q:
+        return
+    p = _current_target_path(str(scene_id or "A"))
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"question": q, "set_at": __import__("time").time()},
+                                ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def clear_current_target(scene_id: str) -> None:
+    """取消当前里程碑锚点（此后驾驶舱降级回自由出题）。"""
+    p = _current_target_path(str(scene_id or "A"))
+    try:
+        if p.exists():
+            p.unlink()
+    except Exception:
+        pass
+
+
+def current_target(scene_id: str) -> str:
+    """当前要优先闭合的里程碑目标问句。
+
+    优先级：① 显式 set_current_target 设的；② 没有显式设置时，默认取本场景
+    **最近一次**生成的骨架缓存（即人最近导入的那句）—— 这样人刚导入的意图
+    不用额外点按钮就能自动成为驾驶舱的锚点。返回 "" 表示没有可用里程碑
+    （驾驶舱降级回自由出题）。
+    """
+    scene_id = str(scene_id or "A")
+    p = _current_target_path(scene_id)
+    try:
+        if p.exists():
+            d = json.loads(p.read_text(encoding="utf-8"))
+            q = str(d.get("question") or "").strip()
+            if q:
+                return q
+    except Exception:
+        pass
+    # 默认：最近一次生成的骨架缓存（按修改时间倒序，跳过寄存器文件本身）
+    try:
+        d = CKPT / scene_id
+        files = sorted(d.glob("*.json"), key=lambda x: x.stat().st_mtime,
+                       reverse=True)
+        for f in files:
+            if f.name.startswith("_"):
+                continue
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            q = str(data.get("question") or "").strip()
+            if q:
+                return q
+    except Exception:
+        pass
+    return ""
+
+
+def milestone_unclosed(scene_id: str, question: str, *,
+                       db_path: str = "") -> list[dict[str, Any]]:
+    """该目标里程碑**还没闭合**的维度（驾驶舱优先学这些）。
+
+    靠 load_progress（已闭合维度 id 集）与 scaffold（全部维度）对账得出 ——
+    不复用 start_learning 内部状态，纯只读，驾驶舱每轮都能安全调用。
+    """
+    q = str(question or "").strip()
+    if not q:
+        return []
+    try:
+        sc = scaffold(q, str(scene_id or "A"), db_path=db_path)
+        dims = sc.get("dimensions") or []
+        if not dims:
+            return []
+        done = load_progress(str(scene_id or "A"), q)
+        return [d for d in dims if str(d.get("id") or "") not in done]
+    except Exception:
+        return []

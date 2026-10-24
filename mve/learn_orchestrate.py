@@ -354,6 +354,7 @@ async def start_learning(
     judge: bool = False,
     context: str = "",
     import_id: str = "",
+    preset_dimension: dict | None = None,
 ) -> dict[str, Any]:
     """启动一轮学习（同构 learn() 单圈）。返回全量过程记录，失败如实带 why。
 
@@ -366,7 +367,8 @@ async def start_learning(
         return await _start_learning_impl(
             question, scene_id, llm=llm, db_path=db_path,
             execute=execute, use_mcp=use_mcp, critique=critique,
-            judge=judge, context=context, import_id=import_id)
+            judge=judge, context=context, import_id=import_id,
+            preset_dimension=preset_dimension)
     finally:
         if use_mcp:
             try:
@@ -388,6 +390,7 @@ async def _start_learning_impl(
     judge: bool = False,
     context: str = "",
     import_id: str = "",
+    preset_dimension: dict | None = None,
 ) -> dict[str, Any]:
     """启动一轮学习（同构 learn() 单圈）的实现体（断开逻辑见外层 start_learning）。"""
     question = str(question or "").strip()
@@ -478,10 +481,24 @@ async def _start_learning_impl(
         _use_scaffold = bool(is_local) or (bool(db_path) and not use_vlml)
     except Exception:
         _use_scaffold = bool(is_local)
+    # 预设维度（驾驶舱逐维度闭合里程碑用）：明确要走维度循环，不管本场景默认的
+    # 拆解路线——传进来的就是一条已知可达、已知有 DB 落点的维度。
+    if preset_dimension is not None:
+        _use_scaffold = True
     plan = task_decompose.plan(question, scene, llm=llm, db_path=db_path,
                                scaffold=_use_scaffold)
     out["plan"] = plan
     out["plan_origin"] = str(plan.get("origin") or "")
+    # 预设维度（驾驶舱逐维度闭合里程碑）：这条维度已知可达、已知有 DB 落点，
+    # 别让它被「无子目标 / 硬不可达」短路踢出去。兜底把子目标补成一条
+    # reachable、counts 对齐，保证后面稳稳进维度循环。
+    if preset_dimension is not None:
+        if not plan.get("subgoals"):
+            plan["subgoals"] = [{"need": str(preset_dimension.get("question") or ""),
+                                "status": "reachable"}]
+        _c = plan.get("counts") or {}
+        _c["unreachable"] = 0
+        plan["counts"] = _c
     if not plan.get("subgoals"):
         out.update(status="failed", why="拆分不出子目标（LLM 不可用且规则兜底也空）")
         _record(out)
@@ -670,6 +687,12 @@ async def _start_learning_impl(
                     _avoid = _ms.drift_notes(plan)
                 except Exception:
                     _dims, _avoid = [], []
+                # 预设维度（驾驶舱逐维度闭合）：只跑传进来的这一条维度，但
+                # `plan["dimensions"]` 仍是**完整**维度集（里程碑判定要用它算
+                # 总进度）。下面 milestone_state 也改用完整集，单条闭合不会误报
+                # "达成"，全闭合那一发才翻 achieved。
+                if preset_dimension is not None:
+                    _dims = [dict(preset_dimension)]
                 if _dims:
                     # ---- 原版子目标制：逐维度 rollout + critic ----
                     # 原版 voyager.py:403-421：拆出的 sub_goals 是**按序逐个
@@ -959,7 +982,9 @@ async def _start_learning_impl(
                     except Exception:
                         pass
                     out["dimension_results"] = {
-                        "total": len(_dims),
+                        # total 用**完整**维度集（不是本轮只跑的那一条），日志才
+                        # 能看出"这一发闭合了 N/M 个"，不会每条都显示 1/1。
+                        "total": len(plan.get("dimensions") or []),
                         "learned": [str(d.get("id") or "") for d in learned_dims],
                         "failed": failed_dims,
                     }
@@ -969,7 +994,10 @@ async def _start_learning_impl(
                         _mst = _ms.milestone_state(
                             scene, question,
                             [str(d.get("id") or "") for d in learned_dims],
-                            scaffold_result={"dimensions": _dims,
+                            # 用**完整**维度集算总进度：预设维度单发闭合时，
+                            # 其它维度仍是未闭合，achieved 才不会误翻。
+                            scaffold_result={"dimensions": (plan.get("dimensions")
+                                                           or []),
                                              "milestone": plan.get("milestone") or {}})
                         out["milestone_scaffold"] = _mst
                         # 达成了 → 这一轮跑通的代码进技能库（同原版 add_new_skill）

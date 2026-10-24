@@ -3252,6 +3252,14 @@ class Handler(BaseHTTPRequestHandler):
                     LEARN_JOB["last_status"] = str(r.get("status") or "")
                     if r.get("status") in ("failed",):
                         LEARN_JOB["error"] = str(r.get("why") or "")[:300]
+                    # 人启动学习=「我要学会这句」→ 设为该场景当前里程碑锚点，
+                    # 驾驶舱从此优先闭合它的未闭合维度（见 scene_learn.py）。
+                    try:
+                        import scenes as _sc
+                        import maieutic_scaffold as _ms
+                        _ms.set_current_target(str(_sc.current_scene_id() or "A"), q)
+                    except Exception:
+                        pass
                 except Exception as e:
                     LEARN_JOB["error"] = f"{type(e).__name__}: {e}"[:300]
                 finally:
@@ -3262,6 +3270,25 @@ class Handler(BaseHTTPRequestHandler):
                              "message": "已受理，学习闭环正在后台跑（拆分→补缺口→"
                                         "取数→入库→结晶，约 1～3 分钟）。"
                                         "进度看下方学习状态，结果进技能库与因果时间线。"})
+            return
+
+        if path == "/api/milestone/current":
+            # 手动设/取/清当前里程碑锚点（驾驶舱选题优先闭合它的未闭合维度）。
+            # POST {"question": "..."} 设为当前目标；{"clear": true} 取消；
+            # 不带 question/clear → 返回当前目标。
+            try:
+                import scenes as _sc
+                import maieutic_scaffold as _ms
+                sid = str(payload.get("scene_id") or "").strip() \
+                    or _sc.current_scene_id() or "A"
+                if "question" in payload and str(payload.get("question") or "").strip():
+                    _ms.set_current_target(sid, str(payload["question"]).strip())
+                elif bool(payload.get("clear")):
+                    _ms.clear_current_target(sid)
+                self._json(200, {"ok": True, "scene_id": sid,
+                                "current_target": _ms.current_target(sid)})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": f"{type(e).__name__}: {e}"[:200]})
             return
 
         if path == "/api/db/probe":
