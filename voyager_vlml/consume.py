@@ -899,7 +899,11 @@ async def consume(
                 # 场景库形态的现场写：同一个 VLMLActionAgent（写 SQL prompt +
                 # 迭代修正），数据面只连场景自己的库（与学习侧 SceneDBEnv
                 # 同一环境，learn_orchestrate.py:583 同款）。
-                from voyager_vlml.agents.action import VLMLActionAgent
+                # ⚠️ 这里**不许再写局部 import**（2026-10-24 09:08 实测）：
+                #   import 是赋值，会把 VLMLActionAgent 变成 consume() 的局部
+                #   名字；走「复用配方」路径时这个分支被跳过，重放取到真空后
+                #   落到下方 ：1166 降级现场写 → UnboundLocalError，整条消费
+                #   通路挂掉。模块级 ：88 已有同一个 import，直接用。
                 _agent = VLMLActionAgent(env=_env)
                 obs, code = await _agent.solve(
                     question, skills=skills,
