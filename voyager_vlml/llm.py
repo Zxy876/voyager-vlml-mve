@@ -59,13 +59,20 @@ def chat(
     max_tokens: int = 1200,
     timeout: float = 90.0,
     retries: int = 3,
+    model: str = "",
 ) -> str:
-    """发一轮对话，返回模型文本。"""
+    """发一轮对话，返回模型文本。
+
+    `model`：单次调用覆盖模型（默认走 MVE_QUIZ_MODEL / ZHIPU_MODEL）。
+    用途：**critic 换强模型**（2026-10-24 实测 glm-4-flash 当 judge 三连放行
+    错误答案 —— 判官这把尺子不能省模型钱；出题/执行层可继续用 flash）。
+    """
     import httpx
 
-    url, key, model = _endpoint()
+    url, key, _model = _endpoint()
     if not key:
         raise RuntimeError("缺少 LLM 密钥（MVE_QUIZ_API_KEY 或 ZHIPU_API_KEY）")
+    model = str(model or "").strip() or _model
 
     last = ""
     for _ in range(retries):

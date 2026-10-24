@@ -199,7 +199,13 @@ def ai_check_task_success(task: str, context: str, result: dict[str, Any], *,
             text = str(llm(msgs) or "")
         else:
             from voyager_vlml.llm import chat
-            text = str(chat(msgs, temperature=0) or "")
+            import os as _os
+            # 判官模型可单配（2026-10-24 实测：glm-4-flash 当 judge，同一份
+            # 带环境观察的输入 3 次全放行一个明显错误的答案 —— 判官不能省
+            # 模型钱；出题/执行层可继续用 flash）。env MVE_CRITIC_MODEL
+            # 一设即切，不设回落全局模型，行为不变。
+            text = str(chat(msgs, temperature=0,
+                            model=_os.getenv("MVE_CRITIC_MODEL", "")) or "")
     except Exception:
         return False, ""
     m = re.search(r"\{.*\}", text, re.S)
