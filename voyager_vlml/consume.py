@@ -95,6 +95,36 @@ from voyager_vlml.llm import chat, chat_json  # noqa: E402
 # ① 这句话归到哪道题（为了拿到评分点 —— 覆盖率要按评分点算）
 # ---------------------------------------------------------------------------
 
+def _critic_env_context(db_path: str) -> str:
+    """给 critic 的**环境观察**（原版同构：critic 看的是同一份 env 末态）。
+
+    原版 critic 能验证「挖到铁矿」，是因为背包清单里看得见 iron_ore×1。SQL
+    场景的同构物 = 库的实查清单（表/行数/列/真实取值，见 curriculum_auto
+    .db_observation，实查不手写）。2026-10-24 实测两类错误只有靠它才拦得住：
+      ① 编造参数：库里没有加班费率，模型编「每小时 150 元」；
+      ② JOIN 缩小人群：「9 名在职员工的总工资」被 INNER JOIN 一张只有
+        1 行记录的津贴表算成 1 个人的（22600），critic 没有群体行数可对照
+        就放行了。
+    """
+    ctx = ""
+    try:
+        if str(db_path or "").strip():
+            from curriculum_auto import db_observation as _dbobs
+            obs = _dbobs(db_path)
+            if obs:
+                ctx = ("[环境实查（数据源真实的表/行数/列/取值）]：\n" + obs
+                       + "\n\n判定要求：①任务假设的任何表、列、业务参数（费率/"
+                         "汇率/税率/政策数值…）必须能在这份清单里指认，指认不了 "
+                         "= 任务在数据源上不可答，判未完成并明说缺什么；"
+                         "②对「总/全部/所有/每个」类题，核对结果覆盖的行数/人数"
+                         "是否与清单里该群体的行数一致 —— INNER JOIN 一张稀疏表"
+                         "会把人群缩小（实测：9 名在职员工的总工资被算成只有 "
+                         "1 名有津贴记录员工的），覆盖不符 = 判未完成。")
+    except Exception:
+        ctx = ""
+    return ctx
+
+
 def _infer(question: str) -> tuple[str, str, Any]:
     """归题 → (topic_id, hit, task)。
 
@@ -933,7 +963,10 @@ async def consume(
         critic_ok, critic_why = True, ""
         try:
             import task_critic as _tc
-            critic_ok, critic_why = _tc.check_task_success(question, "", {
+            _cctx = _critic_env_context(
+                str(((_prof or {}).get("db_path") or ""))
+                if _scene_kind == "scene" else "")
+            critic_ok, critic_why = _tc.check_task_success(question, _cctx, {
                 "execution": {"real_calls": 1 if data is not None else 0,
                               "calls": len(obs or []),
                               "rows": sum(int(o.get("rows") or 0)
@@ -1299,7 +1332,14 @@ async def consume(
     critic_ok, critic_why = True, ""
     try:
         import task_critic as _tc
-        critic_ok, critic_why = _tc.check_task_success(question, "", {
+        # VLML 主路径的数据源 = 默认库（db_switch 唯一定义），环境观察照给
+        # （Scene P 事故同款两类错误在这里同样拦得住）。
+        try:
+            import db_switch as _dbs
+            _cctx = _critic_env_context(str(getattr(_dbs, "DEFAULT_DB", "")))
+        except Exception:
+            _cctx = ""
+        critic_ok, critic_why = _tc.check_task_success(question, _cctx, {
             "execution": {"real_calls": len(real_calls),
                           "calls": len(observations or []),
                           "rows": real_rows},
