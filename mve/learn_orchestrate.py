@@ -466,13 +466,15 @@ async def _start_learning_impl(
     # 拆出 "Get definition of X" 这种空壳（实测就 1 条）。
     try:
         import task_critic as _tc0
-        # 原版同构（2026-10-24 用户定「照原 voyager」）：复杂度拆解在**执行层对
-        # 每任务**做（知识型与数据型都用 Maieutic 骨架）。MVE 此前只给「本机+
-        # 知识型」开了拆解，场景自带库的数据题被短路成单题一锤子 SQL —— 这正是
-        # 「不会循序渐进补前置、里程碑学不成合理版本」的根。现在把场景自带库的
-        # 任务（知识型 + 数据型）也纳入：逐维度 solve（数据面挂 SceneDBEnv）
-        # → 每维度闭合写一条技能 → 全部闭合合成里程碑；消费侧从原子技能组合出
-        # 正确应发工资。vlml（use_vlml）仍走自己的单解分支，不进维度循环。
+        # 复杂度拆解在执行层对每任务做（原版 voyager.py:403-421 子目标逐个完成）。
+        # 两种场景都走 Maieutic 追问骨架，但**数据/SQL 题的骨架必须吃 DB 观察面**
+        # （curriculum_auto.db_observation 实查的表/列/真实取值）—— 否则 Maieutic
+        # 会对着 payroll.duckdb 凭空编出「时薪/加班费/税率」等库里根本不存在的业务
+        # 参数（全 unreachable，永远闭合不了）。maieutic_scaffold 已改为：场景有
+        # db_path 时把 db_observation 喂给 LLM 并加「只指向真实表/列、不许编参数」
+        # 的硬约束。这样拆出的维度每个都有 DB 操作落点，交给 Voyager 的 SQL 执行层
+        # 逐个 solv、闭合、落原子技能，全闭合即里程碑。vlml（use_vlml）仍走自己的
+        # 单解分支，不进维度循环。
         _use_scaffold = bool(is_local) or (bool(db_path) and not use_vlml)
     except Exception:
         _use_scaffold = bool(is_local)

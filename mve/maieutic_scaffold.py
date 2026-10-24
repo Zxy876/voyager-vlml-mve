@@ -93,15 +93,35 @@ SCAFFOLD_SYSTEM = """你是一位擅长「产婆术」（Maieutic）的课程规
   "material_note": "<字符串或 null>"
 }"""
 
+# 数据/SQL 场景专属约束：Maieutic 拆出的维度必须有**真实的 DB 操作落点**，否则会
+# 凭空编出库里不存在的业务参数（实测：对着 payroll.duckdb 编出「时薪/加班费/税率」
+# 全 unreachable）。这条指令只在场景有 db_path 时追加到 system 后面。
+SCAFFOLD_SYSTEM_DB = """
+
+【数据 / SQL 场景专属约束 —— 必须严格遵守】
+这道问题发生在一个**真实数据库**里，下面的「数据库结构」列出了实际存在的表和列，
+以及关键列的真实取值。你拆维度时：
+- 每条维度都必须是能用**一条 SQL 查询直接回答**的具体问题，且明确指向下面真实
+  存在的表/列（如「技术部在职员工的 base_salary 合计是多少」）；
+- **只引用清单里实际存在的表名和列名**，绝不许编造表或列；
+- **绝对不许**发明数据库里不存在的业务参数（如时薪、加班费率、税率、缺勤扣款、
+  计件单价等）——如果某条维度需要这类参数而清单里没有对应列，**就不要出这条维度**；
+- 聚合类问题（如「某部门某月应发工资」）应拆成「筛选目标人群」「取工资基数」
+  「取补贴/津贴」「求和」这类指向真实列的**原子维度**，不要枚举单个实体
+  （如"Get salary of Zhou Lin"），也不要把整道大题当成一条维度。"""
+
 
 def _default_llm(messages: list[dict[str, str]]) -> str:
     from llm_client import chat
     return chat(messages, temperature=0.3, max_tokens=1200)
 
 
-def _cache_path(scene_id: str, question: str) -> Path:
+def _cache_path(scene_id: str, question: str, db_path: str = "") -> Path:
     h = hashlib.md5(str(question or "").strip().encode("utf-8")).hexdigest()[:12]
-    return CKPT / str(scene_id or "A") / f"{h}.json"
+    # db_path 进缓存键：场景换了库 / 首次加 schema 观察面，旧骨架（可能编了不存在
+    # 的参数）不能继续命中，必须重拆。知识型场景 db_path="" 不影响旧键。
+    dh = hashlib.md5(str(db_path or "").encode("utf-8")).hexdigest()[:8]
+    return CKPT / str(scene_id or "A") / f"{h}_{dh}.json"
 
 
 def _parse(text: str) -> dict[str, Any]:
@@ -175,11 +195,24 @@ def render_material(question: str, scene_id: str, *, extras: str = "") -> str:
         pass
     if extras:
         lines.append(str(extras))
+    # 数据/SQL 场景：把**真实 DB 观察面**也喂进去，让骨架只拆出有落点的维度
+    # （避免编出库里不存在的业务参数）。场景没有库时 db_path 为空，这一段不触发。
+    try:
+        import scene_profile as _sp
+        _dp = str((_sp.profile(scene_id) or {}).get("db_path") or "")
+        if _dp:
+            from curriculum_auto import db_observation
+            _obs = db_observation(_dp)
+            if _obs:
+                lines.append("数据库结构（实查，只列真实存在的表/列/取值，"
+                             "维度只能指向这里面的表/列）：\n" + _obs)
+    except Exception:
+        pass
     return "\n".join(lines)
 
 
 def scaffold(question: str, scene_id: str = "A", *, llm: Callable | None = None,
-             use_cache: bool = True, extras: str = "") -> dict[str, Any]:
+             use_cache: bool = True, extras: str = "", db_path: str = "") -> dict[str, Any]:
     """生成一份追问骨架。
 
     返回：
@@ -196,7 +229,15 @@ def scaffold(question: str, scene_id: str = "A", *, llm: Callable | None = None,
     if not q:
         out["reason"] = "空问题"
         return out
-    path = _cache_path(scene_id, q)
+    # 场景自带库时，把 db_path 算出来：① 决定要不要追加数据场景专属约束；
+    # ② 进缓存键，避免换了库/首次加观察面时命中旧的（可能编了不存在参数的）骨架。
+    if not db_path:
+        try:
+            import scene_profile as _sp
+            db_path = str((_sp.profile(scene_id) or {}).get("db_path") or "")
+        except Exception:
+            db_path = ""
+    path = _cache_path(scene_id, q, db_path)
     if use_cache and path.exists():
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -209,7 +250,8 @@ def scaffold(question: str, scene_id: str = "A", *, llm: Callable | None = None,
                         "origin": "cache", "reason": ""}
         except Exception:
             pass
-    messages = [{"role": "system", "content": SCAFFOLD_SYSTEM},
+    system_content = SCAFFOLD_SYSTEM + (SCAFFOLD_SYSTEM_DB if db_path else "")
+    messages = [{"role": "system", "content": system_content},
                 {"role": "user", "content": render_material(q, scene_id, extras=extras)
                  + "\n\n请产出追问骨架，只输出 JSON。"}]
     try:
@@ -250,7 +292,13 @@ def milestone_state(scene_id: str, question: str,
     """
     res = scaffold_result
     if res is None or not (res.get("dimensions") or []):
-        res = scaffold(str(question or ""), str(scene_id or "A"))
+        _dp = ""
+        try:
+            import scene_profile as _sp
+            _dp = str((_sp.profile(str(scene_id or "A")) or {}).get("db_path") or "")
+        except Exception:
+            _dp = ""
+        res = scaffold(str(question or ""), str(scene_id or "A"), db_path=_dp)
     dims = [d for d in (res.get("dimensions") or [])
             if str(d.get("id") or "").strip()]
     total = len(dims)
