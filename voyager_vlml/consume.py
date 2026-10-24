@@ -1887,6 +1887,44 @@ def _looks_like_recipe(code: str) -> bool:
     return bool(_RECIPE_CALL.search(str(code or "")))
 
 
+def _sql_literal_guard(sql: str, db_path: str) -> str:
+    """SQL 配方入库前的确定性守卫：字符串字面量必须能在 db_observation 实查
+    清单里指认。返回拒绝原因；'' = 通过。
+
+    原版同构（2026-10-24 落地的环境观察三方共用）：critic 的判据是「任务假设
+    的表/列/业务参数必须能在观察里指认」。这里把其中**确定性可查**的部分做成
+    代码闸门 —— 实测（Scene B 工资题 10:01）合成配方把 kind 写成 'food'/
+    'transportation'（真实取值是 餐补/交通），学习侧判定放行、坏配方入库、
+    复用即答 243320.83。LLM 判官有残余随机性，字面量对不对不该赌它。
+    费率公式类幻觉（base/8）无法确定性证伪，仍靠判官（MVE_CRITIC_MODEL）。
+    """
+    if not str(sql or "").strip() or not str(db_path or "").strip():
+        return ""
+    try:
+        from curriculum_auto import db_observation
+        obs = str(db_observation(db_path) or "")
+    except Exception:
+        return ""                      # 实查不了 → 如实放行（判官仍在把关）
+    if not obs:
+        return ""
+    lits = re.findall(r"'([^']*)'", str(sql))
+    # 去掉字面量后的 SQL 正文：字面量若兼作标识符/函数参数名（如
+    # date_trunc('month', month)），裸词仍出现 → 不算幻觉。
+    bare = re.sub(r"'[^']*'", " ", str(sql)).lower()
+    for lit in lits:
+        t = lit.strip()
+        if (not t or len(t) < 2 or "%" in t
+                or t.lower() in ("true", "false", "null")):
+            continue
+        if t in obs or t.lower() in obs.lower():
+            continue
+        if t.lower() in bare:
+            continue
+        return (f"SQL 字面量 '{t}' 在数据源实查清单里指认不了"
+                f"（库里没有这个取值）—— 大概率是幻觉取值，拒绝入库")
+    return ""
+
+
 def _absorb(question: str, sql: str, topic_id: str,
             *, scene_id: str = "", answer: str = "",
             used_keys: list[str] | None = None) -> dict[str, Any]:
@@ -1984,6 +2022,19 @@ def _absorb(question: str, sql: str, topic_id: str,
         out["skill_action"] = ("知识型答案（代码里没有任何取数动作，不是配方，"
                                "不写技能库）")
         return out
+    # 入库前确定性守卫（2026-10-24 工资题事故后加）：SQL 字面量取值必须能在
+    # 数据源实查清单里指认 —— 'food'/'transportation' 类幻觉从此进不了库。
+    # 学习侧与消费侧入库都走 _absorb，这道闸天然两端同享。
+    try:
+        from scene_profile import profile as _sp
+        _dbp = str((_sp(_scene_id) or {}).get("db_path") or "")
+        _guard_why = _sql_literal_guard(str(sql), _dbp)
+        if _guard_why:
+            out["skill_action"] = f"拒绝入库：{_guard_why}"
+            print(f"  · {_guard_why}")
+            return out
+    except Exception:  # pragma: no cover
+        pass  # 守卫自身故障不拦入库（LLM 判官仍在）
     try:
         import skill_store
         # 记账对象只能是**这次真的用上的那条**（used_keys）。旧实现按
