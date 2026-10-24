@@ -68,6 +68,10 @@ _SYSTEM = """你是 Voyager 的 critic：评估一个助手有没有完成给定
     答案切题、有依据、不自相矛盾、不编造具体数字/来源 → success=true；
     空话套话、答非所问、编造事实 → success=false 并指出缺什么。
 - 只看任务目标，不看代码写得漂不漂亮。
+- **答案对数**（原版 critic.txt 的例题口径：拿背包里 `'oak_log':2` 对照
+  "Mine 3 wood logs"）：答案里的每个具体数字都必须能从「观察」里的**真实
+  行值**指认或算出来；对不上、指认不了 → success=false，并在 critique 里
+  指出差在哪。
 - 有「必须回答的维度清单」时（Maieutic spec gate），判定由 `maieutic_gate`
   单独做（只核清单 + 带追问），本模块不重复判一遍 —— 别让 critic 又判质量
   又判清单。
@@ -78,8 +82,19 @@ reasoning / critique 一律用中文写。
 """
 
 
-def _evidence_text(result: dict[str, Any], limit: int = 1600) -> str:
-    """把一轮学习结果渲染成原版那种"观察"文本（含答案，知识型任务靠它判）。"""
+def _evidence_text(result: dict[str, Any], limit: int = 2600) -> str:
+    """把一轮学习结果渲染成原版那种"观察"文本（含答案，知识型任务靠它判）。
+
+    原版防幻觉的核心（voyager_original/voyager/agents/critic.py:30-80）：
+    判官看到的是**环境真实末态**——背包里每个物品的真实数量
+    （critic.txt 例题就是拿 `{'oak_log':2}` 对照 "Mine 3 wood logs"），
+    而不是执行者的转述。SQL 同构 = 取回的**真实行值**。
+    2026-10-24 取证：这里原来只给调用计数 + obs 截断 JSON，判官看不到行值，
+    只能凭叙事合理性猜 —— glm-4-plus 漏放 2 条错配方的残余随机性正是从
+    这里来的（内层 VLMLCriticAgent 一直有行：agents/critic.py:194）。
+    修法：每个观察渲染真实行（复用 _render_rows）+ 明示报错（原版
+    critic.py:42-45 onError 对判官可见的同构）。
+    """
     ex = result.get("execution") or {}
     lines: list[str] = []
     lines.append(f"执行后端: {result.get('execution_backend') or (result.get('backend') or {}).get('kind') or '未知'}")
@@ -93,11 +108,24 @@ def _evidence_text(result: dict[str, Any], limit: int = 1600) -> str:
     ans = str(result.get("answer") or "").strip()
     if ans:
         lines.append("最终答案（RESULT）:\n" + ans[:800])
-    # 观察明细（每轮返回什么、调了哪个数据源）—— 知识型任务没有数据源，
-    # 但也要让 critic 看见模型到底交了什么。
+    # 观察明细：每轮调了哪个数据源、返回的**真实行值**、报了什么错。
+    # 知识型任务没有数据源，但也要让 critic 看见模型到底交了什么。
     obs = result.get("observations") or []
     if obs:
-        lines.append("各轮观察: " + json.dumps(obs[-3:], ensure_ascii=False)[:600])
+        try:
+            from voyager_vlml.agents.action import _render_rows as _rr
+        except Exception:
+            def _rr(data: Any, max_rows: int = 4, max_cols: int = 12) -> str:
+                return json.dumps(data, ensure_ascii=False)[:400]
+        for i, o in enumerate(obs[-3:]):
+            ok = bool(o.get("ok"))
+            lines.append(f"观察{i+1}: tool={o.get('tool') or '未知'} ok={ok} rows={o.get('rows')}")
+            if ok and o.get("data") is not None:
+                lines.append(_rr(o.get("data"), max_rows=4))
+            elif not ok:
+                lines.append("报错: " + str(o.get("error") or "调用失败")[:150])
+    else:
+        lines.append("各轮观察: （无）")
     ab = result.get("absorbed") or {}
     if ab:
         lines.append(f"入库: topic={ab.get('topic_id')} mastered={ab.get('mastered')}")
