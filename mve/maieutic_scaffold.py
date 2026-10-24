@@ -358,13 +358,24 @@ def load_progress(scene_id: str, question: str) -> set[str]:
 
 
 def save_progress(scene_id: str, question: str, learned_ids: list[str]) -> None:
-    """写维度学习进度（断点续学用；失败静默 —— 进度丢了顶多重学）。"""
+    """写维度学习进度（断点续学用；失败静默 —— 进度丢了顶多重学）。
+
+    ⚠️ 必须是**并集累加**，不是覆盖：逐维度闭合时每个维度一次 start_learning
+    只把「这一条」传进来，若直接覆盖会把上一条已闭合的维度洗掉（实测：preset
+    路径下缓存进度恒只剩最后闭合的那一条，里程碑永远翻不到 achieved）。与
+    priorIterations / codes 的合并口径一致。
+    """
     path = _cache_path(scene_id, question)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return
-    data["progress"] = {"learned": [str(x) for x in learned_ids],
+    _prev = set(str(x) for x in
+                (data.get("progress") or {}).get("learned") or [])
+    _new = set(str(x) for x in learned_ids)
+    if _new <= _prev:        # 没有新增，不必重写
+        return
+    data["progress"] = {"learned": sorted(_prev | _new),
                         "updated": __import__("time").time()}
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
