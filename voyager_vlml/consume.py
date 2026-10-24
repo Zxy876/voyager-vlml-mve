@@ -254,6 +254,13 @@ _REFILL_SYSTEM = """你是 Valorant 电竞数据分析师。你手里有**以前
    **不是**它上次算出来的数值 —— 数值必须重新算。
 2. 把**当前这句话里的实体值**（队伍名 / 图名 / 赛事 / 选手）填进配方对应的位置。
    配方里写死的字面量要换成当前这句话指的那个值。
+   ⚠️ 原版同构铁律（2026-10-24 实测 10:56 事故后立）：原版 action agent 写代码
+   前，环境观察（nearbyBlocks）里只有**真实存在的方块名** —— 它写不出观察里
+   没有的实体。这里同理：SQL 里的筛选字面量（部门/月份/队伍/图名…）必须
+   **逐字**取自下面环境观察的「真实取值」清单；问句里的口语说法（"九月份"、
+   "技术部"）必须映射成清单里逐字存在的值（如 '2026-09'、'技术'）。
+   清单里没有的写法一律不许出现在 SQL 里 —— 实测把 'September'/'技术部'
+   填进槽位，LEFT JOIN 匹配不上，SUM 出 1 行 NULL，技能"命中却答不出"。
 3. 当前这句话没给实体（比如问"哪支队伍最高"）→ 保留配方的分组结构，别自己造一个值。
 4. 配方可能是**槽位模板**（入库时泛化过的）：`:dept`、`:month` 这种占位符，
    配方头部注释逐个说明了每个槽位该填什么 —— 把每个槽位换成当前这句话指的值，
@@ -264,19 +271,36 @@ _REFILL_SYSTEM = """你是 Valorant 电竞数据分析师。你手里有**以前
 "note": "一句话说明你复用了配方的哪部分、把什么值填了进去（没复用就说明为什么用不上）"}"""
 
 
-def _refill_sql(question: str, skills: list[dict[str, Any]], schema: str) -> dict[str, Any]:
-    """让模型把配方改造成当前这句话的取数 SQL（回填 = 改造计算，不是抄数值）。"""
+def _refill_sql(question: str, skills: list[dict[str, Any]], schema: str,
+                db_path: str = "") -> dict[str, Any]:
+    """让模型把配方改造成当前这句话的取数 SQL（回填 = 改造计算，不是抄数值）。
+
+    db_path 非空时把 db_observation（表/行数/列/**真实取值**）一并给模型 ——
+    原版同构：action agent 写代码前的环境观察就是实体值的地面真话，实体值
+    不许凭问句原文脑补（2026-10-24 实测 'September'/'技术部' 幻觉回填）。
+    """
     recipes = "\n\n".join(
         f"【配方 {i+1}｜topic={s.get('topic')}｜{s.get('name') or ''}】\n"
         f"说明：{str(s.get('text') or '')[:200]}\n"
         f"SQL：\n{str(s.get('code') or '')[:900]}"
         for i, s in enumerate(skills[:5])
     )
+    # 环境观察（原版「写代码前先看环境」的同构物）：筛选字面量的地面真话。
+    ground = ""
+    if str(db_path or "").strip():
+        try:
+            from curriculum_auto import db_observation as _dbobs
+            ground = str(_dbobs(db_path) or "")
+        except Exception:
+            ground = ""
     user = (
         f"当前这句话：\n{question}\n\n"
         f"已学会的配方：\n{recipes}\n\n"
         f"当前库真实存在的表与列（只能引用这里出现的名字）：\n{schema[:6000]}\n\n"
-        "按规则产出回答这句话的 SELECT。"
+        + (f"[环境观察（数据源真实的取值）——筛选字面量必须逐字取自这里，"
+           f"清单里没有的写法不许出现在 SQL 里]：\n{ground[:5000]}\n\n"
+           if ground else "")
+        + "按规则产出回答这句话的 SELECT。"
     )
     out = chat_json(
         [
@@ -841,21 +865,32 @@ async def consume(
             except Exception:
                 _schema = ""
             if skills:
-                _r = _refill_sql(question, skills, _schema)
+                _r = _refill_sql(question, skills, _schema,
+                                 db_path=str((_prof or {}).get("db_path") or ""))
                 if _r["reused"] and _r["sql"]:
-                    _rr = await _env.run_sql(_r["sql"])
-                    _d = _rr.get("data") or {}
-                    if _rr.get("ok") and _d.get("rows"):
-                        data, code = _d, _r["sql"]
-                        reused_skill = {**dict(skills[0]),
-                                        "refill_note": _r["note"]}
-                        obs = [{"ok": True, "tool": "query_sql",
-                                "rows": _rr.get("rows"), "data": _d,
-                                "data_sources": ["query_sql"]}]
-                    else:
+                    # 原版同构（2026-10-24 用户定「一定要搬原 voyager」）：回填
+                    # 出的 SQL 与入库配方过**同一把确定性守卫** —— 字面量必须能在
+                    # 环境实查里指认。守卫拒用 → 这条配方当失败，落到 ③b 现场
+                    # 写（原版：坏代码执行失败，下一轮 action agent 重写）。
+                    _gwhy = _sql_literal_guard(
+                        _r["sql"], str((_prof or {}).get("db_path") or ""))
+                    if _gwhy:
                         reuse_errors.append(
-                            "配方回填后没取到真数："
-                            f"{str(_rr.get('error') or '0 行')[:120]}")
+                            f"配方回填被字面量守卫拒用（幻觉取值）：{_gwhy[:140]}")
+                    else:
+                        _rr = await _env.run_sql(_r["sql"])
+                        _d = _rr.get("data") or {}
+                        if _rr.get("ok") and _d.get("rows"):
+                            data, code = _d, _r["sql"]
+                            reused_skill = {**dict(skills[0]),
+                                            "refill_note": _r["note"]}
+                            obs = [{"ok": True, "tool": "query_sql",
+                                    "rows": _rr.get("rows"), "data": _d,
+                                    "data_sources": ["query_sql"]}]
+                        else:
+                            reuse_errors.append(
+                                "配方回填后没取到真数："
+                                f"{str(_rr.get('error') or '0 行')[:120]}")
                 else:
                     reuse_errors.append(
                         f"配方与这句话对不上，没复用：{str(_r['note'])[:120]}")
@@ -1155,12 +1190,19 @@ async def consume(
     observations: list[dict[str, Any]] = []
     sql, reused, note = "", False, ""
     if skills:
-        r = _refill_sql(question, skills, schema)
+        import db_switch as _dbs_r
+        _def_db = str(getattr(_dbs_r, "DEFAULT_DB", "") or "")
+        r = _refill_sql(question, skills, schema, db_path=_def_db)
         # 模型自己判定"配方算的量与这句话问的不是同一个量" → **不执行它**，
         # 直接现场写。宁可现做，也不许拿一个张冠李戴的 SQL 去取数。
-        if r["reused"] and r["sql"]:
+        # 回填产物同样过字面量守卫（与场景分支同一把尺子，2026-10-24）。
+        _gwhy = _sql_literal_guard(r["sql"], _def_db) if (r["reused"] and r["sql"]) else ""
+        if r["reused"] and r["sql"] and not _gwhy:
             sql, reused, note = r["sql"], True, r["note"]
             observations.append(await env.run_sql(sql))
+        elif _gwhy:
+            note = f"配方回填被字面量守卫拒用：{_gwhy}"
+            print(f"  （{note[:100]}）→ 降级现场写")
         else:
             note = r["note"] or "（配方与这句话问的不是同一个量）"
             print(f"  （未复用配方：{note[:100]}）")
