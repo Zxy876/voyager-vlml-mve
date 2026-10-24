@@ -108,15 +108,25 @@ class SceneDBEnv:
 
     async def schema_block(self, max_cols: int = 20,
                            max_tables: int = 40) -> str:
-        """表 → 列（+ 行数），实查该场景库。形状照 VLMLMCPEnv.schema_block。"""
+        """表 → 列（+ 行数 + 低基数列真实取值），实查该场景库。形状照
+        VLMLMCPEnv.schema_block。
+
+        ⚠️ 必须带**真实取值**：执行层照这个写 SQL，光给列名它会猜字面量
+        （实测编出 dept='技术部'、month='2023-09'，而库里是 '技术'/'2026-09'，
+        整条 SQL 落空）。低基数字符串/布尔列把实查 distinct 值列出来，模型才
+        写得对字面量 —— 与 curriculum_auto.db_observation 同一把尺子。
+        """
         try:
             rows = await asyncio.to_thread(self._schema_rows)
         except Exception:
             return ""
         cols: dict[str, list[str]] = {}
+        types: dict[str, str] = {}
         for r in rows:
-            if len(r) >= 2:
-                cols.setdefault(str(r[0]), []).append(str(r[1]))
+            if len(r) >= 3:
+                t, c, dt = str(r[0]), str(r[1]), str(r[2]).upper()
+                cols.setdefault(t, []).append(c)
+                types[f"{t}.{c}"] = dt
         if not cols:
             return ""
         counts: dict[str, int] = {}
@@ -134,4 +144,21 @@ class SceneDBEnv:
             head = f"- {t}（{n} 行）" + ("：⚠️ 空表，别查它" if n == 0 else "")
             lines.append(head + "：" + "，".join(cs[:max_cols])
                          + ("…" if len(cs) > max_cols else ""))
+            # 低基数字符串/布尔列：把实查 distinct 值列出来，模型照着写字面量
+            # （dept 取值是「技术」不是「技术部」，month 是「2026-09」不是「2023-09」）。
+            for c in cs[:max_cols]:
+                dt = types.get(f"{t}.{c}", "")
+                if dt not in ("VARCHAR", "TEXT", "STRING", "BOOLEAN"):
+                    continue
+                try:
+                    data = await self.run_sql(
+                        f'SELECT DISTINCT "{c}" FROM "{t}" LIMIT 13')
+                    flat = [r[0] for r in ((data.get("data") or {}).get("rows") or [])
+                            if r and r[0] is not None]
+                    if flat and len(flat) <= 12:
+                        lines.append(
+                            f"    · {t}.{c} 真实取值: "
+                            + "、".join(str(x) for x in flat))
+                except Exception:
+                    pass
         return "\n".join(lines)
