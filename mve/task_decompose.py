@@ -395,8 +395,25 @@ def plan(task: str, scene_id: str, *, llm: Callable | None = None,
         dec = decompose(task, scene_id, llm=llm)
     subtasks: list[dict[str, Any]] = []
     counts = {"reachable": 0, "gap": 0, "unreachable": 0}
+    # 数据/SQL 场景的 Maieutic 维度：scaffold 的 SCAFFOLD_SYSTEM_DB 硬约束已保证
+    # 每条维度都指向**真实表/列**（有 DB 操作落点），可直接用场景库跑 SQL 取数。
+    # 这种维度再走英文表名撞中文维度词面的 reachability() 必然全判 unreachable
+    # （"员工/技术部" 2-gram 永远撞不上 employees/allowance），把学习主循环挡在
+    # 门外（learn_orchestrate.py:516 硬不可达短路）→ 用户实测"里程碑学不成"。
+    # 所以这里直接判定可达、落点为场景库可查（grab = query_sql），让执行层进 SQL。
+    # 这是同构原版口径：原版子目标"附近有可挖的方块"才进 execute；这里"场景库
+    # 里有这张表"就等价于"附近有方块"，而 scaffold 已先验过维度都落在这张库上。
+    _scaffold_db = bool(scaffold) and bool(db_path)
     for i, need in enumerate(dec["subgoals"], start=1):
-        r = reachability(need, scene_id, db_path=db_path)
+        if _scaffold_db:
+            from pathlib import Path as _Path
+            r = {"need": need, "status": "reachable",
+                 "grab": {"name": "query_sql",
+                          "description": f"查场景库 {_Path(db_path).name}（只读）"},
+                 "score": 1.0,
+                 "why": "数据题维度（Maieutic 拆出、已落真实表/列）→ 场景库可查"}
+        else:
+            r = reachability(need, scene_id, db_path=db_path)
         counts[r["status"]] = counts.get(r["status"], 0) + 1
         subtasks.append({"seq": i, "need": need, **r})
     return {**dec, "subtasks": subtasks, "counts": counts, **extra}

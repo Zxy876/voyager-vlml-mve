@@ -636,6 +636,18 @@ async def _start_learning_impl(
                             focus.append(t)
             except Exception:
                 focus = []
+            # 数据/SQL 的 Maieutic 维度：中文维度词面撞不上英文表名 → related_tables
+            # 恒空，focus 全空，执行层没了点名的表（只能靠 schema_block 瞎挑）。
+            # 但 scaffold 已先验过维度都落在这张库上，所以直接把**本库全部表**
+            # 列为候选焦点表（场景隔离：只列本场景库的表，不借 rib）。3 张小库
+            # 全给也不算噪，反能防止它挑错表编字面量。
+            if not focus and _use_scaffold and db_path:
+                try:
+                    import db_switch
+                    _all = db_switch.list_tables(db_path) or []
+                    focus = [t for t in _all if t not in focus][:10]
+                except Exception:
+                    focus = []
             out["focus_tables"] = focus[:10]
             _answer_override = ""
             # 题目上下文（口径说明：哪张表、字面量用哪个真实值）随维度进去——
