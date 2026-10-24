@@ -99,6 +99,17 @@ def _load() -> dict[str, Any]:
     try:
         data = json.loads(REGISTRY.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
+        # ⚠️ 损坏不许静默自愈成空表（2026-10-24 09:08 实测事故）：并发写曾把
+        #   登记表截断，下一个读者走到这里就把十几个场景「修」成了只剩 A，
+        #   面板上全部场景消失且无任何痕迹。先把坏文件挪走留证，再重建。
+        import os as _os
+        _bad = REGISTRY.with_name(
+            REGISTRY.name + f".corrupt-{time.strftime('%Y%m%d_%H%M%S')}")
+        try:
+            _os.replace(REGISTRY, _bad)
+            print(f"[scenes] 登记表损坏，已留证：{_bad}")
+        except OSError:
+            pass
         data = _empty()
         _save(data)
         return data
@@ -119,8 +130,14 @@ def _load() -> dict[str, Any]:
 
 
 def _save(data: dict[str, Any]) -> None:
-    REGISTRY.write_text(
+    # 原子写（2026-10-24 事故修复）：write_text 非原子，面板线程 + pilot/
+    # scene_learn 子进程并发写时可能互相截断，下一个读者就会把整张登记表
+    # 自愈成只剩 A。tmp + os.replace 保证读者看到的要么是旧完整版要么是新完整版。
+    import os as _os
+    tmp = REGISTRY.with_name(REGISTRY.name + ".tmp")
+    tmp.write_text(
         json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    _os.replace(tmp, REGISTRY)
 
 
 # ---------------- 注册表查询 ----------------
