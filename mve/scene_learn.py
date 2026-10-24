@@ -215,15 +215,19 @@ def _log_learning_detail(r: dict[str, Any]) -> None:
 
 
 def _run_one(q: str, scene: str, *, context: str = "",
-             max_retries: int = 4, critique: str = "") -> dict[str, Any]:
-    """一次 rollout（原版 voyager.py:298-301）+ 内层重试（voyager.py:214-295）。
+             max_retries: int = 1, critique: str = "") -> dict[str, Any]:
+    """一次外层 rollout（原版 voyager.py:298-301，默认**只跑 1 次**）。
 
-    原版机制照抄：
-      · 单任务最多 `action_agent_task_max_retries=4` 次（voyager.py:30/:277-279）；
-      · 每次失败把 **critic 的 critique 拼进下一次**（:262-268）—— 迭代提示，
-        不是"同一段 prompt 重跑"；
-      · 4 次仍不过 → 任务进 failed_tasks，课程换下一个（curriculum.py:330-345
-        "Skipping to next task"），**不会原地无限重试**。
+    同构修正（2026-10-24）：原版每轮课程对每个任务只 rollout 一次
+    （voyager.py:326-330），任务内部的动作级 4 次重试
+    （action_agent_task_max_retries，voyager.py:30/:277-279）发生在**执行层
+    solve 的 4 步迭代**里 —— 之前这里默认 4 × 内层 4 = 16 次执行，是原版没有
+    的双层重试。默认改回 1；失败 → 进 failed 账换下一个任务
+    （curriculum.py:330-345 "Skipping to next task"），人导入题由主循环
+    沉底重试（那是 manual 语义，见下方主循环注释）。
+
+    每次失败把 critic 的 critique 拼进下一次（:262-268 迭代提示）——
+    本函数保留该机制，供 max_retries>1 的显式调用方使用。
     """
     _log(f"\n----- 场景学习 · Scene {scene} · {q} -----")
     critique = str(critique or "")   # 重试题带入上次的失败评语（迭代提示初值）
@@ -278,8 +282,12 @@ def main() -> int:
     ap.add_argument("--curriculum", choices=["auto", "queue"], default="auto",
                     help="auto=原版 Voyager 行为（人导入的题优先，队列空了自动出题，"
                          "不停；默认）；queue=只学人导入的题，队列空就退。")
-    ap.add_argument("--max-retries", type=int, default=4,
-                    help="单任务最多重试几次（原版 action_agent_task_max_retries=4）")
+    ap.add_argument("--max-retries", type=int, default=1,
+                    help="外层 rollout 次数，默认 1（原版 voyager.py:326-330 每轮"
+                         "只 rollout 一次，判不过 → 进 failed 换下一个任务）；"
+                         "单任务内部的 4 步迭代在执行层 solve 里"
+                         "（对应原版 action_agent_task_max_retries=4，"
+                         "voyager.py:30/:277-279），两层各管各的，不再相乘。")
     ap.add_argument("--max-iterations", type=int, default=160,
                     help="最多学多少个任务（原版 max_iterations=160）")
     args = ap.parse_args()
@@ -371,6 +379,18 @@ def main() -> int:
                 _log(f"[场景学习] 「{task[:36]}」上次失败过（沉底重试），"
                      f"带着上次的评语重学：{retry_critique[:120]}")
         iteration += 1
+        # QA 攻略层（原版 voyager.py:419-424 的同构：rollout 前先
+        # get_task_context(task)，qa_llm 出的 tips 拼进 context）。
+        # 失败返回空串照常跑 —— 攻略层挂掉不能拦住学习。
+        try:
+            qa_ctx = cur.get_task_context(task)
+        except Exception as e:
+            qa_ctx = ""
+            _log(f"[场景学习] QA 攻略层失败（照常继续）：{type(e).__name__}: {e}")
+        if qa_ctx:
+            _log("[场景学习] 攻略 tips 已注入 context（qa agent）：\n"
+                 + qa_ctx[:400])
+            context = "；".join(x for x in (context, qa_ctx) if x)
         info = _run_one(task, scene, context=context, max_retries=max_retries,
                         critique=retry_critique)
         # 原版 curriculum.update_exploration_progress：成功进 completed、失败进 failed

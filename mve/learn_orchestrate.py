@@ -954,6 +954,21 @@ async def _start_learning_impl(
                     question, skills=skills, grabs=grabs, focus_tables=focus,
                     hints=_hint_ctx
                     + [str(s.get("need") or "") for s in plan["subtasks"]])
+                # 唯一 critic（2026-10-24 同构化）：solve 内层每步的判定（口径=
+                # 原版 critic.txt + 环境实查，见 VLMLActionAgent.critic_check）
+                # 就是原版 rollout 的 critic —— 这里把最后一步的判定/判词带出，
+                # ⑤' 直接采用，外层不再让 task_critic 重判一遍（双 critic 偏离）。
+                if getattr(agent, "last_success", None) is not None:
+                    _ic = getattr(agent, "critic", None)
+                    out["inner_critic"] = {
+                        "success": bool(agent.last_success),
+                        "critique": str(getattr(_ic, "last_critique", "") or ""),
+                        "reasoning": str(getattr(agent, "critic_reasoning", "") or ""),
+                    }
+                    if agent.last_success and agent.critic_reasoning \
+                            and not str(out.get("answer") or "").strip():
+                        # 原版：critic 的 reasoning 就是结论句（answer）
+                        out["answer"] = agent.critic_reasoning
             # 执行环境自报数据来源：SceneDBEnv / VLMLMCPEnv 都有 data_source()，
             # 但它们的观察里**不带** data_sources（那是 local_agent 的 MCP 工具才
             # 填的字段）→ 于是真取到数也会算成 real_calls=0 / evidence=knowledge，
@@ -1060,32 +1075,44 @@ async def _start_learning_impl(
                                       "questions": [str(f.get("critique") or "")
                                                     for f in _failed]}}
         else:
-            try:
-                import task_critic
-                # 原版同构（2026-10-24 用户定「用原 voyager 看环境的方法来抄」）：
-                # 原版 critic 看到的是**环境末态**（背包/附近方块），所以能验证
-                # "挖到铁矿" —— 观察里看得见。SQL 场景的同构物 = 库的实查清单
-                # （表/列/真实取值）随 context 交给 critic：任务假设的表/列/业务
-                # 参数（费率/汇率…）必须能在这份清单里指认，指认不了 = 不可答，
-                # 不许把编造的参数当已验证（实测 150 元费率幻觉就是这样放行的）。
-                _ctx = str(context or "")
+            # 唯一 critic（2026-10-24 同构化）：执行层走了 solve（scene/vlml
+            # 后端）时，内层每步判定就是原版 rollout 的 critic —— 外层不再让
+            # task_critic 重判一遍（双 critic 偏离已修）。没有内层判定的后端
+            # （local_agent 写代码路径）才落到 task_critic。
+            inner = out.get("inner_critic") or {}
+            if "success" in inner:
+                _ok = bool(inner.get("success"))
+                _crit = str(inner.get("critique") or "")
+                out["critic"] = {"success": _ok, "critique": _crit,
+                                 "gate": out.get("critic_gate") or {},
+                                 "origin": "inner"}
+            else:
                 try:
-                    if str(db_path or "").strip():
-                        from curriculum_auto import db_observation as _dbobs
-                        _obs = _dbobs(db_path)
-                        if _obs:
-                            _ctx += ("\n\n[环境实查（数据源真实的表/列/取值）：任务"
-                                     "假设的任何表、列、业务参数（费率/汇率/税率/"
-                                     "政策数值…）都必须能在这里指认；指认不了的 = "
-                                     "任务在数据源上不可答，判未完成，并明说缺什么]：\n"
-                                     + _obs)
-                except Exception:
-                    pass
-                _ok, _crit = task_critic.check_task_success(question, _ctx, out)
-            except Exception as e:
-                _ok, _crit = bool(real), f"critic 异常：{type(e).__name__}: {e}"
-            out["critic"] = {"success": bool(_ok), "critique": str(_crit or ""),
-                             "gate": out.get("critic_gate") or {}}
+                    import task_critic
+                    # 原版同构（2026-10-24 用户定「用原 voyager 看环境的方法来抄」）：
+                    # 原版 critic 看到的是**环境末态**（背包/附近方块），所以能验证
+                    # "挖到铁矿" —— 观察里看得见。SQL 场景的同构物 = 库的实查清单
+                    # （表/列/真实取值）随 context 交给 critic：任务假设的表/列/业务
+                    # 参数（费率/汇率…）必须能在这份清单里指认，指认不了 = 不可答，
+                    # 不许把编造的参数当已验证（实测 150 元费率幻觉就是这样放行的）。
+                    _ctx = str(context or "")
+                    try:
+                        if str(db_path or "").strip():
+                            from curriculum_auto import db_observation as _dbobs
+                            _obs = _dbobs(db_path)
+                            if _obs:
+                                _ctx += ("\n\n[环境实查（数据源真实的表/列/取值）：任务"
+                                         "假设的任何表、列、业务参数（费率/汇率/税率/"
+                                         "政策数值…）都必须能在这里指认；指认不了的 = "
+                                         "任务在数据源上不可答，判未完成，并明说缺什么]：\n"
+                                         + _obs)
+                    except Exception:
+                        pass
+                    _ok, _crit = task_critic.check_task_success(question, _ctx, out)
+                except Exception as e:
+                    _ok, _crit = bool(real), f"critic 异常：{type(e).__name__}: {e}"
+                out["critic"] = {"success": bool(_ok), "critique": str(_crit or ""),
+                                 "gate": out.get("critic_gate") or {}}
         if not _ok:
             out.update(status=(("partial" if (_dres or {}).get("learned")
                                 else "failed") if _dres is not None

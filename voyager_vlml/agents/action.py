@@ -461,15 +461,37 @@ class VLMLActionAgent:
 
         判据两级（见 `agents/critic.py`）：先「真的取到数」，再让 LLM 按原版语义
         判「任务要求满足了没有」（口径）。第二级的 reasoning 是结论句，存进 self.answer。
+
+        唯一 critic（2026-10-24 学习循环同构化）：原版一个 critic 判完即停、
+        判词回灌。MVE 原先内层判一次、外层 task_critic 又判一次（双 critic 偏离）
+        —— 现在把外层的强口径（环境实查清单：任务假设的表/列/取值必须能指认 +
+        答案对数）并档进这里，内层判定即唯一判定；外层只汇总不再重判。
         """
         if self.critic is None:
             from voyager_vlml.agents.critic import VLMLCriticAgent
 
             self.critic = VLMLCriticAgent()
+        _ctx = str(self.context or "")
+        try:
+            _dbp = (str(getattr(self.env, "db_path", "") or "")
+                    or str(getattr(self.env, "path", "") or ""))
+            if not _dbp:
+                import db_switch as _dbs
+                _dbp = str(getattr(_dbs, "DEFAULT_DB", "") or "")
+            if _dbp:
+                from curriculum_auto import db_observation as _dbobs
+                _obs = str(_dbobs(_dbp) or "")
+                if _obs:
+                    _ctx += ("\n\n[环境实查（数据源真实的表/列/取值）：SQL 与答案"
+                             "假设的任何表、列、取值都必须能在这里指认，指认不了"
+                             " = 编造，判未完成并明说缺什么；答案里的每个具体数"
+                             "字都必须能从取回数据指认或算出]：\n" + _obs)
+        except Exception:
+            pass  # 实查清单拿不到时退回原口径（真空闸仍在）
         d = self.critic.judge(
             observations=events,
             task={"task": self.task, "hints": self.hints},
-            context=self.context,
+            context=_ctx,
             sql=self.last_sql,
         )
         self.critic_reasoning = str(d.get("reasoning") or "")

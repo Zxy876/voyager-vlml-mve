@@ -441,6 +441,76 @@ class CurriculumAgent:
         return self.propose_next_ai_task(max_retries=max_retries - 1,
                                          _feedback=why)
 
+    # ---------- QA 攻略层（原版 curriculum.py:387-437 run_qa / get_task_context） ----------
+    _QA_SYSTEM = """你是执行前的攻略助手（原版 Voyager qa_llm 的同构）。
+任务马上要交给一个只能查本地 SQL 库 / 读本地文件 / 联网检索的助手去执行。
+你的职责：给 **几条简短的执行攻略（tips）**，帮它一次做对 —— 不是替它做，也不给完整 SQL。
+
+硬规则（2026-10-24 实测事故后钉死）：
+1. 只能引用下面「环境实查」里真实出现的表名、列名、取值；实查里没有的一律不许提；
+2. 数据源里不存在的业务参数（费率、汇率、税率、每单位价格、折算规则……）**绝对不许出现**
+   —— 之前有任务被建议"计算加班费(如有)"后，模型编造了"每小时 150 元"还入库成了技能；
+3. 主动提醒常见口径陷阱（如果与本任务相关）：INNER JOIN 会把匹配不上的行静默丢掉、
+   对「主表 + 每行都带同一金额」的表直接 SUM 会把金额乘出行数倍、NULL 会让 SUM/AVG 静默少算；
+4. 每条攻略一句话，总共 3~5 条，不给完整 SQL、不算具体数字。
+"""
+
+    def get_task_context(self, task: str) -> str:
+        """原版 voyager.py:419-424
+        `rollout(task=next_task, context=get_task_context(next_task))` 的同构：
+        执行前先让攻略 LLM 出 tips，拼进 rollout 的 context。
+
+        原版 qa_cache 用向量相似（阈值 0.05）做近似去重；这里课程账本里的任务
+        本来就是精确字符串（completed/failed 两本账都以原文为键），归一化后
+        **精确去重**即可，不引入向量依赖 —— 与原版的这一差异是刻意的。
+        LLM 挂 / 没有数据源 → 返回空串，调用方照常跑（攻略层挂掉不能拦住学习）。
+        """
+        task = str(task or "").strip()
+        if not task:
+            return ""
+        cache_path = self._dir / "qa_cache.json"
+        try:
+            cache = json.loads(cache_path.read_text("utf-8"))
+            if not isinstance(cache, dict):
+                cache = {}
+        except Exception:
+            cache = {}
+        key = _norm(task)
+        if key in cache:
+            return str(cache.get(key) or "")
+        # 攻略的地面真话 = 环境实查清单（同出题器/critic 三方共用的那一份）。
+        ground = ""
+        if self.db_path:
+            ground = self._db_observation()
+            if not ground:
+                return ""          # 库实查失败 → 没有地面真话就不出攻略（防编造）
+        user = ("[环境实查（数据源真实的表/列/取值）]：\n" + (ground or "（无 SQL 库；"
+                "任务可能由联网检索回答，攻略只谈方法不谈具体数据）")
+                + f"\n\n[即将执行的任务]：{task}\n\n请输出 3~5 条攻略。")
+        msgs = [{"role": "system", "content": self._QA_SYSTEM},
+                {"role": "user", "content": user}]
+        try:
+            if self._llm is not None:
+                text = str(self._llm(msgs) or "")
+            else:
+                from voyager_vlml.llm import chat
+                text = str(chat(msgs, temperature=0.0) or "")
+        except Exception:
+            return ""              # 攻略层失败如实返回空，不假装有攻略
+        tips = text.strip()
+        if not tips:
+            return ""
+        ctx = "执行前攻略（qa agent 的 tips，仅供参考；攻略里提到的表/取值以环境实查为准）：\n" + tips
+        # ⚠️ 原子写（2026-10-24 教训：并发/中断下的非原子写曾把 scenes.json 截断）。
+        try:
+            cache[key] = ctx
+            tmp = cache_path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(cache, ensure_ascii=False, indent=2), "utf-8")
+            tmp.replace(cache_path)
+        except Exception:
+            pass                   # 缓存写失败不影响本次（下次会重新生成）
+        return ctx
+
     @staticmethod
     def parse_ai_message(message: str) -> tuple[str, str]:
         """原版 :312-322：只认 `Task:` 行（原版还可见 `.replace(".", "")`）。"""
