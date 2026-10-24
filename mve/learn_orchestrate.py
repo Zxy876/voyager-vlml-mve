@@ -466,7 +466,14 @@ async def _start_learning_impl(
     # 拆出 "Get definition of X" 这种空壳（实测就 1 条）。
     try:
         import task_critic as _tc0
-        _use_scaffold = bool(is_local) and not _tc0.needs_data(question)
+        # 原版同构（2026-10-24 用户定「照原 voyager」）：复杂度拆解在**执行层对
+        # 每任务**做（知识型与数据型都用 Maieutic 骨架）。MVE 此前只给「本机+
+        # 知识型」开了拆解，场景自带库的数据题被短路成单题一锤子 SQL —— 这正是
+        # 「不会循序渐进补前置、里程碑学不成合理版本」的根。现在把场景自带库的
+        # 任务（知识型 + 数据型）也纳入：逐维度 solve（数据面挂 SceneDBEnv）
+        # → 每维度闭合写一条技能 → 全部闭合合成里程碑；消费侧从原子技能组合出
+        # 正确应发工资。vlml（use_vlml）仍走自己的单解分支，不进维度循环。
+        _use_scaffold = bool(is_local) or (bool(db_path) and not use_vlml)
     except Exception:
         _use_scaffold = bool(is_local)
     plan = task_decompose.plan(question, scene, llm=llm, db_path=db_path,
@@ -629,7 +636,12 @@ async def _start_learning_impl(
                 focus = []
             out["focus_tables"] = focus[:10]
             _answer_override = ""
-            if is_local:
+            # 题目上下文（口径说明：哪张表、字面量用哪个真实值）随维度进去——
+            # 原版 voyager.py:419-424 的 context 槽。场景数据题执行层据此写
+            # dept='技术' 而非常识的 '技术部'（2026-10-23 实测坑）。
+            _hint_ctx = [str(x).strip() for x in (str(context or ""), str(critique or ""))
+                         if str(x or "").strip()]
+            if _use_scaffold:
                 import local_agent
                 # 本机原语先注册成条目（origin=local / group=本机能力），
                 # 才谈得上被 `enabled_entries` 当抓手段交给执行层。
@@ -769,23 +781,22 @@ async def _start_learning_impl(
                             # ⚠️ 第二个返回值是**这一轮跑通的代码**（原版的
                             # `program_code`）。以前写成 `obs1, _ =`，代码直接丢
                             # 掉 → 知识型场景永远学不到技能（2026-10-20 定位）。
-                            obs1, code1 = await local_agent.solve(
-                                _q1, local_dir, llm=llm, scene_id=scene,
-                                avoid=_avoid, critique=str(crit1 or ""),
-                                evidence=_ev1,
-                                # 已学会的配方回注（原版 retrieve_skills →
-                                # system）：技能是新的 primitive，学会之后
-                                # 下一轮就更够得着 —— 可达是循环不是判定。
-                                skills=skills,
-                                # 学习环节：必须真的调数据源取证（原版 rollout
-                                # 必须调 primitive；凭记忆答不入库、不算学会）
-                                require_tools=True,
-                                # ⚠️ 致命点（2026-10-20 实测）：默认 30s 比**单次
-                                # MCP 调用的上限 60s**（local_agent.py:680
-                                # `cfut.result(timeout=60)`）还短 —— 工具还没
-                                # 回来就被判超时，4 次重试因此全部无效。
-                                # 原版 rollout 里 bot 执行本来就允许几十秒。
-                                timeout=EXEC_TIMEOUT)
+                            # 场景数据题（db_path）走 VLMLActionAgent + SceneDBEnv
+                            # 写 SQL；本机题走 local_agent 写代码跑本机原语 ——
+                            # **两种后端都逐维度 solv，每维度闭合写一条技能**
+                            # （原版对每任务都拆，不区分知识/数据）。
+                            if is_local:
+                                obs1, code1 = await local_agent.solve(
+                                    _q1, local_dir, llm=llm, scene_id=scene,
+                                    avoid=_avoid, critique=str(crit1 or ""),
+                                    evidence=_ev1,
+                                    skills=skills, require_tools=True,
+                                    timeout=EXEC_TIMEOUT)
+                            else:
+                                obs1, code1 = await agent.solve(
+                                    _q1, skills=skills, grabs=grabs,
+                                    focus_tables=focus,
+                                    hints=_hint_ctx + [str(crit1 or "")])
                             observations.extend(obs1)
                             r1: dict[str, Any] = {
                                 "execution": {
@@ -931,13 +942,16 @@ async def _start_learning_impl(
                     # 材料账（同构 gathered）：整题一次执行也可能直接交 answer，
                     # 同样把「实际取回的内容」按账收着，供 critic/闸门判定。
                     _ev3: list[dict[str, Any]] = []
-                    observations, sql = await local_agent.solve(
-                        question, local_dir, llm=llm, scene_id=scene,
-                        critique=str(critique or ""),
-                        dimensions=_dims, avoid=_avoid,
-                        skills=skills,           # 同上：已学配方回注执行层
-                        require_tools=True,      # 同维度分支：学习环节必须取证
-                        evidence=_ev3)
+                    if is_local:
+                        observations, sql = await local_agent.solve(
+                            question, local_dir, llm=llm, scene_id=scene,
+                            critique=str(critique or ""),
+                            dimensions=_dims, avoid=_avoid,
+                            skills=skills, require_tools=True, evidence=_ev3)
+                    else:
+                        observations, sql = await agent.solve(
+                            question, skills=skills, grabs=grabs,
+                            focus_tables=focus, hints=_hint_ctx)
                     _answer_override = ""
             else:
                 # ⚠️ 出题器的 Context（口径说明：哪张表、字面量用哪个真实值）
