@@ -799,6 +799,38 @@ async def _start_learning_impl(
                                     _q1, skills=skills, grabs=grabs,
                                     focus_tables=focus,
                                     hints=_hint_ctx + [str(crit1 or "")])
+                                # 数据题路径：agent.solve 不收 evidence，它实取的 SQL
+                                # 结果不会进学习循环的 _ev1 材料账；但闸门
+                                # （check_task_success）靠 evidence 判「有没有取到
+                                # 真实内容」，否则会误报「一次都没取到内容」把维度判死。
+                                # 这里把 agent 实取的观察回填进 _ev1（与 local_agent
+                                # 路径同构：本地题是 local_agent 直接写 _ev1）。
+                                _ev1 = list(obs1)
+                                # 同样，agent 实取的观察**不带** data_sources（那是
+                                # local_agent 的 MCP 工具才填的字段）。不补的话
+                                # r1["execution"]["real_calls"] 恒为 0（行 813-815 只
+                                # 数带 data_sources 的观察），闸门 task_critic.py:169
+                                # 会误判「一次数据源都没调」把维度判死。照全局观察补
+                                # data_sources 的口径（1009-1013）：只给 ok 的观察补，
+                                # 标签用 env 自报（SceneDBEnv.data_source →
+                                # "scene_db:payroll.duckdb"）。
+                                _env_src: list[str] = []
+                                try:
+                                    _ds_fn = getattr(
+                                        getattr(agent, "env", None),
+                                        "data_source", None)
+                                    if callable(_ds_fn):
+                                        _v = str(_ds_fn() or "").strip()
+                                        if _v:
+                                            _env_src = [_v]
+                                except Exception:
+                                    _env_src = []
+                                if _env_src:
+                                    obs1 = [
+                                        dict(o, data_sources=list(
+                                            o.get("data_sources") or (
+                                                _env_src if o.get("ok") else [])))
+                                        for o in obs1]
                             observations.extend(obs1)
                             r1: dict[str, Any] = {
                                 "execution": {
