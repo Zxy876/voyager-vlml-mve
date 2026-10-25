@@ -350,7 +350,9 @@ action.py:94 programs 注入；此前只挑一条写一条 SQL，合成题（bas
   连坐其它条。
 
 只返回一个 JSON：{"items": [{"name": "配方名", "sql": "该配方实例化后的 SELECT"}],
-"note": "一句话说明复用了哪些配方、各填了什么值；哪些没用上、为什么"}""")
+"note": "一句话说明复用了哪些配方、各填了什么值；哪些没用上、为什么"}
+其中 name **必须逐字写配方标签「｜」之后的原配方名**（如 total_base_salary），
+不要把整个【配方 N｜topic=…｜…】标签抄进来 —— 下游要靠它精确对回配方。""")
 
 
 def _refill_sql_multi(question: str, skills: list[dict[str, Any]], schema: str,
@@ -1053,11 +1055,22 @@ async def consume(
                             f" SQL：{str(_mr['note'])[:140]}")
                     for _it in _mr["items"]:
                         _sql = _it["sql"]
+                        # name 对回：先精确，再宽松（LLM 偶尔把整个
+                        # 【配方 N｜topic=…｜原名】标签抄进 name —— 标签里
+                        # 含原配方名就算命中，否则 _sk=None 会让 _used_skills
+                        # 披露丢条目、used_skills 少报（实测「用到 1 条技能」）。
                         _sk = next((s for s in skills
                                     if str(s.get("name") or "") == _it["name"]),
                                    None)
-                        _label = _it["name"] or str(
-                            (_sk or skills[0]).get("name") or "配方")
+                        if _sk is None and _it["name"]:
+                            _sk = next((s for s in skills
+                                        if str(s.get("name") or "")
+                                        and str(s.get("name")) in _it["name"]),
+                                       None)
+                        _label = (str((_sk or {}).get("name") or "")
+                                  or _it["name"]
+                                  or str((skills[0] if skills else {})
+                                         .get("name") or "配方"))
                         _gwhy = _sql_literal_guard(_sql, _dbp)
                         if _gwhy:
                             reuse_errors.append(
