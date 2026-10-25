@@ -238,6 +238,12 @@ def _log_import(result: dict[str, Any]) -> None:
         "miss_node_created": bool(result.get("miss_node_created")),
         "learn_kicked": bool(result.get("learn_kicked")),
         "learn_kick_note": str(result.get("learn_kick_note") or "")[:200],
+        # 里程碑回灌（2026-10-25 拍板）：人导入每句都立为当前里程碑锚点，让
+        # 驾驶舱启动后按本句拆维学、未闭合维度优先。必须进白名单——否则白立了。
+        "milestone_target_set": bool(result.get("milestone_target_set")),
+        # 跨域提示：路由双阈值未命中（max_score=0）的导入，可能不属于本场景，
+        # 面板据此提示"可另建场景承接"。
+        "suggest_new_scene": bool(result.get("suggest_new_scene")),
         # —— 复用可解释（2026-10-20 补）——
         # 用户原话：「这样子两次导入掌握度上升会直观，且能被解释」。consume 在
         # 复用分支里算出了 reuse_explain（哪次导入的哪条配方），但**白名单没带
