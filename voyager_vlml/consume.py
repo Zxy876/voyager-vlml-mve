@@ -885,6 +885,12 @@ async def consume(
               if not str(s.get("topic") or "").startswith("consume_")]
     reused_list = [{"topic": s.get("topic"), "name": s.get("name"),
                     "key": s.get("key")} for s in skills]
+    # 维度覆盖守卫的标尺：本条答案实际**复用**的是哪些技能。默认取全部检回技能；
+    # 复合复用（③b）成功落 `_comp` 后改挂这条组合技能——守卫只核实「被复用的
+    # 组合技能自身覆盖是否自洽」，而不是拿全部维度技能的并集去压它（否则
+    # total_salary 这种「2 表组合维度」会被误判为漏了 attendance 那张维度表而
+    # 被错杀成 fetched_empty，见 2026-10-25 场景 B 九月份总薪酬复验）。
+    _ans_skills = skills
 
     # ---- ③ 取数：优先复用配方，没有就现场写 ----
     # 非 VLML 场景：不连 VLML、不读 rib。
@@ -1051,6 +1057,9 @@ async def consume(
                                         data, code = _d, _r["sql"]
                                         reused_skill = {**dict(_comp),
                                                         "refill_note": _r["note"]}
+                                        # 复合复用成功：守卫标尺收窄到这条组合
+                                        # 技能自身（见 _ans_skills 注释）。
+                                        _ans_skills = [_comp]
                                         obs = [{"ok": True, "tool": "query_sql",
                                                 "rows": _rr.get("rows"),
                                                 "data": _d,
@@ -1137,7 +1146,7 @@ async def consume(
                     _nd = len(_msd)
             except Exception:
                 pass
-            _partial, _cwhy = _answer_is_partial(code, skills, _nd)
+            _partial, _cwhy = _answer_is_partial(code, _ans_skills, _nd)
             if _partial:
                 _coverage_why = _cwhy
                 data = None

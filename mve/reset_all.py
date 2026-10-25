@@ -447,7 +447,14 @@ def _clear_scene(scene: str, *, dry: bool, backup: bool) -> int:
         dest = ROOT / f"_backup_{stamp}_scene{scene}"
         dest.mkdir(parents=True, exist_ok=True)
         for d, _ in dirs:
-            shutil.copytree(d, dest / d.name)
+            # ⚠️ 必须保留相对 ROOT 的目录结构：ckpt_curriculum/B 与
+            # ckpt_maieutic/B 的 d.name 都是 "B"，直接 dest/d.name 会撞名
+            # FileExistsError —— 导致 --scene 清档永远卡在备份、清不掉（实测
+            # 2026-10-25 场景 B 清库失败、脏账残留）。
+            _rel = d.relative_to(ROOT)
+            _bd = dest / _rel
+            _bd.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(d, _bd)
         for p, *_ in row_stats:
             shutil.copy2(p, dest / p.name)
         if gpath.exists():
