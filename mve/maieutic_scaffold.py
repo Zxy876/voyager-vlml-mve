@@ -134,6 +134,25 @@ def _cache_path(scene_id: str, question: str, db_path: str = "") -> Path:
     return CKPT / str(scene_id or "A") / f"{h}_{dh}.json"
 
 
+def milestone_dimensions(scene_id: str, question: str) -> list[dict]:
+    """读里程碑骨架的维度清单（只读，不调 LLM、不重新生成）。
+
+    供消费侧「维度覆盖守卫」判定"这道题拆了几维"：导入式里程碑题（人导入的那句
+    话被 scaffold 拆成多维度）的权威维度数就在这里。没骨架（自由提问、没建里程碑）
+    返回空列表，守卫便回退到 _derive_dims 的维度判定，不会误伤原子题。
+    """
+    try:
+        import json as _json
+        p = _cache_path(str(scene_id or "A"), str(question or ""))
+        if not p.exists():
+            return []
+        data = _json.loads(p.read_text(encoding="utf-8"))
+        return [d for d in (data.get("dimensions") or [])
+                if str(d.get("id") or "").strip()]
+    except Exception:
+        return []
+
+
 def _parse(text: str) -> dict[str, Any]:
     """容错解析（同构原版 fix_and_parse_json 的角色）：允许 ```json 围栏/多余前言。"""
     raw = str(text or "")

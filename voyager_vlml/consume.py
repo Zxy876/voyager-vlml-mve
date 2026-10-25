@@ -1018,7 +1018,17 @@ async def consume(
         # 漏津贴/加班）。命中即不交片面数：data 置空走下面的学习路由，并标未验证。
         _coverage_why = ""
         if data is not None:
-            _partial, _cwhy = _answer_is_partial(code, skills, len(dims))
+            # 维度数优先用里程碑 scaffold 的权威拆分（导入式里程碑题）；否则回退
+            # _derive_dims 的 dims——自由提问无骨架时不误伤原子题。
+            _nd = len(dims)
+            try:
+                import maieutic_scaffold as _ms
+                _msd = _ms.milestone_dimensions(_scene_id, question)
+                if len(_msd) >= 2:
+                    _nd = len(_msd)
+            except Exception:
+                pass
+            _partial, _cwhy = _answer_is_partial(code, skills, _nd)
             if _partial:
                 _coverage_why = _cwhy
                 data = None

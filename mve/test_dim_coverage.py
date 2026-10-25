@@ -125,6 +125,14 @@ def main() -> int:
     check("F 不拦（dim_tabs 空）", partial_f is False, why_f)
 
     print()
+    print("== ⑨ milestone_dimensions（导入式里程碑权威维度）==")
+    try:
+        import maieutic_scaffold as _ms
+        md = _ms.milestone_dimensions("B", "九月份要给技术部员工发多少工资")
+        check("里程碑维度>=2（权威拆分）", len(md) >= 2, f"n={len(md)}")
+    except Exception as e:
+        check("里程碑维度读取", False, f"{type(e).__name__}: {e}")
+
     if _FAILS:
         print(f"✗ 失败 {len(_FAILS)} 项：{_FAILS}")
         return 1
