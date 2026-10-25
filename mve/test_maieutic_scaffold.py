@@ -637,6 +637,47 @@ def test_milestone_achieved_persist_and_readback() -> None:
     print("PASS  test_milestone_achieved_persist_and_readback")
 
 
+def test_milestone_lit_retry_criterion() -> None:
+    """驾驶舱「重试里程碑直至成功」的判据：milestone_lit 只读、不调 LLM。
+
+    覆盖：① 没骨架 → total_dims=0（驾驶舱应释放锚点而非空转重试）；
+    ② 有骨架未点亮 → achieved=False（重试分支接管）；③ mark(fetched=True)
+    后 → achieved=True/verified_real=True（成功，清锚点降级自由出题）；
+    ④ 骨架缓存里 dimensions 缺 id 的脏行不计入 total_dims。
+    """
+    import maieutic_scaffold as M
+
+    tmp = Path(tempfile.mkdtemp())
+    old = M.CKPT
+    M.CKPT = tmp
+    try:
+        q = "九月份公司要支出多少钱"
+        # ① 没骨架：不生成、不调 LLM，直接判 total_dims=0
+        lit0 = M.milestone_lit("B", q)
+        assert lit0 == {"achieved": False, "verified_real": False,
+                        "total_dims": 0}, lit0
+        # ② 有骨架、未点亮：重试分支接管
+        p = M._cache_path("B", q)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({
+            "question": q,
+            "dimensions": [{"id": "d1", "question": "a"},
+                           {"id": "", "question": "脏行没有 id 不计数"},
+                           {"id": "d2", "question": "b"}],
+        }, ensure_ascii=False, indent=1), encoding="utf-8")
+        lit1 = M.milestone_lit("B", q)
+        assert lit1["total_dims"] == 2 and not lit1["achieved"], lit1
+        # ③ 成功点亮后：achieved + verified_real 都翻 True
+        M.mark_milestone_achieved("B", q, fetched=True)
+        lit2 = M.milestone_lit("B", q)
+        assert lit2["achieved"] is True and lit2["verified_real"] is True, lit2
+        assert lit2["total_dims"] == 2, lit2
+    finally:
+        M.CKPT = old
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("PASS  test_milestone_lit_retry_criterion")
+
+
 def main() -> None:
     test_parse_and_cache()
     test_plan_uses_dimensions()
@@ -656,6 +697,7 @@ def main() -> None:
     test_schema_decompose_splits_composite()
     test_scaffold_db_fallback_when_llm_empty()
     test_milestone_achieved_persist_and_readback()
+    test_milestone_lit_retry_criterion()
     print("\nALL PASS")
 
 

@@ -215,36 +215,51 @@ def _log_learning_detail(r: dict[str, Any]) -> None:
 
 
 def _light_up_milestone(scene: str, question: str, db_path: str,
-                        max_retries: int) -> None:
-    """phase-3（天授 test/watch 同构）：里程碑维度全闭合后，重跑合成题（组合已学
-    原子技能）确认可取真数，再把节点**持久化点亮**（对应原版 inference 重试里程碑
-    把子目标标记达成、知识图谱节点变实）。异常守卫，绝不破坏主循环。"""
-    _log(f"\n[场景学习] 里程碑「{str(question)[:42]}」维度已全部闭合 → "
-         f"重跑合成题点亮节点（天授 test/watch 同构：训练后必跑评估判达标）")
+                        max_retries: int) -> bool:
+    """phase-3（天授 test/watch 同构）：里程碑前置维度全闭合后，**重试里程碑本身**
+    （重跑合成题、组合已学原子技能）直至取到真数为止（用户 2026-10-25：
+    「完成前置任务后重试里程碑直至里程碑任务成功为止」）。
+
+    原版 inference() 语义（voyager.py `while progress < len(sub_goals)`）：
+    子目标失败**不跳过**，下一轮 while 立刻重试同一子目标、无重试上限 ——
+    唯一上限是外层主循环的 max_iter。所以这里一次只重试一遍：
+      · 取到真数（成功）→ mark_milestone_achieved 点亮节点，返回 True；
+      · 没取到（失败）→ **不点亮**（维度已学的事实照旧，进度账不动），
+        返回 False —— 调用方下一轮 while 继续重试同一里程碑，绝不降级
+        自由出题。旧版「失败也点亮 + 降级」的假掌握就是这里漏出去的。
+    组合复合技能入库（learn_milestone_composite）挂在 learn_orchestrate 的
+    achieved 分支，重跑成功的那一轮会自动执行，无需在这里重复。
+    """
     fetched = False
     try:
         if _asked_to_stop():
-            _log("[场景学习] 收到停止信号，跳过里程碑重跑，仍标记维度已学。")
-        else:
-            t0 = time.time()
-            info = _run_one(question, scene, max_retries=max_retries)
-            r0 = info.get("result", {}) or {}
-            fetched = bool(r0.get("real_calls")) or (int(r0.get("rows") or 0) > 0)
-            _log(f"[场景学习] 里程碑重跑 → status={r0.get('status')}"
-                 f"（{time.time() - t0:.0f}s，真取到={fetched}）")
-            _log_learning_detail(r0)
+            _log("[场景学习] 收到停止信号，跳过本轮里程碑重试（已学的维度保持）。")
+            return False
+        t0 = time.time()
+        info = _run_one(question, scene, max_retries=max_retries)
+        r0 = info.get("result", {}) or {}
+        fetched = bool(r0.get("real_calls")) or (int(r0.get("rows") or 0) > 0)
+        _log(f"[场景学习] 里程碑重试 → status={r0.get('status')}"
+             f"（{time.time() - t0:.0f}s，真取到={fetched}）")
+        _log_learning_detail(r0)
     except Exception as e:
-        _log(f"[场景学习] 里程碑重跑异常（仍标记维度已学）："
+        _log(f"[场景学习] 里程碑重试异常（按未成功处理，下轮继续）："
              f"{type(e).__name__}: {e}")
+    if not fetched:
+        _log("[场景学习] 里程碑重试未取到真数 → 本轮不点亮、不解锁，"
+             "下一轮继续重试同一里程碑（原版 inference 语义：失败不跳过；"
+             "唯一上限是外层 max_iter）。")
+        return False
     try:
         import maieutic_scaffold as _ms
-        _ms.mark_milestone_achieved(scene, question, fetched=fetched)
+        _ms.mark_milestone_achieved(scene, question, fetched=True)
     except Exception as e:
-        _log(f"[场景学习] 里程碑点亮写盘失败：{type(e).__name__}: {e}")
-    _log(f"[场景学习] 里程碑点亮：fetched_real={fetched}"
-         + ("（维度已学且重跑取到真数 → 节点变实）"
-            if fetched else
-            "（维度已学；合成题重跑未取得真数，待消费侧组合验证，节点已按维度达成点亮）"))
+        _log(f"[场景学习] 里程碑点亮写盘失败（按未成功处理，下轮继续）："
+             f"{type(e).__name__}: {e}")
+        return False
+    _log("[场景学习] 里程碑任务成功：重跑取到真数 → 节点点亮变实"
+         "（组合复合技能入库由本轮 learn_orchestrate achieved 分支自动完成）。")
+    return True
 
 
 def _run_one(q: str, scene: str, *, context: str = "",
@@ -391,16 +406,32 @@ def main() -> int:
                         _log_learning_detail(_r0)
                         # 里程碑维度不进 cur.failed_tasks（那是自由课程的账）；
                         # 进度由 maieutic_scaffold.save_progress 记，断点续学认得。
-                    # phase-3（天授 test/watch 同构）：维度全闭合后，重跑合成题
-                    # （组合已学原子技能）确认可取真数 → 把里程碑节点**点亮变实**。
-                    # 对应原版 inference 重试里程碑把子目标标记达成。
-                    _still = _ms.milestone_unclosed(scene, _tgt, db_path=_dbp)
-                    if not _still:
-                        _light_up_milestone(scene, _tgt, _dbp, max_retries)
-                    else:
-                        _log(f"[场景学习] 里程碑仍有 {len(_still)} 个维度未闭合"
-                             f"（部分维度学习失败），本轮不点亮，下轮继续。")
+                    # 维度闭合只是**前置任务完成**，里程碑本身要重跑取到真数才算
+                    # 成功（用户 2026-10-25：「完成前置任务后重试里程碑直至里程碑
+                    # 任务成功为止」）。重试统一走下方「全闭合」分支，这里不再
+                    # 顺手点亮 —— 旧版「失败也点亮 + 降级自由出题」正是缺的
+                    # 「直至成功为止」循环语义、假掌握就是从这漏出去的。
                     continue
+                # ---- 前置维度全闭合 → 重试里程碑直至成功（原版 inference 语义）----
+                # 子目标失败下一轮 while 立刻重试、无重试上限，唯一上限是外层
+                # max_iter；成功（重跑取到真数）才点亮解锁、清锚点降级自由出题。
+                _lit = _ms.milestone_lit(scene, _tgt)
+                if _lit.get("total_dims") == 0:
+                    # 骨架拆不出维度 → 不构成里程碑（与 milestone_state「0 维度
+                    # 不报达成」同口径），释放锚点降级自由出题，不空转重试。
+                    _log(f"[场景学习] 里程碑「{_tgt[:42]}」骨架无维度（拆解失败/"
+                         f"非数据题），释放锚点降级自由出题。")
+                    _ms.clear_current_target(scene)
+                elif not _lit.get("achieved"):
+                    iteration += 1
+                    if _light_up_milestone(scene, _tgt, _dbp, max_retries):
+                        # 里程碑任务成功：点亮解锁 → 清锚点 → 本轮直接降级自由出题，
+                        # 等下一次人导入立新锚点。
+                        _ms.clear_current_target(scene)
+                    else:
+                        # 未成功：不解锁、不降级，下一轮 while 继续重试同一里程碑
+                        continue
+                # 成功或已点亮 → 落到下面的自由出题
         except Exception as e:
             _log(f"[场景学习] 里程碑锚点检查失败（降级回自由出题）："
                  f"{type(e).__name__}: {e}")

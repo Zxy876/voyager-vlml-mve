@@ -977,3 +977,33 @@ def milestone_unclosed(scene_id: str, question: str, *,
         return [d for d in dims if str(d.get("id") or "") not in done]
     except Exception:
         return []
+
+
+def milestone_lit(scene_id: str, question: str) -> dict[str, Any]:
+    """里程碑「重试成功过没有」的**只读**查询（驾驶舱重试循环的判据）。
+
+    只读骨架缓存文件（与 mark_milestone_achieved 同一把钥匙），不调 LLM、
+    不重新生成骨架 —— 驾驶舱每轮都要查，必须便宜且无副作用。返回：
+      · achieved：重跑合成题取到真数后点亮过（用户 2026-10-25 语义：
+        「重试里程碑直至里程碑任务成功为止」的成功标记）；
+      · verified_real：点亮时是否取到真数；
+      · total_dims：骨架维度数（0 = 没骨架 / 拆不出维度 → 不构成里程碑，
+        驾驶舱应释放锚点而不是空转重试）。
+    """
+    empty = {"achieved": False, "verified_real": False, "total_dims": 0}
+    try:
+        p = _cache_path(str(scene_id or "A"), str(question or ""))
+        if not p.exists():
+            return dict(empty)
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return dict(empty)
+        dims = [d for d in (data.get("dimensions") or [])
+                if isinstance(d, dict) and str(d.get("id") or "").strip()]
+        return {
+            "achieved": bool(data.get("milestone_achieved")),
+            "verified_real": bool(data.get("milestone_verified_real")),
+            "total_dims": len(dims),
+        }
+    except Exception:
+        return dict(empty)
