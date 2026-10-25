@@ -874,7 +874,15 @@ async def consume(
     # （consume_2461737d），本题自己那批（consume_ca2125be）一条都没进 prompt。
     # 表现就是：图谱已经高置信命中、技能库里明明有 6 条，消费却报"用到 0 条"。
     # 同原版 `retrieve_skills(query=self.context)` —— context 里就是当前这道题。
-    skills = _retrieve_skills(question, topic_id or topic_hint, _scene_id)
+    _raw_skills = _retrieve_skills(question, topic_id or topic_hint, _scene_id)
+    # ⚠️ 消费会话级技能（`consume_<md5>` topic）不是「学习跑过的里程碑」技能，
+    # 只是上次消费兜底现做经 `_absorb` 落库的产物。按用户边界（2026-10-25：
+    # 消费只编排、不复用消费会话产物、未学不答只标记）—— 必须排除出「已学
+    # 里程碑」复用池。否则场景里只剩这类技能时，任何新问法都被 `_pick_ability_topic`
+    # 归到它并检回 → `skills` 永远非空 → 未学分支（下方 `else:`）永不触发，
+    # 表现正是用户抱怨的「清库了还是现做/复用混乱」。
+    skills = [s for s in _raw_skills
+              if not str(s.get("topic") or "").startswith("consume_")]
     reused_list = [{"topic": s.get("topic"), "name": s.get("name"),
                     "key": s.get("key")} for s in skills]
 
@@ -1252,12 +1260,17 @@ async def consume(
         # 复用已有配方也要记 —— 但记的不是「再存一条技能」（`_absorb` 自己
         # 判重：已有配方就 mark_result 用过且有效），而是**这题到能力里了**
         # （用户 2026-10-13 的定义：问一句、答完了，这题就进能力库）。
-        # 实测（2026-10-19）：只在「现场新写」时调 `_absorb`，命中复用那条
-        # 路径的 mastered 永远是 False —— 面板上「掌握度」怎么答都不涨。
+        # 用户 2026-10-25 新边界（消费只编排不合成）：`_absorb` **只记录本次
+        # 真正复用的那条已学技能用量**——`reused_skill is None`（现场兜底现做 /
+        # 未学）一律不调 `_absorb`，消费侧永不写新技能。否则兜底现做会落
+        # `consume_<md5>` 脏账，下次又被检回「现做」，正是此前「清库了还是
+        # 现做」的根因。学习侧（learn()）才写技能，消费只调答案出来编排。
         abs_info: dict[str, Any] = {}
         # critic 判没答出来 / answered=false（叙事层自检）→ 不进能力库 ——
         # 有行 ≠ 答出来（2026-10-23 Scene P：fail 的 task 却录入了技能）。
-        if data is not None and critic_ok and nar.get("answered", True):
+        # 且必须「真复用了一条已学技能」才记录（消费不写新技能）。
+        if (data is not None and critic_ok and nar.get("answered", True)
+                and reused_skill is not None):
             try:
                 # 只把**本次真正复用的那一条**记成"用过且有效"（used_keys）。
                 # 不传的话 _absorb 会按 topic 前缀扫出同题下全部技能集体 +1，
