@@ -996,27 +996,14 @@ async def consume(
                 answer = str(nar["answer"])
         # 这段代码到底调了哪些抓手（披露用；不含纯计算，见 `_tools_in_code`）
         _mve_traj = _tools_in_code(code, _scene_id)
-        # 原版 critic 语义（同主路径，2026-10-23）：判「任务要求满足了没有」，
-        # 有行 ≠ 答出来 —— 错语义数据（字面量匹配不到、口径不对）必须拦在
-        # 入库/解锁之前，叙事层自检（answered）拦不住 glm-4-flash。
-        critic_ok, critic_why = True, ""
-        try:
-            import task_critic as _tc
-            _cctx = _critic_env_context(
-                str(((_prof or {}).get("db_path") or ""))
-                if _scene_kind == "scene" else "")
-            critic_ok, critic_why = _tc.check_task_success(question, _cctx, {
-                "execution": {"real_calls": 1 if data is not None else 0,
-                              "calls": len(obs or []),
-                              "rows": sum(int(o.get("rows") or 0)
-                                          for o in (obs or []) if o.get("ok"))},
-                "answer": answer,
-                "observations": obs,
-            })
-            if not critic_ok:
-                print(f"  · critic 判没答出来：{str(critic_why)[:120]}")
-        except Exception as e:  # pragma: no cover
-            critic_ok, critic_why = False, f"critic 判定不可用：{type(e).__name__}: {e}"
+        # 完成判定（2026-10-25 用户拍板）：消费侧 **LLM critic 判定删除**——
+        # 消费不走长期学习链路，只是技能库索引重放；每次重放再过一遍判官，
+        # 结果就是「一直都不会掌握」。判定收敛为确定性的「取到真数」：
+        # 真空仍拦（空 rows / 无结果），语义质量防线回到学习侧入库闸
+        # （task_critic + _sql_literal_guard，原样保留）。
+        critic_ok = data is not None
+        critic_why = ("" if critic_ok
+                      else "没取到真数（真空/无结果）——消费侧确定性判据")
         # 判未完成 → 答案不许以确定句示人（2026-10-24 用户拍板）：
         # 130600 事故三次同款——账面上 fetched_empty、面板上却是自信数字，
         # 展示层必须跟账本一致：判没答出来就明说「未验证、数字不可信」。
@@ -1372,38 +1359,14 @@ async def consume(
         except Exception as e:  # pragma: no cover
             print(f"  （生成新题失败：{type(e).__name__}: {e}）")
 
-    # ---- 原版 critic 语义（根源修复，2026-10-23 两次实测）------------------
-    # 完成判定 = **LLM 看执行观察判「任务要求满足了没有」**（原版
-    # critic.py:112-135 `ai_check_task_success`），不是"有没有取到行"。
-    # Scene P 两次事故同一根因：错语义 SQL（dept='技术部' 在库里 0 匹配）取回
-    # 4 行错数据 → 老判据"answer 非空 + real_calls 非空"判 written → 坏配方
-    # 入库 + 假解锁；叙事层自检（answered）也拦不住（glm-4-flash 把错数据
-    # 讲成了"技术部应发工资合计 32600 元"）。
-    # 学习侧 judge=True 早就在走这把尺子（task_critic.check_task_success，
-    # 原版 critic 的同构）—— 消费侧现在接上**同一把**，一套判据两条链，
-    # 不发明新规则。
-    critic_ok, critic_why = True, ""
-    try:
-        import task_critic as _tc
-        # VLML 主路径的数据源 = 默认库（db_switch 唯一定义），环境观察照给
-        # （Scene P 事故同款两类错误在这里同样拦得住）。
-        try:
-            import db_switch as _dbs
-            _cctx = _critic_env_context(str(getattr(_dbs, "DEFAULT_DB", "")))
-        except Exception:
-            _cctx = ""
-        critic_ok, critic_why = _tc.check_task_success(question, _cctx, {
-            "execution": {"real_calls": len(real_calls),
-                          "calls": len(observations or []),
-                          "rows": real_rows},
-            "answer": answer,
-            "observations": observations,
-        })
-        if not critic_ok:
-            print(f"  · critic 判没答出来：{str(critic_why)[:120]}")
-    except Exception as e:  # pragma: no cover
-        # 原版 critic 挂了 → (False, "")：判不了就不算成功（铁律方向）。
-        critic_ok, critic_why = False, f"critic 判定不可用：{type(e).__name__}: {e}"
+    # ---- 完成判定（2026-10-25 用户拍板，同场景分支）------------------------
+    # 消费侧 LLM critic 判定删除：消费不走长期学习链路，只是技能库索引重放；
+    # 每次重放再过一遍判官 → 「一直都不会掌握」。判定收敛为确定性「取到真数」
+    # （real_calls = ok 调用里含真值的那些，(NULL,0) 空聚合行不算数）。
+    # 学习侧入库闸（task_critic + _sql_literal_guard）原样保留。
+    critic_ok = bool(real_calls)
+    critic_why = ("" if critic_ok
+                  else "取到真空（ok 调用里没有一行真数）——消费侧确定性判据")
     # 判未完成 → 答案标注未验证（与场景分支同款，2026-10-24 用户拍板）。
     if answer and not critic_ok:
         answer = (str(answer).rstrip()
