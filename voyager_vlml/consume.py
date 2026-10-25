@@ -754,19 +754,23 @@ async def consume(
             learn_kick = {"kicked": False, "manual": True,
                           "why": "已登记待审区+图谱节点 —— 学习等你在驾驶舱点"
                                  "「▶ 启动 Voyager」触发（会落运行日志）"}
-            # 回灌环境建新的里程碑（用户 2026-10-25 拍板）：人导入未命中 / 低相关
-            # 度的题，不应只挂待审节点等人工触发 —— 它本身就是要学的里程碑。
-            # 立为当前里程碑锚点后，驾驶舱（scene_learn 里程碑优先块）启动时
-            # 会按本句拆维学、未闭合维度优先（原版 inference 里程碑重试语义）。
-            # 若该问明显跨域不属于本场景，仍可另行新建场景承接（见 suggest_new_scene）。
-            try:
-                import maieutic_scaffold as _ms
-                _ms.set_current_target(str(_scene_id or "A"), question)
-                miss_info["milestone_target_set"] = True
-            except Exception:
-                pass
+            # 回灌环境建里程碑锚点（用户 2026-10-25 拍板）对"未命中"同样生效：
+            # 见下面路由块之后的通用段（人导入的每句都立为当前里程碑锚点）。
     except Exception:
         pass                                     # 待审区写不进去不能拦消费
+    # ---- 回灌环境建里程碑锚点（用户 2026-10-25 拍板）----
+    # 人导入的每句都作为本场景**当前里程碑锚点**（对齐原版 inference 把人工给定
+    # 任务当里程碑反复重试直到掌握）。驾驶舱（scene_learn 里程碑优先块）启动后
+    # 按本句拆维学、未闭合维度优先（"没完成的优先"）。无论是否命中图谱都立锚点
+    # —— 命中但还没学成里程碑的（"不存在于里程碑队列"）同样回灌；跨域明显不属
+    # 本场景的靠 suggest_new_scene 提示可另建场景承接，这里不阻断消费。
+    if str(question or "").strip():
+        try:
+            import maieutic_scaffold as _ms
+            _ms.set_current_target(str(_scene_id or "A"), question)
+            miss_info["milestone_target_set"] = True
+        except Exception:
+            pass
     # ---- ②.5 场景后端（数据源）----
     # 非 VLML 场景**不做 VLML 取数**：那条路连的是 rib/GRID，在别的场景里
     # 拿它回答就是上一次实测看到的「问世界模型，答出一串 Valorant 战队」。
