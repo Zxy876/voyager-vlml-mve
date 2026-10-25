@@ -998,6 +998,16 @@ async def consume(
                     question, skills=skills,
                     hints=[str(s.get("need") or "") for s in
                            ((route_info or {}).get("subtasks") or [])] or None)
+                # 用 agent 跟踪的「最后一次可执行、未乘爆、取到真数」的 (sql,data)
+                # 配对，而不是把 real[-1] 的数据与 last_sql 拆开拼（二者可能来自
+                # 不同轮次 → 数 SQL 对不上，如 67245 数据 vs 58145 干净 SQL）。
+                if _agent.last_ok_data is not None:
+                    data = _agent.last_ok_data
+                    code = _agent.last_ok_sql or code
+                else:
+                    real = [o for o in obs
+                            if o.get("ok") and o.get("data") is not None]
+                    data = (real[-1].get("data") if real else None)
             else:
                 obs, code = await _la.solve(
                     question, _scene_dir, scene_id=_scene_id, skills=skills,
@@ -1012,8 +1022,9 @@ async def consume(
                     # 命中的题一次合成 5 条 → 30s 默认值把整次重放判死
                     # （trace 里 5 条技能全进了、一条都没跑回来 →"执行超时"）。
                     timeout=_consume_timeout(len(skills or [])))
-            real = [o for o in obs if o.get("ok") and o.get("data") is not None]
-            data = (real[-1].get("data") if real else None)
+                real = [o for o in obs
+                        if o.get("ok") and o.get("data") is not None]
+                data = (real[-1].get("data") if real else None)
             if _scene_kind == "scene" and data is not None:
                 # fan-out 闸门（消费侧确定性拒乘爆兜底）：现场写出的 SQL 即便
                 # 过了 _agent.solve 的 critic（消费侧 critic 判定已删，只认

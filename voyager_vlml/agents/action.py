@@ -183,6 +183,8 @@ class VLMLActionAgent:
         self.critic_reasoning = ""
         self.answer = ""
         self.last_success = False      # 最后一轮的判决（critic 两级都过）
+        self.last_ok_sql = ""          # 最后一次「可执行、未乘爆、取到真数」的 SQL
+        self.last_ok_data = None       # 与之配对的 data（见 reset() 注释）
         # 执行层的工具可达性：本场景抓手条目 + 本题候选表（见 render_grabs）。
         self.grabs: list[dict[str, Any]] = []
         self.focus_tables: list[str] = []
@@ -201,6 +203,26 @@ class VLMLActionAgent:
             return await fn(sql)
         except Exception:
             return None
+
+    def _fanout_rejected(self, sql: str) -> bool:
+        """确定性 fan-out 闸（与 `critic_check` 同口径，只回 bool）：JOIN 把驱动表
+        行放大且 SQL 在做聚合 → 父表数值按子表行数翻倍，答案必错。
+
+        抽出来单独给 step() 记录「最后一次未乘爆的成功尝试」用，不重复 `critic_check`
+        的 LLM 判官部分 —— 消费侧的核心正确性只靠这把确定性闸，不靠 LLM。
+        """
+        _dbp = (str(getattr(self.env, "db_path", "") or "")
+                or str(getattr(self.env, "path", "") or ""))
+        if not _dbp or "join" not in (sql or "").lower():
+            return False
+        try:
+            from voyager_vlml.env.vlml_mcp import check_sql_grain, _has_aggregation
+            _fg = check_sql_grain(sql, _dbp)
+            if not _fg:
+                return False
+            return bool(_has_aggregation(sql))
+        except Exception:
+            return False
 
     async def run_calls(self, calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -416,6 +438,12 @@ class VLMLActionAgent:
         self.critic_reasoning = ""
         self.answer = ""
         self.last_success = False
+        # 最后一次「可执行、未乘爆、取到真数」的尝试 (SQL, data) —— 消费/学习侧
+        # 取数一律用这对，杜绝 data 来自中间某次、code 却是另一次收敛结果的对不上
+        # （如 67245 数据 vs 58145 干净 SQL）。观测本身没存产生它的 SQL，必须从
+        # 这里配对取，不能拆开拼（见 step() 与 consume.py ③b）。
+        self.last_ok_sql = ""
+        self.last_ok_data = None
         try:
             self.schema = await self.env.schema_block()
         except Exception:
@@ -456,6 +484,14 @@ class VLMLActionAgent:
                     obs = dict(obs, grain=grain)
             events = [obs]
             self.observations.extend(events)                       # :230 recorder.record
+            # 跟踪「最后一次可执行、未乘爆、取到真数」的尝试 —— 消费/学习侧取数
+            # 一律用这对 (sql, data)，而不是把 real[-1] 的数据与 last_sql 拆开拼
+            # （二者可能来自不同轮次 → 数 SQL 对不上，如 67245 数据 vs 58145 SQL）。
+            # 用确定性 fan-out 闸挡乘爆；乘爆的尝试即便 run_sql 成功也不配进来。
+            if obs.get("ok") and obs.get("data") is not None \
+                    and not self._fanout_rejected(sql):
+                self.last_ok_sql = sql
+                self.last_ok_data = obs.get("data")
             success, critique = self.critic_check(events)          # :232-238
             # :256-270 —— **每步**按本轮执行摘要重检索技能，再重建两条消息
             new_skills = self.retrieve_skills(

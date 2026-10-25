@@ -350,6 +350,9 @@ async def _generate_new_task(curr: Any, env: Any, act: Any = None,
         gen_keys = [str(s.get("key") or "") for s in gen_hits]
         obs, sql = await act.solve(
             question, max_iters=max_iters, hints=hints[:3], skills=gen_hits)
+        # 用 agent 跟踪的「最后一次可执行、未乘爆、取到真数」的 SQL（避免多轮
+        # 迭代里 data 与 last_sql 拆开拼的对不上；学习侧写技能也要用这把对的 SQL）。
+        sql = act.last_ok_sql or sql
         ok, _why = crit.check_task_success(
             observations=obs, task={"task": question, "hints": hints[:3]},
             sql=str(sql or ""))
@@ -486,6 +489,8 @@ async def run_one_round(
             hints=hints,
             skills=skill_hits,
         )
+        # 同上：优先用「最后一次未乘爆、取到真数」的 SQL，写技能/判成败都用它。
+        sql = act.last_ok_sql or sql
 
     # ---- 判成败：真的从 DB 取到数（第一级）+ 口径满足任务要求（第二级，原版 critic） ----
     success, critique = crit.check_task_success(
