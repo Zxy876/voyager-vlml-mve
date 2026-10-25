@@ -276,6 +276,18 @@ class VLMLActionAgent:
                 "\n\n【当前库真实 schema（只能用这里的表名/列名，不要编造）】\n"
                 f"{self.schema}\n"
             )
+        # 跨一对多聚合的通用正确性规则（非场景硬编码，所有数据域都适用）：
+        # 父表一行对应子表多行时，绝不能直接「父 JOIN 子」再 SUM——那会把父表
+        # 数值按子表行数翻倍（乘爆，必错）。这与下方 fan-out 闸门互为表里。
+        base += (
+            "\n\n【跨一对多关系聚合的硬规矩】当父表的一行对应子表多行（如一名员工"
+            "有多条考勤/津贴记录），**绝不能直接 `父 JOIN 子表` 后做 SUM/AVG**——"
+            "那样父表的数值会被子表行数重复乘，答案必错（fan-out 闸门会直接拒用）。"
+            "正确写法二选一：① 先把每个子表按关联键 `GROUP BY` 聚合成单行，再"
+            " `LEFT JOIN` 到父表；② 改用标量子查询 "
+            "`SUM(e.col + (SELECT COALESCE(SUM(amount),0) FROM 子表 s "
+            "WHERE s.emp_id=e.emp_id AND s.month=:month))`。"
+        )
         blocks: list[str] = []
         for i, s in enumerate(list(skills or [])[:5]):
             code = str(s.get("code") or "").strip()
@@ -485,40 +497,64 @@ class VLMLActionAgent:
 
             self.critic = VLMLCriticAgent()
 
-        # 确定性 fan-out 闸门（先于 LLM 判官）：JOIN 把驱动表行放大、且 SQL 在做
-        # 聚合 → 父表数值按子表行数翻倍，答案必错。原版 critic 缺的就是这层实查
-        # 证据（2026-10-23 check_grain 同款）；这里不赌 LLM，实测行数即判。
-        # 让学习侧永不存乘爆配方，也让消费现场写能自纠（critic 失败 → 模型重写）。
-        for _e in events:
-            _g = (_e.get("grain") if isinstance(_e, dict) else None) or {}
-            _n = int(_g.get("rows") or 0)
-            _d = int(_g.get("distinct") or 0)
-            if _d and _n > _d:
-                try:
-                    from voyager_vlml.env.vlml_mcp import _has_aggregation
-                    if _has_aggregation(self.last_sql or ""):
-                        return (False,
-                                f"⚠️ JOIN 把驱动表行放大了 {_g.get('ratio')}×"
-                                f"（{_n} 行 vs 驱动表 {_d} 行），而你在做聚合 —— "
-                                f"父表数值会被按子表行数翻倍，答案必错。请先把右表"
-                                f"按关联键聚合成单行再 JOIN（如 LEFT JOIN "
-                                f"(SELECT emp_id, SUM(amount) AS a FROM allowance "
-                                f"WHERE month=:month GROUP BY emp_id) t "
-                                f"ON t.emp_id=e.emp_id），或改用标量子查询 "
-                                f"SUM(e.col + (SELECT COALESCE(SUM(amount),0) FROM "
-                                f"allowance a WHERE a.emp_id=e.emp_id "
-                                f"AND a.month=:month))")
-                except Exception:
-                    pass
-
-        _ctx = str(self.context or "")
-        try:
-            _dbp = (str(getattr(self.env, "db_path", "") or "")
-                    or str(getattr(self.env, "path", "") or ""))
-            if not _dbp:
+        # 数据源路径（fan-out 实测 + 环境实查都会用到）
+        _dbp = (str(getattr(self.env, "db_path", "") or "")
+                or str(getattr(self.env, "path", "") or ""))
+        if not _dbp:
+            try:
                 import db_switch as _dbs
                 _dbp = str(getattr(_dbs, "DEFAULT_DB", "") or "")
-            if _dbp:
+            except Exception:
+                _dbp = ""
+
+        # 确定性 fan-out 闸门（先于 LLM 判官）：JOIN 把驱动表行放大、且 SQL 在做
+        # 聚合 → 父表数值按子表行数翻倍，答案必错。用 check_sql_grain 实测 JOIN
+        # **原始**翻倍（不受外层聚合把行折叠成 1 行的影响，比事件 grain 更准）；
+        # 事件 grain 作回退。命中即拒 + 给「先按关联键预聚合子表再 JOIN」的改写
+        # 指导，让学习侧永不存乘爆配方、消费现场写能自纠（critic 失败 → 模型重写）。
+        _fan_g = None
+        if _dbp and "join" in (self.last_sql or "").lower():
+            try:
+                from voyager_vlml.env.vlml_mcp import check_sql_grain
+                _fan_g = check_sql_grain(self.last_sql or "", _dbp)
+            except Exception:
+                _fan_g = None
+        if not _fan_g:
+            for _e in events:
+                _g = (_e.get("grain") if isinstance(_e, dict) else None) or {}
+                if int(_g.get("distinct") or 0) and int(_g.get("rows") or 0) > \
+                        int(_g.get("distinct") or 0):
+                    _fan_g = {
+                        "driver": _g.get("driver"),
+                        "rows": int(_g.get("rows") or 0),
+                        "distinct": int(_g.get("distinct") or 0),
+                        "ratio": (round(int(_g.get("rows") or 0)
+                                        / int(_g.get("distinct") or 0), 2)
+                                  if _g.get("distinct") else None),
+                    }
+                    break
+        if _fan_g:
+            try:
+                from voyager_vlml.env.vlml_mcp import _has_aggregation
+                if _has_aggregation(self.last_sql or ""):
+                    return (False,
+                            f"⚠️ JOIN 把驱动表行放大了 {_fan_g.get('ratio')}×"
+                            f"（{_fan_g.get('rows')} 行 vs 驱动表 "
+                            f"{_fan_g.get('distinct')} 行），而你在做聚合 —— "
+                            f"父表数值会被按子表行数翻倍，答案必错。请先把右表"
+                            f"按关联键聚合成单行再 JOIN（如 LEFT JOIN "
+                            f"(SELECT emp_id, SUM(amount) AS a FROM allowance "
+                            f"WHERE month=:month GROUP BY emp_id) t "
+                            f"ON t.emp_id=e.emp_id），或改用标量子查询 "
+                            f"SUM(e.col + (SELECT COALESCE(SUM(amount),0) FROM "
+                            f"allowance a WHERE a.emp_id=e.emp_id "
+                            f"AND a.month=:month))")
+            except Exception:
+                pass
+
+        _ctx = str(self.context or "")
+        if _dbp:
+            try:
                 from curriculum_auto import db_observation as _dbobs
                 _obs = str(_dbobs(_dbp) or "")
                 if _obs:
@@ -526,8 +562,8 @@ class VLMLActionAgent:
                              "假设的任何表、列、取值都必须能在这里指认，指认不了"
                              " = 编造，判未完成并明说缺什么；答案里的每个具体数"
                              "字都必须能从取回数据指认或算出]：\n" + _obs)
-        except Exception:
-            pass  # 实查清单拿不到时退回原口径（真空闸仍在）
+            except Exception:
+                pass  # 实查清单拿不到时退回原口径（真空闸仍在）
         d = self.critic.judge(
             observations=events,
             task={"task": self.task, "hints": self.hints},
