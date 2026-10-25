@@ -754,6 +754,17 @@ async def consume(
             learn_kick = {"kicked": False, "manual": True,
                           "why": "已登记待审区+图谱节点 —— 学习等你在驾驶舱点"
                                  "「▶ 启动 Voyager」触发（会落运行日志）"}
+            # 回灌环境建新的里程碑（用户 2026-10-25 拍板）：人导入未命中 / 低相关
+            # 度的题，不应只挂待审节点等人工触发 —— 它本身就是要学的里程碑。
+            # 立为当前里程碑锚点后，驾驶舱（scene_learn 里程碑优先块）启动时
+            # 会按本句拆维学、未闭合维度优先（原版 inference 里程碑重试语义）。
+            # 若该问明显跨域不属于本场景，仍可另行新建场景承接（见 suggest_new_scene）。
+            try:
+                import maieutic_scaffold as _ms
+                _ms.set_current_target(str(_scene_id or "A"), question)
+                miss_info["milestone_target_set"] = True
+            except Exception:
+                pass
     except Exception:
         pass                                     # 待审区写不进去不能拦消费
     # ---- ②.5 场景后端（数据源）----
@@ -1025,6 +1036,8 @@ async def consume(
                                    or learn_kick.get("reason") or ""),
             "miss_node": str(miss_info.get("node_id") or ""),
             "miss_node_created": bool(miss_info.get("node_created")),
+            "milestone_target_set": bool(miss_info.get("milestone_target_set")),
+            "suggest_new_scene": bool(route_info.get("max_score", 0) == 0),
             "trajectory": (_mve_traj or
                            (["query_sql"] if (_scene_kind == "scene" and code)
                             else (["local_python"] if code else []))),
@@ -1157,6 +1170,8 @@ async def consume(
                                    or learn_kick.get("reason") or ""),
             "miss_node": str(miss_info.get("node_id") or ""),
             "miss_node_created": bool(miss_info.get("node_created")),
+            "milestone_target_set": bool(miss_info.get("milestone_target_set")),
+            "suggest_new_scene": bool(route_info.get("max_score", 0) == 0),
             "trajectory": [], "facts": [], "facts_count": 0,
             "insights": [], "caveats": [], "errors": [],
             "answer": "", "sql": "", "rows": 0,
