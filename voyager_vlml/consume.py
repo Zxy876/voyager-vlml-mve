@@ -1368,10 +1368,16 @@ async def consume(
             base["import_count"] = _cnt
             base["reused_import"] = _from_imp
             if reused_skill and _cnt >= 1:
+                # 多技能编排（2026-10-26）：执行到的每条来源配方都点名，
+                # 别再只显示第一条的 key 让人误以为只用了 1 条。
+                _comp = list((reused_skill or {}).get("composed_of") or [])
+                _desc = ("配方 " + "、".join(f"`{n}`" for n in _comp)
+                         if len(_comp) > 1 else
+                         f"配方 `{reused_skill.get('key')}`")
                 _where = (f"第 {_cnt} 次导入复用了 {_from_imp or '之前导入'} "
-                          f"学到的配方 `{reused_skill.get('key')}`"
+                          f"学到的{_desc}"
                           if _cnt > 1 else
-                          f"第 1 次导入，命中已有配方 `{reused_skill.get('key')}`"
+                          f"第 1 次导入，命中已有{_desc}"
                           f"（来自 {_from_imp or '本场景既有技能'}）")
                 base["reuse_explain"] = (
                     _where + f"；掌握累计 {base.get('mastered_total')}/"
@@ -2146,6 +2152,10 @@ def _looks_like_recipe(code: str) -> bool:
     return bool(_RECIPE_CALL.search(str(code or "")))
 
 
+# 比较边界日期字面量（2026-10-26）：'2026-09-30' / '2026-09' / '2026/9/30'
+_DATE_LIT_RE = re.compile(r"^\d{4}[-/]\d{1,2}([-/]\d{1,2})?$")
+
+
 def _sql_literal_guard(sql: str, db_path: str) -> str:
     """SQL 配方入库前的确定性守卫：字符串字面量必须能在 db_observation 实查
     清单里指认。返回拒绝原因；'' = 通过。
@@ -2179,6 +2189,28 @@ def _sql_literal_guard(sql: str, db_path: str) -> str:
             continue
         if t.lower() in bare:
             continue
+        # 比较边界日期放行（2026-10-26）：`hire_date <= '2026-09-30'` 这类
+        # 范围谓词的右值是**查询边界**，语义上允许不在数据取值域内（库里
+        # 存的是员工入职日，月末 cutoff 不在任何一行里）——把它当幻觉拦掉
+        # 会把 total_base_salary 这种核心配方整条废掉（实测：回填全被拒，
+        # 总支出答案缺了 base 大头）。等值过滤（=/IN）的日期仍必须指认：
+        # 那才是「假设了一个库里没有的取值」。
+        if _DATE_LIT_RE.match(t):
+            _boundary = True
+            # BETWEEN 的右边界前面是 AND（BETWEEN a AND b），仅在 SQL 确有
+            # BETWEEN 时把 AND 也认作边界前缀，避免误放普通等值组合。
+            _has_between = bool(re.search(r"\bbetween\b", str(sql), re.I))
+            _bounds_re = (r"(<|<=|>=|>|between|and)\s*$" if _has_between
+                          else r"(<|<=|>=|>|between)\s*$")
+            for _m in re.finditer(re.escape(lit), str(sql)):
+                _left = str(sql)[max(0, _m.start() - 10):_m.start()]
+                # 截窗尾可能带着字面量的开引号（…<= '2026-…），剥掉再判边界
+                _left = _left.rstrip().rstrip("'").rstrip()
+                if not re.search(_bounds_re, _left, re.I):
+                    _boundary = False
+                    break
+            if _boundary:
+                continue
         return (f"SQL 字面量 '{t}' 在数据源实查清单里指认不了"
                 f"（库里没有这个取值）—— 大概率是幻觉取值，拒绝入库")
     return ""
