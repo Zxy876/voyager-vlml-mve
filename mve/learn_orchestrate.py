@@ -305,7 +305,7 @@ _COMPOSITE_SYSTEM = """你是数据取数方法组合员。手里有为同一道
 规则：
 1. 每条维度配方算的量都要进最终 SQL（该加的加、该减的减，口径照配方，不许改口径）。
 2. 乘爆防线：跨「一对多」JOIN 必须先把右表按关联键聚合成分组子查询再 JOIN
-   （LEFT JOIN (SELECT emp_id, SUM(amount) AS amount FROM … GROUP BY emp_id) t），
+   （LEFT JOIN (SELECT 关联键, SUM(子表数值列) AS v FROM 子表 GROUP BY 关联键) t），
    绝不对明细行直接 SUM 父表列。
 3. 字面量（表/列/筛选值）只能用输入里给出的，一个都不许新造。
 4. 库里给不出的量（费率不存在、类别取值不存在）**不许编**：按 0 处理或省略该维度，

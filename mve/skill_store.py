@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
@@ -37,6 +38,10 @@ from pathlib import Path
 from typing import Any
 
 STORE = Path(__file__).resolve().parent / "skill_store.json"
+# 技能向量（原版同构：Chroma vectordb，skill.py:43-47）。单独落盘、不进
+# skill_store.json —— 面板 build_state / coach_log / 回填 prompt 都会携带技能
+# dict，2048 维向量混进去就是第二个 110MB（2026-10-21 面板挂死同款）。
+EMB_STORE = Path(__file__).resolve().parent / "skill_emb.json"
 
 # 解析结果的进程内缓存（键=文件指纹）。作用见 _load_raw 的 docstring：
 # 大库（110MB）下"一次 build_state 解析 5 遍"足以把整机拖进 swap。
@@ -189,6 +194,117 @@ def similarity(a: str, b: str) -> float:
     return len(ta & tb) / len(ta | tb)
 
 
+# ---------------- 检索向量化（原版同构：embedding 相似度，skill.py:117-130） ----------------
+# 原版技能检索 = 向量库对「技能描述」做 embedding 相似度（add 时 add_texts 入
+# 向量库 skill.py:83-87，检索 similarity_search_with_score :122）。本库此前只有
+# 词面 Jaccard（2-gram 重叠）——同义不同词的问法排不上：实测「九月份公司的
+# 总支出」检不回 base_salary 配方、单维度技能把合成题答掉（3600/264000）。
+# 这里对齐原版：embedding-3 向量化「名字+描述」，余弦相似盲取 top_k；
+# API 不可用 / 无向量时回退词面 Jaccard（离线可用性不丢）。
+
+def _embed_api(texts: list[str]) -> list[list[float]] | None:
+    """智谱 OpenAI 兼容 /embeddings。任何失败返回 None（调用方回退词面）。"""
+    try:
+        import llm_client as _lc
+        _lc.load_env()
+        key = os.getenv("ZHIPU_API_KEY", "")
+        if not key or not texts:
+            return None
+        base = os.getenv("ZHIPU_BASE_URL",
+                         "https://open.bigmodel.cn/api/paas/v4")
+        import httpx
+        r = httpx.post(
+            base.rstrip("/") + "/embeddings",
+            headers={"Authorization": f"Bearer {key}",
+                     "Content-Type": "application/json"},
+            json={"model": os.getenv("ZHIPU_EMBED_MODEL", "embedding-3"),
+                  "input": list(texts)},
+            timeout=20.0,
+        )
+        r.raise_for_status()
+        arr = r.json().get("data") or []
+        if len(arr) != len(texts):
+            return None
+        return [it.get("embedding") for it in arr]
+    except Exception:
+        return None
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    try:
+        num = sum(x * y for x, y in zip(a, b))
+        na = sum(x * x for x in a) ** 0.5
+        nb = sum(y * y for y in b) ** 0.5
+        return num / (na * nb) if na and nb else 0.0
+    except Exception:
+        return 0.0
+
+
+def _entry_embed_text(s: dict[str, Any]) -> str:
+    """向量化对象 = 名字 + 描述（原版入向量库的是 skill_description，:83-87）。"""
+    return f"{s.get('name', '')} {s.get('text', '')}"
+
+
+_EMB_LOCK = threading.Lock()
+_EMB_CACHE: dict[str, Any] = {"sig": None, "data": None}
+
+
+def _load_embs() -> dict[str, list[float]]:
+    try:
+        st = EMB_STORE.stat()
+        sig = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        sig = None
+    with _EMB_LOCK:
+        if sig is not None and _EMB_CACHE["sig"] == sig \
+                and _EMB_CACHE["data"] is not None:
+            return _EMB_CACHE["data"]
+    data: dict[str, list[float]] = {}
+    if EMB_STORE.exists():
+        try:
+            raw = json.loads(EMB_STORE.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                data = {k: v for k, v in raw.items() if isinstance(v, list)}
+        except Exception:
+            data = {}
+    with _EMB_LOCK:
+        _EMB_CACHE["sig"] = sig
+        _EMB_CACHE["data"] = data
+    return data
+
+
+def _save_embs(embs: dict[str, list[float]]) -> None:
+    EMB_STORE.write_text(json.dumps(embs), encoding="utf-8")
+    try:
+        st = EMB_STORE.stat()
+        sig: tuple[int, int] | None = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        sig = None
+    with _EMB_LOCK:
+        _EMB_CACHE["sig"] = sig
+        _EMB_CACHE["data"] = embs
+
+
+def _ensure_embs(skills_by_key: dict[str, dict[str, Any]],
+                 embs: dict[str, list[float]], cap: int = 64) -> bool:
+    """给还没有向量的技能补 embedding（批量一次 API）。返回是否有新增。"""
+    missing = [k for k, s in skills_by_key.items()
+               if k not in embs and str(s.get("text") or "").strip()][:cap]
+    if not missing:
+        return False
+    vecs = _embed_api([_entry_embed_text(skills_by_key[k]) for k in missing])
+    if not vecs:
+        return False
+    added = False
+    for k, v in zip(missing, vecs):
+        if v:
+            embs[k] = v
+            added = True
+    if added:
+        _save_embs(embs)
+    return added
+
+
 # ---------------- 写入（去重覆盖） ----------------
 
 def add(
@@ -333,32 +449,51 @@ def retrieve(
     # 不传 scene_id 仍按全局取（老调用方/测试行为不变）。
     _sid = str(scene_id or "").strip()
     allowed = {_sid, "default", ""} if _sid else set()
+    # 原版同构：向量化检索（skill.py:117-130）。旧条目缺向量先懒补一批；
+    # 查询向量化失败或库里完全没有向量 → 整体回退词面 Jaccard。
+    embs = _load_embs()
+    try:
+        _ensure_embs(data["skills"], embs)
+    except Exception:
+        pass
+    qvec: list[float] | None = None
+    if embs:
+        _qv = _embed_api([str(query or "")])
+        qvec = (_qv or [None])[0] if _qv else None
+    _vec_mode = bool(qvec) and bool(embs)
     scored: list[tuple[float, str, dict[str, Any]]] = []
     for key, s in data["skills"].items():
         if _sid and str(s.get("source_scene") or "default") not in allowed:
             continue
-        same_topic = s.get("topic") == topic
-        sim = similarity(query, f"{s.get('name','')} {s.get('text','')}")
-        if not same_topic and sim < CROSS_TOPIC_MIN_SIM:
-            continue                      # 门槛 1：不相关的跨题经验不进 prompt
-        score = 3.0 if same_topic else 0.0
-        score += 2.5 * sim
-        hits = int(s.get("hits") or 0)
-        score += 0.25 * min(hits, 6)
-        score += 0.6 * (int(s.get("ok") or 0) / max(hits, 1))
+        if _vec_mode and key in embs:
+            # 原版 chroma：相似度盲取 top_k（没有题目/词面门槛，:122-130）；
+            # 「不是同一个量」由回填层规则 0 与守卫拦，不在检索层硬卡。
+            sim = _cosine(qvec, embs[key])
+            score = sim
+        else:
+            sim = similarity(query, f"{s.get('name','')} {s.get('text','')}")
+            same_topic = s.get("topic") == topic
+            if not same_topic and sim < CROSS_TOPIC_MIN_SIM:
+                continue                      # 门槛 1：不相关的跨题经验不进 prompt
+            score = 3.0 if same_topic else 0.0
+            score += 2.5 * sim
+            hits = int(s.get("hits") or 0)
+            score += 0.25 * min(hits, 6)
+            score += 0.6 * (int(s.get("ok") or 0) / max(hits, 1))
         scored.append((score, key, s))
     scored.sort(key=lambda x: -x[0])
 
     out: list[dict[str, Any]] = []
     cross = 0
     for score, key, s in scored:
-        if s.get("topic") != topic:
-            if cross >= CROSS_TOPIC_MAX:  # 门槛 2
+        if not (_vec_mode and key in embs) and s.get("topic") != topic:
+            if cross >= CROSS_TOPIC_MAX:  # 门槛 2（仅词面回退路径）
                 continue
             cross += 1
         if len(out) >= max(1, top_k):
             break
         item = dict(s)
+        item.pop("emb", None)             # 向量不外流（prompt/日志/面板）
         item["key"] = key
         item["score"] = round(score, 3)
         out.append(item)
@@ -448,6 +583,11 @@ def delete_skill(key: str) -> bool:
     del data["skills"][key]
     data["writes"] = int(data.get("writes") or 0) + 1
     _save(data)
+    # 向量一起清（EMB_STORE 以 key 为主键，孤儿向量无害但会白占检索比较）
+    embs = _load_embs()
+    if key in embs:
+        embs.pop(key, None)
+        _save_embs(embs)
     return True
 
 
@@ -511,4 +651,6 @@ def save(memory: list[str]) -> None:
 def reset() -> None:
     if STORE.exists():
         STORE.unlink()
-    print(f"已清空技能库：{STORE}")
+    if EMB_STORE.exists():
+        EMB_STORE.unlink()
+    print(f"已清空技能库：{STORE}（含向量 {EMB_STORE.name}）")

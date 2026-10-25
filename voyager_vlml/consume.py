@@ -118,8 +118,8 @@ def _critic_env_context(db_path: str) -> str:
                          "= 任务在数据源上不可答，判未完成并明说缺什么；"
                          "②对「总/全部/所有/每个」类题，核对结果覆盖的行数/人数"
                          "是否与清单里该群体的行数一致 —— INNER JOIN 一张稀疏表"
-                         "会把人群缩小（实测：9 名在职员工的总工资被算成只有 "
-                         "1 名有津贴记录员工的），覆盖不符 = 判未完成。")
+                         "会把人群缩小（实测：大群体的总账被算成只有少数有 "
+                         "记录者的），覆盖不符 = 判未完成。")
     except Exception:
         ctx = ""
     return ctx
@@ -244,34 +244,35 @@ _REFILL_SYSTEM = """你是 Valorant 电竞数据分析师。你手里有**以前
 0. **先判断配方算的量，与这句话问的量，是不是同一个量。**
    不是同一个量 → 直接返回 {"reused": false, "sql": "", "note": "原因"}，
    不要硬改一个出来。
-   ⚠️ 实测踩过：问「Cloud9 在哪张图上崩得最厉害？」（要的是连败/崩盘），
-   库里只有一条「平均 K/D」配方，模型照样把 'Cloud9' 填进去产出一条 K/D 查询，
-   还自称"复用了配方" —— 结果取到的是 K/D 比，被下游当成"崩盘率"讲了出来。
-   **数字错还能看出来，量错了是方向错，比报错危险得多。**
-   换实体值（Cloud9→NRG）算复用；换个完全不同的量算不上复用。
+   ⚠️ 实测踩过：问句要的是一个量，库里命中的配方算的是另一个量 ——
+   模型把问句里的实体名填进一条
+   量纲不同的配方，还自称"复用了配方" —— 结果取到的是配方那个量，被下游
+   当成要问的量讲了出来。**数字错还能看出来，量错了是方向错，比报错危险得多。**
+   换同类实体值（换一支队伍/一个部门）算复用；换个完全不同的量算不上复用。
 
 1. 复用的是配方的**计算方法**（用了哪些表、怎么聚合、怎么筛选），
    **不是**它上次算出来的数值 —— 数值必须重新算。
-2. 把**当前这句话里的实体值**（队伍名 / 图名 / 赛事 / 选手）填进配方对应的位置。
+2. 把**当前这句话里的实体值**（本题涉及的队伍/部门/月份/图名……）填进配方对应的位置。
    配方里写死的字面量要换成当前这句话指的那个值。
    ⚠️ 原版同构铁律（2026-10-24 实测 10:56 事故后立）：原版 action agent 写代码
    前，环境观察（nearbyBlocks）里只有**真实存在的方块名** —— 它写不出观察里
    没有的实体。这里同理：SQL 里的筛选字面量（部门/月份/队伍/图名…）必须
-   **逐字**取自下面环境观察的「真实取值」清单；问句里的口语说法（"九月份"、
-   "技术部"）必须映射成清单里逐字存在的值（如 '2026-09'、'技术'）。
-   清单里没有的写法一律不许出现在 SQL 里 —— 实测把 'September'/'技术部'
-   填进槽位，LEFT JOIN 匹配不上，SUM 出 1 行 NULL，技能"命中却答不出"。
-   ⚠️ 跨「一对多」JOIN 做聚合是头号陷阱：父表一行（如某员工的 base_salary）
-   会被子表的每一行乘一次（员工有 2 条津贴 → base_salary 算 2 次），SUM 出来
-   翻倍（75120 事故就是这么来的）。正确写法二选一：
+   **逐字**取自下面环境观察的「真实取值」清单；问句里的口语说法必须映射成
+   清单里逐字存在的值（如口语月份 → 清单里的日期写法、口语部门名 → 清单里
+   的部门代码）。
+   清单里没有的写法一律不许出现在 SQL 里 —— 实测把口语写法（英文月份、
+   带俗称的部门名）填进槽位，LEFT JOIN 匹配不上，SUM 出 1 行 NULL，
+   技能"命中却答不出"。
+   ⚠️ 跨「一对多」JOIN 做聚合是头号陷阱：父表一行会被子表的每一行乘一次
+   （父表一行匹配子表 2 行 → 父表数值列被算 2 次），SUM 出来翻倍。正确写法二选一：
      · 先把右表按关联键聚合成单行再 JOIN：
-       `LEFT JOIN (SELECT emp_id, SUM(amount) AS a FROM allowance
-        WHERE month=:month GROUP BY emp_id) t ON t.emp_id=e.emp_id`，
-       然后 `SUM(e.base_salary + COALESCE(t.a, 0))`；
+       `LEFT JOIN (SELECT 关联键, SUM(子表数值列) AS v FROM 子表
+        WHERE … GROUP BY 关联键) t ON t.关联键 = 父表.关联键`，
+       然后 `SUM(父表.数值列 + COALESCE(t.v, 0))`；
      · 或把子表聚合塞进标量子查询：
-       `SUM(e.base_salary + (SELECT COALESCE(SUM(amount),0) FROM allowance a
-        WHERE a.emp_id=e.emp_id AND a.month=:month))`。
-   绝对不要写 `SUM(e.base_salary + a.amount) FROM ... JOIN allowance a` 这种
+       `SUM(父表.数值列 + (SELECT COALESCE(SUM(子表.数值列),0) FROM 子表
+        WHERE 子表.关联键 = 父表.关联键 …))`。
+   绝对不要写 `SUM(父表.数值列 + 子表.数值列) FROM ... JOIN 子表` 这种
    把父表数值列直接带进"带子表 JOIN"的 SUM —— 必乘爆。
 3. 当前这句话没给实体（比如问"哪支队伍最高"）→ 保留配方的分组结构，别自己造一个值。
 4. 配方可能是**槽位模板**（入库时泛化过的）：`:dept`、`:month` 这种占位符，
@@ -329,30 +330,78 @@ def _refill_sql(question: str, skills: list[dict[str, Any]], schema: str,
     }
 
 
-def _pick_composite_skill(skills: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """从检索到的技能里挑「复合技能」（覆盖多张表的完整组合 SQL），用于消费侧**直接复用**
-    （执行已学函数取真实值，调答案出来编排），而不是让 agent 重写成新 SQL 合成。
+# 多技能输出契约 = 共享 _REFILL_SYSTEM 的规则 0-5（量纲判断 / 回填不是抄数值 /
+# 字面量地面真话 / 防乘爆 / 槽位），只换输出段 —— 单文件单一事实源，规则改动
+# 两边同步生效。
+_REFILL_MULTI_SYSTEM = (_REFILL_SYSTEM.split("只返回一个 JSON：")[0] + """多条输出契约（原版同构 2026-10-26：消费检索到的**全部**已学技能整批交给
+执行层按需组合调用 —— voyager.py:195 retrieve → :199 render_system_message →
+action.py:94 programs 注入；此前只挑一条写一条 SQL，合成题（base+津贴+加班）
+被单维度配方答掉，实测 3600/264000/133500 三连）：
 
-    评分：引用的真实表数多 > 名称/说明含复合关键词（总/应发/合计/total/salary…）。
-    必须至少引用 2 张表才算复合；返回最优或 None（全是原子技能时返回 None）。
+- **逐条**判断检索到的每条配方：它算的量，要么本身就是这句话问的量，
+  要么是这句话问的量的**组成部分** —— 问「总支出」时，基本工资/津贴/加班费
+  各条配方都是组成部分，**都要实例化出来**，各自取真数后由叙事层相加组织
+  （用户 2026-10-25：「检索到的技能取到数字，给叙事 LLM 相加或者做什么，
+  也算能力」）。
+- 跟问的量无关的配方不要输出（硬凑 = 张冠李戴，规则 0 同款）。
+- 如果某条**复合配方**（一条 SQL 已覆盖整题全部组成部分）命中，就只输出它，
+  不必再输出它的组成部分。
+- 每条 SQL 必须独立可执行（单条 SELECT）；守卫与执行逐条进行，一条被拒不
+  连坐其它条。
+
+只返回一个 JSON：{"items": [{"name": "配方名", "sql": "该配方实例化后的 SELECT"}],
+"note": "一句话说明复用了哪些配方、各填了什么值；哪些没用上、为什么"}""")
+
+
+def _refill_sql_multi(question: str, skills: list[dict[str, Any]], schema: str,
+                      db_path: str = "") -> dict[str, Any]:
+    """原版同构的多技能实例化：检索到的每条相关配方都回填成 SQL（不是只挑一条）。
+
+    与 `_refill_sql` 同一地面真话（db_observation 实查取值清单 + schema），
+    输出从「一条 SQL」改为「SQL 列表」—— 合成题由多条原子技能各取真数、
+    叙事层组织；复合配方命中时只出它。
     """
-    import re
-
-    best = None
-    best_score = 0
-    for s in skills or []:
-        code = str(s.get("code") or "").strip()
-        if not re.match(r"(?i)^\s*(select|with)\b", code):
+    recipes = "\n\n".join(
+        f"【配方 {i+1}｜topic={s.get('topic')}｜{s.get('name') or ''}】\n"
+        f"说明：{str(s.get('text') or '')[:200]}\n"
+        f"SQL：\n{str(s.get('code') or '')[:900]}"
+        for i, s in enumerate(skills[:5])
+    )
+    ground = ""
+    if str(db_path or "").strip():
+        try:
+            from curriculum_auto import db_observation as _dbobs
+            ground = str(_dbobs(db_path) or "")
+        except Exception:
+            ground = ""
+    user = (
+        f"当前这句话：\n{question}\n\n"
+        f"已学会的配方：\n{recipes}\n\n"
+        f"当前库真实存在的表与列（只能引用这里出现的名字）：\n{schema[:6000]}\n\n"
+        + (f"[环境观察（数据源真实的取值）——筛选字面量必须逐字取自这里，"
+           f"清单里没有的写法不许出现在 SQL 里]：\n{ground[:5000]}\n\n"
+           if ground else "")
+        + "按规则把**每条**要用的配方都实例化成独立的 SELECT。"
+    )
+    out = chat_json(
+        [
+            {"role": "system", "content": _REFILL_MULTI_SYSTEM},
+            {"role": "user", "content": user},
+        ],
+        temperature=0.2,
+    )
+    items: list[dict[str, str]] = []
+    for it in (out.get("items") or [])[:5]:
+        if not isinstance(it, dict):
             continue
-        tbls = set(re.findall(r"(?i)\b(?:FROM|JOIN)\s+([A-Za-z_]\w*)", code))
-        n = len(tbls)
-        name = str(s.get("name") or "") + " " + str(s.get("text") or "")
-        kw = bool(re.search(r"总|应发|合计|汇总|总和|total|salary|gross|combine",
-                            name, re.I))
-        score = n * 10 + (5 if kw else 0)
-        if n >= 2 and score > best_score:
-            best, best_score = s, score
-    return best
+        _sql = str(it.get("sql") or "").strip()
+        if _sql:
+            items.append({"name": str(it.get("name") or ""), "sql": _sql})
+    return {"items": items, "note": str(out.get("note") or "")}
+
+
+# （_pick_composite_skill 已删 —— 2026-10-26 多技能编排取代「挑一条复合配方」：
+#  回填层自己判断是出复合配方还是多条原子配方，见 _refill_sql_multi 的输出契约。）
 
 
 # ---------------------------------------------------------------------------
@@ -480,8 +529,8 @@ def _extract_user(question: str, obs: list[dict[str, Any]],
             )
             + "\n\n⚠️ 硬约束：上面这些维度，工具返回的数据里**算不出来就一条都别写**，"
             "留空数组。**绝对不许把别的数套到这个维度名上** —— 实测踩过：问的是"
-            "崩盘（要连败），取到的其实是 K/D 比，模型照样写成"
-            "`map_fb_conv = 1.146`，下游把它讲成「崩盘率 1.146」。"
+            "A 量，取到的其实是 B 量，模型照样把 B 的数写进 A 的维度名，"
+            "下游把它讲成 A 的答案。"
             "维度名与值不匹配 = 编造，比留空坏得多。宁可少写，不许错配。"
         )
     return f"""工具返回的真实数据：
@@ -496,8 +545,9 @@ def _extract_user(question: str, obs: list[dict[str, Any]],
 {{"subject": {{...}}, "dimension": "...", "value": 数值,
   "unit": "percent|count|ratio|raw", "base": 分母}}
 
-subject 至少要能定位到谁：涉及队伍带 "team"，涉及某张图带 "map"（用真实名字）。
-dimension 要能看出方向：写 max_losing_streak 这种，不要写 round_streak ——
+subject 至少要能定位到谁：用本题库的**真实字段与真实取值**来定位
+（涉及群体带群体字段、涉及个体带个体字段，字段名逐字取自 schema）。
+dimension 要能看出方向：带方向前缀（如 max_ / min_），不要写中性名字 ——
 方向反了比报错更危险。
 
 只输出 JSON：{{"facts":[...]}}
@@ -552,8 +602,8 @@ def _method_compare(question: str, v_sql: str, v_obs: list[dict[str, Any]],
                          "  第二步 same_metric：两边算的是不是同一个量。\n"
                          "  第三步 agreement：口径一致度（不是「谁对谁错」分）。\n"
                          "    **两边口径不同 ≠ Voyager 有硬伤** —— 实测踩过："
-                         "问「每个回合各个角色的平均击杀数」，Voyager 算得完全正确，"
-                         "是裁判自己多算了 deaths 算成 K/D，结果 Voyager 被判"
+                         "Voyager 算的量完全正确，"
+                         "是裁判自己把别的量混进来比对，结果 Voyager 被判"
                          "「做法有硬伤」，面板上显示的是冤枉它。\n"
                          "    裁判跑偏时：same_metric=false，voyager_sound 仍按第一步判，"
                          "并在 diff 里写清「是裁判多算了什么/少算了什么」。\n"
@@ -562,7 +612,7 @@ def _method_compare(question: str, v_sql: str, v_obs: list[dict[str, Any]],
                          "⚠️ 两边都取到 0 行时，SQL 再像也**没有数可比** —— "
                          "这时 agreement 必须给 0，same_metric=false，"
                          "reason 写明「两边都没取到数，无从比对」。别把两个空结果"
-                         "判成「口径一致」 —— 实测踩过：Cloud9/Corrode 在当前库里没有数据，"
+                         "判成「口径一致」 —— 实测踩过：两边的实体在当前库里都没有数据，"
                          "两边各取回 0 行，方法长得一样，就被判成了 100% 一致。"
                          "那等于给「两边都没取到数」发满分，比报错危险得多。\n"
                          "只返回 JSON："
@@ -852,20 +902,8 @@ async def consume(
         dims = [str(p.get("dimension")) for p in derived]
         subs = [dict(p.get("subject") or {}) for p in derived]
 
-    # ---- ①' 合成题判定（路由用）----
-    # 与下方"维度覆盖守卫"同源：本题是否多维度合成题（里程碑 6 维 / 派生 >=2 维）。
-    # 合成题必须走共用 solve 组合（同构学习侧），不走 _refill_sql 单配方捷径；
-    # 原子题才用 _refill_sql 确定性重放。milestone_dimensions 只读骨架 JSON，
-    # 无骨架回退 dims，不误伤自由提问的原子题。
-    _nd_comp = len(dims)
-    try:
-        import maieutic_scaffold as _ms
-        _msd = _ms.milestone_dimensions(_scene_id, question)
-        if len(_msd) >= 2:
-            _nd_comp = len(_msd)
-    except Exception:
-        pass
-    _composite = _nd_comp >= 2
+    # （①' 合成题判定已并入下方「维度覆盖守卫」——同一套 milestone_dimensions
+    # + dims 口径在那边算 _nd；单配方捷径删除后这里不再需要预先分流。）
 
     # ---- ② 找已积累的能力（配方）----
     # ⚠️ 检索键必须是**本题归题结果**（2026-10-20 实测根因）：原来这里传的是
@@ -931,6 +969,10 @@ async def consume(
         obs: list[dict[str, Any]] = []
         reused_skill: dict[str, Any] | None = None
         reuse_errors: list[str] = []
+        # 多技能编排的执行账（_refill_sql_multi 逐条实例化 + 执行成功的技能）；
+        # _used_skills 是它们的技能元数据（面板 used_skills 披露用）。
+        _executed: list[dict[str, Any]] = []
+        _used_skills: list[dict[str, Any]] = []
         if _scene_kind == "scene":
             # ---- 场景库形态的配方复用：**回填**，不原样重放（2026-10-23 用户
             # 定「不要把数值写死，把算法积累成技能」）----
@@ -946,48 +988,9 @@ async def consume(
                 _schema = await _env.schema_block()
             except Exception:
                 _schema = ""
-            # 合成题（_composite）不让 _refill_sql 单配方捷径答掉——直接落 ③b
-            # 共用 solve 组合（同构学习侧"消费和学习异步同原理"）。原子题才走
-            # _refill_sql 确定性重放。
-            if skills and not _composite:
-                _r = _refill_sql(question, skills, _schema,
-                                 db_path=str((_prof or {}).get("db_path") or ""))
-                if _r["reused"] and _r["sql"]:
-                    # 原版同构（2026-10-24 用户定「一定要搬原 voyager」）：回填
-                    # 出的 SQL 与入库配方过**同一把确定性守卫** —— 字面量必须能在
-                    # 环境实查里指认。守卫拒用 → 这条配方当失败，落到 ③b 现场
-                    # 写（原版：坏代码执行失败，下一轮 action agent 重写）。
-                    _gwhy = _sql_literal_guard(
-                        _r["sql"], str((_prof or {}).get("db_path") or ""))
-                    if _gwhy:
-                        reuse_errors.append(
-                            f"配方回填被字面量守卫拒用（幻觉取值）：{_gwhy[:140]}")
-                    else:
-                        # fan-out 闸门（乘爆根因）：字面量守卫拦不住乘爆——
-                        # 乘爆 SQL 的字面量全是真的，只靠"行有没有被 JOIN 乘起来"
-                        # 实查判定。命中即拒这条配方，落 ③b 现场写让它重写。
-                        _fwhy = _fanout_guard(
-                            _r["sql"], str((_prof or {}).get("db_path") or ""))
-                        if _fwhy:
-                            reuse_errors.append(
-                                f"配方回填被 fan-out 闸门拒用（JOIN 乘爆）：{_fwhy[:140]}")
-                        else:
-                            _rr = await _env.run_sql(_r["sql"])
-                        _d = _rr.get("data") or {}
-                        if _rr.get("ok") and _d.get("rows"):
-                            data, code = _d, _r["sql"]
-                            reused_skill = {**dict(skills[0]),
-                                            "refill_note": _r["note"]}
-                            obs = [{"ok": True, "tool": "query_sql",
-                                    "rows": _rr.get("rows"), "data": _d,
-                                    "data_sources": ["query_sql"]}]
-                        else:
-                            reuse_errors.append(
-                                "配方回填后没取到真数："
-                                f"{str(_rr.get('error') or '0 行')[:120]}")
-                else:
-                    reuse_errors.append(
-                        f"配方与这句话对不上，没复用：{str(_r['note'])[:120]}")
+            # （③a 单配方捷径已删 —— 2026-10-26 对齐原版：检索到的**全部**已学
+            # 技能整批实例化、逐条执行，见下方 `if reused_skill is None:` 块；
+            # 原子题/合成题同一条编排路径，不再分流。）
         else:
             for s in skills:
                 sc = str(s.get("code") or "")
@@ -1018,79 +1021,97 @@ async def consume(
                 obs = [{"ok": True, "tool": "local_python", "rows": 1,
                         "data": data_try}]
                 break
-        # ③b 没有可复用的配方 → 现场写
+        # ③b 场景库形态：**多技能编排复用**（原版同构 2026-10-26 用户拍板
+        # 「检索/组织复用没对齐就改」）。原版消费 = inference → rollout → step：
+        # 检索技能**整批**注入执行层（voyager.py:195-199 → action.py:94 programs），
+        # agent 按需组合调用，critic 收口 —— 没有单配方捷径。此前只挑一条配方写
+        # 一条 SQL，合成题被单维度答掉（实测 3600/264000/133500 三连）。现在：
+        # 检索到的全部已学技能整批回填成 SQL 列表（_refill_sql_multi）→ 逐条过
+        # 确定性守卫（字面量 + fan-out）→ 逐条执行取真数 → 合并交叙事层相加组织
+        # （用户 2026-10-25：「取到数字给叙事 LLM 相加也算能力」）。
+        # 边界不变：消费不现做合成 —— 回填全是已学配方的实例化；实例化不出/
+        # 守卫拒/执行空 → 如实标记去学，绝不现场写 SQL。
         if reused_skill is None:
-            # 已学技能**必须进执行层让模型调用合成**（原版 action.py:94
-            # `+ skills`）：命中（HIGH_CONFIDENCE）的题尤其如此 —— 图谱里
-            # 已经学过它，却还去"现场现做"，等于技能库白建（用户 2026-10-20
-            # 「所有命中的题目都要用到已经学到的技能」）。
             if _scene_kind == "scene":
-                # 场景库形态复用优先（同构 Voyager：检索 → 重放/复用 → 取不到才写）。
-                # 设计边界（用户 2026-10-25）：消费侧**不做合成**——学过的里程碑
-                # 直接检索复用已学复合技能（执行已学函数取真实值，调答案出来编排）；
-                # 检索不到（未学）就**不答、只标记去学**，交给课程规划拆解完成。
-                # 2026-10-25 再收紧：连「复合复用失败后的做题兜底」也删了——消费
-                # 只编排复用、不现做合成；复用取不到数就如实标记去学，绝不现场写 SQL。
-                if skills:
-                    # 学过的里程碑：挑出复合技能直接复用（槽位实例化 + 双层确定性
-                    # 守卫），不再让 agent 重写 SQL 合成。
-                    _comp = _pick_composite_skill(skills)
-                    if _comp is not None:
-                        _dbp = str((_prof or {}).get("db_path") or "")
-                        _r = _refill_sql(question, [_comp], _schema, db_path=_dbp)
-                        if _r["reused"] and _r["sql"]:
-                            _gwhy = _sql_literal_guard(_r["sql"], _dbp)
-                            if _gwhy:
-                                reuse_errors.append(
-                                    f"复合技能复用被字面量守卫拒用：{_gwhy[:120]}")
-                            else:
-                                _fwhy = _fanout_guard(_r["sql"], _dbp)
-                                if _fwhy:
-                                    reuse_errors.append(
-                                        f"复合技能复用被 fan-out 拒用：{_fwhy[:120]}")
-                                else:
-                                    _rr = await _env.run_sql(_r["sql"])
-                                    _d = _rr.get("data") or {}
-                                    if _rr.get("ok") and _d.get("rows"):
-                                        data, code = _d, _r["sql"]
-                                        reused_skill = {**dict(_comp),
-                                                        "refill_note": _r["note"]}
-                                        # 复合复用成功：守卫标尺收窄到这条组合
-                                        # 技能自身（见 _ans_skills 注释）。
-                                        _ans_skills = [_comp]
-                                        obs = [{"ok": True, "tool": "query_sql",
-                                                "rows": _rr.get("rows"),
-                                                "data": _d,
-                                                "data_sources": ["query_sql"]}]
-                                    else:
-                                        reuse_errors.append(
-                                            "复合技能复用后没取到真数："
-                                            f"{str(_rr.get('error') or '0 行')[:120]}")
+                _dbp = str((_prof or {}).get("db_path") or "")
+                if not skills:
+                    # 未学（索引不到已学技能）：不合成、不答，标记交给课程规划。
+                    # 设计边界（用户 2026-10-25）：消费侧不做合成，只检索复用；
+                    # 检索不到说明里程碑没跑过，应由学习侧拆解完成。
+                    reuse_errors.append(
+                        "未学：索引不到已学技能 → 标记交给课程规划拆解学习")
+                    learn_kick = {"kicked": False, "manual": True,
+                                  "why": "未学（检索不到已学技能）—— 这道里程碑还没"
+                                         "被学习跑过，需驾驶舱 ▶ 启动 Voyager 学完"}
+                    obs, code = [], ""
+                else:
+                    _mr = _refill_sql_multi(question, skills, _schema,
+                                            db_path=_dbp)
+                    if not _mr["items"]:
+                        reuse_errors.append(
+                            f"检索到 {len(skills)} 条已学技能但回填层没实例化出任何"
+                            f" SQL：{str(_mr['note'])[:140]}")
+                    for _it in _mr["items"]:
+                        _sql = _it["sql"]
+                        _sk = next((s for s in skills
+                                    if str(s.get("name") or "") == _it["name"]),
+                                   None)
+                        _label = _it["name"] or str(
+                            (_sk or skills[0]).get("name") or "配方")
+                        _gwhy = _sql_literal_guard(_sql, _dbp)
+                        if _gwhy:
+                            reuse_errors.append(
+                                f"{_label} 被字面量守卫拒用（幻觉取值）：{_gwhy[:120]}")
+                            continue
+                        _fwhy = _fanout_guard(_sql, _dbp)
+                        if _fwhy:
+                            reuse_errors.append(
+                                f"{_label} 被 fan-out 闸门拒用（JOIN 乘爆）：{_fwhy[:120]}")
+                            continue
+                        _rr = await _env.run_sql(_sql)
+                        _d = _rr.get("data") or {}
+                        if _rr.get("ok") and _d.get("rows"):
+                            _executed.append({"skill": _sk or {}, "name": _label,
+                                              "sql": _sql, "data": _d,
+                                              "rows": _rr.get("rows")})
                         else:
                             reuse_errors.append(
-                                f"复合技能未通过回填实例化：{str(_r['note'])[:120]}")
-                    # 复合复用没成（或本就是原子题已由 ③a 复用）→ **不再做题兜底**
-                    # （用户 2026-10-25：做题兜底不要，只留叙事）。消费只编排复用
-                    # 已学技能、不现做合成：检索到技能却没取到数，如实标记去学，
-                    # 绝不现场写 SQL 编答案（幻觉取值就是这么漏出去的）。
-                    if data is None and reused_skill is None:
-                        if not reuse_errors:
-                            reuse_errors.append(
-                                "已检索到已学技能但复用未取到真数（回填/组合未命中）")
+                                f"{_label} 回填后没取到真数："
+                                f"{str(_rr.get('error') or '0 行')[:120]}")
+                    if _executed:
+                        # 多技能结果合并（原版：agent 组合多条技能的产出交呈现层）：
+                        # 每行标注来源技能，叙事层据此相加/组织；`rows` 键保住
+                        # 下方真空防线的口径不变。
+                        _merged: list[Any] = []
+                        for _e in _executed:
+                            for _row in (_e["data"].get("rows") or []):
+                                if isinstance(_row, dict):
+                                    _merged.append({"来源技能": _e["name"], **_row})
+                                else:
+                                    _merged.append({"来源技能": _e["name"],
+                                                    "值": _row})
+                        data = {"rows": _merged,
+                                "sources": [_e["name"] for _e in _executed]}
+                        code = "\n;\n".join(_e["sql"] for _e in _executed)
+                        _first = next((e["skill"] for e in _executed
+                                       if e.get("skill")), None) or skills[0]
+                        reused_skill = {**dict(_first), "refill_note": _mr["note"],
+                                        "composed_of": [_e["name"]
+                                                        for _e in _executed]}
+                        _used_skills = [dict(e["skill"]) for e in _executed
+                                        if e.get("skill")]
+                        _ans_skills = (_used_skills or skills)
+                        obs = [{"ok": True, "tool": "query_sql",
+                                "rows": _e["rows"], "data": _e["data"],
+                                "data_sources": ["query_sql"]}
+                               for _e in _executed]
+                    else:
+                        reuse_errors.append(
+                            "已检索到已学技能但复用未取到真数（回填/守卫/执行全败）")
                         learn_kick = {"kicked": False, "manual": True,
                                       "why": "已学技能检索到了但复用未取到真数 —— "
                                              "消费不做合成，需驾驶舱 ▶ 启动 Voyager "
                                              "重学该里程碑（或补缺维度）"}
-                        obs, code = [], ""
-                    else:
-                        # 未学（索引不到已学技能）：不合成、不答，标记交给课程规划。
-                        # 设计边界（用户 2026-10-25）：消费侧不做合成，只检索复用；
-                        # 检索不到说明里程碑没跑过，应由学习侧拆解完成。
-                        reuse_errors.append(
-                            "未学：索引不到已学技能 → 标记交给课程规划拆解学习")
-                        learn_kick = {"kicked": False, "manual": True,
-                                      "why": "未学（检索不到已学技能）—— 这道里程碑还没"
-                                             "被学习跑过，需驾驶舱 ▶ 启动 Voyager 学完"}
                         obs, code = [], ""
             else:
                 obs, code = await _la.solve(
@@ -1142,6 +1163,21 @@ async def consume(
                     _nd = len(_msd)
             except Exception:
                 pass
+            # 多技能编排缺口闸（确定性，2026-10-26）：合成题（dims>=2）但执行
+            # 成功的技能只覆盖 1 张源表、且没有复合配方兜底 → 组成部分没齐
+            # （3600=只算津贴 / 264000=只算加班 / 133500=只算基薪，同款）。
+            # 不交片面数，标记去学。多条原子技能都执行到（表并集>=2）或复合
+            # 配方命中（自身覆盖整题）→ 放行交叙事层相加。
+            if _nd >= 2 and _executed:
+                _et: set[str] = set()
+                for _e in _executed:
+                    _et |= _sql_tables(_e["sql"])
+                _has_comp = any(str((e.get("skill") or {}).get("name") or "")
+                                == "milestone" for e in _executed)
+                if len(_et) < 2 and not _has_comp:
+                    _coverage_why = (f"合成题（{_nd} 维）只执行到 {len(_et)} 张源表的"
+                                     f"原子技能，组成部分不齐 —— 不交片面数，标记去学")
+                    data = None
             _partial, _cwhy = _answer_is_partial(code, _ans_skills, _nd)
             if _partial:
                 _coverage_why = _cwhy
@@ -1167,8 +1203,15 @@ async def consume(
                 answer = str(data)[:4000]
             try:
                 import narrator as _nar
+                _nar_note = f"数据源：{_scene_why}"
+                if len((reused_skill or {}).get("composed_of") or []) > 1:
+                    # 多技能编排：各条目是同一总量的组成部分，授权叙事层相加
+                    # （用户 2026-10-25：「检索到的技能取到数字，给叙事 LLM
+                    # 相加或者做什么，也算能力」）。
+                    _nar_note += ("；下面各「来源技能」条目是这句话问的总量的"
+                                  "组成部分，允许相加汇总，逐个来源编号都标上")
                 nar = _nar.narrate_answer(question, data,
-                                          note=f"数据源：{_scene_why}")
+                                          note=_nar_note)
             except Exception as e:      # 连 import 都失败也不许影响取数结果
                 nar = {"ok": False, "why": f"{type(e).__name__}: {e}"}
             if nar.get("ok") and str(nar.get("answer") or "").strip():
@@ -1232,10 +1275,16 @@ async def consume(
             "errors": [str(o.get("error") or "") for o in obs if not o.get("ok")],
             "answer": answer, "sql": code,
             "rows": sum(int(o.get("rows") or 0) for o in obs if o.get("ok")),
-            "used_skills": ([{"topic": reused_skill.get("topic"),
-                              "name": reused_skill.get("name"),
-                              "key": reused_skill.get("key")}]
-                            if reused_skill else []),
+            # 多技能编排：把**每条**执行到的已学技能都披露出来（原版同构：
+            # 注入的 skills 就是 agent 实际可调用的集合）；单技能复用仍走
+            # reused_skill 兜底，口径不变。
+            "used_skills": ([{"topic": s.get("topic"), "name": s.get("name"),
+                              "key": s.get("key")} for s in _used_skills]
+                            if _used_skills else
+                            ([{"topic": reused_skill.get("topic"),
+                               "name": reused_skill.get("name"),
+                               "key": reused_skill.get("key")}]
+                             if reused_skill else [])),
             "reused": bool(reused_skill), "graph_link": {},
             # 复用阶段被真空判据挡下的每一条，都留下证据（不静默跳过）
             "reuse_errors": reuse_errors,
@@ -1796,14 +1845,15 @@ def _derive_dims(question: str) -> list[dict[str, Any]]:
                          "\"subject\":{\"team\":\"...\",\"map\":\"...\"}}]}\n\n"
                          "⚠️ 三个硬约束（每条都实测踩过）：\n"
                          "  1. dimension 必须是**英文 snake_case 的数值指标名** —— "
-                         "kd_ratio / total_damage / usage_rate / win_rate / kast_pct 这种。\n"
-                         "     **不许写中文**（实测写成「K/D 比最高」→ 裁判照它写的 SQL "
-                         "只取了选手名、没取比值 → 一条事实都整理不出来 → 覆盖率落空）。\n"
+                         "total_amount / avg_value / usage_rate 这种（优先取本题库"
+                         "真实存在的数值列）。\n"
+                         "     **不许写中文**（实测写成中文描述 → 裁判照它写的 SQL "
+                         "只取了实体名、没取比值 → 一条事实都整理不出来 → 覆盖率落空）。\n"
                          "     **不许带 最高/最低/最多 这类排序词** —— 那是问法不是指标；"
-                         "问「谁最高」时 dimension 就写那个指标本身（kd_ratio）。\n"
-                         "  2. subject = **说的是谁**（team / map / player 的真实取值，"
-                         "如 {\"map\":\"Corrode\"}），不要把「K/D 比最高」这种描述塞进来，"
-                         "也不要把图名塞进 team 字段（实测串过一次）。\n"
+                         "问「谁最高」时 dimension 就写那个指标本身。\n"
+                         "  2. subject = **说的是谁**（本题实体的字段与真实取值，"
+                         "如 {\"实体字段\":\"真实取值\"}），不要把「XX 最高」这种描述塞进来，"
+                         "也不要把一个实体的值塞进另一个字段（实测串过一次）。\n"
                          "  3. 每个 point 都要是**能用 SQL 算出来的一个数**，"
                          "不是一段描述。")},
             {"role": "user", "content": question},
@@ -1857,18 +1907,18 @@ async def _referee_observations(question: str,
     )
     q2 = (f"（裁判·独立取标准答案）{question}\n"
           + (f"要给出的量（dimension 逐字用这些名字，值从库里算）：{want}\n" if want else "")
-          + "⚠️ 比值/除法必须写 NULLIF(x, 0)（如 AVG(kills)/NULLIF(AVG(deaths),0)）—— "
+          + "⚠️ 比值/除法必须写 NULLIF(x, 0)（如 AVG(数值列)/NULLIF(AVG(另一数值列),0)）—— "
             "DuckDB 里 x/0 得 NaN 不报错，取回来是个没法比的数；"
             "且优先在聚合层做除法（先 AVG 再相除），不要对逐行比值再 MAX。\n"
             "⚠️ 多表 JOIN 时列名必须带表名前缀（两表常有同名列，裸写会 Ambiguous）。\n"
-            "⚠️ 跨「一对多」JOIN 做聚合会乘爆：父表一行（如 base_salary）被子表"
-            "每行乘一次（员工有 2 条津贴 → base_salary 算 2 次）。正确写法：先把"
-            "右表按关联键聚合成单行再 JOIN（LEFT JOIN (SELECT emp_id, SUM(amount)"
-            " AS a FROM allowance WHERE month=:month GROUP BY emp_id) t ON "
-            "t.emp_id=e.emp_id），再 SUM(e.base_salary + COALESCE(t.a,0))；或改用"
-            "标量子查询 SUM(e.col + (SELECT COALESCE(SUM(amount),0) FROM allowance"
-            " a WHERE a.emp_id=e.emp_id AND a.month=:month))。绝不要写"
-            " SUM(e.base_salary + a.amount) FROM ... JOIN allowance a。\n"
+            "⚠️ 跨「一对多」JOIN 做聚合会乘爆：父表一行被子表"
+            "每行乘一次（父表一行匹配子表 2 行 → 父表数值列被算 2 次）。正确写法：先把"
+            "右表按关联键聚合成单行再 JOIN（LEFT JOIN (SELECT 关联键, SUM(子表数值列)"
+            " AS v FROM 子表 WHERE … GROUP BY 关联键) t ON "
+            "t.关联键=父表.关联键），再 SUM(父表.数值列 + COALESCE(t.v,0))；或改用"
+            "标量子查询 SUM(父表.数值列 + (SELECT COALESCE(SUM(子表.数值列),0) FROM 子表"
+            " WHERE 子表.关联键=父表.关联键 …))。绝不要写"
+            " SUM(父表.数值列 + 子表.数值列) FROM ... JOIN 子表。\n"
             # 2026-10-14：schema 中部虽已标注空表，实测 glm-4-flash 仍会
             # 3 轮迭代都查 agg_team_round_summary（0 行）—— 空表纯聚合返回
             # 1 行 (NULL, 0)，看着像取到数其实没有。在 user message 里再强调
@@ -2162,10 +2212,10 @@ def _fanout_guard(sql: str, db_path: str) -> str:
         return (f"JOIN 之后 {n} 行，驱动表 `{g.get('driver')}` 只有 {d} 个不同行"
                 f"（放大 {ratio}×）—— 跨一对多 JOIN 做聚合会把父表数值按子表行数"
                 f"翻倍，答案必错。正确写法：先把右表按关联键聚合成单行再 JOIN"
-                f"（如 LEFT JOIN (SELECT emp_id, SUM(amount) AS a FROM allowance "
-                f"WHERE month=:month GROUP BY emp_id) t ON t.emp_id=e.emp_id），或"
-                f"改用标量子查询 SUM(e.col + (SELECT COALESCE(SUM(amount),0) FROM "
-                f"allowance a WHERE a.emp_id=e.emp_id AND a.month=:month))")
+                f"（如 LEFT JOIN (SELECT 关联键, SUM(子表数值列) AS v FROM 子表 "
+                f"WHERE … GROUP BY 关联键) t ON t.关联键=父表.关联键），或"
+                f"改用标量子查询 SUM(父表.数值列 + (SELECT COALESCE(SUM(子表.数值列),0) "
+                f"FROM 子表 WHERE 子表.关联键=父表.关联键 …))")
     return ""
 
 

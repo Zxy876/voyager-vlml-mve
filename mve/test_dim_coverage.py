@@ -127,9 +127,30 @@ def main() -> int:
     print()
     print("== ⑨ milestone_dimensions（导入式里程碑权威维度）==")
     try:
+        import json as _json
+        import tempfile as _tf
+        import shutil as _sh
         import maieutic_scaffold as _ms
-        md = _ms.milestone_dimensions("B", "九月份要给技术部员工发多少工资")
-        check("里程碑维度>=2（权威拆分）", len(md) >= 2, f"n={len(md)}")
+        # 自建临时骨架缓存（不依赖真实 ckpt —— 测试必须可在干净环境跑）：
+        # 走 _cache_path 同一把钥匙写 3 维骨架，再读回。
+        tmp = _tf.mkdtemp()
+        _old_ckpt = _ms.CKPT
+        _ms.CKPT = Path(tmp)
+        try:
+            _q = "九月份要给技术部员工发多少工资"
+            _p = _ms._cache_path("B", _q)
+            _p.parent.mkdir(parents=True, exist_ok=True)
+            _p.write_text(_json.dumps({
+                "question": _q,
+                "dimensions": [{"id": "d1", "question": "筛选技术部"},
+                               {"id": "d2", "question": "取基本工资"},
+                               {"id": "d3", "question": "取津贴"}],
+            }, ensure_ascii=False), encoding="utf-8")
+            md = _ms.milestone_dimensions("B", _q)
+            check("里程碑维度>=2（权威拆分）", len(md) >= 2, f"n={len(md)}")
+        finally:
+            _ms.CKPT = _old_ckpt
+            _sh.rmtree(tmp, ignore_errors=True)
     except Exception as e:
         check("里程碑维度读取", False, f"{type(e).__name__}: {e}")
 
