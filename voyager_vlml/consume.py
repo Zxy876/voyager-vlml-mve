@@ -1082,15 +1082,16 @@ async def consume(
                                              "消费不做合成，需驾驶舱 ▶ 启动 Voyager "
                                              "重学该里程碑（或补缺维度）"}
                         obs, code = [], ""
-                    # 未学（索引不到已学技能）：不合成、不答，标记交给课程规划。
-                    # 设计边界（用户 2026-10-25）：消费侧不做合成，只检索复用；
-                    # 检索不到说明里程碑没跑过，应由学习侧拆解完成。
-                    reuse_errors.append(
-                        "未学：索引不到已学技能 → 标记交给课程规划拆解学习")
-                    learn_kick = {"kicked": False, "manual": True,
-                                  "why": "未学（检索不到已学技能）—— 这道里程碑还没"
-                                         "被学习跑过，需驾驶舱 ▶ 启动 Voyager 学完"}
-                    obs, code = [], ""
+                    else:
+                        # 未学（索引不到已学技能）：不合成、不答，标记交给课程规划。
+                        # 设计边界（用户 2026-10-25）：消费侧不做合成，只检索复用；
+                        # 检索不到说明里程碑没跑过，应由学习侧拆解完成。
+                        reuse_errors.append(
+                            "未学：索引不到已学技能 → 标记交给课程规划拆解学习")
+                        learn_kick = {"kicked": False, "manual": True,
+                                      "why": "未学（检索不到已学技能）—— 这道里程碑还没"
+                                             "被学习跑过，需驾驶舱 ▶ 启动 Voyager 学完"}
+                        obs, code = [], ""
             else:
                 obs, code = await _la.solve(
                     question, _scene_dir, scene_id=_scene_id, skills=skills,
