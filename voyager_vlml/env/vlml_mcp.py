@@ -138,36 +138,50 @@ class VLMLMCPEnv:
     async def run_sql(self, sql: str) -> dict[str, Any]:
         """执行一条 SQL（模型写的取数代码在这里跑）。"""
         return await self.call("query_sql", sql_query=sql)
-
     async def check_grain(self, sql: str) -> dict[str, Any] | None:
         """实查「这条 JOIN 有没有把驱动表的行放大」（fan-out）。
 
         为什么需要它（2026-10-23 实测）：`JOIN rounds ON e.game_id = r.game_id`
         只连 game_id，而 `rounds` 是**一行一回合**（一个 series 22 回合），
-        13 个首血回合被乘成 286 行 → 算出 169/286，真值是 9/13。
+        13 个首血回合被乘成 286 行 -> 算出 169/286，真值是 9/13。
         critic 只看到「1 行两个数」，分不出哪个对 —— 它缺的不是判断力，是**证据**。
         原版 critic 的观察里，末态本身就是答案面（背包里几个木头一目了然）；
         SQL 世界的对应物就是"行数有没有被 JOIN 乘起来"，只能实测。
 
         做法不需要任何领域知识：把 SELECT 列表换成
-            COUNT(*)              → n（JOIN 之后的行数）
-            COUNT(DISTINCT 别名)   → d（驱动表里不同的行数；DuckDB 允许对别名整体去重）
+            COUNT(*)              -> n（JOIN 之后的行数）
+            COUNT(DISTINCT 别名)   -> d（驱动表里不同的行数；DuckDB 允许对别名整体去重）
         其余 FROM/WHERE 原样保留，跑一次即可。d < n 就是放大，倍数 n/d。
 
         不加 JOIN / 以 WITH 开头（驱动表可能是 CTE，别名出作用域）/ 解析不出来
-        → 返回 None（如实说"这次没测"，不假装测过）。
+        -> 返回 None（如实说"这次没测"，不假装测过）。
         """
-        parsed = _split_from(sql)
-        if parsed is None:
+        probes = _grain_probes(sql)
+        if probes is None:
             return None
-        alias, tail = parsed
-        probes = (
-            # 首选：整行去重（DuckDB 支持 COUNT(DISTINCT 别名)）
-            f"SELECT COUNT(*) AS n, COUNT(DISTINCT {alias}) AS d " + tail,
-            # 退回：子查询去重（不支持整行去重的引擎走这条）
-            f"SELECT (SELECT COUNT(*) {tail}) AS n, "
-            f"(SELECT COUNT(*) FROM (SELECT DISTINCT {alias}.* {tail})) AS d",
-        )
+        alias, _ = _split_from(sql) or ("", "")
+        for probe in probes:
+            obs = await self.run_sql(probe)
+            if not obs.get("ok"):
+                continue
+            data = obs.get("data") or {}
+            rows = data.get("rows") if isinstance(data, dict) else data
+            if not rows:
+                continue
+            try:
+                n, d = int(rows[0][0]), int(rows[0][1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            return {
+                "driver": alias,
+                "rows": n,
+                "distinct": d,
+                "ratio": round(n / d, 2) if d else None,
+                "probe": probe,
+            }
+        return None
+
+        alias, _ = _split_from(sql) or ("", "")
         for probe in probes:
             obs = await self.run_sql(probe)
             if not obs.get("ok"):
@@ -473,5 +487,103 @@ def _main() -> int:
     return 0
 
 
+
+
+def _grain_probes(sql: str) -> list[str] | None:
+    """构造 fan-out 实测探针（JOIN 之后行数 vs 驱动表不同行数）。
+
+    把 SELECT 列表换成
+        COUNT(*)              → n（JOIN 之后的行数）
+        COUNT(DISTINCT 别名)   → d（驱动表里不同的行数；DuckDB 允许对别名整体去重）
+    其余 FROM/WHERE 原样保留（GROUP BY/ORDER BY/LIMIT 已被 `_split_from` 截掉）。
+    d < n 就是放大，倍数 n/d。
+
+    解析不出来（无 JOIN / 以 WITH 开头 / 驱动表是子查询）→ 返回 None（不猜）。
+    """
+    parsed = _split_from(sql)
+    if parsed is None:
+        return None
+    alias, tail = parsed
+    return [
+        # 首选：整行去重（DuckDB 支持 COUNT(DISTINCT 别名)）
+        f"SELECT COUNT(*) AS n, COUNT(DISTINCT {alias}) AS d " + tail,
+        # 退回：子查询去重（不支持整行去重的引擎走这条）
+        f"SELECT (SELECT COUNT(*) {tail}) AS n, "
+        f"(SELECT COUNT(*) FROM (SELECT DISTINCT {alias}.* {tail})) AS d",
+    ]
+
+
+def _has_aggregation(sql: str) -> bool:
+    """SELECT 列表（FROM 之前）是否在做真正的聚合。
+
+    只认会逐行塌缩的聚合：SUM/AVG/MIN/MAX，以及作用在**列**上的 COUNT(col)
+    （COUNT(*) 只数行数，跨一对多 JOIN 时有时本就是想数明细行，不在此拦）。
+    用途：fan-out 只在「聚合 + 行放大」同时成立时才失真 —— 纯明细查询
+    （SELECT 行）跨 JOIN 放大是合法的，不能误杀。
+    """
+    s = str(sql or "")
+    low = s.lower()
+    i = low.find(" from ")
+    head = low[: i if i >= 0 else len(low)]
+    import re as _re
+    if _re.search(r"\b(sum|avg|min|max)\s*\(", head):
+        return True
+    # COUNT( 后面紧跟 * 或空格→ 数行；紧跟列名/非 * → 聚合列
+    for m in _re.finditer(r"count\s*\(\s*", head):
+        j = m.end()
+        while j < len(s) and s[j] in " \t\r\n":
+            j += 1
+        if j < len(s) and s[j] != "*":
+            return True
+    return False
+
+
+def check_sql_grain(sql: str, db_path: str) -> dict[str, Any] | None:
+    """同步版 fan-out 实测：直接 read_only 连 `db_path` 跑探针。
+
+    给**没有 env（MCP 连接）**的上下文用 —— 典型是消费重放路径，那里只有
+    `db_path` 没有 `VLMLMCPEnv`。与 `VLMLMCPEnv.check_grain` 用同一套探针构造
+    （`_grain_probes`）和同一份 duckdb 文件（场景库是 read_only 直连），结果一致。
+    不抛异常：任何失败都返回 None（如实说"这次没测"，不假装测过）。
+    """
+    probes = _grain_probes(sql)
+    if not probes or not str(db_path or "").strip():
+        return None
+    try:
+        import duckdb
+    except Exception:
+        return None
+    parsed = _split_from(sql)
+    alias = parsed[0] if parsed else ""
+    try:
+        con = duckdb.connect(str(db_path), read_only=True)
+    except Exception:
+        return None
+    try:
+        for probe in probes:
+            try:
+                rows = con.execute(probe).fetchall()
+            except Exception:
+                continue
+            if not rows:
+                continue
+            try:
+                n, d = int(rows[0][0] or 0), int(rows[0][1] or 0)
+            except (TypeError, ValueError, IndexError):
+                continue
+            if d:
+                return {
+                    "driver": alias,
+                    "rows": n,
+                    "distinct": d,
+                    "ratio": round(n / d, 2) if d else None,
+                    "probe": probe,
+                }
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+    return None
 if __name__ == "__main__":
     raise SystemExit(_main())

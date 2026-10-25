@@ -261,6 +261,18 @@ _REFILL_SYSTEM = """你是 Valorant 电竞数据分析师。你手里有**以前
    "技术部"）必须映射成清单里逐字存在的值（如 '2026-09'、'技术'）。
    清单里没有的写法一律不许出现在 SQL 里 —— 实测把 'September'/'技术部'
    填进槽位，LEFT JOIN 匹配不上，SUM 出 1 行 NULL，技能"命中却答不出"。
+   ⚠️ 跨「一对多」JOIN 做聚合是头号陷阱：父表一行（如某员工的 base_salary）
+   会被子表的每一行乘一次（员工有 2 条津贴 → base_salary 算 2 次），SUM 出来
+   翻倍（75120 事故就是这么来的）。正确写法二选一：
+     · 先把右表按关联键聚合成单行再 JOIN：
+       `LEFT JOIN (SELECT emp_id, SUM(amount) AS a FROM allowance
+        WHERE month=:month GROUP BY emp_id) t ON t.emp_id=e.emp_id`，
+       然后 `SUM(e.base_salary + COALESCE(t.a, 0))`；
+     · 或把子表聚合塞进标量子查询：
+       `SUM(e.base_salary + (SELECT COALESCE(SUM(amount),0) FROM allowance a
+        WHERE a.emp_id=e.emp_id AND a.month=:month))`。
+   绝对不要写 `SUM(e.base_salary + a.amount) FROM ... JOIN allowance a` 这种
+   把父表数值列直接带进"带子表 JOIN"的 SUM —— 必乘爆。
 3. 当前这句话没给实体（比如问"哪支队伍最高"）→ 保留配方的分组结构，别自己造一个值。
 4. 配方可能是**槽位模板**（入库时泛化过的）：`:dept`、`:month` 这种占位符，
    配方头部注释逐个说明了每个槽位该填什么 —— 把每个槽位换成当前这句话指的值，
@@ -893,7 +905,16 @@ async def consume(
                         reuse_errors.append(
                             f"配方回填被字面量守卫拒用（幻觉取值）：{_gwhy[:140]}")
                     else:
-                        _rr = await _env.run_sql(_r["sql"])
+                        # fan-out 闸门（乘爆根因）：字面量守卫拦不住乘爆——
+                        # 乘爆 SQL 的字面量全是真的，只靠"行有没有被 JOIN 乘起来"
+                        # 实查判定。命中即拒这条配方，落 ③b 现场写让它重写。
+                        _fwhy = _fanout_guard(
+                            _r["sql"], str((_prof or {}).get("db_path") or ""))
+                        if _fwhy:
+                            reuse_errors.append(
+                                f"配方回填被 fan-out 闸门拒用（JOIN 乘爆）：{_fwhy[:140]}")
+                        else:
+                            _rr = await _env.run_sql(_r["sql"])
                         _d = _rr.get("data") or {}
                         if _rr.get("ok") and _d.get("rows"):
                             data, code = _d, _r["sql"]
@@ -976,11 +997,20 @@ async def consume(
             real = [o for o in obs if o.get("ok") and o.get("data") is not None]
             data = (real[-1].get("data") if real else None)
             if _scene_kind == "scene" and data is not None:
+                # fan-out 闸门（消费侧确定性拒乘爆兜底）：现场写出的 SQL 即便
+                # 过了 _agent.solve 的 critic（消费侧 critic 判定已删，只认
+                # data is not None），这里用实查行数再兜一道——跨一对多 JOIN
+                # 放大且做聚合的乘爆 SQL 绝不交出去、也绝不写进技能库。
+                _fwhy = _fanout_guard(code, str((_prof or {}).get("db_path") or ""))
+                if _fwhy:
+                    data = None
+                    reuse_errors.append(
+                        f"现场写被 fan-out 闸门拒用（JOIN 乘爆）：{_fwhy[:140]}")
                 # 场景库形态的真空防线（与 local 分支 _payload 同口径）：
                 # 0 行的查询也返回 {rows: []} —— 不挡的话「0 行 + 模型一段
                 # 文字」会判 written，还把 `WHERE 表达式='y=2x-1'` 这种把
                 # 答案字面量当查询条件的坏配方写进技能库（2026-10-22 K 实测）。
-                if not (data.get("rows") if isinstance(data, dict) else data):
+                elif not (data.get("rows") if isinstance(data, dict) else data):
                     data = None
         # 没取到 → 还是没学会。同样**不自动后台学**（2026-10-19 用户改设计）：
         # 这条问题已在场景学习账上（coach_log 判读 = 没答出来），人点驾驶舱
@@ -1684,6 +1714,14 @@ async def _referee_observations(question: str,
             "DuckDB 里 x/0 得 NaN 不报错，取回来是个没法比的数；"
             "且优先在聚合层做除法（先 AVG 再相除），不要对逐行比值再 MAX。\n"
             "⚠️ 多表 JOIN 时列名必须带表名前缀（两表常有同名列，裸写会 Ambiguous）。\n"
+            "⚠️ 跨「一对多」JOIN 做聚合会乘爆：父表一行（如 base_salary）被子表"
+            "每行乘一次（员工有 2 条津贴 → base_salary 算 2 次）。正确写法：先把"
+            "右表按关联键聚合成单行再 JOIN（LEFT JOIN (SELECT emp_id, SUM(amount)"
+            " AS a FROM allowance WHERE month=:month GROUP BY emp_id) t ON "
+            "t.emp_id=e.emp_id），再 SUM(e.base_salary + COALESCE(t.a,0))；或改用"
+            "标量子查询 SUM(e.col + (SELECT COALESCE(SUM(amount),0) FROM allowance"
+            " a WHERE a.emp_id=e.emp_id AND a.month=:month))。绝不要写"
+            " SUM(e.base_salary + a.amount) FROM ... JOIN allowance a。\n"
             # 2026-10-14：schema 中部虽已标注空表，实测 glm-4-flash 仍会
             # 3 轮迭代都查 agg_team_round_summary（0 行）—— 空表纯聚合返回
             # 1 行 (NULL, 0)，看着像取到数其实没有。在 user message 里再强调
@@ -1946,6 +1984,41 @@ def _sql_literal_guard(sql: str, db_path: str) -> str:
             continue
         return (f"SQL 字面量 '{t}' 在数据源实查清单里指认不了"
                 f"（库里没有这个取值）—— 大概率是幻觉取值，拒绝入库")
+    return ""
+
+
+def _fanout_guard(sql: str, db_path: str) -> str:
+    """消费重放侧的确定性 fan-out 闸门：跨一对多 JOIN 把驱动表行放大、且 SQL
+    在做聚合 → 父表数值列（如 base_salary）被按子表行数翻倍，聚合值必失真
+    （75120 事故根因：李娜 2 条津贴把 base_salary 算两次）。
+
+    与 `_sql_literal_guard`（只查字面量真伪）互补：字面量守卫拦不住乘爆，因为
+    乘爆 SQL 的字面量（'技术'/'2026-09'）全是真的；它只靠"行有没有被 JOIN 乘
+    起来"的实查证据判定（同构 `vlml_mcp.check_grain`，2026-10-23 落地）。
+
+    返回拒绝原因；'' = 通过。任何异常 / 测不了都返回 ''（不假装测过、不误杀
+    —— 字面量守卫与判官仍在兜底）。纯明细查询（SELECT 行）跨 JOIN 放大是合法的，
+    只在「聚合 + 行放大」同时成立时才拒（见 `vlml_mcp._has_aggregation`）。
+    """
+    if not str(sql or "").strip() or not str(db_path or "").strip():
+        return ""
+    try:
+        from voyager_vlml.env.vlml_mcp import check_sql_grain, _has_aggregation
+        g = check_sql_grain(sql, db_path)
+    except Exception:
+        return ""
+    if not g:
+        return ""
+    n, d = int(g.get("rows") or 0), int(g.get("distinct") or 0)
+    if d and n > d and _has_aggregation(sql):
+        ratio = round(n / d, 2)
+        return (f"JOIN 之后 {n} 行，驱动表 `{g.get('driver')}` 只有 {d} 个不同行"
+                f"（放大 {ratio}×）—— 跨一对多 JOIN 做聚合会把父表数值按子表行数"
+                f"翻倍，答案必错。正确写法：先把右表按关联键聚合成单行再 JOIN"
+                f"（如 LEFT JOIN (SELECT emp_id, SUM(amount) AS a FROM allowance "
+                f"WHERE month=:month GROUP BY emp_id) t ON t.emp_id=e.emp_id），或"
+                f"改用标量子查询 SUM(e.col + (SELECT COALESCE(SUM(amount),0) FROM "
+                f"allowance a WHERE a.emp_id=e.emp_id AND a.month=:month))")
     return ""
 
 

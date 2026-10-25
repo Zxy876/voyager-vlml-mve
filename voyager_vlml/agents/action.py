@@ -471,6 +471,33 @@ class VLMLActionAgent:
             from voyager_vlml.agents.critic import VLMLCriticAgent
 
             self.critic = VLMLCriticAgent()
+
+        # 确定性 fan-out 闸门（先于 LLM 判官）：JOIN 把驱动表行放大、且 SQL 在做
+        # 聚合 → 父表数值按子表行数翻倍，答案必错。原版 critic 缺的就是这层实查
+        # 证据（2026-10-23 check_grain 同款）；这里不赌 LLM，实测行数即判。
+        # 让学习侧永不存乘爆配方，也让消费现场写能自纠（critic 失败 → 模型重写）。
+        for _e in events:
+            _g = (_e.get("grain") if isinstance(_e, dict) else None) or {}
+            _n = int(_g.get("rows") or 0)
+            _d = int(_g.get("distinct") or 0)
+            if _d and _n > _d:
+                try:
+                    from voyager_vlml.env.vlml_mcp import _has_aggregation
+                    if _has_aggregation(self.last_sql or ""):
+                        return (False,
+                                f"⚠️ JOIN 把驱动表行放大了 {_g.get('ratio')}×"
+                                f"（{_n} 行 vs 驱动表 {_d} 行），而你在做聚合 —— "
+                                f"父表数值会被按子表行数翻倍，答案必错。请先把右表"
+                                f"按关联键聚合成单行再 JOIN（如 LEFT JOIN "
+                                f"(SELECT emp_id, SUM(amount) AS a FROM allowance "
+                                f"WHERE month=:month GROUP BY emp_id) t "
+                                f"ON t.emp_id=e.emp_id），或改用标量子查询 "
+                                f"SUM(e.col + (SELECT COALESCE(SUM(amount),0) FROM "
+                                f"allowance a WHERE a.emp_id=e.emp_id "
+                                f"AND a.month=:month))")
+                except Exception:
+                    pass
+
         _ctx = str(self.context or "")
         try:
             _dbp = (str(getattr(self.env, "db_path", "") or "")
