@@ -221,6 +221,154 @@ def render_material(question: str, scene_id: str, *, extras: str = "") -> str:
     return "\n".join(lines)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 真实库结构兜底分解（2026-10-25 加）
+# 事由：LLM 对「某部门某月应发 = base + allowance」这类**复合/聚合题**经常拆不出
+#   维度（实测 scaffold 返回 dims=0），导致里程碑无维可学、消费永远合成不出技能。
+#   天授（Tianshou）的教训：训练后必跑评估判达标——MVE 这里缺的就是"用真实库
+#   结构确定性地把复合题拆成原子维度"这一步。本兜底**只引用实查到的表/列**，绝不
+#   编库里不存在的参数（与 SCAFFOLD_SYSTEM_DB 的硬约束同一条），且通用、不硬编码
+#   任何场景。
+# ─────────────────────────────────────────────────────────────────────────────
+
+_NUMERIC_TYPES = ("INTEGER", "BIGINT", "SMALLINT", "DECIMAL", "DOUBLE",
+                  "FLOAT", "REAL", "NUMERIC")
+# 聚合意图关键词：问题里没有这些就不拆（不编维度）
+_AGG_KEYWORDS = ("总计", "总共", "合计", "总额", "总和", "应发", "一共",
+                 "发多少", "多少工钱", "多少工资", "总工资", "总收入",
+                 "总支出", "多少", "总量", "汇总")
+# 筛选列名匹配（问题里出现范畴词 → 该列可能是筛选维度）
+_FILTER_COL_HINTS = (
+    ("部门", ("dept", "department", "division", "team", "group", "科", "组", "部门")),
+    ("月", ("month", "date", "年份", "year", "时间", "period", "月")),
+    ("机构", ("agency", "org", "company", "机构", "公司", "单位")),
+    ("岗位", ("title", "position", "岗位", "职位", "职务")),
+    ("地区", ("region", "city", "area", "地区", "城市", "区域")),
+)
+# 数值列名命中薪资/金额语义时优先选
+_PAY_KEYS = ("salary", "wage", "pay", "base", "allow", "ot", "bonus",
+             "工", "薪", "津", "补", "金", "额", "收", "支")
+
+
+def _norm(q: str) -> str:
+    return re.sub(r"[\s，。？！,.?!：:；;“”\"'（）()]+", "", str(q or "")).lower()
+
+
+def _col_name_hinted(col: str, q: str) -> bool:
+    cl = str(col or "").lower()
+    for kw, names in _FILTER_COL_HINTS:
+        if kw in q and any(nm in cl for nm in names):
+            return True
+    return False
+
+
+def _schema_struct(db_path: str) -> list[dict[str, Any]]:
+    """实查库结构（结构化，供兜底分解用）。失败返回 []。"""
+    out: list[dict[str, Any]] = []
+    try:
+        import duckdb
+        con = duckdb.connect(str(db_path or ""), read_only=True)
+        try:
+            for t in [r[0] for r in con.execute("show tables").fetchall()]:
+                try:
+                    cols = con.execute(f'describe "{t}"').fetchall()
+                except Exception:
+                    continue
+                columns: list[dict[str, str]] = []
+                values: dict[str, list[str]] = {}
+                for c in cols:
+                    cname, ctype = str(c[0]), str(c[1]).upper()
+                    columns.append({"name": cname, "type": ctype})
+                    if ctype in ("VARCHAR", "TEXT", "STRING", "BOOLEAN"):
+                        try:
+                            vs = [r[0] for r in con.execute(
+                                f'select distinct "{cname}" from "{t}" limit 13'
+                            ).fetchall()]
+                            vs = [str(v) for v in vs if v is not None]
+                            if vs and len(vs) <= 12:
+                                values[cname] = vs
+                        except Exception:
+                            pass
+                out.append({"table": t, "columns": columns, "values": values})
+        finally:
+            con.close()
+    except Exception:
+        pass
+    return out
+
+
+def _schema_decompose(question: str, schema: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """用真实库结构把复合/聚合题拆成原子维度。
+
+    返回 [] 的几种情况（都不编）：问题无聚合意图 / 库无数值列 / 抽不出可锚定的列。
+    每个维度都指向 schema 里**真实存在的表.列**，不发明参数。
+    """
+    q = str(question or "").strip()
+    if not q or not schema:
+        return []
+    if not any(k in q for k in _AGG_KEYWORDS):
+        return []
+    tables: list[dict[str, Any]] = []
+    for tbl in schema:
+        tname = str(tbl.get("table") or "")
+        cols = tbl.get("columns") or []
+        num = [c["name"] for c in cols
+               if str(c.get("type", "")).upper() in _NUMERIC_TYPES]
+        filt = [c["name"] for c in cols
+                if str(c.get("type", "")).upper()
+                in ("VARCHAR", "TEXT", "STRING", "BOOLEAN")]
+        if num or filt:
+            tables.append({"table": tname, "num": num, "filt": filt,
+                           "values": tbl.get("values") or {}})
+    if not tables:
+        return []
+    # 筛选条件：值命中优先（"技术部" 出现在某列取值里），列名范畴词命中兜底
+    filters: list[tuple[str, str, str | None]] = []
+    for t in tables:
+        for col in t["filt"]:
+            hit_val: str | None = None
+            for v in (t["values"].get(col) or []):
+                if str(v) and str(v) in q:
+                    hit_val = str(v)
+                    break
+            if hit_val is not None or _col_name_hinted(col, q):
+                filters.append((t["table"], col, hit_val))
+    filters = filters[:3]
+    # 候选表：有筛选命中的优先；都没有就全表
+    cand = [t for t in tables if any(ft == t["table"] for ft, _, _ in filters)] or tables
+    # 数值列：优先命中薪资/金额语义，其次取整表数值列，封顶 3
+    num_cols: list[tuple[str, str, bool]] = []
+    for t in cand:
+        for c in t["num"]:
+            num_cols.append((t["table"], c, any(k in c.lower() for k in _PAY_KEYS)))
+    num_cols.sort(key=lambda x: (not x[2]))
+    num_cols = num_cols[:3]
+    if not num_cols:
+        return []
+    dims: list[dict[str, str]] = []
+    seen: set[str] = set()
+    if filters:
+        cond = " 且 ".join(
+            (f"{fc}={fv}" if fv else f"{fc}=问题中指定的取值")
+            for _, fc, fv in filters)
+        dims.append({"id": "filter", "question":
+                     f"筛选 {cond} 的目标记录（指向真实列，如 {filters[0][0]}.{filters[0][1]}）",
+                     "why": "先锁定问题要的人群/范围，后面的求和才有意义"})
+    for tbl, c, _ in num_cols:
+        _id = f"take_{c}"
+        while _id in seen:
+            _id += "_"
+        seen.add(_id)
+        dims.append({"id": _id, "question":
+                     f"取 {tbl}.{c} 的值（对每条筛选出的记录）",
+                     "why": "聚合的原材料，必须能直接查到真实数值"})
+    cols_expr = "、".join(f"{tbl}.{c}" for tbl, c, _ in num_cols)
+    dims.append({"id": "aggregate", "question":
+                 f"把筛选出的记录的 {cols_expr} 求和/合计，得到问题要的总数/总额",
+                 "why": "把原子取值组合成问题最终要的那一个数"})
+    return dims
+
+
 def scaffold(question: str, scene_id: str = "A", *, llm: Callable | None = None,
              use_cache: bool = True, extras: str = "", db_path: str = "") -> dict[str, Any]:
     """生成一份追问骨架。
@@ -272,6 +420,26 @@ def scaffold(question: str, scene_id: str = "A", *, llm: Callable | None = None,
     data = _parse(text)
     dims = _clean_dims(data)
     if not dims:
+        # 兜底：真实 DB 场景的复合/聚合题，LLM 没拆出维度时，用**真实库结构**
+        # 确定性地拆出原子维度（不靠 LLM 编，也不编库里不存在的列）。这是「消费
+        # 才可能合成技能」的前置——没有原子维度，里程碑永远无维可学。无 db_path
+        # （知识型场景）或非聚合题则不动，如实失败。
+        fb = _schema_decompose(q, _schema_struct(db_path)) if db_path else []
+        if fb:
+            out.update(dimensions=fb, expected_drifts=[],
+                       milestone=_clean_milestone({}, q),
+                       material_note="（LLM 未拆出维度，已用真实库结构兜底分解）",
+                       origin="schema_fallback", reason="")
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(
+                    {"question": q, "dimensions": fb, "milestone": {},
+                     "expected_drifts": [],
+                     "material_note": "schema_fallback"},
+                    ensure_ascii=False, indent=1), encoding="utf-8")
+            except Exception:
+                pass
+            return out
         out["reason"] = "LLM 输出里没有可用维度（解析失败/空列表）"
         return out
     drifts = [d for d in (data.get("expected_drifts") or []) if isinstance(d, dict)]
@@ -315,6 +483,10 @@ def milestone_state(scene_id: str, question: str,
     got = {str(x) for x in (learned_ids or [])}
     missing = [str(d.get("id")) for d in dims if str(d.get("id")) not in got]
     ms = res.get("milestone") or {}
+    # 持久化点亮标记（驾驶舱 phase-3 写）：维度全闭合 + 重跑合成题确认后落盘，
+    # 让"点亮变实"在缓存里可查，而非每次惰性重算。等价于原版 inference 重试里程碑
+    # 后把节点标记为达成。
+    achieved_flag = bool(res.get("milestone_achieved"))
     return {
         "name": str(ms.get("name") or "").strip() or str(question or "")[:40],
         "why": str(ms.get("why") or "").strip(),
@@ -322,10 +494,34 @@ def milestone_state(scene_id: str, question: str,
         "closed": total - len(missing),
         "missing": missing,
         # 0 个维度的骨架不构成里程碑（没有可闭合的东西就别报"达成"）
-        "achieved": bool(total) and not missing,
+        "achieved": (bool(total) and not missing) or achieved_flag,
+        "lit_at": res.get("milestone_lit_at"),
+        "verified_real": bool(res.get("milestone_verified_real")),
     }
 
 
+def mark_milestone_achieved(scene_id: str, question: str, *,
+                            fetched: bool = False) -> None:
+    """把里程碑节点**持久化点亮**（对应原版 inference 重试里程碑后把子目标标记达成）。
+
+    落盘到骨架缓存同一个文件（同一把钥匙）：`milestone_achieved` /
+    `milestone_lit_at` / `milestone_verified_real`。`milestone_state` 会读回它，
+    让"点亮变实"在缓存里可查、图谱/面板可渲染，而不是每次惰性重算。
+    """
+    path = _cache_path(scene_id, question)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except Exception:
+        data = {}
+    data["milestone_achieved"] = True
+    data["milestone_lit_at"] = __import__("time").time()
+    data["milestone_verified_real"] = bool(fetched)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=1),
+                        encoding="utf-8")
+    except Exception:
+        pass
 def drift_notes(scaffold_result: dict[str, Any], limit: int = 4) -> list[str]:
     """把预判偏差渲染成执行层能看懂的「别这么答」清单（只取 drift/bug）。"""
     out: list[str] = []

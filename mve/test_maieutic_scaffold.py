@@ -525,6 +525,118 @@ def test_progress_iterations_accumulate() -> None:
     print("PASS  test_progress_iterations_accumulate")
 
 
+# 模拟场景 B 工资库结构（真实库同构：employees 有 base_salary + dept/month；
+# allowance 有 amount + dept）。仅用于本地测试，不连真库。
+FAKE_SCHEMA = [
+    {"table": "employees", "columns": [
+        {"name": "emp_id", "type": "VARCHAR"},
+        {"name": "dept", "type": "VARCHAR"},
+        {"name": "base_salary", "type": "DECIMAL"},
+        {"name": "month", "type": "VARCHAR"},
+    ], "values": {"dept": ["技术部", "销售部"], "month": ["9月", "10月"]}},
+    {"table": "allowance", "columns": [
+        {"name": "emp_id", "type": "VARCHAR"},
+        {"name": "dept", "type": "VARCHAR"},
+        {"name": "amount", "type": "DECIMAL"},
+    ], "values": {"dept": ["技术部", "销售部"]}},
+]
+
+
+def test_schema_decompose_splits_composite() -> None:
+    """真实库结构兜底分解（2026-10-25）：复合/聚合题必须拆出**指向真实列**的原子
+    维度（筛选 + 取数 + 聚合），绝不编库里不存在的列；无聚合意图/空结构则空手而归。
+    """
+    import maieutic_scaffold as M
+
+    q = "九月最后总共要给技术部员工发多少工钱"
+    dims = M._schema_decompose(q, FAKE_SCHEMA)
+    assert dims, "聚合题必须拆出维度"
+    ids = [d["id"] for d in dims]
+    assert len(ids) == len(set(ids)), f"维度 id 必须唯一：{ids}"
+    txt = " ".join(d["question"] for d in dims)
+    # 四类原子维度都在，且都锚定真实列
+    assert "技术部" in txt, txt                       # 筛选条件命中真实取值
+    assert "employees.base_salary" in txt, txt         # 取真实数值列
+    assert "allowance.amount" in txt, txt
+    assert "求和" in txt, txt                          # 聚合步骤
+    # 不编维度：非聚合问题 / 空结构 → 空
+    assert M._schema_decompose("什么是阿斯伯格", FAKE_SCHEMA) == [], \
+        "无聚合意图不得编造维度"
+    assert M._schema_decompose(q, []) == [], "空结构不得编造维度"
+    print("PASS  test_schema_decompose_splits_composite")
+
+
+def test_scaffold_db_fallback_when_llm_empty() -> None:
+    """llm 拆不出维度（dims=0）时，真实 DB 场景应走 schema 兜底（origin=schema_fallback
+    且维度锚定真实列）；知识型场景（无 db_path）则如实 failed，不编维度。"""
+    import maieutic_scaffold as M
+
+    tmp = Path(tempfile.mkdtemp())
+    old = M.CKPT
+    orig_struct = M._schema_struct
+    M.CKPT = tmp
+    M._schema_struct = lambda dp: FAKE_SCHEMA           # 不依赖 duckdb
+    try:
+        a = M.scaffold("九月最后总共要给技术部员工发多少工钱", "B",
+                       llm=lambda m: "我不会", db_path="fake.db")
+        assert a["origin"] == "schema_fallback", a
+        assert a["dimensions"], a
+        txt = " ".join(d["question"] for d in a["dimensions"])
+        assert all(k in txt for k in ("技术部", "base_salary", "amount", "求和")), txt
+        # 缓存命中（兜底结果已落盘，下次不再调 LLM）
+        b = M.scaffold("九月最后总共要给技术部员工发多少工钱", "B",
+                       llm=lambda m: "我不会", db_path="fake.db")
+        assert b["origin"] == "cache", b
+        # 知识型场景（无 db_path）：LLM 空 → failed，不兜底不编维度
+        c = M.scaffold("另一句没有库的问题", "T", llm=lambda m: "我不会")
+        assert c["origin"] == "failed" and not c["dimensions"], c
+    finally:
+        M._schema_struct = orig_struct
+        M.CKPT = old
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("PASS  test_scaffold_db_fallback_when_llm_empty")
+
+
+def test_milestone_achieved_persist_and_readback() -> None:
+    """里程碑点亮：mark_milestone_achieved 写盘后，milestone_state 读回（即便不传
+    learned_ids 也 achieved=True、verified_real/lit_at 都在）—— "点亮变实"持久化。"""
+    import maieutic_scaffold as M
+
+    tmp = Path(tempfile.mkdtemp())
+    old = M.CKPT
+    M.CKPT = tmp
+    try:
+        q = "九月最后总共要给技术部员工发多少工钱"
+        p = M._cache_path("B", q)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({
+            "question": q,
+            "dimensions": [{"id": "filter", "question": "筛选 dept=技术部"},
+                           {"id": "take_base_salary", "question": "取 base_salary"},
+                           {"id": "take_amount", "question": "取 amount"},
+                           {"id": "aggregate", "question": "求和"}],
+            "milestone": {"name": "九月技术部应发", "why": "x"},
+        }, ensure_ascii=False, indent=1), encoding="utf-8")
+        data = json.loads(p.read_text(encoding="utf-8"))
+        # 点亮前：维度只闭合 2/4 → achieved=False
+        st0 = M.milestone_state("B", q, ["filter", "take_base_salary"],
+                                scaffold_result=data)
+        assert st0["total"] == 4 and st0["closed"] == 2 and not st0["achieved"], st0
+        # 点亮（维度全闭合 + 重跑取到真数）
+        M.mark_milestone_achieved("B", q, fetched=True)
+        back = json.loads(p.read_text(encoding="utf-8"))
+        assert back["milestone_achieved"] is True, back
+        assert back["milestone_verified_real"] is True, back
+        # 读回：持久化点亮即使不传 learned_ids 也 achieved
+        st1 = M.milestone_state("B", q, [], scaffold_result=back)
+        assert st1["achieved"] is True, st1
+        assert st1["verified_real"] is True and st1["lit_at"], st1
+    finally:
+        M.CKPT = old
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("PASS  test_milestone_achieved_persist_and_readback")
+
+
 def main() -> None:
     test_parse_and_cache()
     test_plan_uses_dimensions()
@@ -541,6 +653,9 @@ def main() -> None:
     test_called_tools_parses_code()
     test_learning_must_fetch_consuming_may_answer()
     test_progress_iterations_accumulate()
+    test_schema_decompose_splits_composite()
+    test_scaffold_db_fallback_when_llm_empty()
+    test_milestone_achieved_persist_and_readback()
     print("\nALL PASS")
 
 

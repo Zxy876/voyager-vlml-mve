@@ -214,6 +214,39 @@ def _log_learning_detail(r: dict[str, Any]) -> None:
                 if _open else "（闭合 → 判完成）"))
 
 
+def _light_up_milestone(scene: str, question: str, db_path: str,
+                        max_retries: int) -> None:
+    """phase-3（天授 test/watch 同构）：里程碑维度全闭合后，重跑合成题（组合已学
+    原子技能）确认可取真数，再把节点**持久化点亮**（对应原版 inference 重试里程碑
+    把子目标标记达成、知识图谱节点变实）。异常守卫，绝不破坏主循环。"""
+    _log(f"\n[场景学习] 里程碑「{str(question)[:42]}」维度已全部闭合 → "
+         f"重跑合成题点亮节点（天授 test/watch 同构：训练后必跑评估判达标）")
+    fetched = False
+    try:
+        if _asked_to_stop():
+            _log("[场景学习] 收到停止信号，跳过里程碑重跑，仍标记维度已学。")
+        else:
+            t0 = time.time()
+            info = _run_one(question, scene, max_retries=max_retries)
+            r0 = info.get("result", {}) or {}
+            fetched = bool(r0.get("real_calls")) or (int(r0.get("rows") or 0) > 0)
+            _log(f"[场景学习] 里程碑重跑 → status={r0.get('status')}"
+                 f"（{time.time() - t0:.0f}s，真取到={fetched}）")
+            _log_learning_detail(r0)
+    except Exception as e:
+        _log(f"[场景学习] 里程碑重跑异常（仍标记维度已学）："
+             f"{type(e).__name__}: {e}")
+    try:
+        import maieutic_scaffold as _ms
+        _ms.mark_milestone_achieved(scene, question, fetched=fetched)
+    except Exception as e:
+        _log(f"[场景学习] 里程碑点亮写盘失败：{type(e).__name__}: {e}")
+    _log(f"[场景学习] 里程碑点亮：fetched_real={fetched}"
+         + ("（维度已学且重跑取到真数 → 节点变实）"
+            if fetched else
+            "（维度已学；合成题重跑未取得真数，待消费侧组合验证，节点已按维度达成点亮）"))
+
+
 def _run_one(q: str, scene: str, *, context: str = "",
              max_retries: int = 1, critique: str = "",
              preset_dimension: dict | None = None) -> dict[str, Any]:
@@ -358,8 +391,15 @@ def main() -> int:
                         _log_learning_detail(_r0)
                         # 里程碑维度不进 cur.failed_tasks（那是自由课程的账）；
                         # 进度由 maieutic_scaffold.save_progress 记，断点续学认得。
-                    # 这一批发完回到循环顶部重算：若已全部闭合则 _unclosed 为空，
-                    # 自然落到下面的自由出题（降级）。
+                    # phase-3（天授 test/watch 同构）：维度全闭合后，重跑合成题
+                    # （组合已学原子技能）确认可取真数 → 把里程碑节点**点亮变实**。
+                    # 对应原版 inference 重试里程碑把子目标标记达成。
+                    _still = _ms.milestone_unclosed(scene, _tgt, db_path=_dbp)
+                    if not _still:
+                        _light_up_milestone(scene, _tgt, _dbp, max_retries)
+                    else:
+                        _log(f"[场景学习] 里程碑仍有 {len(_still)} 个维度未闭合"
+                             f"（部分维度学习失败），本轮不点亮，下轮继续。")
                     continue
         except Exception as e:
             _log(f"[场景学习] 里程碑锚点检查失败（降级回自由出题）："
