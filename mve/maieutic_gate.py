@@ -47,6 +47,13 @@ GATE_SYSTEM = """你是产婆术（Maieutic）的**闸门检查员**。一个助
 - 判定**以材料为准**：用户消息里会给你「助手取到的材料」（来自执行层，失败项
   已剔除）。答案只有落在材料上的内容才算答到；材料为空 = 没有任何可取证的
   内容，全部维度都算没答到（别拿"它写了段话"当答到）。
+- **口径真实性**（同款严格：提到 ≠ 做出）：用户消息里还会给你「环境实查清单」
+  （数据源真实的表/列/取值，实查不手写）。答案的**计算口径**必须能在这份清单里
+  指认。**两个数值列相乘/相除合成一个新口径（如 base_salary × overtime_hours
+  当作「加班费」）= 假设库里不存在的业务参数（费率/汇率/系数）** —— 库里没有
+  该口径的列或费率，这个量就不可计算：该维度判**未答到**（进 gaps_still_open），
+  并在 questions 里明说「库里没有这个口径/费率，该量不可计算，缺什么」。
+  把月薪当时薪用是语义造假 —— 材料里真取到数字也不算答到。
 - 如果你还发现了清单外的遗漏（`emergent_gaps`），照样可以列 —— 但它**不阻塞**
   闭合：清单全部答到就 passed=true，把额外发现当信息带回去即可。
 
@@ -106,8 +113,14 @@ def _material_block(evidence: Any, limit: int = 3, per: int = 1200) -> str:
 
 def render(question: str, answer: str,
            dimensions: list[dict[str, Any]], *, critique: str = "",
-           evidence: Any = None) -> str:
-    """照 spec-examiner 的 user 模板：任务 + 维度清单（含内部理由）+ 它交上来的回答。"""
+           evidence: Any = None, env_obs: str = "") -> str:
+    """照 spec-examiner 的 user 模板：任务 + 维度清单（含内部理由）+ 它交上来的回答。
+
+    `env_obs` = 环境实查清单（数据源真实的表/列/取值）—— 口径真实性的判据：
+    答案的计算口径必须能在清单里指认，指认不了 = 假设业务参数 = 未答到
+    （2026-10-26 实测 base_salary×overtime_hours 当加班费穿过旧判据入库成
+    164000 假数；闸门只核清单核不出口径幻觉，环境实况必须一起给它）。
+    """
     dim_block = "\n".join(
         f"  - id: {str(d.get('id') or '')}\n"
         f"    question: {str(d.get('question') or '')}\n"
@@ -115,8 +128,12 @@ def render(question: str, answer: str,
         for d in (dimensions or []) if isinstance(d, dict))
     prior = (f"\n上一轮你提的追问（它可能照着改了）：\n  - {critique}\n"
              if critique else "")
+    env_block = (f"\n环境实查清单（数据源真实的表/列/取值，实查不手写 —— "
+                 f"答案的计算口径必须能在这里指认）：\n{env_obs}\n"
+                 if str(env_obs or "").strip() else "")
     return (f"任务：{question}\n\n"
-            f"必须回答的维度清单：\n{dim_block or '  （无）'}\n{prior}\n"
+            f"必须回答的维度清单：\n{dim_block or '  （无）'}\n{prior}"
+            f"{env_block}\n"
             f"助手取到的材料（执行层剪裁，失败项已剔除）：\n"
             f"{_material_block(evidence)}\n\n"
             f"它交上来的回答：\n\"\"\"\n{str(answer or '')[:2500]}\n\"\"\"\n\n"
@@ -125,10 +142,14 @@ def render(question: str, answer: str,
 
 def check(question: str, answer: str, dimensions: list[dict[str, Any]], *,
           llm: Callable | None = None, critique: str = "",
-          max_retries: int = 2, evidence: Any = None) -> dict[str, Any]:
+          max_retries: int = 2, evidence: Any = None,
+          env_obs: str = "") -> dict[str, Any]:
     """闸门判定。返回 {"passed","addressed","open","questions","emergent","origin"}。
 
     `origin="failed"` = 模型/解析不可用（调用方应退回原版 critic，不假装判过）。
+
+    `env_obs` = 环境实查清单（数据源真实的表/列/取值）→ 进 user 消息，
+    口径真实性的判据（列×列合成新口径 = 假设费率 = 未答到）。
     """
     out: dict[str, Any] = {"passed": False, "addressed": [], "open": [],
                            "questions": [], "emergent": [],
@@ -150,7 +171,7 @@ def check(question: str, answer: str, dimensions: list[dict[str, Any]], *,
             text = call([{"role": "system", "content": GATE_SYSTEM},
                          {"role": "user", "content": render(
                              question, answer, dims, critique=critique,
-                             evidence=evidence)}])
+                             evidence=evidence, env_obs=env_obs)}])
         except Exception as e:
             last = f"LLM 调用失败：{type(e).__name__}: {e}"
             continue

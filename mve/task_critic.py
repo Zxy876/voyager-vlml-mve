@@ -135,7 +135,8 @@ def _evidence_text(result: dict[str, Any], limit: int = 2600) -> str:
 
 def check_task_success(task: str, context: str, result: dict[str, Any], *,
                        llm=None, max_retries: int = 5,
-                       dimensions: list[dict[str, Any]] | None = None
+                       dimensions: list[dict[str, Any]] | None = None,
+                       env_obs: str = ""
                        ) -> tuple[bool, str]:
     """返回 (success, critique)。照原版：出错 → (False, "")；其余交 LLM 判。
 
@@ -193,7 +194,8 @@ def check_task_success(task: str, context: str, result: dict[str, Any], *,
             import maieutic_gate
             g = maieutic_gate.check(task, answer, dimensions, llm=llm,
                                     critique=str(context or ""),
-                                    evidence=result.get("evidence"))
+                                    evidence=result.get("evidence"),
+                                    env_obs=str(env_obs or ""))
         except Exception as e:
             g = {"origin": "failed", "reason": f"{type(e).__name__}: {e}"}
         if g.get("origin") != "failed":

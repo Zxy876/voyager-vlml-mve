@@ -479,6 +479,32 @@ def close_one_dimension(scene_id: str, topic_id: str, question: str,
         return []
 
 
+def _env_obs_block(db_path: str) -> str:
+    """环境实查块（学习侧判官共用）：库里没有的费率/口径不许假设。
+
+    原版 critic 读环境末态判（`voyager/agents/critic.py:30` 传 events +
+    chest_observation），SQL 场景的同构物 = `curriculum_auto.db_observation`
+    实查清单。两个数值列相乘/相除合成新口径（base_salary × overtime_hours
+    当加班费）= 假设业务参数 —— 2026-10-26 实测该模式穿过字面量守卫和
+    fan-out 闸入库（164000 假数、1.0 假数），判官必须点名这条。
+    """
+    try:
+        if not str(db_path or "").strip():
+            return ""
+        from curriculum_auto import db_observation as _dbobs
+        obs = str(_dbobs(db_path) or "")
+        if not obs:
+            return ""
+        return ("\n\n[环境实查（数据源真实的表/列/取值）：任务假设的任何表、列、"
+                "业务参数（费率/汇率/税率/政策数值…）都必须能在这里指认，指认不了"
+                " = 任务在数据源上不可答，判未完成，并明说缺什么。**特别地：两个"
+                "数值列相乘/相除合成新口径（如 base_salary × overtime_hours "
+                "当作「加班费」）同样是假设业务参数** —— 库里没有该口径的列或"
+                "费率，就是不可计算，判未完成；把月薪当时薪用是语义造假]\n" + obs)
+    except Exception:
+        return ""
+
+
 async def start_learning(
     question: str,
     scene_id: str = "",
@@ -1089,9 +1115,14 @@ async def _start_learning_impl(
                                 "status": "learned"}
                             try:
                                 import task_critic as _tc1
-                                # dimensions=[一个维度] → 走 maieutic_gate 闭合判定
+                                # dimensions=[一个维度] → 走 maieutic_gate 闭合判定。
+                                # env_obs 必须一起给：闸门只核清单核不出口径幻觉，
+                                # 2026-10-26 实测 base_salary×overtime_hours 当加班费
+                                # 就是穿过只核清单的闸门入库的（164000 假数）——
+                                # 列×列合成新口径 = 假设费率，判据里点名它。
                                 ok1, crit1 = _tc1.check_task_success(
-                                    _q1, str(crit1 or ""), r1, dimensions=[_d])
+                                    _q1, str(crit1 or ""), r1, dimensions=[_d],
+                                    env_obs=_env_obs_block(db_path))
                             except Exception as e1:
                                 ok1, crit1 = False, f"critic 异常：{type(e1).__name__}: {e1}"
                             if ok1:
@@ -1416,24 +1447,7 @@ async def _start_learning_impl(
                     # （表/列/真实取值）随 context 交给 critic：任务假设的表/列/业务
                     # 参数（费率/汇率…）必须能在这份清单里指认，指认不了 = 不可答，
                     # 不许把编造的参数当已验证（实测 150 元费率幻觉就是这样放行的）。
-                    _ctx = str(context or "")
-                    try:
-                        if str(db_path or "").strip():
-                            from curriculum_auto import db_observation as _dbobs
-                            _obs = _dbobs(db_path)
-                            if _obs:
-                                _ctx += ("\n\n[环境实查（数据源真实的表/列/取值）：任务"
-                                         "假设的任何表、列、业务参数（费率/汇率/税率/"
-                                         "政策数值…）都必须能在这里指认；指认不了的 = "
-                                         "任务在数据源上不可答，判未完成，并明说缺什么。"
-                                         "特别地：**两个数值列相乘/相除合成新口径"
-                                         "（如 base_salary × overtime_hours 当作"
-                                         "「加班费」）同样是假设业务参数** —— 库里"
-                                         "没有该口径的列或费率，就是不可计算，判未"
-                                         "完成；把月薪当时薪用是语义造假]\n"
-                                         + _obs)
-                    except Exception:
-                        pass
+                    _ctx = str(context or "") + _env_obs_block(db_path)
                     _ok, _crit = task_critic.check_task_success(question, _ctx, out)
                 except Exception as e:
                     _ok, _crit = bool(real), f"critic 异常：{type(e).__name__}: {e}"
