@@ -356,12 +356,15 @@ action.py:94 programs 注入；此前只挑一条写一条 SQL，合成题（bas
 
 
 def _refill_sql_multi(question: str, skills: list[dict[str, Any]], schema: str,
-                      db_path: str = "") -> dict[str, Any]:
+                      db_path: str = "", feedback: str = "") -> dict[str, Any]:
     """原版同构的多技能实例化：检索到的每条相关配方都回填成 SQL（不是只挑一条）。
 
     与 `_refill_sql` 同一地面真话（db_observation 实查取值清单 + schema），
     输出从「一条 SQL」改为「SQL 列表」—— 合成题由多条原子技能各取真数、
     叙事层组织；复合配方命中时只出它。
+
+    `feedback`（2026-10-26）：上一轮回填/执行的报错清单（原版 step 的
+    critique——环境报错是地面真话，喂回去 LLM 才修正得了，voyager.py:236-271）。
     """
     recipes = "\n\n".join(
         f"【配方 {i+1}｜topic={s.get('topic')}｜{s.get('name') or ''}】\n"
@@ -384,6 +387,9 @@ def _refill_sql_multi(question: str, skills: list[dict[str, Any]], schema: str,
            f"清单里没有的写法不许出现在 SQL 里]：\n{ground[:5000]}\n\n"
            if ground else "")
         + "按规则把**每条**要用的配方都实例化成独立的 SELECT。"
+        + (f"\n\n⚠️ 上一轮这些配方的回填/执行失败了（报错是环境给的地面真话，"
+           f"照着修——列名/表名以 schema 为准，不许发明列）：\n{feedback}"
+           if feedback else "")
     )
     out = chat_json(
         [
@@ -1053,44 +1059,71 @@ async def consume(
                         reuse_errors.append(
                             f"检索到 {len(skills)} 条已学技能但回填层没实例化出任何"
                             f" SQL：{str(_mr['note'])[:140]}")
-                    for _it in _mr["items"]:
-                        _sql = _it["sql"]
-                        # name 对回：先精确，再宽松（LLM 偶尔把整个
-                        # 【配方 N｜topic=…｜原名】标签抄进 name —— 标签里
-                        # 含原配方名就算命中，否则 _sk=None 会让 _used_skills
-                        # 披露丢条目、used_skills 少报（实测「用到 1 条技能」）。
-                        _sk = next((s for s in skills
-                                    if str(s.get("name") or "") == _it["name"]),
-                                   None)
-                        if _sk is None and _it["name"]:
+                    _fails: list[dict[str, str]] = []
+
+                    async def _try_items(_items: list[dict[str, str]],
+                                         _round: str) -> None:
+                        """逐条守卫 → 执行（原版 step 同构：每条配方 = 一个
+                        子目标 rollout，环境报错如实记账）。"""
+                        for _it in _items:
+                            _sql = _it["sql"]
+                            # name 对回：先精确，再宽松（LLM 偶尔把整个
+                            # 【配方 N｜topic=…｜原名】标签抄进 name —— 标签里
+                            # 含原配方名就算命中，否则 _sk=None 会让 _used_skills
+                            # 披露丢条目、used_skills 少报（实测「用到 1 条技能」）。
                             _sk = next((s for s in skills
-                                        if str(s.get("name") or "")
-                                        and str(s.get("name")) in _it["name"]),
+                                        if str(s.get("name") or "") == _it["name"]),
                                        None)
-                        _label = (str((_sk or {}).get("name") or "")
-                                  or _it["name"]
-                                  or str((skills[0] if skills else {})
-                                         .get("name") or "配方"))
-                        _gwhy = _sql_literal_guard(_sql, _dbp)
-                        if _gwhy:
-                            reuse_errors.append(
-                                f"{_label} 被字面量守卫拒用（幻觉取值）：{_gwhy[:120]}")
-                            continue
-                        _fwhy = _fanout_guard(_sql, _dbp)
-                        if _fwhy:
-                            reuse_errors.append(
-                                f"{_label} 被 fan-out 闸门拒用（JOIN 乘爆）：{_fwhy[:120]}")
-                            continue
-                        _rr = await _env.run_sql(_sql)
-                        _d = _rr.get("data") or {}
-                        if _rr.get("ok") and _d.get("rows"):
-                            _executed.append({"skill": _sk or {}, "name": _label,
-                                              "sql": _sql, "data": _d,
-                                              "rows": _rr.get("rows")})
-                        else:
-                            reuse_errors.append(
-                                f"{_label} 回填后没取到真数："
-                                f"{str(_rr.get('error') or '0 行')[:120]}")
+                            if _sk is None and _it["name"]:
+                                _sk = next((s for s in skills
+                                            if str(s.get("name") or "")
+                                            and str(s.get("name")) in _it["name"]),
+                                           None)
+                            _label = (str((_sk or {}).get("name") or "")
+                                      or _it["name"]
+                                      or str((skills[0] if skills else {})
+                                             .get("name") or "配方"))
+                            _gwhy = _sql_literal_guard(_sql, _dbp)
+                            if _gwhy:
+                                reuse_errors.append(
+                                    f"{_label} 被字面量守卫拒用（幻觉取值）：{_gwhy[:120]}")
+                                _fails.append({"name": _label, "why": _gwhy[:200]})
+                                continue
+                            _fwhy = _fanout_guard(_sql, _dbp)
+                            if _fwhy:
+                                reuse_errors.append(
+                                    f"{_label} 被 fan-out 闸门拒用（JOIN 乘爆）：{_fwhy[:120]}")
+                                _fails.append({"name": _label, "why": _fwhy[:200]})
+                                continue
+                            _rr = await _env.run_sql(_sql)
+                            _d = _rr.get("data") or {}
+                            if _rr.get("ok") and _d.get("rows"):
+                                _executed.append({"skill": _sk or {},
+                                                  "name": _label,
+                                                  "sql": _sql, "data": _d,
+                                                  "rows": _rr.get("rows")})
+                            else:
+                                _why = str(_rr.get("error") or "0 行")[:200]
+                                reuse_errors.append(
+                                    f"{_label} 回填后没取到真数：{_why[:120]}")
+                                _fails.append({"name": _label, "why": _why})
+
+                    await _try_items(_mr["items"], "首轮")
+                    if not _executed and _fails:
+                        # 原版 step 同构（voyager.py:236-271）：执行报错作为
+                        # critique 重新 render 进下一轮 human message —— 环境报错
+                        # 是地面真话，喂回去 LLM 才修正得了。冷启动单发实测会犯
+                        # BinderException（total_salary 配方本身干净，回填 LLM
+                        # 画蛇添足给 employees 加了不存在的 month 列）。重试一次
+                        # （= 原版 4 步迭代里的一次修正轮，不是新发明）。
+                        _fb = "\n".join(f"- {_f['name']}：{_f['why']}"
+                                        for _f in _fails[:5])
+                        print(f"  · 复用首轮全败（{len(_fails)} 条）→ 报错当 critique "
+                              f"重试一轮（原版 step 迭代同构）", flush=True)
+                        _mr2 = _refill_sql_multi(question, skills, _schema,
+                                                 db_path=_dbp, feedback=_fb)
+                        if _mr2["items"]:
+                            await _try_items(_mr2["items"], "重试")
                     if _executed:
                         # 多技能结果合并（原版：agent 组合多条技能的产出交呈现层）：
                         # 每行标注来源技能，叙事层据此相加/组织；`rows` 键保住
@@ -2190,6 +2223,23 @@ def _sql_literal_guard(sql: str, db_path: str) -> str:
     if not obs:
         return ""
     lits = re.findall(r"'([^']*)'", str(sql))
+    # 数值费率守卫（2026-10-26）：字符串守卫守不住数值幻觉 —— 实测（场景 B
+    # 重学后）`SUM(overtime_hours * 100)` 入库：库里只有 overtime_hours（小时
+    # 数），没有任何费率列，100 是 LLM 编的时薪，算出的 5250/4530 全是假数
+    # 进了能力库（规则 8「库里没有的费率不许假设」被字符串口径漏过）。乘除
+    # 里的数值字面量 = 换算系数（费率/汇率/百分比），必须能在实查清单里指认；
+    # 加减与 LIMIT 的数值合法形态多（偏移/采样行数），不查。
+    for _mm in re.finditer(
+            r"([\w.)])\s*([*/])\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*([*/])\s*[\w(]",
+            str(sql)):
+        _n = _mm.group(3) or _mm.group(4)
+        if not _n:
+            continue
+        if re.search(rf"(?<![\d.]){re.escape(_n)}(?![\d.])", obs):
+            continue                      # 实查清单里有这个数（词边界匹配）
+        _op = _mm.group(2) or _mm.group(5)
+        return (f"SQL 里的换算系数（{_op} {_n}）在数据源实查清单里指认不了"
+                f"（库里没有这个费率/系数取值）—— 大概率是假设的费率，拒绝入库")
     # 去掉字面量后的 SQL 正文：字面量若兼作标识符/函数参数名（如
     # date_trunc('month', month)），裸词仍出现 → 不算幻觉。
     bare = re.sub(r"'[^']*'", " ", str(sql)).lower()
