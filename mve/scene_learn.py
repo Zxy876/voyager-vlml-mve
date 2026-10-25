@@ -244,7 +244,14 @@ def _light_up_milestone(scene: str, question: str, db_path: str,
         info = _run_one(question, scene, max_retries=max_retries,
                         critique=_prev, milestone_retry=True)
         r0 = info.get("result", {}) or {}
-        fetched = bool(r0.get("real_calls")) or (int(r0.get("rows") or 0) > 0)
+        # 「真取到」口径（2026-10-26 修）：real_calls/rows 挂在 r0["execution"]
+        # 嵌套层（learn_orchestrate out["execution"]），顶层键不存在 —— 只读
+        # 顶层会永远 fetched=False，哪怕本体 rollout 真取了 4 次数（实测：
+        # calls=4 真取到=4 证据=data 却判"未取到真数"，死活不点亮）。
+        _exec0 = r0.get("execution") or {}
+        fetched = (bool(r0.get("real_calls")) or bool(_exec0.get("real_calls"))
+                   or (int(r0.get("rows") or 0) > 0)
+                   or (int(_exec0.get("rows") or 0) > 0))
         _log(f"[场景学习] 里程碑重试 → status={r0.get('status')}"
              f"（{time.time() - t0:.0f}s，真取到={fetched}）")
         _log_learning_detail(r0)
