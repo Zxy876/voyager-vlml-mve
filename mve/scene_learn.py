@@ -231,17 +231,31 @@ def _light_up_milestone(scene: str, question: str, db_path: str,
     achieved 分支，重跑成功的那一轮会自动执行，无需在这里重复。
     """
     fetched = False
+    # 跨轮评语缓存（2026-10-26）：原版 inference 的重试发生在**同一个 agent
+    # 会话**里，critic 反馈天然可见；MVE 每轮重试是冷启动 —— 不把上一轮的
+    # 失败评语带进去，LLM 会用同样的输入重复同样的错误（实测：组合层把
+    # 题面词「工资」写进 SQL 被守卫拒 → 整轮 no_data → 10s 后原样重试）。
+    _prev = getattr(_light_up_milestone, "_last_crit", "") or ""
     try:
         if _asked_to_stop():
             _log("[场景学习] 收到停止信号，跳过本轮里程碑重试（已学的维度保持）。")
             return False
         t0 = time.time()
-        info = _run_one(question, scene, max_retries=max_retries)
+        info = _run_one(question, scene, max_retries=max_retries,
+                        critique=_prev, milestone_retry=True)
         r0 = info.get("result", {}) or {}
         fetched = bool(r0.get("real_calls")) or (int(r0.get("rows") or 0) > 0)
         _log(f"[场景学习] 里程碑重试 → status={r0.get('status')}"
              f"（{time.time() - t0:.0f}s，真取到={fetched}）")
         _log_learning_detail(r0)
+        # 失败评语 = critic 评语 + 复合技能组合失败原因（守卫/fan-out/执行
+        # 拒因在这里），下一轮重试带进去 —— 重试才有修正的信息，不是原样重摇。
+        _parts = [str(((r0.get("critic") or {}).get("critique")) or "")]
+        _mcomp = r0.get("milestone_skill") or {}
+        if isinstance(_mcomp, dict) and _mcomp.get("skipped"):
+            _parts.append("上轮里程碑复合技能组合失败："
+                          + str(_mcomp["skipped"]))
+        _light_up_milestone._last_crit = "；".join(p for p in _parts if p)[:600]
     except Exception as e:
         _log(f"[场景学习] 里程碑重试异常（按未成功处理，下轮继续）："
              f"{type(e).__name__}: {e}")
@@ -264,7 +278,8 @@ def _light_up_milestone(scene: str, question: str, db_path: str,
 
 def _run_one(q: str, scene: str, *, context: str = "",
              max_retries: int = 1, critique: str = "",
-             preset_dimension: dict | None = None) -> dict[str, Any]:
+             preset_dimension: dict | None = None,
+             milestone_retry: bool = False) -> dict[str, Any]:
     """一次外层 rollout（原版 voyager.py:298-301，默认**只跑 1 次**）。
 
     同构修正（2026-10-24）：原版每轮课程对每个任务只 rollout 一次
@@ -287,7 +302,8 @@ def _run_one(q: str, scene: str, *, context: str = "",
         try:
             r = asyncio.run(learn_orchestrate.start_learning(
                 q, scene, critique=critique, judge=True, context=context,
-                preset_dimension=preset_dimension))
+                preset_dimension=preset_dimension,
+                milestone_retry=milestone_retry))
         except Exception as e:
             r = {"status": "failed", "why": f"{type(e).__name__}: {e}"}
         status = str(r.get("status") or "")

@@ -492,6 +492,7 @@ async def start_learning(
     context: str = "",
     import_id: str = "",
     preset_dimension: dict | None = None,
+    milestone_retry: bool = False,
 ) -> dict[str, Any]:
     """启动一轮学习（同构 learn() 单圈）。返回全量过程记录，失败如实带 why。
 
@@ -505,7 +506,8 @@ async def start_learning(
             question, scene_id, llm=llm, db_path=db_path,
             execute=execute, use_mcp=use_mcp, critique=critique,
             judge=judge, context=context, import_id=import_id,
-            preset_dimension=preset_dimension)
+            preset_dimension=preset_dimension,
+            milestone_retry=milestone_retry)
     finally:
         if use_mcp:
             try:
@@ -528,8 +530,20 @@ async def _start_learning_impl(
     context: str = "",
     import_id: str = "",
     preset_dimension: dict | None = None,
+    milestone_retry: bool = False,
 ) -> dict[str, Any]:
-    """启动一轮学习（同构 learn() 单圈）的实现体（断开逻辑见外层 start_learning）。"""
+    """启动一轮学习（同构 learn() 单圈）的实现体（断开逻辑见外层 start_learning）。
+
+    `milestone_retry`（2026-10-26，用户：「参考原 voyager 的重试里程碑方法，
+    不要自己发明」）—— 里程碑重试轮走**原版 rollout 同构**（voyager.py:283-289
+    rollout(task)）：对 task **本体**执行 —— skills 注入（:199 retrieve →
+    render_system_message）、上轮 critique 进 context 槽（:231-234
+    render_human_message(critique=...)）、内层 4 步迭代（solve 自带）。
+    已闭合维度**不重学**（原版子目标完成即 progress+1，不重做）；本体取到
+    真数 → 存量闭合账判达成 → 组合复合技能入库（learn() 第二步同构）。
+    之前的问题：重试轮走维度循环，全部「维重复用」跳过 → 整轮唯一取数步骤
+    是组合层，它被守卫拒后整轮 calls=0 → no_data 死循环（实测场景 B 10s/轮）。
+    """
     question = str(question or "").strip()
     scene = _resolve_scene(scene_id)
     # ---- 导入批次（用户 2026-10-20）----
@@ -876,7 +890,54 @@ async def _start_learning_impl(
                     except Exception:
                         _iters = {}
                     _timed_out_dims = 0
-                    for _d in _dims:
+                    if milestone_retry:
+                        # ---- 里程碑重试轮：原版 rollout 同构（用户 2026-10-26：
+                        # 「参考原 voyager 的重试里程碑方法，不要自己发明」）----
+                        # voyager.py:283-289 rollout(task)：执行层对 task **本体**
+                        # 写代码执行。同构三件套：skills 注入（:195 retrieve →
+                        # :199 render_system_message，上面 739 行已做）、上轮
+                        # critique 进 context 槽（:231-234 render_human_message
+                        # (critique=...)，scene_learn 跨轮传入 → _hint_ctx）、
+                        # 内层 4 步迭代（solve 自带）。已闭合维度**不重学**（原版
+                        # 子目标完成即 progress+1，不会重做）—— 本轮只做「里程碑
+                        # 本体取到真数」，critic 收口；组合复合技能入库走下方
+                        # achieved 分支（learn() 第二步同构，用存量配方）。
+                        print("  · 里程碑重试：对题目本体执行（已闭合维度不重学，"
+                              "上轮评语进 context 槽）", flush=True)
+                        if is_local:
+                            _ev0: list[dict[str, Any]] = []
+                            observations, sql = await local_agent.solve(
+                                question, local_dir, llm=llm, scene_id=scene,
+                                critique=str(critique or ""), dimensions=[],
+                                avoid=_avoid, skills=skills,
+                                require_tools=True, evidence=_ev0)
+                        else:
+                            observations, sql = await agent.solve(
+                                question, skills=skills, grabs=grabs,
+                                focus_tables=focus, hints=_hint_ctx)
+                        # 存量闭合账（原版 progress：完成的子目标数——不重做）
+                        learned_dims = [d for d in _dims
+                                        if str(d.get("id") or "") in _prog]
+                        closed_ids.update(str(d.get("id") or "") for d in learned_dims
+                                          if str(d.get("id") or ""))
+                        dim_codes = [
+                            {"id": _did,
+                             "question": str((_old_codes.get(_did) or {}).get(
+                                 "question") or ""),
+                             "code": (_old_codes.get(_did) or {}).get("code"),
+                             "answer": (_old_codes.get(_did) or {}).get("answer")}
+                            for _did in [str(d.get("id") or "") for d in learned_dims]
+                            if str((_old_codes.get(_did) or {}).get(
+                                "code") or "").strip()]
+                        answers = [
+                            f"【{str((_old_codes.get(str(d.get('id') or '')) or {}).get('question') or '')[:60]}】"
+                            f"{str((_old_codes.get(str(d.get('id') or '')) or {}).get('answer') or '')[:500]}"
+                            for d in learned_dims
+                            if str((_old_codes.get(str(d.get('id') or '')) or {})
+                                   .get("answer") or "").strip()]
+                    # milestone_retry 时维度循环零次（已闭合维度不重学，原版
+                    # progress 语义），上面的本体 rollout 产物直接进判定段。
+                    for _d in ([] if milestone_retry else _dims):
                         _did = str(_d.get("id") or "")
                         _q1 = str(_d.get("question") or "").strip()
                         if not _q1:
@@ -1138,9 +1199,14 @@ async def _start_learning_impl(
                             [str(d.get("id") or "") for d in learned_dims],
                             # 用**完整**维度集算总进度：预设维度单发闭合时，
                             # 其它维度仍是未闭合，achieved 才不会误翻。
-                            scaffold_result={"dimensions": (plan.get("dimensions")
-                                                           or []),
-                                             "milestone": plan.get("milestone") or {}})
+                            # 里程碑重试轮传 None → milestone_state 读**骨架
+                            # 缓存**（plan 是重拆的，维度 id 可能与骨架漂移；
+                            # 存量闭合账 _prog 记的是骨架维度 id，两者必须
+                            # 同一把尺子，否则 achieved 永远判不出）。
+                            scaffold_result=(None if milestone_retry else
+                                             {"dimensions": (plan.get("dimensions")
+                                                             or []),
+                                              "milestone": plan.get("milestone") or {}}))
                         out["milestone_scaffold"] = _mst
                         # 达成了 → 这一轮跑通的代码进技能库（同原版 add_new_skill）
                         # 没全闭合也照样把**已闭合**那几条入库 —— 它们各自是一次
