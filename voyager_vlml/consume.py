@@ -329,6 +329,32 @@ def _refill_sql(question: str, skills: list[dict[str, Any]], schema: str,
     }
 
 
+def _pick_composite_skill(skills: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """从检索到的技能里挑「复合技能」（覆盖多张表的完整组合 SQL），用于消费侧**直接复用**
+    （执行已学函数取真实值，调答案出来编排），而不是让 agent 重写成新 SQL 合成。
+
+    评分：引用的真实表数多 > 名称/说明含复合关键词（总/应发/合计/total/salary…）。
+    必须至少引用 2 张表才算复合；返回最优或 None（全是原子技能时返回 None）。
+    """
+    import re
+
+    best = None
+    best_score = 0
+    for s in skills or []:
+        code = str(s.get("code") or "").strip()
+        if not re.match(r"(?i)^\s*(select|with)\b", code):
+            continue
+        tbls = set(re.findall(r"(?i)\b(?:FROM|JOIN)\s+([A-Za-z_]\w*)", code))
+        n = len(tbls)
+        name = str(s.get("name") or "") + " " + str(s.get("text") or "")
+        kw = bool(re.search(r"总|应发|合计|汇总|总和|total|salary|gross|combine",
+                            name, re.I))
+        score = n * 10 + (5 if kw else 0)
+        if n >= 2 and score > best_score:
+            best, best_score = s, score
+    return best
+
+
 # ---------------------------------------------------------------------------
 # ③' 配方泛化：入库前把「上一题的取数 SQL」改写成**槽位模板**
 #     （用户 2026-10-23 定：「不要把数值写死，而是把算法积累成技能」）
@@ -985,29 +1011,75 @@ async def consume(
             # 已经学过它，却还去"现场现做"，等于技能库白建（用户 2026-10-20
             # 「所有命中的题目都要用到已经学到的技能」）。
             if _scene_kind == "scene":
-                # 场景库形态的现场写：同一个 VLMLActionAgent（写 SQL prompt +
-                # 迭代修正），数据面只连场景自己的库（与学习侧 SceneDBEnv
-                # 同一环境，learn_orchestrate.py:583 同款）。
-                # ⚠️ 这里**不许再写局部 import**（2026-10-24 09:08 实测）：
-                #   import 是赋值，会把 VLMLActionAgent 变成 consume() 的局部
-                #   名字；走「复用配方」路径时这个分支被跳过，重放取到真空后
-                #   落到下方 ：1166 降级现场写 → UnboundLocalError，整条消费
-                #   通路挂掉。模块级 ：88 已有同一个 import，直接用。
+                # 场景库形态复用优先（同构 Voyager：检索 → 重放/复用 → 取不到才写）。
+                # 设计边界（用户 2026-10-25）：消费侧**不做合成**——学过的里程碑
+                # 直接检索复用已学复合技能（执行已学函数取真实值，调答案出来编排）；
+                # 检索不到（未学）就**不答、只标记去学**，交给课程规划拆解完成。
+                # ⚠️ 这里**不许再写局部 import**（2026-10-24 09:08 实测）：import
+                #   是赋值，会把 VLMLActionAgent 变成 consume() 的局部名字 → 整条
+                #   消费通路挂掉。模块级 ：88 已有同一个 import，直接用。
                 _agent = VLMLActionAgent(env=_env)
-                obs, code = await _agent.solve(
-                    question, skills=skills,
-                    hints=[str(s.get("need") or "") for s in
-                           ((route_info or {}).get("subtasks") or [])] or None)
-                # 用 agent 跟踪的「最后一次可执行、未乘爆、取到真数」的 (sql,data)
-                # 配对，而不是把 real[-1] 的数据与 last_sql 拆开拼（二者可能来自
-                # 不同轮次 → 数 SQL 对不上，如 67245 数据 vs 58145 干净 SQL）。
-                if _agent.last_ok_data is not None:
-                    data = _agent.last_ok_data
-                    code = _agent.last_ok_sql or code
+                if skills:
+                    # 学过的里程碑：挑出复合技能直接复用（槽位实例化 + 双层确定性
+                    # 守卫），不再让 agent 重写 SQL 合成。
+                    _comp = _pick_composite_skill(skills)
+                    if _comp is not None:
+                        _dbp = str((_prof or {}).get("db_path") or "")
+                        _r = _refill_sql(question, [_comp], _schema, db_path=_dbp)
+                        if _r["reused"] and _r["sql"]:
+                            _gwhy = _sql_literal_guard(_r["sql"], _dbp)
+                            if _gwhy:
+                                reuse_errors.append(
+                                    f"复合技能复用被字面量守卫拒用：{_gwhy[:120]}")
+                            else:
+                                _fwhy = _fanout_guard(_r["sql"], _dbp)
+                                if _fwhy:
+                                    reuse_errors.append(
+                                        f"复合技能复用被 fan-out 拒用：{_fwhy[:120]}")
+                                else:
+                                    _rr = await _env.run_sql(_r["sql"])
+                                    _d = _rr.get("data") or {}
+                                    if _rr.get("ok") and _d.get("rows"):
+                                        data, code = _d, _r["sql"]
+                                        reused_skill = {**dict(_comp),
+                                                        "refill_note": _r["note"]}
+                                        obs = [{"ok": True, "tool": "query_sql",
+                                                "rows": _rr.get("rows"),
+                                                "data": _d,
+                                                "data_sources": ["query_sql"]}]
+                                    else:
+                                        reuse_errors.append(
+                                            "复合技能复用后没取到真数："
+                                            f"{str(_rr.get('error') or '0 行')[:120]}")
+                        else:
+                            reuse_errors.append(
+                                f"复合技能未通过回填实例化：{str(_r['note'])[:120]}")
+                    # 复合复用没成（或本就是原子题、已由 ③a 复用）→ 保留 guided
+                    # solve 兜底（带已学技能引用，属编排而非凭空合成）。
+                    if data is None and reused_skill is None:
+                        obs, code = await _agent.solve(
+                            question, skills=skills,
+                            hints=[str(s.get("need") or "") for s in
+                                   ((route_info or {}).get("subtasks") or [])] or None)
+                        # 用 agent 跟踪的「最后一次可执行、未乘爆、取到真数」的
+                        # (sql,data) 配对，避免 data 与 code 拆开拼（67245 vs 58145）。
+                        if _agent.last_ok_data is not None:
+                            data = _agent.last_ok_data
+                            code = _agent.last_ok_sql or code
+                        else:
+                            real = [o for o in obs
+                                    if o.get("ok") and o.get("data") is not None]
+                            data = (real[-1].get("data") if real else None)
                 else:
-                    real = [o for o in obs
-                            if o.get("ok") and o.get("data") is not None]
-                    data = (real[-1].get("data") if real else None)
+                    # 未学（索引不到已学技能）：不合成、不答，标记交给课程规划。
+                    # 设计边界（用户 2026-10-25）：消费侧不做合成，只检索复用；
+                    # 检索不到说明里程碑没跑过，应由学习侧拆解完成。
+                    reuse_errors.append(
+                        "未学：索引不到已学技能 → 标记交给课程规划拆解学习")
+                    learn_kick = {"kicked": False, "manual": True,
+                                  "why": "未学（检索不到已学技能）—— 这道里程碑还没"
+                                         "被学习跑过，需驾驶舱 ▶ 启动 Voyager 学完"}
+                    obs, code = [], ""
             else:
                 obs, code = await _la.solve(
                     question, _scene_dir, scene_id=_scene_id, skills=skills,
@@ -1105,10 +1177,14 @@ async def consume(
         # 判未完成 → 答案不许以确定句示人（2026-10-24 用户拍板）：
         # 130600 事故三次同款——账面上 fetched_empty、面板上却是自信数字，
         # 展示层必须跟账本一致：判没答出来就明说「未验证、数字不可信」。
-        if answer and not (data is not None and critic_ok
+        if answer and data is not None and not (critic_ok
                            and nar.get("answered", True)):
             answer = (str(answer).rstrip()
                       + "（⚠️ 未验证：本轮未通过 critic 判定，此数字不可信）")
+        # 未学（检索不到已学技能）：不答、只标记交给课程规划，明确告知人。
+        if data is None and not skills:
+            answer = ("⚠️ 未学：本题里程碑尚未被学习跑过，检索不到已学技能 —— "
+                      "已标记交给课程规划拆解学习（驾驶舱 ▶ 启动 Voyager 学完即可复用）。")
         base = {
             "question": question, "mode": "voyager_consume",
             "topic_id": topic_id, "topic_hit": hit,
