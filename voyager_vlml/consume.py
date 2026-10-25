@@ -1029,10 +1029,8 @@ async def consume(
                 # 设计边界（用户 2026-10-25）：消费侧**不做合成**——学过的里程碑
                 # 直接检索复用已学复合技能（执行已学函数取真实值，调答案出来编排）；
                 # 检索不到（未学）就**不答、只标记去学**，交给课程规划拆解完成。
-                # ⚠️ 这里**不许再写局部 import**（2026-10-24 09:08 实测）：import
-                #   是赋值，会把 VLMLActionAgent 变成 consume() 的局部名字 → 整条
-                #   消费通路挂掉。模块级 ：88 已有同一个 import，直接用。
-                _agent = VLMLActionAgent(env=_env)
+                # 2026-10-25 再收紧：连「复合复用失败后的做题兜底」也删了——消费
+                # 只编排复用、不现做合成；复用取不到数就如实标记去学，绝不现场写 SQL。
                 if skills:
                     # 学过的里程碑：挑出复合技能直接复用（槽位实例化 + 双层确定性
                     # 守卫），不再让 agent 重写 SQL 合成。
@@ -1071,23 +1069,19 @@ async def consume(
                         else:
                             reuse_errors.append(
                                 f"复合技能未通过回填实例化：{str(_r['note'])[:120]}")
-                    # 复合复用没成（或本就是原子题、已由 ③a 复用）→ 保留 guided
-                    # solve 兜底（带已学技能引用，属编排而非凭空合成）。
+                    # 复合复用没成（或本就是原子题已由 ③a 复用）→ **不再做题兜底**
+                    # （用户 2026-10-25：做题兜底不要，只留叙事）。消费只编排复用
+                    # 已学技能、不现做合成：检索到技能却没取到数，如实标记去学，
+                    # 绝不现场写 SQL 编答案（幻觉取值就是这么漏出去的）。
                     if data is None and reused_skill is None:
-                        obs, code = await _agent.solve(
-                            question, skills=skills,
-                            hints=[str(s.get("need") or "") for s in
-                                   ((route_info or {}).get("subtasks") or [])] or None)
-                        # 用 agent 跟踪的「最后一次可执行、未乘爆、取到真数」的
-                        # (sql,data) 配对，避免 data 与 code 拆开拼（67245 vs 58145）。
-                        if _agent.last_ok_data is not None:
-                            data = _agent.last_ok_data
-                            code = _agent.last_ok_sql or code
-                        else:
-                            real = [o for o in obs
-                                    if o.get("ok") and o.get("data") is not None]
-                            data = (real[-1].get("data") if real else None)
-                else:
+                        if not reuse_errors:
+                            reuse_errors.append(
+                                "已检索到已学技能但复用未取到真数（回填/组合未命中）")
+                        learn_kick = {"kicked": False, "manual": True,
+                                      "why": "已学技能检索到了但复用未取到真数 —— "
+                                             "消费不做合成，需驾驶舱 ▶ 启动 Voyager "
+                                             "重学该里程碑（或补缺维度）"}
+                        obs, code = [], ""
                     # 未学（索引不到已学技能）：不合成、不答，标记交给课程规划。
                     # 设计边界（用户 2026-10-25）：消费侧不做合成，只检索复用；
                     # 检索不到说明里程碑没跑过，应由学习侧拆解完成。
@@ -1115,34 +1109,22 @@ async def consume(
                         if o.get("ok") and o.get("data") is not None]
                 data = (real[-1].get("data") if real else None)
             if _scene_kind == "scene" and data is not None:
-                # 字面量守卫（消费侧第三道确定性闸，2026-10-25 补）：现场写
-                # （③b 兜底 _agent.solve）的 SQL 此前只过 fan-out 闸不过字面量
-                # 闸 —— 实测「九月份公司要支出多少钱」兜底写出 kind='奖金'
-                # （库里没有）和 *50/*100 幻觉费率直接出了答案。幻觉答案可以
-                # 不入库（6271151 已堵），但**交出去也不行**：库里没有的取值
-                # /费率必须能在 db_observation 实查清单里指认。
-                _dbp3 = str((_prof or {}).get("db_path") or "")
-                _gwhy3 = _sql_literal_guard(code, _dbp3)
-                if _gwhy3:
+                # fan-out 闸门（消费侧确定性拒乘爆兜底）：复用回填出的 SQL 即便
+                # 过了上面的字面量守卫，这里用实查行数再兜一道——跨一对多 JOIN
+                # 放大且做聚合的乘爆 SQL 绝不交出去（原版 critic 删后的确定性防线）。
+                # 注：字面量守卫已在回填后执行前（:1044）逐条过过，复用路径不会再
+                # 带幻觉取值；做题兜底已删（2026-10-25），此处无需再为现场写补闸。
+                _fwhy = _fanout_guard(code, str((_prof or {}).get("db_path") or ""))
+                if _fwhy:
                     data = None
                     reuse_errors.append(
-                        f"现场写被字面量守卫拒用（幻觉取值）：{_gwhy3[:140]}")
-                if data is not None:
-                    # fan-out 闸门（消费侧确定性拒乘爆兜底）：现场写出的 SQL 即便
-                    # 过了 _agent.solve 的 critic（消费侧 critic 判定已删，只认
-                    # data is not None），这里用实查行数再兜一道——跨一对多 JOIN
-                    # 放大且做聚合的乘爆 SQL 绝不交出去、也绝不写进技能库。
-                    _fwhy = _fanout_guard(code, _dbp3)
-                    if _fwhy:
-                        data = None
-                        reuse_errors.append(
-                            f"现场写被 fan-out 闸门拒用（JOIN 乘爆）：{_fwhy[:140]}")
-                    # 场景库形态的真空防线（与 local 分支 _payload 同口径）：
-                    # 0 行的查询也返回 {rows: []} —— 不挡的话「0 行 + 模型一段
-                    # 文字」会判 written，还把 `WHERE 表达式='y=2x-1'` 这种把
-                    # 答案字面量当查询条件的坏配方写进技能库（2026-10-22 K 实测）。
-                    elif not (data.get("rows") if isinstance(data, dict) else data):
-                        data = None
+                        f"复用 SQL 被 fan-out 闸门拒用（JOIN 乘爆）：{_fwhy[:140]}")
+                # 场景库形态的真空防线（与 local 分支 _payload 同口径）：
+                # 0 行的查询也返回 {rows: []} —— 不挡的话「0 行 + 模型一段
+                # 文字」会判 written，还把 `WHERE 表达式='y=2x-1'` 这种把
+                # 答案字面量当查询条件的坏配方写进技能库（2026-10-22 K 实测）。
+                elif not (data.get("rows") if isinstance(data, dict) else data):
+                    data = None
         # ---- 维度覆盖守卫（合成题被单配方/单表答的确定性闸）----
         # 与 fan-out 闸同风格、同位置：不赌 LLM。本题拆成多维度（dims>=2）却只
         # 覆盖 1 张维度源表 → 合成题被单维度答掉（如"发多少工资"只答了基薪、
