@@ -78,7 +78,14 @@ GATE_SYSTEM = """你是产婆术（Maieutic）的**闸门检查员**。一个助
 
 def _default_llm(messages: list[dict[str, str]]) -> str:
     from voyager_vlml.llm import chat
-    return chat(messages, temperature=0)
+    import os as _os
+    # 判官模型可单配（2026-10-24 实测：glm-4-flash 当 judge，同一份带环境观察的
+    # 输入 3 次全放行一个明显错误的答案 —— 判官不能省模型钱；出题/执行层可继续
+    # 用 flash）。闸门是**维度闭合的决定性判官**，2026-10-26 实测：flash 闸门
+    # 把 base_salary×overtime_hours 费率幻觉判成「已答到」（env_obs + 点名判据
+    # 都在 prompt 里也没用）—— 毒配方再次入库。env MVE_CRITIC_MODEL 一设即切。
+    return chat(messages, temperature=0,
+                model=_os.getenv("MVE_CRITIC_MODEL", ""))
 
 
 def _parse(text: str) -> dict[str, Any]:

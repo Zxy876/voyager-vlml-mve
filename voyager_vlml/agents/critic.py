@@ -221,8 +221,12 @@ class VLMLCriticAgent:
             return False, "", ""
 
         from voyager_vlml.llm import chat_json
-
-        obj = chat_json(messages, temperature=0)
+        import os as _os
+        # 判官模型可单配（同 task_critic.ai_check_task_success 的口径：
+        # 2026-10-24 实测 glm-4-flash 当 judge 3 次全放行明显错误的答案，
+        # 判官不能省模型钱）。内层 critic 是 solve 每步的唯一判定。
+        obj = chat_json(messages, temperature=0,
+                        model=_os.getenv("MVE_CRITIC_MODEL", ""))
         if not isinstance(obj, dict) or obj.get("success") not in (True, False):
             # 原版这里 `assert response["success"] in [True, False]` 失败 → 递归重试
             print("Critic：回复不是 {reasoning, success, critique} 形状 · Trying again!")
