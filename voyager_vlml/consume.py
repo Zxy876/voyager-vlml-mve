@@ -1115,21 +1115,34 @@ async def consume(
                         if o.get("ok") and o.get("data") is not None]
                 data = (real[-1].get("data") if real else None)
             if _scene_kind == "scene" and data is not None:
-                # fan-out 闸门（消费侧确定性拒乘爆兜底）：现场写出的 SQL 即便
-                # 过了 _agent.solve 的 critic（消费侧 critic 判定已删，只认
-                # data is not None），这里用实查行数再兜一道——跨一对多 JOIN
-                # 放大且做聚合的乘爆 SQL 绝不交出去、也绝不写进技能库。
-                _fwhy = _fanout_guard(code, str((_prof or {}).get("db_path") or ""))
-                if _fwhy:
+                # 字面量守卫（消费侧第三道确定性闸，2026-10-25 补）：现场写
+                # （③b 兜底 _agent.solve）的 SQL 此前只过 fan-out 闸不过字面量
+                # 闸 —— 实测「九月份公司要支出多少钱」兜底写出 kind='奖金'
+                # （库里没有）和 *50/*100 幻觉费率直接出了答案。幻觉答案可以
+                # 不入库（6271151 已堵），但**交出去也不行**：库里没有的取值
+                # /费率必须能在 db_observation 实查清单里指认。
+                _dbp3 = str((_prof or {}).get("db_path") or "")
+                _gwhy3 = _sql_literal_guard(code, _dbp3)
+                if _gwhy3:
                     data = None
                     reuse_errors.append(
-                        f"现场写被 fan-out 闸门拒用（JOIN 乘爆）：{_fwhy[:140]}")
-                # 场景库形态的真空防线（与 local 分支 _payload 同口径）：
-                # 0 行的查询也返回 {rows: []} —— 不挡的话「0 行 + 模型一段
-                # 文字」会判 written，还把 `WHERE 表达式='y=2x-1'` 这种把
-                # 答案字面量当查询条件的坏配方写进技能库（2026-10-22 K 实测）。
-                elif not (data.get("rows") if isinstance(data, dict) else data):
-                    data = None
+                        f"现场写被字面量守卫拒用（幻觉取值）：{_gwhy3[:140]}")
+                if data is not None:
+                    # fan-out 闸门（消费侧确定性拒乘爆兜底）：现场写出的 SQL 即便
+                    # 过了 _agent.solve 的 critic（消费侧 critic 判定已删，只认
+                    # data is not None），这里用实查行数再兜一道——跨一对多 JOIN
+                    # 放大且做聚合的乘爆 SQL 绝不交出去、也绝不写进技能库。
+                    _fwhy = _fanout_guard(code, _dbp3)
+                    if _fwhy:
+                        data = None
+                        reuse_errors.append(
+                            f"现场写被 fan-out 闸门拒用（JOIN 乘爆）：{_fwhy[:140]}")
+                    # 场景库形态的真空防线（与 local 分支 _payload 同口径）：
+                    # 0 行的查询也返回 {rows: []} —— 不挡的话「0 行 + 模型一段
+                    # 文字」会判 written，还把 `WHERE 表达式='y=2x-1'` 这种把
+                    # 答案字面量当查询条件的坏配方写进技能库（2026-10-22 K 实测）。
+                    elif not (data.get("rows") if isinstance(data, dict) else data):
+                        data = None
         # ---- 维度覆盖守卫（合成题被单配方/单表答的确定性闸）----
         # 与 fan-out 闸同风格、同位置：不赌 LLM。本题拆成多维度（dims>=2）却只
         # 覆盖 1 张维度源表 → 合成题被单维度答掉（如"发多少工资"只答了基薪、

@@ -296,6 +296,143 @@ def learn_milestone_skills(scene_id: str, topic_id: str, question: str,
     return out
 
 
+# 里程碑级复合技能的组合 prompt（原版 learn() 第二步的同构物：
+# 「组合成复合 program 按里程碑索引入库」—— 用户 2026-10-25：
+# 「把里程碑在学习侧重试之后计入技能，不计的话消费检索不到」）
+_COMPOSITE_SYSTEM = """你是数据取数方法组合员。手里有为同一道题学好的多条**维度配方**
+（每条答一个维度），要把它们组合成**一条**能整体回答题目的 SELECT。
+
+规则：
+1. 每条维度配方算的量都要进最终 SQL（该加的加、该减的减，口径照配方，不许改口径）。
+2. 乘爆防线：跨「一对多」JOIN 必须先把右表按关联键聚合成分组子查询再 JOIN
+   （LEFT JOIN (SELECT emp_id, SUM(amount) AS amount FROM … GROUP BY emp_id) t），
+   绝不对明细行直接 SUM 父表列。
+3. 字面量（表/列/筛选值）只能用输入里给出的，一个都不许新造。
+4. 库里给不出的量（费率不存在、类别取值不存在）**不许编**：按 0 处理或省略该维度，
+   并在 note 里说明哪条维度因为什么被按 0/省略。
+5. 输出必须是单条 SELECT 或 WITH 开头的语句，不许 INSERT/UPDATE/DROP。
+
+只返回一个 JSON：{"sql": "组合后的 SQL", "note": "一句话说明组合方式与取舍"}"""
+
+
+async def learn_milestone_composite(scene_id: str, topic_id: str, question: str,
+                                    dim_codes: list[dict[str, Any]], *,
+                                    db_path: str = "",
+                                    milestone_name: str = "") -> dict[str, Any]:
+    """里程碑**全闭合**后把「里程碑本身」组合成**一条复合技能**入库。
+
+    用户 2026-10-25 指令：「把里程碑在学习侧重试之后计入技能，不计的话消费
+    检索不到」。维度技能各存各的，消费侧复合复用（_pick_composite_skill +
+    _refill_sql）只会**单配方**实例化，押在一条维度技能上必漏维 —— 实测
+    （2026-10-25 22:21）押中含「奖金」的维度配方，回填写出库里不存在的
+    kind='奖金' 被字面量守卫拒用，落兜底现做。原版 learn() 的第二步就是把
+    原子技能**组合成复合 program 按里程碑索引入库**（voyager.py:230 成功才
+    add_new_skill）—— 这里补上这一步。
+
+    入库三道关（缺一不入，宁缺毋滥）：
+      ① 字面量守卫：组合 SQL 里的每个取值必须能在 db_observation 实查里指认；
+      ② fan-out 闸：跨一对多 JOIN 乘爆的 SQL 不入；
+      ③ 真执行取到真数：跑不通 / 0 行 / 整行 NULL（空表聚合 (NULL,0) 骗局）
+         都不入。
+    任何一步失败都不入库（复合技能缺失只是退回「消费单配方复用」，不会存坏技能）。
+    """
+    out: dict[str, Any] = {"added": "", "skipped": "", "sql": "", "note": ""}
+    codes = [str(d.get("code") or "").strip() for d in (dim_codes or [])]
+    codes = [c for c in codes if c]
+    if not codes or not str(topic_id or "").strip():
+        out["skipped"] = "没有维度配方或 topic 为空"
+        return out
+    try:
+        from voyager_vlml.llm import chat_json as _cj
+        from voyager_vlml.consume import (_sql_literal_guard as _lg,
+                                          _fanout_guard as _fg,
+                                          generalize_sql_recipe as _gen)
+        from scene_db import SceneDBEnv
+        import skill_store
+    except Exception as e:
+        out["skipped"] = f"依赖不可用：{type(e).__name__}: {e}"
+        return out
+    # 环境观察（地面真话）：组合时字面量只能从这里取 —— 防止把维度配方里
+    # 泛化前的旧值或幻觉值（'奖金'）再抄回来。
+    ground = ""
+    if str(db_path or "").strip():
+        try:
+            from curriculum_auto import db_observation as _dbobs
+            ground = str(_dbobs(db_path) or "")
+        except Exception:
+            ground = ""
+    recipes = "\n\n".join(
+        f"【维度 {i+1}｜{str((dim_codes[i] or {}).get('id') or '')}】"
+        f"问：{str((dim_codes[i] or {}).get('question') or '')[:80]}\n"
+        f"{c[:700]}"
+        for i, c in enumerate(codes[:6]))
+    user = (f"题目：{question}\n\n已学好的维度配方：\n{recipes}\n\n"
+            f"当前库真实存在的表/列/真实取值（字面量只能从这里取）：\n"
+            f"{ground[:4500]}\n\n按规则产出组合 SQL。")
+    try:
+        resp = _cj([{"role": "system", "content": _COMPOSITE_SYSTEM},
+                    {"role": "user", "content": user}], temperature=0.2)
+    except Exception as e:
+        out["skipped"] = f"组合 LLM 失败：{type(e).__name__}: {e}"
+        return out
+    sql = str(resp.get("sql") or "").strip()
+    note = str(resp.get("note") or "")
+    out["note"] = note
+    body = sql
+    if not body.lower().startswith(("select", "with")):
+        out["skipped"] = "组合产物不是 SELECT/WITH"
+        return out
+    out["sql"] = body
+    # ① 字面量守卫（'奖金' 幻觉在这里被拦）
+    _gwhy = _lg(body, str(db_path or ""))
+    if _gwhy:
+        out["skipped"] = f"组合 SQL 被字面量守卫拒用：{_gwhy[:160]}"
+        return out
+    # ② fan-out 闸
+    _fwhy = _fg(body, str(db_path or ""))
+    if _fwhy:
+        out["skipped"] = f"组合 SQL 被 fan-out 闸拒用：{_fwhy[:160]}"
+        return out
+    # ③ 真执行取真数（真空成功防线：整行 NULL 不算）
+    try:
+        env = SceneDBEnv(str(db_path or ""))
+        rr = await env.run_sql(body)
+    except Exception as e:
+        out["skipped"] = f"组合 SQL 执行抛错：{type(e).__name__}: {e}"
+        return out
+    _d = (rr or {}).get("data") or {}
+    rows = _d.get("rows") or []
+    real = bool(rows) and any(
+        v is not None for row in rows[:3] for v in (row if isinstance(row, (list, tuple)) else [row]))
+    if not (rr or {}).get("ok") or not real:
+        out["skipped"] = (f"组合 SQL 没取到真数（ok={bool((rr or {}).get('ok'))} "
+                          f"rows={len(rows)}）—— 不入库")
+        return out
+    # 技能存算法不存数值：组合 SQL 也先泛化成槽位模板再入库
+    try:
+        code = _gen(body, question)
+    except Exception:
+        code = body
+    text = (f"【里程碑{('：' + milestone_name[:40]) if milestone_name else ''}】"
+            f"{question}：全维度闭合后组合出的整体取数做法"
+            f"（维度配方组合，非单维度）")
+    try:
+        _act, key = skill_store.add(
+            topic_id, "milestone", text, code=code, source="learn",
+            exact_only=True,
+            blueprint={"from": "maieutic_milestone_composite",
+                       "milestone": str(milestone_name or ""),
+                       "question": str(question or ""),
+                       "scene": str(scene_id or ""),
+                       "dims": [str((d or {}).get("id") or "") for d in dim_codes]},
+            source_scene=str(scene_id or "A"))
+        out["added"] = str(key or "")
+        out["action"] = str(_act or "")
+    except Exception as e:
+        out["skipped"] = f"入库失败：{type(e).__name__}: {e}"
+    return out
+
+
 def _called_tools(code: str) -> list[str]:
     """从跑通的代码里解析**调用了哪些动作**（与 consume._RECIPE_CALL 同一族，
     但这里是提取名字不是判真假 —— 真假判据仍走 `_looks_like_recipe`）。
@@ -1011,6 +1148,31 @@ async def _start_learning_impl(
                         out["skills"] = learn_milestone_skills(
                             scene, _tid, question, _mst, dim_codes,
                             import_id=imp_id)
+                        # 里程碑**全闭合** → 把里程碑本身组合成一条复合技能
+                        # 入库（用户 2026-10-25：「把里程碑在学习侧重试之后
+                        # 计入技能，不计的话消费检索不到」）。原版 learn()
+                        # 第二步：原子技能组合成复合 program 按里程碑索引入库。
+                        # 没全闭合不组合（组合了也是漏维的片面 SQL）。
+                        if bool((_mst or {}).get("achieved")) and dim_codes:
+                            try:
+                                out["milestone_skill"] = (
+                                    await learn_milestone_composite(
+                                        scene, _tid, question, dim_codes,
+                                        db_path=str(prof.get("db_path") or ""),
+                                        milestone_name=str(
+                                            ((_mst or {}).get("milestone")
+                                             or {}).get("name") or "")))
+                                _mcomp = out.get("milestone_skill") or {}
+                                if _mcomp.get("added"):
+                                    print(f"  · 里程碑复合技能已入库："
+                                          f"{_mcomp['added']}", flush=True)
+                                elif _mcomp.get("skipped"):
+                                    print(f"  · 里程碑复合技能未入库："
+                                          f"{str(_mcomp['skipped'])[:110]}",
+                                          flush=True)
+                            except Exception as _ce:
+                                out["milestone_skill"] = {
+                                    "skipped": f"{type(_ce).__name__}: {_ce}"}
                     except Exception as e:
                         out["milestone_scaffold"] = {
                             "error": f"{type(e).__name__}: {e}"}
