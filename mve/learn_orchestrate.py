@@ -711,12 +711,17 @@ async def _start_learning_impl(
                     tools_map: dict[str, list[str]] = {}
                     # 父节点（这枚"问题节点"）的 id 必须与 ⑥ `_absorb` 用同一算法，
                     # 否则循环里先落的维度节点和 ⑥ 后落的会算出两套 id → 不幂等。
-                    try:
-                        from voyager_vlml.consume import (
-                            _runtime_topic_id as _rtid)
-                        _tid = str(_rtid(question, scene) or "")
-                    except Exception:
-                        _tid = ""
+                    # ⚠️ 学习侧**不能用**消费侧的 `consume_<md5>` 运行期 topic：
+                    # `_runtime_topic_id`（consume.py:1949）永远返回 `consume_<md5>`，
+                    # 那是"答出来但归不上图谱节点"的**消费运行时**标记。若学习侧复用
+                    # 它，学过的里程碑技能会被打上 `consume_*` 前缀 → 消费侧
+                    # `consume.py:877` 的过滤把它们当"消费会话级脏账"排除 → 检索不到
+                    # 已学技能 → 表现正是用户原话「学过还是现做」。学习侧改用独立的
+                    # `learn_<md5>` 前缀，与消费侧 `consume_` 运行时脏账彻底隔离；
+                    # 消费侧过滤只排 `consume_*`，放行 `learn_*`。
+                    import hashlib as _hl
+                    _tid = (f"learn_{_hl.md5(str(question or '').strip()
+                                        .encode('utf-8')).hexdigest()[:8]}")
                     try:
                         _prog = _ms.load_progress(scene, question)
                     except Exception:
