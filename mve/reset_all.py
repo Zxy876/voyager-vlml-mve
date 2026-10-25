@@ -6,6 +6,14 @@
 比如 run_log 空了但因果时间线还在，出题器就会照着旧的时间线选题，
 而掌握度视图里什么都看不到。
 
+⚠️ 2026-10-26 补齐（用户：「清库按钮要清得彻底，连账本都清掉」）：
+  全清原来只删 TARGETS 整文件，**不删按场景分目录的 ckpt** ——
+  ckpt_curriculum/<场景>/（课程两本账）和 ckpt_maieutic/<场景>/
+  （追问骨架 + 维度进度 + _current_target 锚点）全残留。实测
+  （2026-10-25 面板全清后重学场景 B）：毒化的里程碑骨架照旧点亮、
+  旧锚点照旧把学习循环拽回旧目标。全清现在把这两个目录**整删**
+  （所有场景一起归零，先备份）；按场景清早就走 SCENE_DIRS，不受影响。
+
 ⚠️ 2026-10-14 补齐（用户指出「清库没有改对应的 voyager 学习记录」）：
   原来只清 10 项，而服务器上真实存在的状态文件有 20 个。漏掉的那批里
   `topic_mastery.jsonl` 最要命 —— 它记着「哪些节点已经规划过了」，
@@ -20,6 +28,9 @@
 
   【学习成果】
   skill_store.json       技能库（Voyager 学的取数配方 / 教训）
+  skill_emb.json         技能向量索引（embedding 检索用，跟 skill_store 走 ★补）
+  ckpt_curriculum/<场景>/ 课程两本账（completed / failed，按场景分目录 ★补）
+  ckpt_maieutic/<场景>/   追问骨架缓存 + 维度进度 + _current_target（★补）
   topic_mastery.jsonl    掌握库（每个节点"规划过了没有 / 做得多好"）★本轮补
   runtime_topics.json    运行期生成的图谱节点（练习线 + 消费线共用）★本轮补
   generated_tasks.json   出题器生成的题 ★本轮补
@@ -79,13 +90,15 @@
     python mve/reset_all.py --scene D
     python mve/reset_all.py --scene D --dry-run
 
-⚠️ 按场景清**不动**这些（不是学习成果，或本来就不带场景字段）：
+⚠️ 按场景清**不动**这些（不是学习成果，或属于其它场景）：
     scene_data/<场景>/       人的本机文件 —— 那是**数据源**（同 .duckdb）
     scenes.json              场景注册（清了场景就没了）
     action_registry.json     猫爪总开关 / 组开关
-    skill_store.json         技能是**跨场景复用**资产，且不带场景字段
     exam_log.jsonl           裸考记录，不带场景字段
-    想连这些一起清 → 用不带 --scene 的全清。
+    技能库中其它场景/default 的配方
+⚠️ 2026-10-26 起，按场景清**会清** `source_scene=本场景` 的技能配方
+   （用户：「清场景清彻底，连账本都清掉」后重学 —— 旧配方残留会被
+   embedding 盲取检索回来，含毒配方，等于没从零学）。
 """
 
 from __future__ import annotations
@@ -102,6 +115,10 @@ ROOT = Path(__file__).resolve().parent
 TARGETS = [
     # ---- 学习成果 ----
     ("skill_store.json", "技能库 / 记忆"),
+    # 向量索引（2026-10-26 embedding 检索引入）：跟 skill_store.json 走，
+    # 全清不清它 → 重建的技能库带着旧指纹缓存，虽然 _load_embs 会按指纹
+    # 懒补，但孤儿向量留着就是第二个 110MB 的隐患（2026-10-21 面板挂死同款）。
+    ("skill_emb.json", "技能向量索引（跟 skill_store.json 走）"),
     # ⚠️ 本轮补：这是「清库没清干净」里最要命的一个。
     # `topic_mastery.jsonl` 上的 completed 是**去重位**（「规划过了，别再规划」），
     # `select_next` 据此排除节点。不清它 → 清库后 55 道题被判"已经练过"，
@@ -335,6 +352,16 @@ SCENE_DIRS = [
     ("ckpt_maieutic/{s}", "Maieutic 追问骨架缓存 + 维度进度（断点续学）"),
 ]
 
+# 全清（不带 --scene）要**整删**的目录（2026-10-26 补）：所有场景的课程账 /
+# 骨架缓存一起归零。以前全清只删 TARGETS 整文件，这两个目录残留 —— 实测
+# （2026-10-25 面板全清后重学场景 B）毒化的里程碑骨架照旧点亮、旧
+# _current_target 锚点照旧把学习循环拽回旧目标，用户被迫手工补刀
+# reset_all.py --scene B。按场景清走上面的 SCENE_DIRS，不受影响。
+FULL_RESET_DIRS = [
+    ("ckpt_curriculum", "课程两本账（所有场景）"),
+    ("ckpt_maieutic", "追问骨架 + 维度进度 + _current_target 锚点（所有场景）"),
+]
+
 # 按场景清：**逐条过滤重写**（只删这个场景的行/条目，其它场景原样留着）
 #   (文件名, 场景字段名, 说明)
 SCENE_ROWS = [
@@ -373,9 +400,16 @@ def _clear_scene(scene: str, *, dry: bool, backup: bool) -> int:
       · `scene_data/<scene>/` —— 人的本机文件，那是**数据源**（同 .duckdb，
         不在清库范围），清了等于删人东西；
       · `scenes.json` / `action_registry.json` —— 场景注册与猫爪开关，是配置；
-      · `skill_store.json` / `exam_log.jsonl` —— **不带场景字段**，技能还是
-        跨场景复用资产（`source_scene` 只说明它从哪来，别的场景照样用）。
-        按场景清不会动它们，需要清就走全清。
+      · `exam_log.jsonl` —— 不带场景字段。
+      · `skill_store.json` 里 **source_scene=其它场景/default 的技能** ——
+        跨场景复用资产，别的场景照样用。
+
+    ⚠️ 2026-10-26 改（用户：「清场景清彻底，连账本都清掉」后重学）：
+      `source_scene=本场景` 的技能**现在要清**。以前按场景清不动
+      skill_store（技能被当跨场景资产整体保留）—— 但重学场景时旧配方
+      残留会被 embedding 盲取 top_k 检回来（检索已无词面门槛，2026-10-26
+      对齐原版），含当年漏放的毒配方（total_leave 伪日薪口径），等于没
+      从零学。逐条走 `skill_store.delete_skill`（铁律：不手写 JSON）。
     """
     print("=" * 68)
     print(f"  MVE 清档 · 只清场景 {scene}"
@@ -421,6 +455,17 @@ def _clear_scene(scene: str, *, dry: bool, backup: bool) -> int:
                                   or str(e.get("to") or "") in ids))
         except Exception as e:
             print(f"  ⚠️ 读不了图谱（跳过）：{type(e).__name__}: {e}")
+    # 4. 技能：source_scene == 本场景 的配方（2026-10-26 补，重学要从零）。
+    #    只收集统计，真删走 delete_skill（含向量连带清理），不手写 JSON。
+    sk_del: list[tuple[str, str]] = []
+    try:
+        import skill_store as _ss
+        _skdata = _ss._load_raw()
+        sk_del = [(k, str(s.get("name") or "")) for k, s in
+                  (_skdata.get("skills") or {}).items()
+                  if str(s.get("source_scene") or "default") == scene]
+    except Exception as e:
+        print(f"  ⚠️ 读不了技能库（跳过）：{type(e).__name__}: {e}")
 
     print("\n  会清掉：")
     for d, desc in dirs:
@@ -431,13 +476,19 @@ def _clear_scene(scene: str, *, dry: bool, backup: bool) -> int:
     if drop_nodes:
         print(f"    {'knowledge_graph.json':26s} {drop_nodes} 个节点 + "
               f"{drop_edges} 条边（root_scene={scene}）")
-    if not dirs and not any(h for *_x, h in row_stats) and not drop_nodes:
+    if sk_del:
+        print(f"    {'skill_store.json':26s} {len(sk_del)} 条配方  "
+              f"（source_scene={scene}："
+              f"{', '.join(n or k for k, n in sk_del[:6])}"
+              f"{'…' if len(sk_del) > 6 else ''}）")
+    if (not dirs and not any(h for *_x, h in row_stats) and not drop_nodes
+            and not sk_del):
         print("    （这个场景没有可清的东西）")
         return 0
     print("\n  有意不动：scene_data/<场景>/（人的本机数据 = 数据源）、"
           "scenes.json（场景注册）、")
-    print("            action_registry.json（猫爪开关）、skill_store.json / "
-          "exam_log.jsonl（不带场景字段，跨场景共享）")
+    print("            action_registry.json（猫爪开关）、exam_log.jsonl、"
+          "技能库中其它场景/default 的配方")
 
     if dry:
         return 0
@@ -459,6 +510,13 @@ def _clear_scene(scene: str, *, dry: bool, backup: bool) -> int:
             shutil.copy2(p, dest / p.name)
         if gpath.exists():
             shutil.copy2(gpath, dest / gpath.name)
+        # 技能库也备份（2026-10-26 起按场景清会删本场景配方）
+        sk_path = ROOT / "skill_store.json"
+        if sk_del and sk_path.exists():
+            shutil.copy2(sk_path, dest / sk_path.name)
+            emb_path = ROOT / "skill_emb.json"
+            if emb_path.exists():
+                shutil.copy2(emb_path, dest / emb_path.name)
         print(f"\n  已备份到：{dest}")
 
     # 目录：整删
@@ -525,6 +583,15 @@ def _clear_scene(scene: str, *, dry: bool, backup: bool) -> int:
                 print(f"  · 图谱：剩 {len(ng.nodes)} 节点 / {len(ng.edges)} 边")
         except Exception as e:
             print(f"  ⚠️ 图谱按场景清理失败（未改动）：{type(e).__name__}: {e}")
+    # 技能：逐条走 delete_skill（本体 + 向量连带清，铁律：不手写 JSON）
+    if sk_del:
+        try:
+            import skill_store as _ss2
+            _n = sum(1 for k, _ in sk_del if _ss2.delete_skill(k))
+            print(f"  · 技能：删掉 source_scene={scene} 的 {_n} 条配方"
+                  "（其它场景/default 保留）")
+        except Exception as e:
+            print(f"  ⚠️ 技能清理失败（未改动）：{type(e).__name__}: {e}")
     print(f"\n  已清场景 {scene}。其它场景的学习成果、数据源、场景注册都原样保留。")
     print("  下一步：面板切到该场景点「练题」，或 "
           f"`python mve/scene_learn.py --scene {scene} --max-iterations N`")
@@ -568,6 +635,13 @@ def main() -> int:
     for name, desc in existing:
         size = (ROOT / name).stat().st_size
         print(f"  {name:26s} {size:>9,} B   {desc}")
+    # 全清目录（2026-10-26 补）：课程账 / 骨架缓存按场景分目录，TARGETS 整
+    # 文件删够不着它们 —— 这里整删（所有场景一起归零）。
+    dirs_existing = [(name, desc) for name, desc in FULL_RESET_DIRS
+                     if (ROOT / name).exists()]
+    for name, desc in dirs_existing:
+        n = sum(1 for _ in (ROOT / name).rglob("*"))
+        print(f"  {name + '/':26s} {n:>9,} 项   {desc}")
     missing = [n for n, _ in targets if not (ROOT / n).exists()]
     if missing:
         print(f"  （本来就不存在：{', '.join(missing)}）")
@@ -582,8 +656,8 @@ def main() -> int:
     # 这时候还没真删，正是确认"我在哪个库上"的最后机会。
     _report_db()
 
-    if dry or not existing:
-        if not existing:
+    if dry or (not existing and not dirs_existing):
+        if not existing and not dirs_existing:
             print("\n  没有可清的东西。")
         return 0
 
@@ -603,11 +677,21 @@ def main() -> int:
         dest.mkdir(exist_ok=True)
         for name, _ in existing:
             shutil.copy2(ROOT / name, dest / name)
+        # 目录也要备份（2026-10-26：ckpt 进了全清范围，不备份 = 课程账
+        # 误删无解）。保留相对结构防 ckpt_curriculum/A 与 ckpt_maieutic/A
+        # 撞名（同 _clear_scene 备份的教训）。
+        for name, _ in dirs_existing:
+            _bd = dest / name
+            _bd.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(ROOT / name, _bd)
         print(f"\n  已备份到：{dest}")
 
     for name, _ in existing:
         (ROOT / name).unlink()
-    print(f"\n  已清 {len(existing)} 个文件。现在的状态：零技能、零记录、零因果、零进度。")
+    for name, _ in dirs_existing:
+        shutil.rmtree(ROOT / name)
+    print(f"\n  已清 {len(existing)} 个文件 + {len(dirs_existing)} 个目录。"
+          "现在的状态：零技能、零记录、零因果、零进度、零课程账、零骨架。")
 
     # 清完第一件事是确认"我到底在哪个数据源上" —— 学习记录清了，数据源没清，
     # 两者不同步就是"清空了但取到的还是旧库的数"这种最难查的状态。

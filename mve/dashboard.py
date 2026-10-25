@@ -576,6 +576,7 @@ li{margin:3px 0}
           <span class="lbl">场景</span>
           <select id="sceneSel" onchange="switchScene(this.value)"></select>
           <button class="btn btn-secondary" id="btnNewScene" title="插入一个新场景：注册命名空间 + 注册可执行动作，不重启不清库">＋ 新建场景</button>
+          <button class="btn btn-danger" id="btnResetScene" onclick="resetScene()" title="清掉当前场景的全部学习账：课程两本账、追问骨架、当前锚点（ckpt 目录）、图谱节点/边、掌握库、运行/导入/消费日志、本场景学到的配方。自动备份到 mve/_backup_*；数据源与场景注册不动，其它场景不受影响">🗑 清本场景</button>
           <span class="hint" id="sceneHint">加载中…</span>
         </div>
         <!-- 猫爪总开关（同构 neko）：一组能力一个开关，关掉该组「对模型不可见、
@@ -1287,6 +1288,32 @@ function createScene(){
       :('插入被拒：'+(r.error||'')+'（可执行动作缺席的场景不许插入）'));
     loadSceneBar();
   });
+}
+
+/* 清本场景（2026-10-26）：彻底清掉当前场景的全部学习账后从零重学。
+   清单 = 课程两本账 + 追问骨架 + 当前锚点（ckpt 目录整删）+ 图谱节点/边
+   + 掌握库 + 运行/导入/消费日志 + 本场景学到的配方（skill_store 里
+   source_scene=本场景 的条目，逐条 delete_skill 连向量一起清）。
+   自动备份到 mve/_backup_*；数据源与场景注册不动，其它场景不受影响。 */
+function resetScene(){
+  const sel=document.getElementById('sceneSel');
+  const sid=(sel&&sel.value)||'A';
+  if(!confirm('清掉场景 '+sid+' 的全部学习账：\\n'
+    +'· 课程两本账 + 追问骨架 + 当前锚点（ckpt）\\n'
+    +'· 图谱节点/边、掌握库、运行/导入/消费日志\\n'
+    +'· 本场景学到的全部配方（技能库）\\n\\n'
+    +'自动备份到 mve/_backup_*；数据源与场景注册不动，其它场景不受影响。\\n'
+    +'清掉后从零重学。确定？')) return;
+  const b=document.getElementById('btnResetScene');
+  if(b){ b.disabled=true; b.textContent='清档中…'; }
+  fetch('/api/scene/reset',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({scene_id:sid})}).then(x=>x.json()).then(r=>{
+    if(!r.ok){ alert('清场景失败：'+(r.error||'未知')); return; }
+    uiEvent('reset_scene',{scene:sid},'已清场景（已备份）');
+    alert('场景 '+sid+' 已清干净（已备份）。可以 ▶ 重学了。');
+    location.reload();
+  }).catch(e=>alert('清场景失败：'+e))
+    .finally(()=>{ if(b){ b.disabled=false; b.textContent='🗑 清本场景'; } });
 }
 
 /* 判据中文名。以前这一列只有 VLML0 / rubric 两种，新后端的 `db_evidence`
@@ -3130,6 +3157,35 @@ class Handler(BaseHTTPRequestHandler):
                                          __import__("actions").entries(new_id))})
             except Exception as e:
                 self._json(500, {"ok": False, "error": f"{type(e).__name__}: {e}"[:200]})
+            return
+
+        if path == "/api/scene/reset":
+            # 清当前场景的全部学习账（2026-10-26 用户：「清场景清彻底，连
+            # 账本都清掉」后重学）。走 reset_all --scene：课程账/骨架/锚点
+            # 目录整删、日志/图谱按场景过滤重写、本场景配方逐条 delete_skill；
+            # 自带备份到 _backup_*；循环在跑会拒绝（rc!=0 → 409）。
+            try:
+                import scenes as _sc_r
+                import reset_all as _ra
+                sid = str(payload.get("scene_id") or
+                          _sc_r.current_scene_id() or "A").strip()
+                if sid not in [s["id"] for s in _sc_r.list_scenes()]:
+                    self._json(400, {"ok": False, "error": f"场景 {sid} 不存在"})
+                    return
+                _old = sys.argv[:]
+                sys.argv = ["reset_all.py", f"--scene={sid}"]
+                try:
+                    rc = _ra.main()
+                finally:
+                    sys.argv = _old
+                if rc != 0:
+                    self._json(409, {"ok": False,
+                                     "error": "还有任务在跑，已拒绝清档 —— 先点「■ 停止」，"
+                                              "等循环收尾完（约 1 分钟）再清"})
+                    return
+                self._json(200, {"ok": True, "scene_id": sid})
+            except Exception as e:
+                self._json(500, {"ok": False, "error": f"{type(e).__name__}: {e}"[:300]})
             return
 
         if path == "/api/actions/switch":
