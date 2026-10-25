@@ -277,12 +277,25 @@ class VLMLActionAgent:
                 f"{self.schema}\n"
             )
         blocks: list[str] = []
-        for s in list(skills or [])[:5]:
+        for i, s in enumerate(list(skills or [])[:5]):
             code = str(s.get("code") or "").strip()
+            name = str(s.get("name") or f"skill_{i+1}")
             if code:
-                blocks.append(code[:1200])
+                blocks.append(
+                    f"/* === 已学技能 {i+1}：{name} ===\n"
+                    f"   说明：{str(s.get('text') or '')[:160]}\n"
+                    f"{code[:1200]}\n"
+                    f"=== 结束 {name} === */"
+                )
         if blocks:
-            base += "\n\n" + "\n\n".join(blocks)
+            base += (
+                "\n\n【已学会的技能（可复用，按名引用其逻辑）】\n"
+                + "\n\n".join(blocks)
+                + "\n\n复用规则：若题目要求跨多张源表合计（例如「应发 = 基薪 + "
+                  "津贴 + 加班」这类合成题），必须把上面多条技能的逻辑**组合**进"
+                  "同一条查询——分别取各源表的测度再相加/汇总，"
+                  "严禁只取其中一条技能就作答（那样会漏维度、给出片面数）。"
+            )
         return base
 
     # ---------- 同构 agents/action.py:105-202 render_human_message ----------

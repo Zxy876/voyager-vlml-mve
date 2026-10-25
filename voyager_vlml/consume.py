@@ -826,6 +826,21 @@ async def consume(
         dims = [str(p.get("dimension")) for p in derived]
         subs = [dict(p.get("subject") or {}) for p in derived]
 
+    # ---- ①' 合成题判定（路由用）----
+    # 与下方"维度覆盖守卫"同源：本题是否多维度合成题（里程碑 6 维 / 派生 >=2 维）。
+    # 合成题必须走共用 solve 组合（同构学习侧），不走 _refill_sql 单配方捷径；
+    # 原子题才用 _refill_sql 确定性重放。milestone_dimensions 只读骨架 JSON，
+    # 无骨架回退 dims，不误伤自由提问的原子题。
+    _nd_comp = len(dims)
+    try:
+        import maieutic_scaffold as _ms
+        _msd = _ms.milestone_dimensions(_scene_id, question)
+        if len(_msd) >= 2:
+            _nd_comp = len(_msd)
+    except Exception:
+        pass
+    _composite = _nd_comp >= 2
+
     # ---- ② 找已积累的能力（配方）----
     # ⚠️ 检索键必须是**本题归题结果**（2026-10-20 实测根因）：原来这里传的是
     # 函数入参 `topic_hint`（默认空），`_pick_ability_topic` 于是按词面**随便
@@ -891,7 +906,10 @@ async def consume(
                 _schema = await _env.schema_block()
             except Exception:
                 _schema = ""
-            if skills:
+            # 合成题（_composite）不让 _refill_sql 单配方捷径答掉——直接落 ③b
+            # 共用 solve 组合（同构学习侧"消费和学习异步同原理"）。原子题才走
+            # _refill_sql 确定性重放。
+            if skills and not _composite:
                 _r = _refill_sql(question, skills, _schema,
                                  db_path=str((_prof or {}).get("db_path") or ""))
                 if _r["reused"] and _r["sql"]:
