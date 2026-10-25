@@ -287,6 +287,9 @@ class VLMLActionAgent:
             " `LEFT JOIN` 到父表；② 改用标量子查询 "
             "`SUM(e.col + (SELECT COALESCE(SUM(amount),0) FROM 子表 s "
             "WHERE s.emp_id=e.emp_id AND s.month=:month))`。"
+            "⚠️ 无论哪种写法，父表自身也要被汇总的列**必须用聚合函数包住**"
+            "（如 `SUM(e.base_salary)`），否则要整句按父表关联键 `GROUP BY emp_id`，"
+            "否则数据库会报 `column must appear in GROUP BY` 错误。"
         )
         blocks: list[str] = []
         for i, s in enumerate(list(skills or [])[:5]):
