@@ -1012,6 +1012,16 @@ async def consume(
                 # 答案字面量当查询条件的坏配方写进技能库（2026-10-22 K 实测）。
                 elif not (data.get("rows") if isinstance(data, dict) else data):
                     data = None
+        # ---- 维度覆盖守卫（合成题被单配方/单表答的确定性闸）----
+        # 与 fan-out 闸同风格、同位置：不赌 LLM。本题拆成多维度（dims>=2）却只
+        # 覆盖 1 张维度源表 → 合成题被单维度答掉（如"发多少工资"只答了基薪、
+        # 漏津贴/加班）。命中即不交片面数：data 置空走下面的学习路由，并标未验证。
+        _coverage_why = ""
+        if data is not None:
+            _partial, _cwhy = _answer_is_partial(code, skills, len(dims))
+            if _partial:
+                _coverage_why = _cwhy
+                data = None
         # 没取到 → 还是没学会。同样**不自动后台学**（2026-10-19 用户改设计）：
         # 这条问题已在场景学习账上（coach_log 判读 = 没答出来），人点驾驶舱
         # 「▶ 启动 Voyager」时 scene_learn.py 会排到它 —— 每轮落 run_log 可见。
@@ -1049,6 +1059,10 @@ async def consume(
         critic_ok = data is not None
         critic_why = ("" if critic_ok
                       else "没取到真数（真空/无结果）——消费侧确定性判据")
+        # 维度覆盖守卫：合成题被单表答 → 即便取到了数也标未验证，不交片面数。
+        if _coverage_why:
+            critic_ok = False
+            critic_why = _coverage_why
         # 判未完成 → 答案不许以确定句示人（2026-10-24 用户拍板）：
         # 130600 事故三次同款——账面上 fetched_empty、面板上却是自信数字，
         # 展示层必须跟账本一致：判没答出来就明说「未验证、数字不可信」。
@@ -2020,6 +2034,56 @@ def _fanout_guard(sql: str, db_path: str) -> str:
                 f"改用标量子查询 SUM(e.col + (SELECT COALESCE(SUM(amount),0) FROM "
                 f"allowance a WHERE a.emp_id=e.emp_id AND a.month=:month))")
     return ""
+
+
+def _sql_tables(sql: str) -> set[str]:
+    """从 SQL 里抽取 FROM/JOIN 之后的表名（去注释与字符串字面量）。
+
+    用于维度覆盖判定：比较答案 SQL 与已检索技能配方各自涉及的源表。
+    """
+    if not str(sql or "").strip():
+        return set()
+    s = re.sub(r"--[^\n]*", " ", str(sql))
+    s = re.sub(r"'[^']*'", " ", s)
+    tabs: set[str] = set()
+    for m in re.finditer(r"\b(FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)",
+                         s, re.IGNORECASE):
+        tabs.add(m.group(2).lower())
+    return tabs
+
+
+def _answer_is_partial(answer_sql: str,
+                       skills: list[dict[str, Any]],
+                       n_dims: int) -> tuple[bool, str]:
+    """维度覆盖守卫的判定核心（确定性，不赌 LLM）。
+
+    合成题（n_dims>=2）的答案是**一条** SQL：若它只触及了「本题各维度技能所涉
+    源表」里的 1 张、而维度本跨多张表（如"九月份发多少工资" = base(员工表) +
+    津贴(allowance 表) + 加班(attendance 表)，却只写了 SELECT SUM(base_salary)
+    FROM employees）→ 这是把合成题当单表/单维度答了，必漏维度，不能当最终数。
+
+    - 返回 (False, "") = 不是片面（原子题 / 同源单表题 / 答案已组合多表）。
+    - 返回 (True, 描述) = 片面，调用方据此标未验证并路由去学习组合。
+
+    与 fan-out 闸互补：fan-out 管「JOIN 放大」，本闸管「合成题没组合全」。都不靠
+    LLM 判官（2026-10-25 删消费 critic 后的确定性防线）。
+    """
+    if n_dims < 2 or not skills or not str(answer_sql or "").strip():
+        return (False, "")
+    dim_tabs: set[str] = set()
+    for s in skills:
+        dim_tabs |= _sql_tables(s.get("code") or s.get("recipe") or "")
+    # 各维度本就同源单表（如只查员工表的"名+基薪"）→ 谈不上"组合漏维"，不拦。
+    if len(dim_tabs) < 2:
+        return (False, "")
+    ans_tabs = _sql_tables(answer_sql)
+    hit = dim_tabs & ans_tabs
+    if len(hit) >= 1 and len(hit) < len(dim_tabs):
+        return (True,
+                f"维度覆盖守卫：答案只触及 {len(hit)}/{len(dim_tabs)} 张维度源表"
+                f"（{sorted(hit)} / {sorted(dim_tabs)}）—— 合成题被单表答，"
+                f"缺其它维度（如津贴/加班）→ 不交片面数，路由去学习组合")
+    return (False, "")
 
 
 def _absorb(question: str, sql: str, topic_id: str,
