@@ -116,6 +116,9 @@ def _critic_env_context(db_path: str) -> str:
                        + "\n\n判定要求：①任务假设的任何表、列、业务参数（费率/"
                          "汇率/税率/政策数值…）必须能在这份清单里指认，指认不了 "
                          "= 任务在数据源上不可答，判未完成并明说缺什么；"
+                         "特别地，两个数值列相乘/相除合成新口径（如 base_salary "
+                         "× overtime_hours 当作「加班费」）同样是假设业务参数"
+                         "——库里没有该口径的列或费率就是不可计算，判未完成；"
                          "②对「总/全部/所有/每个」类题，核对结果覆盖的行数/人数"
                          "是否与清单里该群体的行数一致 —— INNER JOIN 一张稀疏表"
                          "会把人群缩小（实测：大群体的总账被算成只有少数有 "
@@ -389,6 +392,9 @@ def _refill_sql_multi(question: str, skills: list[dict[str, Any]], schema: str,
         + "按规则把**每条**要用的配方都实例化成独立的 SELECT。"
         + (f"\n\n⚠️ 上一轮这些配方的回填/执行失败了（报错是环境给的地面真话，"
            f"照着修——列名/表名以 schema 为准，不许发明列）：\n{feedback}"
+           f"\n\n⚠️ 硬约束：被拒原因是「费率/系数不存在」的配方，说明该量在"
+           f"库里**不可计算** —— 直接不输出那条，绝不许去掉系数、换口径、"
+           f"换列来凑一个数（那是语义造假，比答不出更糟）。"
            if feedback else "")
     )
     out = chat_json(
@@ -2223,23 +2229,6 @@ def _sql_literal_guard(sql: str, db_path: str) -> str:
     if not obs:
         return ""
     lits = re.findall(r"'([^']*)'", str(sql))
-    # 数值费率守卫（2026-10-26）：字符串守卫守不住数值幻觉 —— 实测（场景 B
-    # 重学后）`SUM(overtime_hours * 100)` 入库：库里只有 overtime_hours（小时
-    # 数），没有任何费率列，100 是 LLM 编的时薪，算出的 5250/4530 全是假数
-    # 进了能力库（规则 8「库里没有的费率不许假设」被字符串口径漏过）。乘除
-    # 里的数值字面量 = 换算系数（费率/汇率/百分比），必须能在实查清单里指认；
-    # 加减与 LIMIT 的数值合法形态多（偏移/采样行数），不查。
-    for _mm in re.finditer(
-            r"([\w.)])\s*([*/])\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*([*/])\s*[\w(]",
-            str(sql)):
-        _n = _mm.group(3) or _mm.group(4)
-        if not _n:
-            continue
-        if re.search(rf"(?<![\d.]){re.escape(_n)}(?![\d.])", obs):
-            continue                      # 实查清单里有这个数（词边界匹配）
-        _op = _mm.group(2) or _mm.group(5)
-        return (f"SQL 里的换算系数（{_op} {_n}）在数据源实查清单里指认不了"
-                f"（库里没有这个费率/系数取值）—— 大概率是假设的费率，拒绝入库")
     # 去掉字面量后的 SQL 正文：字面量若兼作标识符/函数参数名（如
     # date_trunc('month', month)），裸词仍出现 → 不算幻觉。
     bare = re.sub(r"'[^']*'", " ", str(sql)).lower()
