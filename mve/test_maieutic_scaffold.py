@@ -567,12 +567,12 @@ FAKE_SCHEMA = [
 ]
 
 
-def test_stuck_dims_signal() -> None:
-    """「这条维度试过几轮」的信号（2026-10-26 补，原版 failed_tasks 的同构）。
+def test_exhausted_dims_signal() -> None:
+    """「这条维度试过几轮还没闭合」的信号（原版 failed_tasks 的同构）。
 
     实测病根：`_iters` 每轮覆盖、rounds 恒为 1 → 系统不知道某维度已连挂 19 轮。
     本信号只认两个执行结果：progress 账（闭合与否）+ iters 账（尝试轮数），
-    不做任何词面判断。已闭合的不算卡住；判词如实带出给下一轮出题器看。
+    不做任何词面判断。已闭合的不算；判词带出判官原话。
     """
     import maieutic_scaffold as M
 
@@ -583,41 +583,45 @@ def test_stuck_dims_signal() -> None:
         q = "九月在职员工的基本工资和津贴合计是多少"
         # 进度写在骨架缓存文件里，先落一份空骨架（同 test_progress_iterations_accumulate）
         p = M._cache_path("B", q)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps({"dimensions": [], "milestone": {}}),
-                     encoding="utf-8")
-        # 已闭合的：不该出现在卡住清单里
+        M._atomic_write(p, {"dimensions": [], "milestone": {}})
+        # 已闭合的：不该出现在「该跳过」清单里（哪怕轮数够）
         M.save_progress("B", q, ["base_salary_sum"])
         M.save_progress_iterations("B", q, {
             "base_salary_sum": {"rounds": 5, "asked": "早过了"},
             "emp_active": {"rounds": 3, "asked": "需要明确哪些员工在九月是活跃的"},
             "total_salary": {"rounds": 1, "asked": "再试试"},
         })
-        stuck = M._stuck_dims("B", q)
-        ids = [d for d, _n, _c in stuck]
-        assert ids == ["emp_active"], f"只有未闭合且轮数够的才算卡住：{stuck}"
-        assert stuck[0][1] == 3, stuck
-        assert "九月" in stuck[0][2], stuck        # 判词原话带出来
-        # 指纹 = id:轮数；轮数变化 → 指纹变化（下一轮据此重拆）
-        _txt, fp1 = M._retries_block("B", q)
-        assert "emp_active" in _txt and "已试 3 轮" in _txt, _txt
-        assert fp1 == "emp_active:3", fp1
+        ex = M._exhausted_dims("B", q)
+        ids = [d for d, _n, _c in ex]
+        assert ids == ["emp_active"], f"只有未闭合且轮数够的才算该跳过：{ex}"
+        assert ex[0][1] == 3, ex
+        assert "九月" in ex[0][2], ex        # 判词原话带出来
+        # 又试一轮 → 仍在清单里，轮数跟着涨（账是累加的）
         M.save_progress_iterations("B", q, {
-            "emp_active": {"rounds": 6, "asked": "还是不行"},
+            "emp_active": {"rounds": 3, "asked": "还是不行"},
         })
-        _txt2, fp2 = M._retries_block("B", q)
-        assert fp2 != fp1, f"轮数变了指纹必须变：{fp1} → {fp2}"
+        ex2 = {d: n for d, n, _c in M._exhausted_dims("B", q)}
+        assert ex2.get("emp_active") == 6, ex2
+        # 死代码已删：指纹/重拆那套不再存在
+        assert not hasattr(M, "_retries_block"), "指纹重拆机制应已撤掉"
+        assert not hasattr(M, "RESCAFFOLD_AFTER_ROUNDS"), \
+            "RESCAFFOLD_AFTER_ROUNDS 应已改名为 GIVE_UP_AFTER_ROUNDS"
     finally:
         M.CKPT = old
         shutil.rmtree(tmp, ignore_errors=True)
-    print("PASS  test_stuck_dims_signal")
+    print("PASS  test_exhausted_dims_signal")
 
 
-def test_scaffold_rebuilds_when_stuck_rounds_grow() -> None:
-    """骨架缓存按失败账指纹失效：某维度又多试一轮 → 旧骨架过期 → 重新拆。
+def test_skeleton_never_rebuilt_once_made() -> None:
+    """骨架**拆一次就固定**，维度重试再多轮也不重拆（原版 voyager 同构）。
 
-    这是原版「出题器看到 failed_tasks 就换个题」的同构物。有界：不是每轮都
-    重拆，只有卡住的维度又试够 RESCAFFOLD_AFTER_ROUNDS 轮才重拆一次。
+    踩过的坑（2026-10-26 生产实证，保留记录别再走回去）：曾按「失败账指纹变化」
+    重拆骨架来模拟「换个题」。结果 4 轮里骨架被拆了 4 次，维度 id 每次都变
+    （emp_active → active_employees → emp_active_status → emp_active_september，
+    条数 4 → 5），闭合账记的是 id → 老账全对不上，已闭合的 base_salary_sum 被当
+    成新维度重跑还连挂 3 轮，里程碑从 0/4 退到 0/5。**原版 sub_goals 拆一次就
+    固定**，失败是原地重试 / 试满轮数跳过，换题发生在上层 curriculum（换新任务），
+    不是把同一道题重新拆一遍。
     """
     import maieutic_scaffold as M
 
@@ -637,31 +641,26 @@ def test_scaffold_rebuilds_when_stuck_rounds_grow() -> None:
     try:
         assert M.scaffold(q, "B", llm=_llm)["origin"] == "llm"
         assert len(calls) == 1
-        # 失败账没变 → 命中缓存，不再调 LLM
-        assert M.scaffold(q, "B", llm=_llm)["origin"] == "cache"
-        assert len(calls) == 1, f"指纹没变不该重拆：{len(calls)} 次"
-        # 某维度卡够轮数 → 指纹变化 → 重拆（带着失败账）
+        # 维度试到远超门槛的轮数 → 骨架照样命中缓存，绝不重拆
         M.save_progress_iterations("B", q, {
-            "d1": {"rounds": M.RESCAFFOLD_AFTER_ROUNDS, "asked": "判词原话"}})
+            "d1": {"rounds": M.GIVE_UP_AFTER_ROUNDS * 3, "asked": "判词原话"}})
         r = M.scaffold(q, "B", llm=_llm)
-        assert r["origin"] == "llm", f"指纹变了必须重拆：{r}"
-        assert len(calls) == 2
-        # 失败账回了出题器：这一轮 LLM 收到的材料里带着卡住的维度、轮数与判词
-        assert "已试" in calls[-1] and "判词原话" in calls[-1], calls[-1][:200]
+        assert r["origin"] == "cache", f"骨架不许重拆：{r}"
+        assert [d["id"] for d in r["dimensions"]] == ["d1"], r
+        assert len(calls) == 1, f"骨架只许拆一次：{len(calls)} 次"
     finally:
         M.CKPT = old
         shutil.rmtree(tmp, ignore_errors=True)
-    print("PASS  test_scaffold_rebuilds_when_stuck_rounds_grow")
+    print("PASS  test_skeleton_never_rebuilt_once_made")
 
 
-def test_rescaffold_keeps_progress_account() -> None:
-    """重拆骨架**不清进度账**（原版同构：换个题，completed_tasks 照旧累积）。
+def test_rebuild_keeps_progress_account() -> None:
+    """缓存里的骨架没了（被清/损坏）而重建时，**进度账要跟着搬过去**。
 
-    2026-10-26 生产实测：指纹变化触发重拆后，新骨架整份覆盖旧文件 →
-    progress（learned/codes/iterations）被清空 → 上一轮刚闭合的 base_salary_sum
-    又被当成未闭合重跑一遍。原版 voyager.py:133-135 的 `progress =
-    len(completed_tasks)` 不会因为 curriculum 换了个题归零 —— 这里同理：
-    换拆法不动已闭合的账，id 对不上的自然不计入新骨架，不丢也不虚报。
+    2026-10-26 生产实测：新骨架整份覆盖旧文件 → progress（learned/codes/
+    iterations）被清空 → 上一轮刚闭合的 base_salary_sum 又被当成未闭合重跑。
+    原版 voyager.py:133-135 的 `progress = len(completed_tasks)` 不会因为骨架
+    重算归零 —— 这里同理：重建不动已闭合的账。
     """
     import maieutic_scaffold as M
 
@@ -669,35 +668,31 @@ def test_rescaffold_keeps_progress_account() -> None:
     old = M.CKPT
     M.CKPT = tmp
     try:
-        q = "一句会被重拆的话"
-        # ① 第一次拆：两条维度
-        M.scaffold(q, "B", llm=lambda m: json.dumps(
+        q = "一句骨架会重建的话"
+        # ① 先有一份带账的缓存，但 dimensions 是空的（等价于骨架丢了，账还在）
+        p = M._cache_path("B", q)
+        M._atomic_write(p, {"question": q, "dimensions": [], "milestone": {},
+                            "progress": {"learned": ["d1"], "codes": [
+                                {"id": "d1", "question": "维度一",
+                                 "code": "SELECT 1", "answer": "1", "tools": []}],
+                                "iterations": [
+                                    {"id": "d2", "rounds": 3, "asked": "差啥"}]}})
+        # ② 重建骨架（LLM 给出维度）
+        r = M.scaffold(q, "B", llm=lambda m: json.dumps(
             {"dimensions": [{"id": "d1", "question": "维度一"},
                             {"id": "d2", "question": "维度二"}]},
             ensure_ascii=False))
-        # ② 学成一条 + 记下追问历史与跑通的代码
-        M.save_progress("B", q, ["d1"])
-        M.save_progress_codes("B", q, [{"id": "d1", "question": "维度一",
-                                        "code": "SELECT 1", "answer": "1"}])
-        M.save_progress_iterations("B", q, {"d2": {"rounds": 1, "asked": "差啥"}})
-        # ③ 把 d2 试到卡住的门槛 → 指纹变化 → 下一次 scaffold 必须重拆
-        M.save_progress_iterations("B", q, {
-            "d2": {"rounds": M.RESCAFFOLD_AFTER_ROUNDS - 1, "asked": "还是差啥"}})
-        r = M.scaffold(q, "B", llm=lambda m: json.dumps(
-            {"dimensions": [{"id": "d1", "question": "维度一"},
-                            {"id": "d9", "question": "换个拆法"}]},
-            ensure_ascii=False))
-        assert r["origin"] == "llm", f"指纹变了必须重拆：{r}"
-        assert [d["id"] for d in r["dimensions"]] == ["d1", "d9"], r
-        # ④ 账还在：已闭合的 d1 没被洗掉，codes / iterations 也都还在
+        assert r["origin"] == "llm", f"没有维度就得重建：{r}"
+        assert [d["id"] for d in r["dimensions"]] == ["d1", "d2"], r
+        # ③ 账还在：已闭合的 d1 没被洗掉，codes / iterations 也都还在
         assert M.load_progress("B", q) == {"d1"}, M.load_progress("B", q)
         assert "d1" in M.load_progress_codes("B", q), M.load_progress_codes("B", q)
-        _it = M.load_progress_iterations("B", q)
-        assert _it.get("d2", {}).get("rounds") == M.RESCAFFOLD_AFTER_ROUNDS, _it
+        assert M.load_progress_iterations("B", q).get("d2", {}).get("rounds") == 3, \
+            M.load_progress_iterations("B", q)
     finally:
         M.CKPT = old
         shutil.rmtree(tmp, ignore_errors=True)
-    print("PASS  test_rescaffold_keeps_progress_account")
+    print("PASS  test_rebuild_keeps_progress_account")
 
 
 def test_save_progress_keeps_codes_and_iterations() -> None:
@@ -735,6 +730,59 @@ def test_save_progress_keeps_codes_and_iterations() -> None:
         M.CKPT = old
         shutil.rmtree(tmp, ignore_errors=True)
     print("PASS  test_save_progress_keeps_codes_and_iterations")
+
+
+def test_given_up_dims_are_skipped_not_repeated() -> None:
+    """试满轮数仍不闭合的维度：驾驶舱不再选它，里程碑则如实报 exhausted。
+
+    这是「维度层跳过」的落地：原版 task 内的子目标拆一次固定、失败原地重试；
+    反复够不着的（MVE 场景 B 的「哪些员工在九月是活跃的」—— 库里只有 active
+    布尔、没有月份字段）按 `Skipping to next task` 处理，**不假装达成**、也不
+    无限烧同一张骨架。关键两条：
+      · milestone_unclosed 必须排除它们（否则驾驶舱每轮都选它，永远有未闭合）；
+      · 剩下的未闭合维度全是它们时 exhausted=True（驾驶舱据此判 failed、停止重试）。
+    """
+    import maieutic_scaffold as M
+
+    tmp = Path(tempfile.mkdtemp())
+    old = M.CKPT
+    M.CKPT = tmp
+    try:
+        q = "九月在职员工的基本工资和津贴合计是多少"
+        p = M._cache_path("B", q)
+        M._atomic_write(p, {"question": q, "milestone": {"name": "工资合计"},
+                            "dimensions": [
+                                {"id": "d1", "question": "维度一"},
+                                {"id": "d2", "question": "维度二"},
+                                {"id": "d3", "question": "维度三"}]})
+        # d1 已闭合、d2 试满轮数仍不闭合、d3 才试一轮
+        M.save_progress("B", q, ["d1"])
+        M.save_progress_iterations("B", q, {
+            "d2": {"rounds": M.GIVE_UP_AFTER_ROUNDS, "asked": "这条落不了地"},
+            "d3": {"rounds": 1, "asked": "再试"},
+        })
+        # 驾驶舱选题：只该选 d3（d1 闭合、d2 已跳过）
+        assert [d["id"] for d in M.milestone_unclosed("B", q)] == ["d3"], \
+            M.milestone_unclosed("B", q)
+        st = M.milestone_state("B", q, ["d1"])
+        assert st["given_up"] == ["d2"], st
+        assert st["missing"] == ["d2", "d3"], st
+        assert not st["exhausted"], f"还有 d3 可攻，不算 exhausted：{st}"
+        assert not st["achieved"], f"不许假装达成：{st}"
+        _lit = M.milestone_lit("B", q)
+        assert _lit["given_up"] == ["d2"] and not _lit["exhausted"], _lit
+        # d3 也试满 → 没有可攻的维度了，exhausted 翻真，仍未达成
+        M.save_progress_iterations("B", q, {
+            "d3": {"rounds": M.GIVE_UP_AFTER_ROUNDS - 1, "asked": "还是不行"}})
+        assert M.milestone_unclosed("B", q) == [], M.milestone_unclosed("B", q)
+        st2 = M.milestone_state("B", q, ["d1"])
+        assert st2["exhausted"] and not st2["achieved"], st2
+        assert st2["closed"] == 1 and st2["total"] == 3, st2
+        assert M.milestone_lit("B", q)["exhausted"], M.milestone_lit("B", q)
+    finally:
+        M.CKPT = old
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("PASS  test_given_up_dims_are_skipped_not_repeated")
 
 
 def test_scaffold_llm_empty_is_failed_no_keyword_fallback() -> None:
@@ -829,7 +877,8 @@ def test_milestone_lit_retry_criterion() -> None:
         # ① 没骨架：不生成、不调 LLM，直接判 total_dims=0
         lit0 = M.milestone_lit("B", q)
         assert lit0 == {"achieved": False, "verified_real": False,
-                        "total_dims": 0}, lit0
+                        "total_dims": 0, "given_up": [],
+                        "exhausted": False}, lit0
         # ② 有骨架、未点亮：重试分支接管
         p = M._cache_path("B", q)
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -868,10 +917,11 @@ def main() -> None:
     test_called_tools_parses_code()
     test_learning_must_fetch_consuming_may_answer()
     test_progress_iterations_accumulate()
-    test_stuck_dims_signal()
-    test_scaffold_rebuilds_when_stuck_rounds_grow()
-    test_rescaffold_keeps_progress_account()
+    test_exhausted_dims_signal()
+    test_skeleton_never_rebuilt_once_made()
+    test_rebuild_keeps_progress_account()
     test_save_progress_keeps_codes_and_iterations()
+    test_given_up_dims_are_skipped_not_repeated()
     test_scaffold_llm_empty_is_failed_no_keyword_fallback()
     test_milestone_achieved_persist_and_readback()
     test_milestone_lit_retry_criterion()

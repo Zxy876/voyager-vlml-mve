@@ -924,7 +924,7 @@ async def _start_learning_impl(
                     # 只能交「本轮真正尝试过的那几条」：save_progress_iterations
                     # 是老值 + 本次（同 priorIterations 的按轮累积），把没尝试过的
                     # 旧账整包传回去会被**再加一遍**（预设维度路径每轮只跑一条，
-                    # 其余 4 条的轮次会翻倍 → _stuck_dims 据此误判卡住）。
+                    # 其余 4 条的轮次会翻倍 → _exhausted_dims 据此误判该跳过）。
                     _iters_round: dict[str, dict] = {}
                     _timed_out_dims = 0
                     if milestone_retry:

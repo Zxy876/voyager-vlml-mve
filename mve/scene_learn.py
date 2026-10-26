@@ -197,6 +197,13 @@ def _log_learning_detail(r: dict[str, Any]) -> None:
         _log(f"  · 里程碑：{_name}（{ms.get('closed')}/{ms.get('total')} 闭合）"
              + ("✅ 达成" if ms.get("achieved")
                 else f"未达成（还差：{'，'.join(ms.get('missing') or []) or '？'}）"))
+        # 试满轮数仍不闭合的维度（原版「跳过这条子目标」）：如实报，别装没发生
+        _gu = ms.get("given_up") or []
+        if _gu:
+            _log(f"  · 已跳过 {len(_gu)} 条（试满轮数仍不闭合）："
+                 + "，".join(str(x) for x in _gu)
+                 + ("　→ 这题已没有可再攻的维度，按 failed 收（不假装达成）"
+                    if ms.get("exhausted") else ""))
     sk = r.get("skills") or {}
     if sk:
         _add = sk.get("added") or []
@@ -445,6 +452,20 @@ def main() -> int:
                     _log(f"[场景学习] 里程碑「{_tgt[:42]}」骨架无维度（拆解失败/"
                          f"非数据题），释放锚点降级自由出题。")
                     _ms.clear_current_target(scene)
+                elif _lit.get("exhausted") and not _lit.get("achieved"):
+                    # 剩下的未闭合维度**全部**是「试满轮数仍不闭合」那批 → 原版
+                    # 「Skipping to next task」在这一层的同构：这题已经没有可再攻
+                    # 的子目标了。如实判 failed，**不走**「重试里程碑直至成功」的
+                    # 循环（那只会无限烧同一个取数动作，永远闭不上），也不点亮
+                    # （不假装达成）。锚点**保留不清** —— 人设的题属 manual 语义，
+                    # 等人换题 / 换库 / 补数据后再说。
+                    # 不写 continue：直接落到下方选题队列，本轮去学自由出题的题。
+                    _gu = _lit.get("given_up") or []
+                    _n_gu = getattr(_ms, "GIVE_UP_AFTER_ROUNDS", 3)
+                    _log(f"[场景学习] 里程碑「{_tgt[:42]}」的未闭合维度已全部试满"
+                         f" {_n_gu} 轮仍不闭合"
+                         f"（{'，'.join(str(x) for x in _gu) or '？'}）→ 如实判"
+                         f" failed，不再重试这张骨架，本轮降级自由出题（锚点保留）。")
                 elif not _lit.get("achieved"):
                     iteration += 1
                     if _light_up_milestone(scene, _tgt, _dbp, max_retries):

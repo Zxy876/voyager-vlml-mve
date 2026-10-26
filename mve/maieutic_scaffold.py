@@ -178,24 +178,35 @@ def _read_cache(path: Path) -> tuple[dict, str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 原版同构：出题器要看得见「失败账」（2026-10-26 补）
+# 原版同构：失败的子目标/任务要**跳过**，不是把同一道题反复重拆（2026-10-26 定稿）
 #
-#   原版 curriculum.py:129-130 把 completed/failed 两本账渲染进**出题器的观察**，
-#   :340-344 失败即 "Skipping to next task" —— 出题器**换个题**再试，不在同一条
-#   上无限耗。MVE 的断点续学比原版更保守（允许带判词重试同一条维度），但缺了原版
-#   「这条试过几次了」这个信号：`_iters` 每轮整体覆盖、rounds 恒为 1（2026-10-26
-#   实测：一个自造口径的维度连挂 19 轮，系统完全不知道它已经失败过）。
+#   原版两层语义（voyager.py）：
+#     · 任务内：sub_goals **拆一次就固定**，失败是原地重试（inference 的 while 循环
+#       不重新拆解），重试无上限但骨架不变 —— `progress = len(completed_tasks)`
+#       靠的是同一份子目标清单，换一份清单这个计数就没意义了；
+#     · 任务间：整个 rollout 失败 → 进 `failed_tasks` → curriculum.py:340-344
+#       "Skipping to next task"，**换一个新题**再试。
 #
-# 这里补的是**信号本身**，不是加任何关键词规则：轮数是执行结果、判词是判官原话，
-# 两者拼成一段「这些维度试过多轮没闭合」交回出题器，让它自己换个能落地的拆法 ——
-# 这是原版「出题器看到 failed_tasks 就换个题」的同构物，不针对任何场景/词面。
+#   MVE 此前缺的是「这条已经试过几次了」这个信号：`_iters` 每轮整体覆盖、rounds
+#   恒为 1（2026-10-26 实测：一个自造口径的维度连挂 19 轮，系统完全不知道）。
+#
+#   ⚠️ 中途踩过的坑（保留记录，别再走回去）：曾把信号接到「指纹变化 → 重拆骨架」，
+#   想用「换个拆法」实现「换个题」。生产实测 4 轮里骨架被拆了 4 次，维度 id 每次都
+#   变（emp_active → active_employees → emp_active_status → emp_active_september，
+#   条数从 4 涨到 5），而闭合账记的是 id → 老账全对不上 → 已闭合的 base_salary_sum
+#   被当成新维度重跑还连挂 3 轮，里程碑从 0/4 退到 0/5。**骨架必须固定**，否则
+#   `progress` 这个计数没有意义。
+#
+#   正确的落点：试满 N 轮仍不闭合的维度 → 按原版「跳过这条子目标」处理
+#   （`_exhausted_dims`），驾驶舱不再选它；全部维度要么闭合要么跳过仍不达成 →
+#   里程碑如实报 failed，不假装、也不无限重试同一张骨节。
 # ─────────────────────────────────────────────────────────────────────────────
-RESCAFFOLD_AFTER_ROUNDS = 3
+GIVE_UP_AFTER_ROUNDS = 3
 
 
-def _stuck_dims(scene_id: str, question: str,
-                db_path: str = "") -> list[tuple[str, int, str]]:
-    """试过 ≥ RESCAFFOLD_AFTER_ROUNDS 轮**仍未闭合**的维度（原版 failed_tasks 同构）。
+def _exhausted_dims(scene_id: str, question: str,
+                    db_path: str = "") -> list[tuple[str, int, str]]:
+    """试过 ≥ GIVE_UP_AFTER_ROUNDS 轮**仍未闭合**的维度 = 按原版语义跳过的那些。
 
     只读信号，不做任何词面判断：闭合与否看 progress 账，轮数看 _iters 账，
     判词取判官最后一次的原话。返回 [(维度 id, 已试轮数, 判词)]。
@@ -218,29 +229,10 @@ def _stuck_dims(scene_id: str, question: str,
             n = int(rec.get("rounds") or 0)
         except (TypeError, ValueError):
             n = 0
-        if n >= RESCAFFOLD_AFTER_ROUNDS:
+        if n >= GIVE_UP_AFTER_ROUNDS:
             out.append((str(did), n, str(rec.get("asked") or "").strip()[:120]))
     out.sort(key=lambda x: (-x[1], x[0]))
     return out
-
-
-def _retries_block(scene_id: str, question: str,
-                   db_path: str = "") -> tuple[str, str]:
-    """（给出题器看的一段话, 指纹）。
-
-    指纹 = 各卡住维度的「id:轮数」。轮数变化 → 指纹变化 → 骨架缓存视为失效
-    → 带着新的失败账重新拆一次（原版「换个题」的同构）。这样重拆有界：
-    每多试 RESCAFFOLD_AFTER_ROUNDS 轮才重拆一次，不是每轮都重拆。
-    """
-    stuck = _stuck_dims(scene_id, question, db_path)
-    if not stuck:
-        return "", ""
-    lines = ["**这些维度已经试过多轮仍未闭合**（原版 failed_tasks 的同构：请换个"
-             "能落地的拆法或换个问法，别原样再出一次）："]
-    for did, n, crit in stuck:
-        lines.append(f"- 维度 {did}：已试 {n} 轮"
-                     + (f"，判官原话：{crit}" if crit else "（判词缺失）"))
-    return "\n".join(lines), "|".join(f"{d}:{n}" for d, n, _ in stuck)
 
 
 def milestone_dimensions(scene_id: str, question: str) -> list[dict]:
@@ -347,15 +339,6 @@ def render_material(question: str, scene_id: str, *, extras: str = "") -> str:
                              "维度只能指向这里面的表/列）：\n" + _obs)
     except Exception:
         pass
-    # 原版同构：把「试过多轮仍未闭合」的失败账也给回出题器（见 _retries_block
-    # 注释）。这是原版 curriculum.py:129-130 把 failed_tasks 渲染进出题器观察的
-    # 同构物 —— 换不换拆法由出题器（LLM）自己定，这里只如实提供信号。
-    try:
-        _rb, _ = _retries_block(str(scene_id or "A"), str(question or ""), _dp)
-        if _rb:
-            lines.append(_rb)
-    except Exception:
-        pass
     return "\n".join(lines)
 
 
@@ -386,26 +369,19 @@ def scaffold(question: str, scene_id: str = "A", *, llm: Callable | None = None,
         except Exception:
             db_path = ""
     path = _cache_path(scene_id, q, db_path)
-    # 卡住的维度（含轮数与判词）→ 失败账指纹。指纹变化 = 该重拆了，见下方缓存比对。
-    try:
-        _stuck, retries_fp = _retries_block(str(scene_id or "A"), q, db_path)
-    except Exception:
-        _stuck, retries_fp = "", ""
-    old_data: dict[str, Any] = {}
+    # ⚠️ 骨架**拆一次就固定**（原版 voyager.py 同构：sub_goals 拆一次，失败的维度
+    # 原地重试 / 试满 N 轮就跳过，不重拆）。曾经按「失败账指纹变化」重拆过一版，
+    # 生产实测维度 id 每轮都变、闭合账全对不上（详见 GIVE_UP_AFTER_ROUNDS 的注释），
+    # 已撤掉 —— 命中缓存就返回，判据只在维度层（_exhausted_dims）。
     if use_cache:
         cached, _state = _read_cache(path)
         dims = _clean_dims(cached)
-        # ⚠️ 失败账指纹比对（2026-10-26 补）：缓存里那份骨架是在当时的
-        # 失败账下拆的。只要某条卡住的维度又多试了一轮，指纹就变 —— 这份
-        # 旧骨架对现在的处境已经过期，必须带着新的失败账重拆一次（原版
-        # 「出题器看到 failed_tasks 换个题」的同构）。指纹没变就照旧命中。
-        if dims and str(cached.get("retries_fp") or "") == retries_fp:
+        if dims:
             return {"dimensions": dims,
                     "expected_drifts": list(cached.get("expected_drifts") or []),
                     "milestone": _clean_milestone(cached, q),
                     "material_note": str(cached.get("material_note") or ""),
                     "origin": "cache", "reason": ""}
-        old_data = cached            # 重拆时要把旧的进度账带过去，见下方写盘
     system_content = SCAFFOLD_SYSTEM + (SCAFFOLD_SYSTEM_DB if db_path else "")
     messages = [{"role": "system", "content": system_content},
                 {"role": "user", "content": render_material(q, scene_id, extras=extras)
@@ -434,17 +410,14 @@ def scaffold(question: str, scene_id: str = "A", *, llm: Callable | None = None,
                material_note=str(data.get("material_note") or ""),
                origin="llm", reason="")
     try:
-        # ⚠️ 重拆**不清进度账**（原版同构：curriculum 换个题，completed_tasks
-        # 照旧累积，voyager.py:133-135 的 progress 不会因为换了题归零）。
-        # 2026-10-26 生产实测：指纹变化触发重拆后，新骨架写盘整份覆盖了旧文件，
-        # progress（learned/codes/iterations）被清空 → 上一轮刚闭合的
-        # base_salary_sum 又被当成未闭合重跑一遍。维度 id 相同的照旧算已闭合
-        # （技能本来就已经入库了），id 对不上的自然不计入新骨架，不丢也不虚报。
-        _carry = old_data.get("progress")
-        # retries_fp 随骨架一起落盘：下次进来比对它，判断这份骨架是不是还
-        # 对得上现在的失败账（见上面缓存比对处的注释）。
+        # ⚠️ 新骨架写盘**不许清掉同文件里的进度账**（原版同构：completed_tasks
+        # 不会因为骨架重算归零）。正常路径下骨架拆过一次就固定、不会走到这里；
+        # 但缓存文件坏掉（_read_cache 判 broken，已改名留证）或人手动删过时，
+        # 这里会重建 —— 若旧文件还在，progress 必须跟着搬过去，否则已闭合的
+        # 维度会被当成未闭合重跑（2026-10-26 生产实测踩到）。
+        _prev, _st = _read_cache(path)
+        _carry = _prev.get("progress") if _st == "ok" else None
         _atomic_write(path, {**data, "question": q,
-                             "retries_fp": retries_fp,
                              **({"progress": _carry} if isinstance(_carry, dict)
                                 else {})})
     except Exception:
@@ -478,6 +451,12 @@ def milestone_state(scene_id: str, question: str,
     total = len(dims)
     got = {str(x) for x in (learned_ids or [])}
     missing = [str(d.get("id")) for d in dims if str(d.get("id")) not in got]
+    # 试满 GIVE_UP_AFTER_ROUNDS 轮仍不闭合的维度 = 原版「跳过这条子目标」。
+    # 它们仍算 missing（**不假装达成**），只是不再被驾驶舱选来重试；
+    # 当 missing 全部落在这一批里 → exhausted=True（这题已经没什么可再攻的了）。
+    _ex = {d for d, _n, _c in _exhausted_dims(str(scene_id or "A"),
+                                              str(question or ""))}
+    given_up = [d for d in missing if d in _ex]
     ms = res.get("milestone") or {}
     # 持久化点亮标记（驾驶舱 phase-3 写）：维度全闭合 + 重跑合成题确认后落盘，
     # 让"点亮变实"在缓存里可查，而非每次惰性重算。等价于原版 inference 重试里程碑
@@ -489,6 +468,10 @@ def milestone_state(scene_id: str, question: str,
         "total": total,
         "closed": total - len(missing),
         "missing": missing,
+        # 已按原版语义跳过（试满轮数仍不闭合）的维度 —— 仍是 missing，不算闭合
+        "given_up": given_up,
+        # 没有可再攻的维度了（剩下的全是跳过的那批）：该如实报 failed，别再空转
+        "exhausted": bool(total) and bool(missing) and len(given_up) == len(missing),
         # 0 个维度的骨架不构成里程碑（没有可闭合的东西就别报"达成"）
         "achieved": (bool(total) and not missing) or achieved_flag,
         "lit_at": res.get("milestone_lit_at"),
@@ -935,10 +918,16 @@ def current_target(scene_id: str) -> str:
 
 def milestone_unclosed(scene_id: str, question: str, *,
                        db_path: str = "") -> list[dict[str, Any]]:
-    """该目标里程碑**还没闭合**的维度（驾驶舱优先学这些）。
+    """该目标里程碑**还没闭合、且还没被跳过**的维度（驾驶舱优先学这些）。
 
     靠 load_progress（已闭合维度 id 集）与 scaffold（全部维度）对账得出 ——
     不复用 start_learning 内部状态，纯只读，驾驶舱每轮都能安全调用。
+
+    ⚠️ 必须排除 `_exhausted_dims`（试满 GIVE_UP_AFTER_ROUNDS 轮仍不闭合的）：
+    否则驾驶舱每轮都把同一条不可达维度再选一遍，永远「有未闭合维度」→ 无限烧
+    同一张骨架（2026-10-26 生产实测：场景 B 卡在「哪些员工在九月是活跃的」这
+    条 —— 库里只有 active 布尔、没有月份字段，这条维度永远闭合不了）。原版
+    遇到这种情况是「Skipping to next task」，不是原地重试到 160 轮用尽。
     """
     q = str(question or "").strip()
     if not q:
@@ -949,7 +938,10 @@ def milestone_unclosed(scene_id: str, question: str, *,
         if not dims:
             return []
         done = load_progress(str(scene_id or "A"), q)
-        return [d for d in dims if str(d.get("id") or "") not in done]
+        _ex = {d for d, _n, _c in _exhausted_dims(str(scene_id or "A"), q)}
+        return [d for d in dims
+                if str(d.get("id") or "") not in done
+                and str(d.get("id") or "") not in _ex]
     except Exception:
         return []
 
@@ -965,20 +957,30 @@ def milestone_lit(scene_id: str, question: str) -> dict[str, Any]:
       · total_dims：骨架维度数（0 = 没骨架 / 拆不出维度 → 不构成里程碑，
         驾驶舱应释放锚点而不是空转重试）。
     """
-    empty = {"achieved": False, "verified_real": False, "total_dims": 0}
+    empty = {"achieved": False, "verified_real": False, "total_dims": 0,
+             "given_up": [], "exhausted": False}
     try:
         p = _cache_path(str(scene_id or "A"), str(question or ""))
-        if not p.exists():
-            return dict(empty)
-        data = json.loads(p.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
+        data, _state = _read_cache(p)
+        if not isinstance(data, dict) or not data:
             return dict(empty)
         dims = [d for d in (data.get("dimensions") or [])
                 if isinstance(d, dict) and str(d.get("id") or "").strip()]
+        _q = str(question or "")
+        _done = load_progress(str(scene_id or "A"), _q)
+        _ex = {d for d, _n, _c in _exhausted_dims(str(scene_id or "A"), _q)}
+        _missing = [str(d.get("id")) for d in dims
+                    if str(d.get("id")) not in _done]
+        _gu = [d for d in _missing if d in _ex]
         return {
             "achieved": bool(data.get("milestone_achieved")),
             "verified_real": bool(data.get("milestone_verified_real")),
             "total_dims": len(dims),
+            # 试满轮数仍不闭合、按原版语义跳过的维度（如实报，不假装达成）
+            "given_up": _gu,
+            # 剩下的未闭合维度全是跳过的 → 这题没什么可再攻的了，
+            # 驾驶舱该如实判 failed，而不是继续走「重试里程碑直至成功」的循环
+            "exhausted": bool(dims) and bool(_missing) and len(_gu) == len(_missing),
         }
     except Exception:
         return dict(empty)
