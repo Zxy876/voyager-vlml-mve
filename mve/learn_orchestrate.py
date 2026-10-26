@@ -1030,6 +1030,9 @@ async def _start_learning_impl(
                         # （curriculum.py:342 "Skipping to next task"），
                         # 不原地无限重试。
                         ok1, crit1, obs1, r1 = False, "", [], {}
+                        # 内层判定（真伪）末态：闸门（覆盖）与内层 critic（真伪）
+                        # 两个都过才闭合这条维度，见下方重试循环内的合并判定
+                        _inner_ok = False
                         # 追问历史回灌：这条维度上次（上一轮/上一次学这句话）
                         # 被问过什么、还差什么 —— 直接作为第一轮的输入，别让
                         # 它从零开始撞同一堵墙（maieutic priorIterations 同款）。
@@ -1125,7 +1128,31 @@ async def _start_learning_impl(
                                     env_obs=_env_obs_block(db_path))
                             except Exception as e1:
                                 ok1, crit1 = False, f"critic 异常：{type(e1).__name__}: {e1}"
-                            if ok1:
+                            # 内层判定（真伪）也是闭合条件 —— 2026-10-26 回归项目
+                            # 自己的「唯一判定」原则（内层 critic_check 带环境实查，
+                            # 是原版 rollout critic 的同构；闸门只管覆盖）。实测：
+                            # 闸门（flash 与 glm-4-plus 都试过）问「维度有没有被
+                            # 答到」，毒答案确实答出了一个数 → 放行；内层 critic
+                            # 两次实测 4/4 拒绝 base_salary×overtime_hours 费率
+                            # 幻觉。闸门过 + 内层过才闭合；内层没过就把它的判词
+                            # 并进 critique 重试（可操作的反馈，不是空话）。
+                            # local_agent 路径没有内层 critic，维持闸门口径。
+                            _inner_ok = True
+                            if not is_local:
+                                _inner_ok = bool(getattr(agent, "last_success", False))
+                                if not _inner_ok:
+                                    _icrit = ""
+                                    try:
+                                        _icrit = str(getattr(
+                                            getattr(agent, "critic", None),
+                                            "last_critique", "") or "")
+                                    except Exception:
+                                        _icrit = ""
+                                    if _icrit:
+                                        crit1 = (f"{crit1}；内层判官未过：{_icrit}"
+                                                 if crit1
+                                                 else f"内层判官未过：{_icrit}")
+                            if ok1 and _inner_ok:
                                 break
                             # 超时 = 外部工具没回来（慢/被限流），**不是代码写错
                             # 了** —— 原地重试毫无意义（原线程还在等，新线程又
@@ -1139,7 +1166,7 @@ async def _start_learning_impl(
                                       f"{_q1[:28]}", flush=True)
                                 _timed_out_dims += 1
                                 break
-                        if ok1:
+                        if ok1 and _inner_ok:
                             learned_dims.append(_d)
                             a1 = str(r1.get("answer") or "").strip()
                             if a1:
@@ -1203,8 +1230,8 @@ async def _start_learning_impl(
                         _iters[_did] = {
                             "rounds": 1,
                             "asked": str(crit1)[:300],
-                            "gap": ("" if ok1 else str(_q1)[:300]),
-                            "passed": bool(ok1),
+                            "gap": ("" if (ok1 and _inner_ok) else str(_q1)[:300]),
+                            "passed": bool(ok1 and _inner_ok),
                             "tools": list(tools_map.get(_did) or []),
                         }
                     try:
