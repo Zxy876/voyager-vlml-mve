@@ -1538,54 +1538,65 @@ async def _start_learning_impl(
     # ---- ⑤' 完成判定（原版 critic.check_task_success 的同构）----
     # 放在入库**之前**：判定结果决定这一轮算不算学到（原版 voyager.py:230 在
     # step 里判，判过才 add_new_skill、update_exploration_progress）。
-    if judge:
-        _dres = out.get("dimension_results")
-        if _dres is not None:
-            # 维度模式：判定已经在**每个维度各自的 rollout 后**做过了
-            # （maieutic_gate 的闭合口径）。这里只汇总，不再让 critic 判一遍。
-            _failed = _dres.get("failed") or []
-            _ok = not _failed
-            _crit = " ".join(f"[{f.get('id')}] {str(f.get('critique') or '')}"
-                             for f in _failed).strip()[:300]
-            out["critic"] = {"success": bool(_ok), "critique": _crit,
-                             "gate": {"addressed": _dres.get("learned") or [],
-                                      "open": [f.get("id") for f in _failed],
-                                      "questions": [str(f.get("critique") or "")
-                                                    for f in _failed]}}
+    # ⚠️ 维度汇总**不受 judge 形参管**（2026-10-26 服务器实测修复）：每条
+    # 维度的闭合判定在各自 rollout 内已经做完了（步级双判定：内层 critic
+    # × 闸门），这里的汇总只是数 failed 条数，**不花一次 LLM**。曾经整段
+    # 挂在 `if judge:` 下面 → 面板「▶ 学会这句」按钮（judge=False）整段
+    # 跳过，0/6 全败的一轮被 ⑥ `_absorb` 的「有答案文本」判成 learned
+    # （run_log verdict=ok、面板/轨迹页显示成功）—— 正是「有行≠答出来」
+    # 铁律要防的事：判定必须过同一把尺子，入口不同不改口径。
+    _dres = out.get("dimension_results")
+    _crit = ""
+    if _dres is not None:
+        # 维度模式：判定已经在**每个维度各自的 rollout 后**做过了
+        # （maieutic_gate 的闭合口径）。这里只汇总，不再让 critic 判一遍。
+        _failed = _dres.get("failed") or []
+        _ok = not _failed
+        _crit = " ".join(f"[{f.get('id')}] {str(f.get('critique') or '')}"
+                         for f in _failed).strip()[:300]
+        out["critic"] = {"success": bool(_ok), "critique": _crit,
+                         "gate": {"addressed": _dres.get("learned") or [],
+                                  "open": [f.get("id") for f in _failed],
+                                  "questions": [str(f.get("critique") or "")
+                                                for f in _failed]}}
+    else:
+        # 唯一 critic（2026-10-24 同构化）：执行层走了 solve（scene/vlml
+        # 后端）时，内层每步判定就是原版 rollout 的 critic —— 外层不再让
+        # task_critic 重判一遍（双 critic 偏离已修）。没有内层判定的后端
+        # （local_agent 写代码路径）才落到 task_critic。
+        inner = out.get("inner_critic") or {}
+        if "success" in inner:
+            _ok = bool(inner.get("success"))
+            _crit = str(inner.get("critique") or "")
+            out["critic"] = {"success": _ok, "critique": _crit,
+                             "gate": out.get("critic_gate") or {},
+                             "origin": "inner"}
+        elif judge:
+            try:
+                import task_critic
+                # 原版同构（2026-10-24 用户定「用原 voyager 看环境的方法来抄」）：
+                # 原版 critic 看到的是**环境末态**（背包/附近方块），所以能验证
+                # "挖到铁矿" —— 观察里看得见。SQL 场景的同构物 = 库的实查清单
+                # （表/列/真实取值）随 context 交给 critic：任务假设的表/列/业务
+                # 参数（费率/汇率…）必须能在这份清单里指认，指认不了 = 不可答，
+                # 不许把编造的参数当已验证（实测 150 元费率幻觉就是这样放行的）。
+                _ctx = str(context or "") + _env_obs_block(db_path)
+                _ok, _crit = task_critic.check_task_success(question, _ctx, out)
+            except Exception as e:
+                _ok, _crit = bool(real), f"critic 异常：{type(e).__name__}: {e}"
+            out["critic"] = {"success": bool(_ok), "critique": str(_crit or ""),
+                             "gate": out.get("critic_gate") or {}}
         else:
-            # 唯一 critic（2026-10-24 同构化）：执行层走了 solve（scene/vlml
-            # 后端）时，内层每步判定就是原版 rollout 的 critic —— 外层不再让
-            # task_critic 重判一遍（双 critic 偏离已修）。没有内层判定的后端
-            # （local_agent 写代码路径）才落到 task_critic。
-            inner = out.get("inner_critic") or {}
-            if "success" in inner:
-                _ok = bool(inner.get("success"))
-                _crit = str(inner.get("critique") or "")
-                out["critic"] = {"success": _ok, "critique": _crit,
-                                 "gate": out.get("critic_gate") or {},
-                                 "origin": "inner"}
-            else:
-                try:
-                    import task_critic
-                    # 原版同构（2026-10-24 用户定「用原 voyager 看环境的方法来抄」）：
-                    # 原版 critic 看到的是**环境末态**（背包/附近方块），所以能验证
-                    # "挖到铁矿" —— 观察里看得见。SQL 场景的同构物 = 库的实查清单
-                    # （表/列/真实取值）随 context 交给 critic：任务假设的表/列/业务
-                    # 参数（费率/汇率…）必须能在这份清单里指认，指认不了 = 不可答，
-                    # 不许把编造的参数当已验证（实测 150 元费率幻觉就是这样放行的）。
-                    _ctx = str(context or "") + _env_obs_block(db_path)
-                    _ok, _crit = task_critic.check_task_success(question, _ctx, out)
-                except Exception as e:
-                    _ok, _crit = bool(real), f"critic 异常：{type(e).__name__}: {e}"
-                out["critic"] = {"success": bool(_ok), "critique": str(_crit or ""),
-                                 "gate": out.get("critic_gate") or {}}
-        if not _ok:
-            out.update(status=(("partial" if (_dres or {}).get("learned")
-                                else "failed") if _dres is not None
-                               else ("no_data" if not real else "failed")),
-                       why=(str(_crit or "") or "闸门/critic 判未完成")[:300])
-            _record(out)
-            return out
+            # 无内层判定、又不让调 critic（judge=False 的老入口）：维持原
+            # 行为 —— 不拦，交给 ⑥ 入库侧决定（absorb 的 mastered 口径）。
+            _ok = True
+    if not _ok:
+        out.update(status=(("partial" if (_dres or {}).get("learned")
+                            else "failed") if _dres is not None
+                           else ("no_data" if not real else "failed")),
+                   why=(str(_crit or "") or "闸门/critic 判未完成")[:300])
+        _record(out)
+        return out
 
     # ---- ⑥ 判过 → 图谱建点 + 掌握 + 配方入库（复用消费侧同一套账）----
     try:
