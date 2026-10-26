@@ -16,7 +16,10 @@
      不结晶）—— 修复前这里会报 learned；
   ② 负路径 parity：judge=True 同口径（汇总与 judge 无关）；
   ③ 正路径：judge=False + 维度闭合 → status=learned（汇总不拦好人），
-     且闭合维度的技能带 blueprint.rollout_sql（泛化前原文，结晶重放用）。
+     且闭合维度的技能带 blueprint.rollout_sql（泛化前原文，结晶重放用）；
+  ④ 部分闭合（1/2 闭合）→ status=partial、⑥ 之前早退（absorbed={}），
+     但**已闭合维度的技能同轮结晶**成 invoke 条目（2026-10-26 生产实测：
+     2/4 闭合时提前 return 把 ⑦ 挡在后面，闭合维度的技能永远停在文本层）。
 
 场景必须注册成**带库场景**（kind≠vlml）：默认场景 A 是 VLML 数据域，
 `_use_scaffold = is_local or (db_path and not use_vlml)` 为 False，不走
@@ -53,6 +56,7 @@ import skill_store            # noqa: E402
 import topic_graph            # noqa: E402
 
 QUESTION = "查一下 player 的 kills 按地图过滤"
+QUESTION2 = "查一下 player 的 score 按地图过滤"   # ④ 用新问题（技能 key 不撞 ③）
 SQL = "SELECT p.kills FROM players p JOIN maps m ON p.map_id = m.map_id"
 SCENE = "T"                    # 带库场景（create_scene + data_source）
 
@@ -79,6 +83,9 @@ class _FakeAgent:
     _gate_asked = ["桩追问：请从 players 表取 kills 并按 maps 过滤"]
     vacuous = False
     last_grabs: list = []
+    # 部分闭合控制（场景 ④）：solve 按维度问句文本逐条判闭合。
+    # None = 所有维度都用 last_success（场景 ①②③ 的口径）。
+    close_pred = None
 
     def __init__(self, env=None) -> None:
         pass
@@ -86,6 +93,13 @@ class _FakeAgent:
     async def solve(self, question, *, max_iters=3, hints=None, skills=None,
                     grabs=None, focus_tables=None, gate_check=None, **_kw):
         _FakeAgent.last_grabs = list(grabs or [])
+        if _FakeAgent.close_pred is not None:
+            # 逐维度：命中的闭合（内层过 + 闸门不挡），没命中的不过
+            _close = bool(_FakeAgent.close_pred(str(question)))
+            _FakeAgent.last_success = _close
+            _FakeAgent.last_gate_passed = None if _close else False
+            _FakeAgent.last_gate_critique = (
+                "" if _close else "桩闸门追问：这条维度清单没覆盖，不过")
         data = ([{"n": None}] if self.vacuous
                 else [{"kills": 300}, {"kills": 180}])
         return ([{"ok": True, "rows": len(data), "data": data,
@@ -252,6 +266,35 @@ async def _main() -> int:
         check("invoke 重放判对后固化的原文（不是带槽位的模板）",
               isinstance(res, dict) and res.get("_sql") == SQL,
               str(res)[:80])
+
+    print("\n== ④ 部分闭合（1/2）→ 闭合维度的技能同轮结晶（生产实测修复） ==")
+    # 生产实测（2026-10-26 服务器场景 B 2/4 闭合）：`if not _ok` 提前
+    # return 把 ⑦ 挡在后面 → 闭合维度的技能落了库却从没变成 invoke 条目。
+    # 换新问题（QUESTION2）保证技能 key 是新的（③ 已入过同维度的库）。
+    _FakeAgent.close_pred = lambda q: "kills" in q
+    r4 = await learn_orchestrate.start_learning(
+        QUESTION2, SCENE, llm=_fake_llm, use_mcp=False)
+    _FakeAgent.close_pred = None
+    check("status=partial（不是 learned 也不是 failed）",
+          r4["status"] == "partial",
+          f"{r4['status']}｜{str(r4.get('why'))[:60]}")
+    check("只闭合了 kills 那条维度",
+          (r4.get("dimension_results") or {}).get("learned") == ["dim_kills"]
+          and len((r4.get("dimension_results") or {}).get("failed") or []) == 1,
+          json.dumps(r4.get("dimension_results"), ensure_ascii=False)[:120])
+    check("⑥ 之前早退：整题没入库（absorbed={}）",
+          r4["absorbed"] == {}, str(r4.get("absorbed"))[:80])
+    check("但闭合维度的技能同轮结晶成 invoke 条目",
+          bool(r4["crystallized"].get("ok"))
+          and r4["crystallized"].get("entry") == "learned_dim_kills",
+          json.dumps(r4.get("crystallized"), ensure_ascii=False)[:120])
+    entries4 = [n for n in actions.names(SCENE) if n.startswith("learned_")]
+    check("注册表不重复注册（仍是 2 条，幂等覆盖）",
+          sorted(entries4) == ["learned_dim_kills", "learned_dim_map"],
+          str(entries4))
+    res4 = await actions.invoke(SCENE, "learned_dim_kills", mcp=_FakeMCP())
+    check("invoke 仍重放判对后固化的原文",
+          isinstance(res4, dict) and res4.get("_sql") == SQL, str(res4)[:80])
 
     print()
     if FAIL:

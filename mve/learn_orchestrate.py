@@ -1591,6 +1591,13 @@ async def _start_learning_impl(
             # 行为 —— 不拦，交给 ⑥ 入库侧决定（absorb 的 mastered 口径）。
             _ok = True
     if not _ok:
+        # 已闭合的维度各自是一次成功 rollout：它们的技能在维度循环里已经
+        # 落库（learn_milestone_skills 不连坐，见 1368 行注释）—— **同轮
+        # 就要结晶**。以前这里提前 return 把 ⑦ 挡在后面：部分闭合的轮次
+        # （2026-10-26 生产实测 2/4 闭合）闭合维度的技能永远停在技能库
+        # 文本层，消费侧 invoke 不到（crystallize_all 零调用方，面板重启
+        # 自检也不重结晶）。0 闭合时 added 为空，helper 自然空转。
+        _crystallize_round_skills(out, scene, local_dir, is_local, sql)
         out.update(status=(("partial" if (_dres or {}).get("learned")
                             else "failed") if _dres is not None
                            else ("no_data" if not real else "failed")),
@@ -1649,60 +1656,7 @@ async def _start_learning_impl(
         out["milestone"]["why"] = f"{type(e).__name__}: {e}"
 
     # ---- ⑦ 写入技能库 → 结晶成条目（闭环最后一环：下次抓得到）----
-    try:
-        import skill_store
-        import plugin_forge
-        # 这一轮**真实落库**的技能 key（三条通道，2026-10-26 补齐维度路径）：
-        #   ① 整题路径：_absorb 落的配方（skill_key）；
-        #   ② 维度路径：闭合维度写的原子技能（skills.added）—— 以前只结晶
-        #      ①，而维度路径 sql="" 永远匹配不上 → 学成的维度技能从没变成
-        #      过 invoke 条目（crystallize_all 全库零调用方，面板重启自检
-        #      只 restore 注册表快照、不重结晶）→ 「学会」停在技能库文本层；
-        #   ③ 里程碑全闭合的复合技能（milestone_skill.added）。
-        # ⚠️ 指认用 key、不许按 code 字符串匹配：入库前 generalize_sql_recipe
-        # 会把 SQL 泛化成 :slot 模板，库里存的是模板、这里是这次跑通的原文
-        # → 相等永不成立 → 结晶静默跳过（2026-10-26 实测挂过两条断言）。
-        _keys: list[str] = []
-        _sk = str((out.get("absorbed") or {}).get("skill_key") or "")
-        if _sk:
-            _keys.append(_sk)
-        for _a in ((out.get("skills") or {}).get("added") or []):
-            _k = str((_a or {}).get("key") or "")
-            if _k and _k not in _keys:
-                _keys.append(_k)
-        _mk = str((out.get("milestone_skill") or {}).get("added") or "")
-        if _mk and _mk not in _keys:
-            _keys.append(_mk)
-        fresh: list[dict[str, Any]] = []
-        if _keys:
-            _want = set(_keys)
-            fresh = [s for s in skill_store.all_skills()
-                     if str(s.get("key") or "") in _want]
-        if not fresh and str(sql).strip():
-            # 兜底（老结果没有 key）：按本次 SQL 原文 / rollout_sql 匹配
-            fresh = [s for s in skill_store.all_skills()
-                     if str(s.get("code") or "") == str(sql)
-                     or str((s.get("blueprint") or {}).get("rollout_sql")
-                            or "") == str(sql)]
-        _cries: list[dict[str, Any]] = []
-        for _s in fresh:
-            _cries.append(plugin_forge.crystallize_skill(
-                _s, into_scene=scene,
-                local_scene_dir=(local_dir if is_local else "")))
-        if _cries:
-            # 主结果保持 dict 形状（面板 / scene_learn 按 .ok/.entry 读）；
-            # 多条时全量进 crystallized_all —— 别把后几条 silently 丢掉。
-            out["crystallized"] = next(
-                (c for c in _cries if c.get("ok")), _cries[0])
-            if len(_cries) > 1:
-                out["crystallized_all"] = _cries
-            _n_ok = sum(1 for c in _cries if c.get("ok"))
-            if _n_ok:
-                print(f"  · 技能结晶：{_n_ok}/{len(_cries)} 条变成可 invoke 条目"
-                      f"（{', '.join(str(c.get('entry') or '') for c in _cries if c.get('ok'))}）",
-                      flush=True)
-    except Exception as e:
-        out["crystallized"] = {"ok": False, "why": f"{type(e).__name__}: {e}"}
+    _crystallize_round_skills(out, scene, local_dir, is_local, sql)
 
     out["status"] = "learned" if out["absorbed"].get("mastered") else "partial"
     if out["status"] == "partial":
@@ -1756,6 +1710,74 @@ def kick_learning(question: str, scene_id: str = "", *,
     t.start()
     return {"kicked": True, "question": question[:60], "mode": "thread",
             "reason": str(reason or "")}
+
+
+def _crystallize_round_skills(out: dict[str, Any], scene: str,
+                              local_dir: str, is_local: bool,
+                              sql: str) -> None:
+    """把这一轮**真实落库**的技能结晶成可 invoke 条目（闭环最后一环）。
+
+    三条通道（2026-10-26 补齐维度路径）：
+      ① 整题路径：_absorb 落的配方（absorbed.skill_key）；
+      ② 维度路径：闭合维度写的原子技能（skills.added）—— 维度路径
+         sql="" 按原文永远匹配不上，且 crystallize_all 全库零调用方、
+         面板重启自检只 restore 注册表快照不重结晶 → 不主动结晶，
+         「学会」就停在技能库文本层，消费侧 invoke 不到；
+      ③ 里程碑全闭合的复合技能（milestone_skill.added）。
+
+    ⚠️ 指认用 key、不许按 code 字符串匹配：入库前 generalize_sql_recipe
+    会把 SQL 泛化成 :slot 模板，库里存的是模板、这里是这次跑通的原文
+    → 相等永不成立 → 结晶静默跳过（2026-10-26 实测挂过两条断言）。
+
+    **部分闭合的轮次也要调用**（⑤' 判 partial 会提前 return）：已闭合
+    维度各自是一次成功 rollout，不该被没闭合的维度连坐（2026-10-26
+    生产实测：2/4 闭合，技能在库、零 invoke 条目）。0 闭合时 added
+    为空，本函数自然空转，不写 out["crystallized"]。
+    """
+    try:
+        import skill_store
+        import plugin_forge
+        _keys: list[str] = []
+        _sk = str((out.get("absorbed") or {}).get("skill_key") or "")
+        if _sk:
+            _keys.append(_sk)
+        for _a in ((out.get("skills") or {}).get("added") or []):
+            _k = str((_a or {}).get("key") or "")
+            if _k and _k not in _keys:
+                _keys.append(_k)
+        _mk = str((out.get("milestone_skill") or {}).get("added") or "")
+        if _mk and _mk not in _keys:
+            _keys.append(_mk)
+        fresh: list[dict[str, Any]] = []
+        if _keys:
+            _want = set(_keys)
+            fresh = [s for s in skill_store.all_skills()
+                     if str(s.get("key") or "") in _want]
+        if not fresh and str(sql).strip():
+            # 兜底（老结果没有 key）：按本次 SQL 原文 / rollout_sql 匹配
+            fresh = [s for s in skill_store.all_skills()
+                     if str(s.get("code") or "") == str(sql)
+                     or str((s.get("blueprint") or {}).get("rollout_sql")
+                            or "") == str(sql)]
+        _cries: list[dict[str, Any]] = []
+        for _s in fresh:
+            _cries.append(plugin_forge.crystallize_skill(
+                _s, into_scene=scene,
+                local_scene_dir=(local_dir if is_local else "")))
+        if _cries:
+            # 主结果保持 dict 形状（面板 / scene_learn 按 .ok/.entry 读）；
+            # 多条时全量进 crystallized_all —— 别把后几条 silently 丢掉。
+            out["crystallized"] = next(
+                (c for c in _cries if c.get("ok")), _cries[0])
+            if len(_cries) > 1:
+                out["crystallized_all"] = _cries
+            _n_ok = sum(1 for c in _cries if c.get("ok"))
+            if _n_ok:
+                print(f"  · 技能结晶：{_n_ok}/{len(_cries)} 条变成可 invoke 条目"
+                      f"（{', '.join(str(c.get('entry') or '') for c in _cries if c.get('ok'))}）",
+                      flush=True)
+    except Exception as e:
+        out["crystallized"] = {"ok": False, "why": f"{type(e).__name__}: {e}"}
 
 
 def _record(result: dict[str, Any]) -> None:
