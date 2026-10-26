@@ -201,6 +201,43 @@ def main() -> int:
               mcp5.calls == ["SELECT p.kills FROM players p WHERE p.kills > 100"],
               str(mcp5.calls))
 
+    print("\n== 6c. 泛化模板 + rollout_sql：结晶重放判对后固化的原文 ==")
+    # 2026-10-26：技能库里 code 存的是 :slot 模板（检索+回填通道用），
+    # blueprint.rollout_sql 存泛化前判对后固化的原文 —— 结晶 embed 后者，
+    # 否则带槽位的模板原样重放必错。
+    RAW = "SELECT p.kills FROM players p WHERE p.kills > 100"
+    TPL = "SELECT p.kills FROM players p WHERE p.kills > :min_kills"
+    act4, key4 = skill_store.add(
+        "t4", "tpl_recipe", "泛化后的槽位模板（原文在 blueprint.rollout_sql）",
+        code=TPL, source="consume", source_scene=SCENE,
+        blueprint={"source": "consume", "question": "kills 超过 100 的玩家",
+                   "rollout_sql": RAW})
+    skills4 = {s["key"]: s for s in skill_store.all_skills()}
+    tpl_sk = next((s for s in skills4.values()
+                   if s.get("code") == TPL), None)
+    check("6c 前置：模板已在技能库里", tpl_sk is not None)
+    cry4 = plugin_forge.crystallize_skill(tpl_sk, into_scene=SCENE)
+    check("模板技能结晶成功（用 rollout_sql 不用 code）", cry4["ok"], cry4["why"])
+    if cry4["ok"]:
+        mcp6 = FakeMCP()
+        asyncio.run(actions.invoke(SCENE, cry4["entry"], mcp=mcp6))
+        check("invoke 重放的是判对后固化的原文（不是带槽位的模板）",
+              mcp6.calls == [RAW], str(mcp6.calls))
+
+    print("\n== 6d. 泛化模板无 rollout_sql（老技能）：如实拒绝，不注册坏条目 ==")
+    act5, key5 = skill_store.add(
+        "t5", "tpl_old", "泛化上线前入库的模板技能（没有 rollout_sql）",
+        code=TPL, source="consume", source_scene=SCENE)
+    skills5 = {s["key"]: s for s in skill_store.all_skills()}
+    old_tpl = next((s for s in skills5.values()
+                    if s.get("name") == "tpl_old"), None)
+    check("6d 前置：老模板已在技能库里", old_tpl is not None)
+    cry5 = plugin_forge.crystallize_skill(old_tpl, into_scene=SCENE)
+    check("老模板 ok=False 且说清原因（槽位不能原样重放）",
+          not cry5["ok"] and "rollout_sql" in cry5["why"], cry5["why"][:60])
+    check("没有偷偷注册 learned_tpl_old",
+          "learned_tpl_old" not in actions.names(SCENE))
+
     print("\n== 7. 跨场景注册：scene_id 不互相污染 ==")
     cry3 = plugin_forge.crystallize_skill(skills[key], into_scene="U")
     check("同一技能注册进 T 与 U",
@@ -213,11 +250,15 @@ def main() -> int:
           and te["learned_demo_skill"]["scene_id"] == "T")
 
     print("\n== 8. actions.restore() 重启恢复 ==")
+    # 期望集**派生**自前面各节真实结晶/forge 出的条目（6b/6c 又结晶了
+    # learned_sql_recipe / learned_tpl_recipe 两条）—— 写死条数的话，
+    # 每加一个契约测试这里就要挂一次（2026-10-26 实测踩到）。
     expect_T = {"query_players", "query_maps",
-                "learned_demo_skill", "learned_sql_recipe"}
+                "learned_demo_skill", "learned_sql_recipe",
+                "learned_tpl_recipe"}
     actions._REGISTRY.clear()
     restored = actions.restore()
-    check("T 恢复全部 4 条（forged×2 + learned×2 都走 impl 引用）",
+    check("T 恢复全部条目（forged×2 + learned×3 都走 impl 引用）",
           set(actions.names(SCENE)) == expect_T, str(sorted(actions.names(SCENE))))
     check("U 恢复 1 条", actions.names("U") == ["learned_demo_skill"])
     re_entries = {e["name"]: e for e in actions.entries(SCENE)}

@@ -252,8 +252,12 @@ def learn_milestone_skills(scene_id: str, topic_id: str, question: str,
         # 是增强不是闸门，不阻塞学习闭环。
         try:
             from voyager_vlml.consume import generalize_sql_recipe as _gen
+            # 泛化前的原文留着：模板（code）给检索+回填通道，原文给
+            # plugin_forge 结晶重放（带 :slot 的模板原样重放必错）。
+            _raw_dim = code
             code = _gen(code, str(item.get("question") or question))
         except Exception:
+            _raw_dim = code
             pass
         try:
             _act, key = skill_store.add(
@@ -276,6 +280,8 @@ def learn_milestone_skills(scene_id: str, topic_id: str, question: str,
                            "dimension": did,
                            "question": str(item.get("question") or ""),
                            "scene": scene_id,
+                           # 这次判对后固化的原文（泛化前）—— 结晶条目重放它
+                           "rollout_sql": _raw_dim,
                            # 技能归属那次人导入（用户 2026-10-20）：
                            # 「技能的归属也是如此」。面板据此显示
                            # 「这条技能来自 imp_xxx（第 N 次导入）」，
@@ -407,6 +413,9 @@ async def learn_milestone_composite(scene_id: str, topic_id: str, question: str,
         code = _gen(body, question)
     except Exception:
         code = body
+    # body 是**真执行取到真数**的那条（上面 ③ 验过）—— 泛化前的原文留
+    # blueprint.rollout_sql，结晶条目重放它（模板给检索+回填通道）。
+    _raw_comp = body
     text = (f"【里程碑{('：' + milestone_name[:40]) if milestone_name else ''}】"
             f"{question}：全维度闭合后组合出的整体取数做法"
             f"（维度配方组合，非单维度）")
@@ -418,6 +427,8 @@ async def learn_milestone_composite(scene_id: str, topic_id: str, question: str,
                        "milestone": str(milestone_name or ""),
                        "question": str(question or ""),
                        "scene": str(scene_id or ""),
+                       # 真执行取到真数的组合 SQL 原文（泛化前）
+                       "rollout_sql": _raw_comp,
                        "dims": [str((d or {}).get("id") or "") for d in dim_codes]},
             source_scene=str(scene_id or "A"))
         out["added"] = str(key or "")
@@ -1630,8 +1641,21 @@ async def _start_learning_impl(
     try:
         import skill_store
         import plugin_forge
-        fresh = ([s for s in skill_store.all_skills()
-                  if str(s.get("code") or "") == str(sql)] if str(sql).strip() else [])
+        # 指认这次落的**是哪一条**：优先用 _absorb 返回的 skill_key。
+        # ⚠️ 不许按 code 字符串匹配：入库前 generalize_sql_recipe 会把 SQL
+        # 泛化成 :slot 模板（2026-10-23 起），库里存的是模板、这里是这次
+        # 跑通的原文 → 相等永不成立 → 结晶静默跳过（闭环最后一环断了，
+        # 2026-10-26 实测挂了两条断言）。兜底匹配也认 rollout_sql。
+        _sk = str((out.get("absorbed") or {}).get("skill_key") or "")
+        fresh: list[dict[str, Any]] = []
+        if _sk:
+            fresh = [s for s in skill_store.all_skills()
+                     if str(s.get("key") or "") == _sk]
+        if not fresh and str(sql).strip():
+            fresh = [s for s in skill_store.all_skills()
+                     if str(s.get("code") or "") == str(sql)
+                     or str((s.get("blueprint") or {}).get("rollout_sql")
+                            or "") == str(sql)]
         if fresh:
             out["crystallized"] = plugin_forge.crystallize_skill(
                 fresh[-1], into_scene=scene,

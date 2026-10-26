@@ -141,6 +141,15 @@ async def _main() -> int:
     fake = types.ModuleType("voyager_vlml.agents.action")
     fake.VLMLActionAgent = _FakeAgent
     sys.modules["voyager_vlml.agents.action"] = fake
+    # 泛化（generalize_sql_recipe）打桩：技能入库前要把 SQL 泛化成 :slot
+    # 模板（2026-10-23「技能存算法不存数值」），真调 LLM 输出不稳定
+    # （2026-10-26 实测：同一输入五次三种写法）→ 测试结果会随机挂。
+    # 固定成「原 SQL + WHERE m.name = :map」（合法模板：槽位只在 WHERE
+    # 值位），入库/结晶/重放的契约全部可确定断言。
+    import voyager_vlml.consume as _consume_mod
+    _consume_mod.chat_json = lambda _messages, **_kw: {
+        "sql": SQL + " WHERE m.name = :map",
+        "slots": ["map"], "note": "test stub"}
 
     print("== 0. 人导入（未命中）==")
     m0 = routing.match(QUESTION, SCENE)
@@ -185,8 +194,18 @@ async def _main() -> int:
           and r.get("grabs_offered", 0) > 0,
           f"grabs_offered={r.get('grabs_offered')}")
     items = skill_store.all_skills()
-    check("计入技能库（配方 code=本次 SQL）",
-          any(str(s.get("code") or "") == SQL for s in items))
+    # 入库的是**槽位模板**（技能存算法不存数值）：code 带 :map；判对后
+    # 固化的原文（泛化前）留 blueprint.rollout_sql —— 结晶条目重放它，
+    # 检索+回填通道用模板（_refill_sql 填槽）。2026-10-26 修：旧断言
+    # 「code == 本次 SQL」在泛化上线后必败（库里存的是模板不是原文）。
+    check("计入技能库（入库的是槽位模板，原文留 blueprint.rollout_sql）",
+          any(":map" in str(s.get("code") or "") for s in items)
+          and any(str((s.get("blueprint") or {}).get("rollout_sql") or "") == SQL
+                  for s in items),
+          json.dumps([str(s.get("code"))[:70] for s in items], ensure_ascii=False))
+    check("_absorb 指认了入库的那一条（skill_key，不按 code 匹配）",
+          bool(str((r["absorbed"] or {}).get("skill_key") or "")),
+          str((r["absorbed"] or {}).get("skill_key")))
     learned = [n for n in actions.names(SCENE) if n.startswith("learned_")]
     check("配方结晶成可 invoke 条目", r["crystallized"].get("ok") is True
           and len(learned) == 1, str(learned))

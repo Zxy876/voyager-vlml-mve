@@ -367,6 +367,10 @@ def crystallize_skill(skill: dict[str, Any] | str, *,
     伪代码）→ 如实返回 ok=False。学到话术的技能让它继续以文字形式进 prompt，
     不假装它是程序。
 
+    ⚠️ `code` 存的是**泛化模板**（:slot，给检索+回填通道用）时，结晶 embed
+    的换成 `blueprint.rollout_sql`（泛化前判对后固化的原文）—— 带槽位的
+    模板原样重放必错，2026-10-26 定位（test_learn_orchestrate 结晶断言挂）。
+
     into_scene：当前消费场景。技能通常注册进它的 source_scene；若此刻人在另
     一个场景消费同一问题，同时注册进 into_scene（技能是跨场景复用资产，
     但抓手段必须落在人消费的那个场景命名空间里才找得到）。
@@ -378,6 +382,20 @@ def crystallize_skill(skill: dict[str, Any] | str, *,
         out["why"] = "技能不存在（key 查不到）"
         return out
     code = str(s.get("code") or "")
+    # 泛化模板（code 带 :slot）是给「检索 + _refill_sql 回填」通道用的，
+    # 原样重放必错（槽位没填）。结晶条目要重放的是**判对后固化的那段程序**
+    # —— blueprint.rollout_sql（泛化前的原文，2026-10-26 补记）。没有该
+    # 字段的老技能照旧用 code（本机 Python 配方/未泛化的 SQL 都不受影响）。
+    _raw = str((s.get("blueprint") or {}).get("rollout_sql") or "").strip()
+    if _raw:
+        code = _raw
+    elif re.search(r":[a-z_][a-z0-9_]*", code, re.I):
+        # 泛化模板（带 :slot）且没有 rollout_sql（2026-10-23 泛化上线前
+        # 入库的老技能）—— 槽位没填的原样重放必错，如实拒绝，不注册坏条目。
+        out["why"] = ("该技能是泛化模板（带 :slot）且无 blueprint.rollout_sql"
+                      " —— 模板只能走「检索 + _refill_sql 回填」通道，"
+                      "不能原样重放")
+        return out
     if not code.strip():
         out["why"] = "该技能没有可执行源码（只有文字经验）—— 学到的是话术不是程序"
         return out

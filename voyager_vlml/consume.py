@@ -2376,7 +2376,10 @@ def _absorb(question: str, sql: str, topic_id: str,
     """
     out: dict[str, Any] = {"mastered": False, "skill_action": "",
                            "mastered_total": 0, "ability_total": 0, "topic_id": "",
-                           "cold_start": False, "root_scene": "", "node_status": ""}
+                           "cold_start": False, "root_scene": "", "node_status": "",
+                           # 这次落到技能库的 key（没有则为空）—— 调用方据此
+                           # 指认「是哪一条」，别按 code 字符串匹配（泛化后必败）。
+                           "skill_key": ""}
     # 知识型任务（怎么养育/如何理解…）没有取数 SQL，但有答案 —— 照样算"答出来了"，
     # 建节点 + 标掌握；只是不写技能库（技能存的是**可执行配方**，答案本身不是配方）。
     if not sql and not str(answer or "").strip():
@@ -2478,9 +2481,18 @@ def _absorb(question: str, sql: str, topic_id: str,
             skill_store.mark_result(have, True)
             out["skill_action"] = ("已有配方，标记为用过且有效"
                                    + ("" if used_keys else "（按同题全量记账）"))
+            # 调用方（学习闭环 ⑦ 结晶）要能指认**是哪一条** —— 按 code 字符串
+            # 匹配在泛化时代必败（库里存的是模板，不是这次跑通的原文），
+            # 2026-10-26 实测 test_learn_orchestrate 两条断言就这样挂的。
+            out["skill_key"] = str(have[-1])
         else:
             # 入库的同样是**方法**不是数值（用户 2026-10-23）：泛化成槽位模板
             # 再入库，失败原样入库。消费复用走 _refill_sql 按当前问句实例化。
+            # ⚠️ 泛化前的**原文**（这次判对后固化的程序）要留在
+            # blueprint.rollout_sql：模板（code）是给「检索 + 回填」通道用的，
+            # 带 :slot 的模板原样重放必错；plugin_forge 结晶条目重放的是
+            # rollout_sql（见 crystallize_skill 的取值口径）。
+            _raw_sql = str(sql)
             try:
                 sql = generalize_sql_recipe(sql, question)
             except Exception:
@@ -2489,10 +2501,12 @@ def _absorb(question: str, sql: str, topic_id: str,
                 tid, tid,
                 f"消费时答出来的取数方法：{question[:60]}",
                 code=sql,
-                blueprint={"source": "consume", "question": question},
+                blueprint={"source": "consume", "question": question,
+                           "rollout_sql": _raw_sql},
                 source="consume",
                 source_scene=_scene_id,
             )
+            out["skill_key"] = str(key or "")
             out["skill_action"] = f"新配方入库：{key}" if key else "（内容太短未入库）"
             # 确保技能归属当前场景（兜底：即便上面的 source_scene 没传也补上）
             try:
