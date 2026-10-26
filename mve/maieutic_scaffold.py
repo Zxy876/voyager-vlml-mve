@@ -693,6 +693,12 @@ def load_progress_iterations(scene_id: str, question: str) -> dict[str, dict]:
                     "passed": bool(it.get("passed")),
                     "tools": [str(x) for x in (it.get("tools") or [])
                               if str(x).strip()],
+                    # 步级闸门（候选A）：本次闭合问过的**干净追问清单**——
+                    # 闸门每步都判，跨轮的 prior_questions 从这取（同构
+                    # spec-examiner 的 priorIterations）。asked 是合并判词
+                    # （人看的），asked_q 是问句列表（机器复用），两份都要。
+                    "asked_q": [str(x)[:200] for x in (it.get("asked_q") or [])
+                                if str(x).strip()],
                 }
         return out
     except Exception:
@@ -727,6 +733,10 @@ def save_progress_iterations(scene_id: str, question: str,
             "gap": str(rec.get("gap") or "")[:300],
             "passed": bool(rec.get("passed")),
             "tools": [str(x) for x in (rec.get("tools") or []) if str(x).strip()],
+            # asked_q：本次闭合问过的干净追问清单（步级闸门跨轮防重复问）。
+            # 与 asked（合并判词）分工：一个给机器复用，一个给人回看。
+            "asked_q": [str(x)[:200] for x in (rec.get("asked_q") or [])
+                        if str(x).strip()],
         }
     pr["iterations"] = list(merged.values())
     data["progress"] = pr

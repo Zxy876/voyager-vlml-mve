@@ -524,12 +524,17 @@ def test_progress_iterations_accumulate() -> None:
         # 第二次学同一句：轮次累加（不是覆盖成 1），闭合了就标 passed
         M.save_progress_iterations("T", "什么是阿斯伯格", {
             "def": {"rounds": 1, "asked": "这次问的是发病率", "gap": "",
-                    "passed": True, "tools": ["mcp_ddg_search"]},
+                    "passed": True, "tools": ["mcp_ddg_search"],
+                    "asked_q": ["发病率数据出自哪个统计口径？"]},
         })
         it2 = M.load_progress_iterations("T", "什么是阿斯伯格")
         assert it2["def"]["rounds"] == 2, it2          # 累加，别回到 1
         assert it2["def"]["passed"] is True, it2
         assert it2["def"]["tools"] == ["mcp_ddg_search"], it2
+        # asked_q（步级闸门的干净追问清单）必须活得下来 —— load/save 两边
+        # 都是字段白名单，漏一个就静默丢（本项目第五次踩同一个坑：
+        # 「写了却没落盘」）。下一轮闸门的 prior_questions 从这取。
+        assert it2["def"]["asked_q"] == ["发病率数据出自哪个统计口径？"], it2
         # 另一条维度独立记账
         M.save_progress_iterations("T", "什么是阿斯伯格", {
             "history": {"rounds": 1, "asked": "起源？", "gap": "起源？",
@@ -537,6 +542,8 @@ def test_progress_iterations_accumulate() -> None:
         it3 = M.load_progress_iterations("T", "什么是阿斯伯格")
         assert set(it3) == {"def", "history"}, it3
         assert it3["def"]["rounds"] == 2, "不该被别的维度写掉"
+        assert it3["def"]["asked_q"] == ["发病率数据出自哪个统计口径？"], \
+            "另一维度写入时 asked_q 不该被洗掉"
     finally:
         M.CKPT = old
         shutil.rmtree(tmp, ignore_errors=True)

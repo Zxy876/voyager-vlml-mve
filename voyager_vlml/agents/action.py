@@ -28,7 +28,7 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
@@ -188,6 +188,20 @@ class VLMLActionAgent:
         # 执行层的工具可达性：本场景抓手条目 + 本题候选表（见 render_grabs）。
         self.grabs: list[dict[str, Any]] = []
         self.focus_tables: list[str] = []
+        # ---- 步级闸门（候选A，2026-10-26 用户拍板）----
+        # 原版 Voyager 的追问全部在 rollout 内（critic 每步读环境判，critique
+        # 回灌下一步，voyager.py:262-268）；原版 Maieutic 的 examiner 也是
+        # 一步一判（spec/route.ts:82-100，判词当轮进下一轮输入）。MVE 曾经
+        # 把闸门放在 rollout **之后**判一次（追问要等下一轮重跑才注入），
+        # 4 步全用在没人告诉它清单缺口的事上。现在闸门进 step()：
+        # gate_check 回调由学习循环注入（带当前维度 + env_obs），返回
+        # {"passed","questions","origin",...}；origin="failed" = 闸门不可用，
+        # 不阻塞（退化成内层 critic 单独判，它自带 env_obs 口径判据）。
+        self.gate_check: Callable[["VLMLActionAgent"], dict[str, Any]] | None = None
+        self.last_gate_passed: bool | None = None   # None=没跑/不可用
+        self.last_gate_critique = ""                # 闸门追问（≤3 条合并）
+        self.last_gate_result: dict[str, Any] = {}  # 闸门原始返回（留痕）
+        self._gate_asked: list[str] = []            # 本 rollout 已问（防重复）
 
     # ---------- 执行 ----------
     async def run_sql(self, sql: str) -> dict[str, Any]:
@@ -425,6 +439,7 @@ class VLMLActionAgent:
         hints: list[str] | None = None,
         grabs: list[dict[str, Any]] | None = None,
         focus_tables: list[str] | None = None,
+        gate_check: Callable[["VLMLActionAgent"], dict[str, Any]] | None = None,
     ) -> None:
         self.rollout_num_iter = 0
         self.task = task
@@ -444,6 +459,12 @@ class VLMLActionAgent:
         # 这里配对取，不能拆开拼（见 step() 与 consume.py ③b）。
         self.last_ok_sql = ""
         self.last_ok_data = None
+        # 步级闸门状态随 rollout 重置（每个维度一次 rollout 一份账）
+        self.gate_check = gate_check
+        self.last_gate_passed = None
+        self.last_gate_critique = ""
+        self.last_gate_result = {}
+        self._gate_asked = []
         try:
             self.schema = await self.env.schema_block()
         except Exception:
@@ -493,6 +514,41 @@ class VLMLActionAgent:
                 self.last_ok_sql = sql
                 self.last_ok_data = obs.get("data")
             success, critique = self.critic_check(events)          # :232-238
+            # ---- 步级闸门（候选A）：内层判「真取到数 + 口径对」之后，闸门
+            # （Maieutic examiner 同构）核「这条维度的清单答到了没有」——
+            # 原版 spec/route.ts:82-100 就是一步一判、判词当轮进下一轮输入。
+            # 只有内层过（有答案可核）才跑：0 行/真空/语法错时没有可核的
+            # 提交物，跑了也是空核（同构「学生交了 spec 才判」）。
+            # 闸门不可用（origin=failed）不阻塞：退化成内层 critic 单独判
+            # （它自带 env_obs 口径判据，action.py 的 critic_check 里）。
+            if success and self.gate_check is not None:
+                try:
+                    _g = self.gate_check(self) or {}
+                except Exception as _ge:
+                    _g = {"passed": True, "questions": [], "origin": "failed",
+                          "reason": f"{type(_ge).__name__}: {_ge}"}
+                self.last_gate_result = dict(_g) if isinstance(_g, dict) else {}
+                if str(self.last_gate_result.get("origin") or "") == "failed":
+                    self.last_gate_passed = None
+                    self.last_gate_critique = (
+                        f"闸门不可用（{str(self.last_gate_result.get('reason') or '')[:80]}）"
+                        "，本步以内层判定为准")
+                else:
+                    self.last_gate_passed = bool(self.last_gate_result.get("passed"))
+                    _gq = [str(q).strip() for q in
+                           (self.last_gate_result.get("questions") or [])
+                           if str(q or "").strip()]
+                    self.last_gate_critique = " ".join(_gq)[:300]
+                    for _q in _gq:                # 已问清单（防下一步重复问）
+                        if _q not in self._gate_asked:
+                            self._gate_asked.append(_q)
+                    if not self.last_gate_passed:
+                        # 闸门追问并进 critique 槽（原版同一条通路：
+                        # action.py:197-200 的 Critique:）—— 当步注入下一步
+                        _ask = ("；".join(_gq))[:300] or "维度清单还有没答到的"
+                        critique = (f"{critique}；【清单追问】{_ask}"
+                                    if critique else f"【清单追问】{_ask}")
+                        success = False
             # :256-270 —— **每步**按本轮执行摘要重检索技能，再重建两条消息
             new_skills = self.retrieve_skills(
                 query=self.task + "\n\n" + self.summarize_chatlog(events))
@@ -506,6 +562,14 @@ class VLMLActionAgent:
             ]
             print(f"  [第 {self.rollout_num_iter + 1}/{self.task_max_retries} 次] "
                   f"{'成功' if success else '失败'} · {self.summarize_chatlog(events)}")
+            if self.gate_check is not None and self.last_gate_result:
+                _gs = ("闸门不可用，内层单独判"
+                       if self.last_gate_passed is None
+                       else ("闸门过" if self.last_gate_passed else "闸门不过"))
+                print(f"    闸门：{_gs}"
+                      + (f"｜追问：{self.last_gate_critique[:140]}"
+                         if (self.last_gate_passed is False
+                             and self.last_gate_critique) else ""))
             if success and self.critic_reasoning:
                 print(f"    critic 判词：{self.critic_reasoning[:160]}")
         else:
@@ -626,10 +690,12 @@ class VLMLActionAgent:
         hints: list[str] | None = None,
         grabs: list[dict[str, Any]] | None = None,
         focus_tables: list[str] | None = None,
+        gate_check: Callable[["VLMLActionAgent"], dict[str, Any]] | None = None,
     ) -> tuple[list[dict[str, Any]], str]:
         await self.reset(task=task, context=context, skills=skills,
                          topic_id=topic_id, hints=hints,
-                         grabs=grabs, focus_tables=focus_tables)
+                         grabs=grabs, focus_tables=focus_tables,
+                         gate_check=gate_check)
         while True:
             _events, done = await self.step()
             if done:
@@ -643,19 +709,24 @@ class VLMLActionAgent:
         topic_id: str = "",
         grabs: list[dict[str, Any]] | None = None,
         focus_tables: list[str] | None = None,
+        gate_check: Callable[["VLMLActionAgent"], dict[str, Any]] | None = None,
     ) -> tuple[list[dict[str, Any]], str]:
         """= 原版 `voyager.inference(sub_goals=[…])` 里那一步：reset → rollout。
 
         `hints` 不是新通道，它就是原版的 `context`（人给的补充说明），
         走 human message 的 `Context:` 槽。
         `grabs` / `focus_tables` = 本场景抓手条目与本题候选表（见 render_grabs）。
+        `gate_check` = 步级闸门回调（候选A，2026-10-26）：内层 critic 每步
+        判过之后调它核维度清单，追问当步注入下一步。不传 = 原版行为
+        （只有内层 critic 一个判官），消费侧重放等旧调用方零改动。
         """
         self.task_max_retries = max(1, int(max_iters))
         ctx = "\n".join(str(h) for h in (hints or []) if str(h or "").strip())
         return await self.rollout(
             task=question, context=ctx, skills=skills,
             topic_id=topic_id, hints=hints,
-            grabs=grabs, focus_tables=focus_tables)
+            grabs=grabs, focus_tables=focus_tables,
+            gate_check=gate_check)
 
     # ---------- 环境自述 ----------
     def _available_tools(self) -> set[str] | None:

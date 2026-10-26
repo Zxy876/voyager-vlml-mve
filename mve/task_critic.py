@@ -136,7 +136,8 @@ def _evidence_text(result: dict[str, Any], limit: int = 2600) -> str:
 def check_task_success(task: str, context: str, result: dict[str, Any], *,
                        llm=None, max_retries: int = 5,
                        dimensions: list[dict[str, Any]] | None = None,
-                       env_obs: str = ""
+                       env_obs: str = "",
+                       prior_questions: list[str] | None = None
                        ) -> tuple[bool, str]:
     """返回 (success, critique)。照原版：出错 → (False, "")；其余交 LLM 判。
 
@@ -146,6 +147,9 @@ def check_task_success(task: str, context: str, result: dict[str, Any], *,
     `dimensions` = Maieutic 追问骨架出的维度清单（{"id","question","why"}）。
     给了 → **交给 `maieutic_gate` 判闸门**（照 spec-examiner 的闭合口径：
     passed = gaps_still_open 为空；不判整体质量，只带回最多 3 条追问）。
+
+    `prior_questions` = 本次闭合已问过的追问 → 透传闸门防重复问（同构
+    spec-examiner 的 priorIterations；步级闸门每步都判，不给历史会重复问）。
     """
     ex = result.get("execution") or {}
     real = int(ex.get("real_calls") or 0)
@@ -195,7 +199,8 @@ def check_task_success(task: str, context: str, result: dict[str, Any], *,
             g = maieutic_gate.check(task, answer, dimensions, llm=llm,
                                     critique=str(context or ""),
                                     evidence=result.get("evidence"),
-                                    env_obs=str(env_obs or ""))
+                                    env_obs=str(env_obs or ""),
+                                    prior_questions=prior_questions)
         except Exception as e:
             g = {"origin": "failed", "reason": f"{type(e).__name__}: {e}"}
         if g.get("origin") != "failed":

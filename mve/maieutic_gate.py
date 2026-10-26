@@ -120,13 +120,19 @@ def _material_block(evidence: Any, limit: int = 3, per: int = 1200) -> str:
 
 def render(question: str, answer: str,
            dimensions: list[dict[str, Any]], *, critique: str = "",
-           evidence: Any = None, env_obs: str = "") -> str:
+           evidence: Any = None, env_obs: str = "",
+           prior_questions: list[str] | None = None) -> str:
     """照 spec-examiner 的 user 模板：任务 + 维度清单（含内部理由）+ 它交上来的回答。
 
     `env_obs` = 环境实查清单（数据源真实的表/列/取值）—— 口径真实性的判据：
     答案的计算口径必须能在清单里指认，指认不了 = 假设业务参数 = 未答到
     （2026-10-26 实测 base_salary×overtime_hours 当加班费穿过旧判据入库成
     164000 假数；闸门只核清单核不出口径幻觉，环境实况必须一起给它）。
+
+    `prior_questions` = 本次闭合过程中**已经问过**的追问（步级闸门用，同构
+    spec-examiner.ts:224-235 的 PRIOR ITERATIONS：examiner 每轮都看得见
+    自己问过什么，不重复问）。步级化后闸门一步一判，不给它这份历史它会
+    每步问同一句 → 模型对着同一句改 4 步，浪费整个 rollout。
     """
     dim_block = "\n".join(
         f"  - id: {str(d.get('id') or '')}\n"
@@ -135,12 +141,19 @@ def render(question: str, answer: str,
         for d in (dimensions or []) if isinstance(d, dict))
     prior = (f"\n上一轮你提的追问（它可能照着改了）：\n  - {critique}\n"
              if critique else "")
+    asked_block = ""
+    _pq = [str(q).strip() for q in (prior_questions or [])
+           if str(q or "").strip()]
+    if _pq:
+        asked_block = ("\n本次闭合过程中你已经问过以下追问（它可能已经照着"
+                       "改了，**不要重复问**——改问缺口本身、或换一个角度）：\n"
+                       + "\n".join(f"  - {q[:200]}" for q in _pq[:6]) + "\n")
     env_block = (f"\n环境实查清单（数据源真实的表/列/取值，实查不手写 —— "
                  f"答案的计算口径必须能在这里指认）：\n{env_obs}\n"
                  if str(env_obs or "").strip() else "")
     return (f"任务：{question}\n\n"
             f"必须回答的维度清单：\n{dim_block or '  （无）'}\n{prior}"
-            f"{env_block}\n"
+            f"{asked_block}{env_block}\n"
             f"助手取到的材料（执行层剪裁，失败项已剔除）：\n"
             f"{_material_block(evidence)}\n\n"
             f"它交上来的回答：\n\"\"\"\n{str(answer or '')[:2500]}\n\"\"\"\n\n"
@@ -150,13 +163,17 @@ def render(question: str, answer: str,
 def check(question: str, answer: str, dimensions: list[dict[str, Any]], *,
           llm: Callable | None = None, critique: str = "",
           max_retries: int = 2, evidence: Any = None,
-          env_obs: str = "") -> dict[str, Any]:
+          env_obs: str = "",
+          prior_questions: list[str] | None = None) -> dict[str, Any]:
     """闸门判定。返回 {"passed","addressed","open","questions","emergent","origin"}。
 
     `origin="failed"` = 模型/解析不可用（调用方应退回原版 critic，不假装判过）。
 
     `env_obs` = 环境实查清单（数据源真实的表/列/取值）→ 进 user 消息，
     口径真实性的判据（列×列合成新口径 = 假设费率 = 未答到）。
+
+    `prior_questions` = 本次闭合已问过的追问（步级闸门防重复问，同构
+    spec-examiner 的 priorIterations）。
     """
     out: dict[str, Any] = {"passed": False, "addressed": [], "open": [],
                            "questions": [], "emergent": [],
@@ -178,7 +195,8 @@ def check(question: str, answer: str, dimensions: list[dict[str, Any]], *,
             text = call([{"role": "system", "content": GATE_SYSTEM},
                          {"role": "user", "content": render(
                              question, answer, dims, critique=critique,
-                             evidence=evidence, env_obs=env_obs)}])
+                             evidence=evidence, env_obs=env_obs,
+                             prior_questions=prior_questions)}])
         except Exception as e:
             last = f"LLM 调用失败：{type(e).__name__}: {e}"
             continue

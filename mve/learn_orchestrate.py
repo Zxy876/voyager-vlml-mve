@@ -1047,11 +1047,26 @@ async def _start_learning_impl(
                         # 原版 step 的机制，voyager.py:262-268），外层再套一层
                         # 重试 = 单维度 16 步、双重重试，是原版 4 倍（实测交通
                         # 补贴维度 3+ 个 solve 块连跑 4 分钟）。
-                        # 现在：一次 solve（4 步）封顶 → 闸门(覆盖) + 内层
-                        # critic(真伪) 双判定 → 不闭合进 failed_dims、跳过下一
-                        # 条维度；闸门追问写进 _iters，下一轮带着它再来
-                        # （原版 failed_tasks 的软重试语义，curriculum.py:184
-                        #  把 failed 列表给出题器看）。
+                        # 现在：一次 solve（4 步）封顶 → 4 步**之内**双判定
+                        # （步级闸门，见下方 _gate_stepwise）→ 不闭合进
+                        # failed_dims、跳过下一维度；闸门追问写进 _iters，下一轮
+                        # 带着它再来（原版 failed_tasks 的软重试语义，
+                        # curriculum.py:184 把 failed 列表给出题器看）。
+                        # 步级闸门（候选A，2026-10-26 用户拍板「子维度追问闭合
+                        # 由 voyager 根据自己的状况规划、一直实时注入」）：
+                        # 原版 Maieutic 的 examiner 就是**一步一判**
+                        # （spec/route.ts:82-100：passed = gaps_still_open 为空，
+                        #  判词当轮进下一轮输入）；原版 Voyager 的 critique 回灌
+                        # 也在 rollout 内（action.py:197-200）。MVE 曾把闸门放在
+                        # rollout **之后**判一次 → 4 步全用在没人告诉它清单缺口的
+                        # 事上，追问要等下一轮重跑才注入。现在闸门进 step()：
+                        # 内层 critic 每步判「真取到数 + 口径对」之后，闸门核
+                        # 「这条维度清单答到了没有」，questions（≤3 条）当步并进
+                        # critique 槽；双过 = 本步成功（done 提前），任一方不过
+                        # 就带着合并判词进下一步；4 步封顶仍不双过 → 跳过。
+                        # 闸门自己看**本 rollout 已问 + 跨轮 _iters.asked_q**
+                        # （同构 priorIterations，spec-examiner.ts:224-235），
+                        # 不重复问同一句。
                         # ⚠️ 第二个返回值是**这一轮跑通的代码**（原版的
                         # `program_code`）。以前写成 `obs1, _ =`，代码直接丢
                         # 掉 → 知识型场景永远学不到技能（2026-10-20 定位）。
@@ -1059,6 +1074,43 @@ async def _start_learning_impl(
                         # 写 SQL；本机题走 local_agent 写代码跑本机原语 ——
                         # **两种后端都逐维度 solv，每维度闭合写一条技能**
                         # （原版对每任务都拆，不区分知识/数据）。
+                        # ---- 步级闸门回调（候选A）：内层 critic 每步判过之后
+                        # 由 step() 调用（见 action.py 的 gate_check 契约）。
+                        # 闸门读的三样都从 agent 上取（实时，不是快照）：
+                        # ① 本 rollout 实取的观察（材料账，失败项已由 ok 过滤）
+                        # ② 交上来的答案（取到的数据 / 内层判官结论句）
+                        # ③ 已问清单：本 rollout 已问 + 跨轮 _iters.asked_q
+                        #    （同构 priorIterations）—— 不重复问同一句。
+                        # 异常/不可用 → origin=failed 且 passed=True（不阻塞，
+                        # 退化成内层 critic 单独判；它自带 env_obs 口径判据）。
+                        # env_obs 块一次 attempt 算一次（库只读，rollout 内
+                        # 不会变；db_observation 无缓存，每步打库是浪费）。
+                        _env1 = _env_obs_block(db_path)
+
+                        def _gate_stepwise(ag) -> dict[str, Any]:
+                            _ev = [o for o in (getattr(ag, "observations", None)
+                                               or [])
+                                   if isinstance(o, dict) and o.get("ok")]
+                            _ans = _answer_text(_ev, ok_only=True) \
+                                or str(getattr(ag, "critic_reasoning", "") or "")
+                            _asked = [str(q).strip() for q in
+                                      (getattr(ag, "_gate_asked", None) or [])
+                                      if str(q).strip()]
+                            for _q in ((_iters.get(_did) or {}).get("asked_q")
+                                       or []):
+                                if str(_q).strip() and str(_q).strip() not in _asked:
+                                    _asked.append(str(_q).strip())
+                            try:
+                                import maieutic_gate as _mg
+                                return _mg.check(
+                                    _q1, _ans, [_d], evidence=_ev,
+                                    env_obs=_env1,
+                                    prior_questions=_asked)
+                            except Exception as _ge:
+                                return {"passed": True, "questions": [],
+                                        "origin": "failed",
+                                        "reason": f"{type(_ge).__name__}: {_ge}"}
+
                         if is_local:
                             obs1, code1 = await local_agent.solve(
                                 _q1, local_dir, llm=llm, scene_id=scene,
@@ -1070,7 +1122,8 @@ async def _start_learning_impl(
                             obs1, code1 = await agent.solve(
                                 _q1, skills=skills, grabs=grabs,
                                 focus_tables=focus,
-                                hints=_hint_ctx + [str(crit1 or "")])
+                                hints=_hint_ctx + [str(crit1 or "")],
+                                gate_check=_gate_stepwise)
                             # 数据题路径：agent.solve 不收 evidence，它实取的 SQL
                             # 结果不会进学习循环的 _ev1 材料账；但闸门
                             # （check_task_success）靠 evidence 判「有没有取到
@@ -1121,42 +1174,64 @@ async def _start_learning_impl(
                             # critic/闸门：没有材料 = 没取到内容，直接不闭合
                             "evidence": _ev1,
                             "status": "learned"}
-                        try:
-                            import task_critic as _tc1
-                            # dimensions=[一个维度] → 走 maieutic_gate 闭合判定。
-                            # env_obs 必须一起给：闸门只核清单核不出口径幻觉，
-                            # 2026-10-26 实测 base_salary×overtime_hours 当加班费
-                            # 就是穿过只核清单的闸门入库的（164000 假数）——
-                            # 列×列合成新口径 = 假设费率，判据里点名它。
-                            ok1, crit1 = _tc1.check_task_success(
-                                _q1, str(crit1 or ""), r1, dimensions=[_d],
-                                env_obs=_env_obs_block(db_path))
-                        except Exception as e1:
-                            ok1, crit1 = False, f"critic 异常：{type(e1).__name__}: {e1}"
-                        # 内层判定（真伪）也是闭合条件 —— 2026-10-26 回归项目
-                        # 自己的「唯一判定」原则（内层 critic_check 带环境实查，
-                        # 是原版 rollout critic 的同构；闸门只管覆盖）。实测：
-                        # 闸门（flash 与 glm-4-plus 都试过）问「维度有没有被
-                        # 答到」，毒答案确实答出了一个数 → 放行；内层 critic
-                        # 两次实测 4/4 拒绝 base_salary×overtime_hours 费率
-                        # 幻觉。闸门过 + 内层过才闭合；内层没过就把它的判词
-                        # 并进 critique 重试（可操作的反馈，不是空话）。
-                        # local_agent 路径没有内层 critic，维持闸门口径。
+                        # ---- 闭合判定：步级双判定的结果读取（候选A）----
+                        # 数据路径：内层 critic（真伪）× 闸门（清单覆盖）已在
+                        # rollout 内**每步**判完（action.py step() 的 gate_check
+                        # 契约）：agent.last_success 已含闸门（双过才 True），
+                        # agent.last_gate_passed = None 表示闸门没跑/不可用
+                        # （不阻塞，退化成内层单独判）。轮级 check_task_success
+                        # 对数据路径**退役**——它的活儿步级已经干了，再跑一遍
+                        # 是双倍 LLM 调用 + 轮级/步级两个判官口径漂移的风险。
+                        # local 路径没有内层 critic，轮级闸门仍是唯一判官，
+                        # 维持原口径（is_local 分支）。
                         _inner_ok = True
-                        if not is_local:
+                        if is_local:
+                            try:
+                                import task_critic as _tc1
+                                # dimensions=[一个维度] → 走 maieutic_gate 闭合
+                                # 判定。env_obs 必须一起给：闸门只核清单核不出
+                                # 口径幻觉，2026-10-26 实测 base_salary ×
+                                # overtime_hours 当加班费穿过只核清单的闸门入库
+                                # （164000 假数）——列×列合成新口径 = 假设费率。
+                                ok1, crit1 = _tc1.check_task_success(
+                                    _q1, str(crit1 or ""), r1, dimensions=[_d],
+                                    env_obs=_env_obs_block(db_path),
+                                    prior_questions=list(
+                                        (_iters.get(_did) or {}).get("asked_q")
+                                        or []))
+                            except Exception as e1:
+                                ok1, crit1 = False, f"critic 异常：{type(e1).__name__}: {e1}"
+                        else:
                             _inner_ok = bool(getattr(agent, "last_success", False))
-                            if not _inner_ok:
+                            _gp = getattr(agent, "last_gate_passed", None)
+                            ok1 = _inner_ok and (_gp is not False)
+                            # 判词 = 闸门追问 + 内层判词（可操作的反馈；
+                            # 2026-10-26 实证：内层两次 4/4 拒绝
+                            # base_salary×overtime_hours 费率幻觉，闸门放行——
+                            # 两份判词都要留，人和下一轮都需要）
+                            _icrit = ""
+                            try:
+                                _icrit = str(getattr(
+                                    getattr(agent, "critic", None),
+                                    "last_critique", "") or "")
+                            except Exception:
                                 _icrit = ""
-                                try:
-                                    _icrit = str(getattr(
-                                        getattr(agent, "critic", None),
-                                        "last_critique", "") or "")
-                                except Exception:
-                                    _icrit = ""
-                                if _icrit:
-                                    crit1 = (f"{crit1}；内层判官未过：{_icrit}"
-                                             if crit1
-                                             else f"内层判官未过：{_icrit}")
+                            _gcrit = str(getattr(
+                                agent, "last_gate_critique", "") or "")
+                            crit1 = "；".join(x for x in (_gcrit, _icrit)
+                                             if x)[:400]
+                            # 闸门留痕（取代轮级 check_task_success 写的
+                            # r1["critic_gate"]）—— 面板/日志要能回看
+                            # 「清单核到哪几条、追问了什么」
+                            _gr = getattr(agent, "last_gate_result", None) or {}
+                            r1["critic_gate"] = {
+                                "addressed": list(_gr.get("addressed") or []),
+                                "open": list(_gr.get("open") or []),
+                                "questions": list(_gr.get("questions") or []),
+                                "emergent": list(_gr.get("emergent") or []),
+                                "origin": str(_gr.get("origin") or ""),
+                                "gate_passed": _gp,
+                            }
                         # （闭合判定在下方：一次 attempt 后的单次判定）
                         # 超时 = 外部工具没回来（慢/被限流），**不是代码写错
                         # 了** —— 原地重试毫无意义（原线程还在等，新线程又
@@ -1235,6 +1310,14 @@ async def _start_learning_impl(
                         _iters[_did] = {
                             "rounds": 1,
                             "asked": str(crit1)[:300],
+                            # asked_q：本次闭合问过的**干净追问清单**（步级
+                            # 闸门的 questions）—— 下一轮 gate 回调的
+                            # prior_questions 从这取（同构 priorIterations，
+                            # 防重复问）。asked 是合并判词（人看的），
+                            # asked_q 是问句列表（机器复用的），两份都要。
+                            "asked_q": [str(q)[:200] for q in
+                                        (getattr(agent, "_gate_asked", None)
+                                         or [])][:6] if not is_local else [],
                             "gap": ("" if (ok1 and _inner_ok) else str(_q1)[:300]),
                             "passed": bool(ok1 and _inner_ok),
                             "tools": list(tools_map.get(_did) or []),
