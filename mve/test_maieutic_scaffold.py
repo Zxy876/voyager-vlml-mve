@@ -654,6 +654,89 @@ def test_scaffold_rebuilds_when_stuck_rounds_grow() -> None:
     print("PASS  test_scaffold_rebuilds_when_stuck_rounds_grow")
 
 
+def test_rescaffold_keeps_progress_account() -> None:
+    """重拆骨架**不清进度账**（原版同构：换个题，completed_tasks 照旧累积）。
+
+    2026-10-26 生产实测：指纹变化触发重拆后，新骨架整份覆盖旧文件 →
+    progress（learned/codes/iterations）被清空 → 上一轮刚闭合的 base_salary_sum
+    又被当成未闭合重跑一遍。原版 voyager.py:133-135 的 `progress =
+    len(completed_tasks)` 不会因为 curriculum 换了个题归零 —— 这里同理：
+    换拆法不动已闭合的账，id 对不上的自然不计入新骨架，不丢也不虚报。
+    """
+    import maieutic_scaffold as M
+
+    tmp = Path(tempfile.mkdtemp())
+    old = M.CKPT
+    M.CKPT = tmp
+    try:
+        q = "一句会被重拆的话"
+        # ① 第一次拆：两条维度
+        M.scaffold(q, "B", llm=lambda m: json.dumps(
+            {"dimensions": [{"id": "d1", "question": "维度一"},
+                            {"id": "d2", "question": "维度二"}]},
+            ensure_ascii=False))
+        # ② 学成一条 + 记下追问历史与跑通的代码
+        M.save_progress("B", q, ["d1"])
+        M.save_progress_codes("B", q, [{"id": "d1", "question": "维度一",
+                                        "code": "SELECT 1", "answer": "1"}])
+        M.save_progress_iterations("B", q, {"d2": {"rounds": 1, "asked": "差啥"}})
+        # ③ 把 d2 试到卡住的门槛 → 指纹变化 → 下一次 scaffold 必须重拆
+        M.save_progress_iterations("B", q, {
+            "d2": {"rounds": M.RESCAFFOLD_AFTER_ROUNDS - 1, "asked": "还是差啥"}})
+        r = M.scaffold(q, "B", llm=lambda m: json.dumps(
+            {"dimensions": [{"id": "d1", "question": "维度一"},
+                            {"id": "d9", "question": "换个拆法"}]},
+            ensure_ascii=False))
+        assert r["origin"] == "llm", f"指纹变了必须重拆：{r}"
+        assert [d["id"] for d in r["dimensions"]] == ["d1", "d9"], r
+        # ④ 账还在：已闭合的 d1 没被洗掉，codes / iterations 也都还在
+        assert M.load_progress("B", q) == {"d1"}, M.load_progress("B", q)
+        assert "d1" in M.load_progress_codes("B", q), M.load_progress_codes("B", q)
+        _it = M.load_progress_iterations("B", q)
+        assert _it.get("d2", {}).get("rounds") == M.RESCAFFOLD_AFTER_ROUNDS, _it
+    finally:
+        M.CKPT = old
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("PASS  test_rescaffold_keeps_progress_account")
+
+
+def test_save_progress_keeps_codes_and_iterations() -> None:
+    """save_progress 只改 learned，不洗掉同一 progress 里的 codes / iterations。
+
+    2026-10-26 修：以前写成 `data["progress"] = {"learned": ..., "updated": ...}`
+    整包替换 —— 闭合一条维度就把其余维度的轮次账与「上次跑通的代码」全洗掉，
+    断点续学（复用上次跑通的代码）和里程碑「全闭合解锁」因此名存实亡。
+    生产实证：闭合 allowance_sum 之后，iterations 里只剩它一条，前面三条全没了。
+    """
+    import maieutic_scaffold as M
+
+    tmp = Path(tempfile.mkdtemp())
+    old = M.CKPT
+    M.CKPT = tmp
+    try:
+        q = "一句会被写进度的话"
+        p = M._cache_path("B", q)
+        M._atomic_write(p, {"question": q, "dimensions": [
+            {"id": "d1", "question": "维度一"}, {"id": "d2", "question": "维度二"}]})
+        M.save_progress_codes("B", q, [{"id": "d1", "question": "维度一",
+                                        "code": "SELECT 1", "answer": "1"}])
+        M.save_progress_iterations("B", q, {"d2": {"rounds": 1, "asked": "差啥"}})
+        # 闭合 d1 —— 只许动 learned
+        M.save_progress("B", q, ["d1"])
+        assert M.load_progress("B", q) == {"d1"}, M.load_progress("B", q)
+        assert "d1" in M.load_progress_codes("B", q), \
+            f"闭合维度不能洗掉 codes：{M.load_progress_codes('B', q)}"
+        assert M.load_progress_iterations("B", q).get("d2", {}).get("rounds") == 1, \
+            f"闭合维度不能洗掉 iterations：{M.load_progress_iterations('B', q)}"
+        # 并集累加仍然生效：再闭合 d2，两条都在
+        M.save_progress("B", q, ["d2"])
+        assert M.load_progress("B", q) == {"d1", "d2"}, M.load_progress("B", q)
+    finally:
+        M.CKPT = old
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("PASS  test_save_progress_keeps_codes_and_iterations")
+
+
 def test_scaffold_llm_empty_is_failed_no_keyword_fallback() -> None:
     """LLM 拆不出维度 → **如实 failed**，不再用关键词兜底编维度（2026-10-26 拆掉）。
 
@@ -787,6 +870,8 @@ def main() -> None:
     test_progress_iterations_accumulate()
     test_stuck_dims_signal()
     test_scaffold_rebuilds_when_stuck_rounds_grow()
+    test_rescaffold_keeps_progress_account()
+    test_save_progress_keeps_codes_and_iterations()
     test_scaffold_llm_empty_is_failed_no_keyword_fallback()
     test_milestone_achieved_persist_and_readback()
     test_milestone_lit_retry_criterion()

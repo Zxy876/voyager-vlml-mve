@@ -36,7 +36,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -132,6 +134,47 @@ def _cache_path(scene_id: str, question: str, db_path: str = "") -> Path:
             db_path = ""
     dh = hashlib.md5(str(db_path or "").encode("utf-8")).hexdigest()[:8]
     return CKPT / str(scene_id or "A") / f"{h}_{dh}.json"
+
+
+def _atomic_write(path: Path, data: dict) -> None:
+    """原子写（tmp + os.replace）。
+
+    为什么必须原子：骨架缓存文件的**读者**（scaffold 的缓存命中判断）和
+    **写者**（scaffold 重拆 / save_progress* 三个）是不同进程（面板主进程 +
+    scene_learn 子进程）。非原子写时读者可能读到半截 JSON → `json.loads`
+    抛错 → 被 `except: pass` 吞掉 → 判定「缓存不可用」→ 重新调 LLM 拆骨架
+    → **顺带把 progress（learned/codes/iterations）整份清空** —— 已闭合的
+    维度会被重新跑一遍（2026-10-26 生产实测：base_salary_sum 明明已闭合，
+    下一轮又当作未闭合重跑）。与 scenes.json 同一条铁律：登记表必须原子写。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1),
+                   encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _read_cache(path: Path) -> tuple[dict, str]:
+    """读骨架缓存，返回 (数据, 状态)：ok / missing / broken。
+
+    ⚠️ 以前这里 `except Exception: pass` 把「文件不存在」和「文件坏了」
+    一视同仁地吞掉，坏文件因此**无声无息**地触发重拆（连坐清空进度账）。
+    现在分开：坏了就留证（改名存档），让下次排查有据，不靠猜。
+    """
+    if not path.exists():
+        return {}, "missing"
+    try:
+        return json.loads(path.read_text(encoding="utf-8")), "ok"
+    except Exception as e:                      # 半截文件 / 编码坏了
+        try:
+            _bak = path.with_name(
+                f"{path.stem}.broken{int(time.time())}{path.suffix}")
+            path.replace(_bak)
+        except Exception:
+            pass
+        print(f"[maieutic] 骨架缓存读坏了（{type(e).__name__}: {e}）"
+              f"→ 已留证 {path.name}.broken*，本次重新拆")
+        return {}, "broken"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -348,22 +391,21 @@ def scaffold(question: str, scene_id: str = "A", *, llm: Callable | None = None,
         _stuck, retries_fp = _retries_block(str(scene_id or "A"), q, db_path)
     except Exception:
         _stuck, retries_fp = "", ""
-    if use_cache and path.exists():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            dims = _clean_dims(data)
-            # ⚠️ 失败账指纹比对（2026-10-26 补）：缓存里那份骨架是在当时的
-            # 失败账下拆的。只要某条卡住的维度又多试了一轮，指纹就变 —— 这份
-            # 旧骨架对现在的处境已经过期，必须带着新的失败账重拆一次（原版
-            # 「出题器看到 failed_tasks 换个题」的同构）。指纹没变就照旧命中。
-            if dims and str(data.get("retries_fp") or "") == retries_fp:
-                return {"dimensions": dims,
-                        "expected_drifts": list(data.get("expected_drifts") or []),
-                        "milestone": _clean_milestone(data, q),
-                        "material_note": str(data.get("material_note") or ""),
-                        "origin": "cache", "reason": ""}
-        except Exception:
-            pass
+    old_data: dict[str, Any] = {}
+    if use_cache:
+        cached, _state = _read_cache(path)
+        dims = _clean_dims(cached)
+        # ⚠️ 失败账指纹比对（2026-10-26 补）：缓存里那份骨架是在当时的
+        # 失败账下拆的。只要某条卡住的维度又多试了一轮，指纹就变 —— 这份
+        # 旧骨架对现在的处境已经过期，必须带着新的失败账重拆一次（原版
+        # 「出题器看到 failed_tasks 换个题」的同构）。指纹没变就照旧命中。
+        if dims and str(cached.get("retries_fp") or "") == retries_fp:
+            return {"dimensions": dims,
+                    "expected_drifts": list(cached.get("expected_drifts") or []),
+                    "milestone": _clean_milestone(cached, q),
+                    "material_note": str(cached.get("material_note") or ""),
+                    "origin": "cache", "reason": ""}
+        old_data = cached            # 重拆时要把旧的进度账带过去，见下方写盘
     system_content = SCAFFOLD_SYSTEM + (SCAFFOLD_SYSTEM_DB if db_path else "")
     messages = [{"role": "system", "content": system_content},
                 {"role": "user", "content": render_material(q, scene_id, extras=extras)
@@ -392,13 +434,19 @@ def scaffold(question: str, scene_id: str = "A", *, llm: Callable | None = None,
                material_note=str(data.get("material_note") or ""),
                origin="llm", reason="")
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        # ⚠️ 重拆**不清进度账**（原版同构：curriculum 换个题，completed_tasks
+        # 照旧累积，voyager.py:133-135 的 progress 不会因为换了题归零）。
+        # 2026-10-26 生产实测：指纹变化触发重拆后，新骨架写盘整份覆盖了旧文件，
+        # progress（learned/codes/iterations）被清空 → 上一轮刚闭合的
+        # base_salary_sum 又被当成未闭合重跑一遍。维度 id 相同的照旧算已闭合
+        # （技能本来就已经入库了），id 对不上的自然不计入新骨架，不丢也不虚报。
+        _carry = old_data.get("progress")
         # retries_fp 随骨架一起落盘：下次进来比对它，判断这份骨架是不是还
         # 对得上现在的失败账（见上面缓存比对处的注释）。
-        path.write_text(json.dumps({**data, "question": q,
-                                    "retries_fp": retries_fp},
-                                   ensure_ascii=False, indent=1),
-                        encoding="utf-8")
+        _atomic_write(path, {**data, "question": q,
+                             "retries_fp": retries_fp,
+                             **({"progress": _carry} if isinstance(_carry, dict)
+                                else {})})
     except Exception:
         pass
     return out
@@ -457,17 +505,12 @@ def mark_milestone_achieved(scene_id: str, question: str, *,
     让"点亮变实"在缓存里可查、图谱/面板可渲染，而不是每次惰性重算。
     """
     path = _cache_path(scene_id, question)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    except Exception:
-        data = {}
+    data, _state = _read_cache(path)
     data["milestone_achieved"] = True
-    data["milestone_lit_at"] = __import__("time").time()
+    data["milestone_lit_at"] = time.time()
     data["milestone_verified_real"] = bool(fetched)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=1),
-                        encoding="utf-8")
+        _atomic_write(path, data)
     except Exception:
         pass
 def drift_notes(scaffold_result: dict[str, Any], limit: int = 4) -> list[str]:
@@ -493,12 +536,9 @@ def load_progress(scene_id: str, question: str) -> set[str]:
     进度就存在骨架缓存同一个文件里（同一把钥匙），不另开存储。
     """
     path = _cache_path(scene_id, question)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        pr = data.get("progress") or {}
-        return {str(x) for x in (pr.get("learned") or [])}
-    except Exception:
-        return set()
+    data, _state = _read_cache(path)
+    pr = data.get("progress") or {}
+    return {str(x) for x in (pr.get("learned") or [])}
 
 
 def save_progress(scene_id: str, question: str, learned_ids: list[str]) -> None:
@@ -508,23 +548,29 @@ def save_progress(scene_id: str, question: str, learned_ids: list[str]) -> None:
     只把「这一条」传进来，若直接覆盖会把上一条已闭合的维度洗掉（实测：preset
     路径下缓存进度恒只剩最后闭合的那一条，里程碑永远翻不到 achieved）。与
     priorIterations / codes 的合并口径一致。
+
+    ⚠️ 只改 `learned` 一个字段，**不要整包替换 progress**（2026-10-26 修）：
+    以前写成 `data["progress"] = {"learned": ..., "updated": ...}`，等于把同一
+    个 progress 里的 `codes`（断点续学要复用的上次跑通代码）和 `iterations`
+    （跨轮追问历史 + 轮数）一起洗掉。生产实测后果：闭合一条维度后，其余维度
+    的轮次账与已跑通代码全没了 → 断点续学与里程碑「全闭合解锁」再次名存实亡。
     """
     path = _cache_path(scene_id, question)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    data, _state = _read_cache(path)
+    if _state == "missing":
         return
-    _prev = set(str(x) for x in
-                (data.get("progress") or {}).get("learned") or [])
+    pr = data.get("progress")
+    if not isinstance(pr, dict):
+        pr = {}
+    _prev = set(str(x) for x in (pr.get("learned") or []))
     _new = set(str(x) for x in learned_ids)
     if _new <= _prev:        # 没有新增，不必重写
         return
-    data["progress"] = {"learned": sorted(_prev | _new),
-                        "updated": __import__("time").time()}
+    pr["learned"] = sorted(_prev | _new)
+    pr["updated"] = time.time()
+    data["progress"] = pr
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=1),
-                        encoding="utf-8")
+        _atomic_write(path, data)
     except Exception:
         pass
 
@@ -538,19 +584,16 @@ def load_progress_codes(scene_id: str, question: str) -> dict[str, dict[str, str
     把上次跑通的代码留下来，续学时才复用得回那次 rollout 的成果。
     """
     path = _cache_path(scene_id, question)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        pr = data.get("progress") or {}
-        out: dict[str, dict[str, str]] = {}
-        for c in (pr.get("codes") or []):
-            if isinstance(c, dict) and str(c.get("id") or ""):
-                out[str(c["id"])] = {"question": str(c.get("question") or ""),
-                                     "code": str(c.get("code") or ""),
-                                     "answer": str(c.get("answer") or ""),
-                                     "tools": list(c.get("tools") or [])}
-        return out
-    except Exception:
-        return {}
+    data, _state = _read_cache(path)
+    pr = data.get("progress") or {}
+    out: dict[str, dict[str, str]] = {}
+    for c in (pr.get("codes") or []):
+        if isinstance(c, dict) and str(c.get("id") or ""):
+            out[str(c["id"])] = {"question": str(c.get("question") or ""),
+                                 "code": str(c.get("code") or ""),
+                                 "answer": str(c.get("answer") or ""),
+                                 "tools": list(c.get("tools") or [])}
+    return out
 
 
 def save_progress_codes(scene_id: str, question: str,
@@ -559,11 +602,12 @@ def save_progress_codes(scene_id: str, question: str,
     if not codes:
         return
     path = _cache_path(scene_id, question)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    data, _state = _read_cache(path)
+    if _state == "missing":
         return
-    pr = data.get("progress") or {}
+    pr = data.get("progress")
+    if not isinstance(pr, dict):
+        pr = {}
     merged: dict[str, dict[str, str]] = {}
     for c in (pr.get("codes") or []):
         if isinstance(c, dict) and str(c.get("id") or ""):
@@ -585,9 +629,7 @@ def save_progress_codes(scene_id: str, question: str,
                    for k, v in merged.items()]
     data["progress"] = pr
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=1),
-                        encoding="utf-8")
+        _atomic_write(path, data)
     except Exception:
         pass
 
@@ -609,29 +651,26 @@ def save_progress_codes(scene_id: str, question: str,
 def load_progress_iterations(scene_id: str, question: str) -> dict[str, dict]:
     """读追问历史：维度 id → 上次那一轮的记录。读不到返回 {}（首次学习）。"""
     path = _cache_path(scene_id, question)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        pr = data.get("progress") or {}
-        out: dict[str, dict] = {}
-        for it in (pr.get("iterations") or []):
-            if isinstance(it, dict) and str(it.get("id") or ""):
-                out[str(it["id"])] = {
-                    "rounds": int(it.get("rounds") or 0),
-                    "asked": str(it.get("asked") or ""),
-                    "gap": str(it.get("gap") or ""),
-                    "passed": bool(it.get("passed")),
-                    "tools": [str(x) for x in (it.get("tools") or [])
-                              if str(x).strip()],
-                    # 步级闸门（候选A）：本次闭合问过的**干净追问清单**——
-                    # 闸门每步都判，跨轮的 prior_questions 从这取（同构
-                    # spec-examiner 的 priorIterations）。asked 是合并判词
-                    # （人看的），asked_q 是问句列表（机器复用），两份都要。
-                    "asked_q": [str(x)[:200] for x in (it.get("asked_q") or [])
-                                if str(x).strip()],
-                }
-        return out
-    except Exception:
-        return {}
+    data, _state = _read_cache(path)
+    pr = data.get("progress") or {}
+    out: dict[str, dict] = {}
+    for it in (pr.get("iterations") or []):
+        if isinstance(it, dict) and str(it.get("id") or ""):
+            out[str(it["id"])] = {
+                "rounds": int(it.get("rounds") or 0),
+                "asked": str(it.get("asked") or ""),
+                "gap": str(it.get("gap") or ""),
+                "passed": bool(it.get("passed")),
+                "tools": [str(x) for x in (it.get("tools") or [])
+                          if str(x).strip()],
+                # 步级闸门（候选A）：本次闭合问过的**干净追问清单**——
+                # 闸门每步都判，跨轮的 prior_questions 从这取（同构
+                # spec-examiner 的 priorIterations）。asked 是合并判词
+                # （人看的），asked_q 是问句列表（机器复用），两份都要。
+                "asked_q": [str(x)[:200] for x in (it.get("asked_q") or [])
+                            if str(x).strip()],
+            }
+    return out
 
 
 def save_progress_iterations(scene_id: str, question: str,
@@ -640,11 +679,12 @@ def save_progress_iterations(scene_id: str, question: str,
     if not iterations:
         return
     path = _cache_path(scene_id, question)
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    data, _state = _read_cache(path)
+    if _state == "missing":
         return
-    pr = data.get("progress") or {}
+    pr = data.get("progress")
+    if not isinstance(pr, dict):
+        pr = {}
     merged: dict[str, dict] = {}
     for it in (pr.get("iterations") or []):
         if isinstance(it, dict) and str(it.get("id") or ""):
@@ -670,9 +710,7 @@ def save_progress_iterations(scene_id: str, question: str,
     pr["iterations"] = list(merged.values())
     data["progress"] = pr
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, ensure_ascii=False, indent=1),
-                        encoding="utf-8")
+        _atomic_write(path, data)
     except Exception:
         pass
 
@@ -842,9 +880,7 @@ def set_current_target(scene_id: str, question: str) -> None:
         return
     p = _current_target_path(str(scene_id or "A"))
     try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps({"question": q, "set_at": __import__("time").time()},
-                                ensure_ascii=False), encoding="utf-8")
+        _atomic_write(p, {"question": q, "set_at": time.time()})
     except Exception:
         pass
 
