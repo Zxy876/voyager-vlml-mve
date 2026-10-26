@@ -237,6 +237,21 @@ async def _main() -> int:
                           or "") == SQL for s in stored),
               json.dumps([str((s.get("blueprint") or {}).get("rollout_sql"))
                           for s in stored], ensure_ascii=False)[:120])
+    # 维度路径的结晶（2026-10-26 补）：闭合维度写的原子技能也要变成可
+    # invoke 条目 —— 以前 ⑦ 只结晶整题路径（维度路径 sql="" 永远匹配
+    # 不上），学成的维度技能停在技能库文本层，从没成为注册表条目。
+    check("闭合维度的技能结晶成可 invoke 条目（2 条）",
+          bool(r3["crystallized"].get("ok"))
+          and len(r3.get("crystallized_all") or []) == 2
+          and all(c.get("ok") for c in (r3.get("crystallized_all") or [])),
+          json.dumps(r3.get("crystallized"), ensure_ascii=False)[:120])
+    entries = [n for n in actions.names(SCENE) if n.startswith("learned_")]
+    check("两条维度技能都注册进场景", len(entries) == 2, str(entries))
+    if entries:
+        res = await actions.invoke(SCENE, entries[0], mcp=_FakeMCP())
+        check("invoke 重放判对后固化的原文（不是带槽位的模板）",
+              isinstance(res, dict) and res.get("_sql") == SQL,
+              str(res)[:80])
 
     print()
     if FAIL:
