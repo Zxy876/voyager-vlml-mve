@@ -920,6 +920,12 @@ async def _start_learning_impl(
                         _iters = _ms.load_progress_iterations(scene, question)
                     except Exception:
                         _iters = {}
+                    # _iters 里混着**上一轮加载来的旧账**和本轮要写的新账。落盘时
+                    # 只能交「本轮真正尝试过的那几条」：save_progress_iterations
+                    # 是老值 + 本次（同 priorIterations 的按轮累积），把没尝试过的
+                    # 旧账整包传回去会被**再加一遍**（预设维度路径每轮只跑一条，
+                    # 其余 4 条的轮次会翻倍 → _stuck_dims 据此误判卡住）。
+                    _iters_round: dict[str, dict] = {}
                     _timed_out_dims = 0
                     if milestone_retry:
                         # ---- 里程碑重试轮：原版 rollout 同构（用户 2026-10-26：
@@ -1257,6 +1263,19 @@ async def _start_learning_impl(
                             _timed_out_dims += 1
                             ok1 = False
                             _inner_ok = False
+                        # ---- (success, critique) 不可分契约（2026-10-26 补）----
+                        # 原版 check_task_success **一次调用同时产出** success 与
+                        # critique（voyager.py:232-238 返回二元组），结构上不存在
+                        # 「判过但没判词」这个状态。MVE 的判词是三处拼的（闸门
+                        # 追问 + 内层 critic + 执行报错），没有一处兜底 —— 实测出现
+                        # 过 4 步全「取到 1 行」、critique 为空就判未闭合，下一轮
+                        # 拿着空判词续学 = 原地打转（日志里形如「｜｜」）。
+                        # 补齐契约而不是补丁：**没判词 = 这次判定没发生**，如实
+                        # 记一行，不拿它当下一轮的追问输入。
+                        _crit_missing = not str(crit1 or "").strip()
+                        if _crit_missing:
+                            crit1 = ("（本轮没有产生判词：闸门与内层 critic 都未给出"
+                                     "理由 —— 如实记录，判未闭合，不带入下一轮追问）")
                         if ok1 and _inner_ok:
                             learned_dims.append(_d)
                             a1 = str(r1.get("answer") or "").strip()
@@ -1318,6 +1337,11 @@ async def _start_learning_impl(
                                   flush=True)
                         # 记一条追问历史（同 maieutic 的 appendPhase1Iteration）：
                         # **成没闭合都要记** —— 下次才知道这题问过、卡在哪一句。
+                        #
+                        # ⚠️ rounds 这里是**本轮的尝试次数**（恒为 1：一次 rollout
+                        # 封顶），累加发生在 save_progress_iterations（老值 + 本次，
+                        # 同 maieutic priorIterations 的按轮累积）。别在这里再加一
+                        # 遍 —— 实测会双重计数（2026-10-26 修）。
                         _iters[_did] = {
                             "rounds": 1,
                             "asked": str(crit1)[:300],
@@ -1326,19 +1350,27 @@ async def _start_learning_impl(
                             # prior_questions 从这取（同构 priorIterations，
                             # 防重复问）。asked 是合并判词（人看的），
                             # asked_q 是问句列表（机器复用的），两份都要。
-                            "asked_q": [str(q)[:200] for q in
-                                        (getattr(agent, "_gate_asked", None)
-                                         or [])][:6] if not is_local else [],
+                            # ⚠️ 判词缺失时**不写 asked_q**：那是下一轮闸门回调的
+                            # prior_questions（机器复用的追问清单），拿一条占位
+                            # 话进去等于让下一轮对着空气问（见上面契约注释）。
+                            "asked_q": ([] if _crit_missing else
+                                        [str(q)[:200] for q in
+                                         (getattr(agent, "_gate_asked", None)
+                                          or [])][:6]) if not is_local else [],
                             "gap": ("" if (ok1 and _inner_ok) else str(_q1)[:300]),
                             "passed": bool(ok1 and _inner_ok),
                             "tools": list(tools_map.get(_did) or []),
                         }
+                        # 只把**本轮尝试过的**交出去落盘（老值 + 本次）；未尝试的
+                        # 旧账留在文件里不动，见 _iters_round 处的注释。
+                        _iters_round[_did] = _iters[_did]
                     try:
                         _ms.save_progress(scene, question,
                                           [str(d.get("id") or "")
                                            for d in learned_dims])
                         _ms.save_progress_codes(scene, question, dim_codes)
-                        _ms.save_progress_iterations(scene, question, _iters)
+                        _ms.save_progress_iterations(scene, question,
+                                                     _iters_round)
                     except Exception:
                         pass
                     out["dimension_results"] = {

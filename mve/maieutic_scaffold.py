@@ -134,6 +134,72 @@ def _cache_path(scene_id: str, question: str, db_path: str = "") -> Path:
     return CKPT / str(scene_id or "A") / f"{h}_{dh}.json"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 原版同构：出题器要看得见「失败账」（2026-10-26 补）
+#
+#   原版 curriculum.py:129-130 把 completed/failed 两本账渲染进**出题器的观察**，
+#   :340-344 失败即 "Skipping to next task" —— 出题器**换个题**再试，不在同一条
+#   上无限耗。MVE 的断点续学比原版更保守（允许带判词重试同一条维度），但缺了原版
+#   「这条试过几次了」这个信号：`_iters` 每轮整体覆盖、rounds 恒为 1（2026-10-26
+#   实测：一个自造口径的维度连挂 19 轮，系统完全不知道它已经失败过）。
+#
+# 这里补的是**信号本身**，不是加任何关键词规则：轮数是执行结果、判词是判官原话，
+# 两者拼成一段「这些维度试过多轮没闭合」交回出题器，让它自己换个能落地的拆法 ——
+# 这是原版「出题器看到 failed_tasks 就换个题」的同构物，不针对任何场景/词面。
+# ─────────────────────────────────────────────────────────────────────────────
+RESCAFFOLD_AFTER_ROUNDS = 3
+
+
+def _stuck_dims(scene_id: str, question: str,
+                db_path: str = "") -> list[tuple[str, int, str]]:
+    """试过 ≥ RESCAFFOLD_AFTER_ROUNDS 轮**仍未闭合**的维度（原版 failed_tasks 同构）。
+
+    只读信号，不做任何词面判断：闭合与否看 progress 账，轮数看 _iters 账，
+    判词取判官最后一次的原话。返回 [(维度 id, 已试轮数, 判词)]。
+    """
+    try:
+        learned = load_progress(str(scene_id or "A"), str(question or ""))
+    except Exception:
+        learned = set()
+    try:
+        iters = load_progress_iterations(str(scene_id or "A"), str(question or ""))
+    except Exception:
+        iters = {}
+    out: list[tuple[str, int, str]] = []
+    for did, rec in (iters or {}).items():
+        if not isinstance(rec, dict):
+            continue
+        if str(did) in learned:                  # 已闭合的不算卡住
+            continue
+        try:
+            n = int(rec.get("rounds") or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n >= RESCAFFOLD_AFTER_ROUNDS:
+            out.append((str(did), n, str(rec.get("asked") or "").strip()[:120]))
+    out.sort(key=lambda x: (-x[1], x[0]))
+    return out
+
+
+def _retries_block(scene_id: str, question: str,
+                   db_path: str = "") -> tuple[str, str]:
+    """（给出题器看的一段话, 指纹）。
+
+    指纹 = 各卡住维度的「id:轮数」。轮数变化 → 指纹变化 → 骨架缓存视为失效
+    → 带着新的失败账重新拆一次（原版「换个题」的同构）。这样重拆有界：
+    每多试 RESCAFFOLD_AFTER_ROUNDS 轮才重拆一次，不是每轮都重拆。
+    """
+    stuck = _stuck_dims(scene_id, question, db_path)
+    if not stuck:
+        return "", ""
+    lines = ["**这些维度已经试过多轮仍未闭合**（原版 failed_tasks 的同构：请换个"
+             "能落地的拆法或换个问法，别原样再出一次）："]
+    for did, n, crit in stuck:
+        lines.append(f"- 维度 {did}：已试 {n} 轮"
+                     + (f"，判官原话：{crit}" if crit else "（判词缺失）"))
+    return "\n".join(lines), "|".join(f"{d}:{n}" for d, n, _ in stuck)
+
+
 def milestone_dimensions(scene_id: str, question: str) -> list[dict]:
     """读里程碑骨架的维度清单（只读，不调 LLM、不重新生成）。
 
@@ -224,6 +290,7 @@ def render_material(question: str, scene_id: str, *, extras: str = "") -> str:
         pass
     if extras:
         lines.append(str(extras))
+    _dp = ""
     # 数据/SQL 场景：把**真实 DB 观察面**也喂进去，让骨架只拆出有落点的维度
     # （避免编出库里不存在的业务参数）。场景没有库时 db_path 为空，这一段不触发。
     try:
@@ -237,155 +304,16 @@ def render_material(question: str, scene_id: str, *, extras: str = "") -> str:
                              "维度只能指向这里面的表/列）：\n" + _obs)
     except Exception:
         pass
-    return "\n".join(lines)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 真实库结构兜底分解（2026-10-25 加）
-# 事由：LLM 对「某部门某月应发 = base + allowance」这类**复合/聚合题**经常拆不出
-#   维度（实测 scaffold 返回 dims=0），导致里程碑无维可学、消费永远合成不出技能。
-#   天授（Tianshou）的教训：训练后必跑评估判达标——MVE 这里缺的就是"用真实库
-#   结构确定性地把复合题拆成原子维度"这一步。本兜底**只引用实查到的表/列**，绝不
-#   编库里不存在的参数（与 SCAFFOLD_SYSTEM_DB 的硬约束同一条），且通用、不硬编码
-#   任何场景。
-# ─────────────────────────────────────────────────────────────────────────────
-
-_NUMERIC_TYPES = ("INTEGER", "BIGINT", "SMALLINT", "DECIMAL", "DOUBLE",
-                  "FLOAT", "REAL", "NUMERIC")
-# 聚合意图关键词：问题里没有这些就不拆（不编维度）
-_AGG_KEYWORDS = ("总计", "总共", "合计", "总额", "总和", "应发", "一共",
-                 "发多少", "多少工钱", "多少工资", "总工资", "总收入",
-                 "总支出", "多少", "总量", "汇总")
-# 筛选列名匹配（问题里出现范畴词 → 该列可能是筛选维度）
-_FILTER_COL_HINTS = (
-    ("部门", ("dept", "department", "division", "team", "group", "科", "组", "部门")),
-    ("月", ("month", "date", "年份", "year", "时间", "period", "月")),
-    ("机构", ("agency", "org", "company", "机构", "公司", "单位")),
-    ("岗位", ("title", "position", "岗位", "职位", "职务")),
-    ("地区", ("region", "city", "area", "地区", "城市", "区域")),
-)
-# 数值列名命中薪资/金额语义时优先选
-_PAY_KEYS = ("salary", "wage", "pay", "base", "allow", "ot", "bonus",
-             "工", "薪", "津", "补", "金", "额", "收", "支")
-
-
-def _norm(q: str) -> str:
-    return re.sub(r"[\s，。？！,.?!：:；;“”\"'（）()]+", "", str(q or "")).lower()
-
-
-def _col_name_hinted(col: str, q: str) -> bool:
-    cl = str(col or "").lower()
-    for kw, names in _FILTER_COL_HINTS:
-        if kw in q and any(nm in cl for nm in names):
-            return True
-    return False
-
-
-def _schema_struct(db_path: str) -> list[dict[str, Any]]:
-    """实查库结构（结构化，供兜底分解用）。失败返回 []。"""
-    out: list[dict[str, Any]] = []
+    # 原版同构：把「试过多轮仍未闭合」的失败账也给回出题器（见 _retries_block
+    # 注释）。这是原版 curriculum.py:129-130 把 failed_tasks 渲染进出题器观察的
+    # 同构物 —— 换不换拆法由出题器（LLM）自己定，这里只如实提供信号。
     try:
-        import duckdb
-        con = duckdb.connect(str(db_path or ""), read_only=True)
-        try:
-            for t in [r[0] for r in con.execute("show tables").fetchall()]:
-                try:
-                    cols = con.execute(f'describe "{t}"').fetchall()
-                except Exception:
-                    continue
-                columns: list[dict[str, str]] = []
-                values: dict[str, list[str]] = {}
-                for c in cols:
-                    cname, ctype = str(c[0]), str(c[1]).upper()
-                    columns.append({"name": cname, "type": ctype})
-                    if ctype in ("VARCHAR", "TEXT", "STRING", "BOOLEAN"):
-                        try:
-                            vs = [r[0] for r in con.execute(
-                                f'select distinct "{cname}" from "{t}" limit 13'
-                            ).fetchall()]
-                            vs = [str(v) for v in vs if v is not None]
-                            if vs and len(vs) <= 12:
-                                values[cname] = vs
-                        except Exception:
-                            pass
-                out.append({"table": t, "columns": columns, "values": values})
-        finally:
-            con.close()
+        _rb, _ = _retries_block(str(scene_id or "A"), str(question or ""), _dp)
+        if _rb:
+            lines.append(_rb)
     except Exception:
         pass
-    return out
-
-
-def _schema_decompose(question: str, schema: list[dict[str, Any]]) -> list[dict[str, str]]:
-    """用真实库结构把复合/聚合题拆成原子维度。
-
-    返回 [] 的几种情况（都不编）：问题无聚合意图 / 库无数值列 / 抽不出可锚定的列。
-    每个维度都指向 schema 里**真实存在的表.列**，不发明参数。
-    """
-    q = str(question or "").strip()
-    if not q or not schema:
-        return []
-    if not any(k in q for k in _AGG_KEYWORDS):
-        return []
-    tables: list[dict[str, Any]] = []
-    for tbl in schema:
-        tname = str(tbl.get("table") or "")
-        cols = tbl.get("columns") or []
-        num = [c["name"] for c in cols
-               if str(c.get("type", "")).upper() in _NUMERIC_TYPES]
-        filt = [c["name"] for c in cols
-                if str(c.get("type", "")).upper()
-                in ("VARCHAR", "TEXT", "STRING", "BOOLEAN")]
-        if num or filt:
-            tables.append({"table": tname, "num": num, "filt": filt,
-                           "values": tbl.get("values") or {}})
-    if not tables:
-        return []
-    # 筛选条件：值命中优先（"技术部" 出现在某列取值里），列名范畴词命中兜底
-    filters: list[tuple[str, str, str | None]] = []
-    for t in tables:
-        for col in t["filt"]:
-            hit_val: str | None = None
-            for v in (t["values"].get(col) or []):
-                if str(v) and str(v) in q:
-                    hit_val = str(v)
-                    break
-            if hit_val is not None or _col_name_hinted(col, q):
-                filters.append((t["table"], col, hit_val))
-    filters = filters[:3]
-    # 候选表：有筛选命中的优先；都没有就全表
-    cand = [t for t in tables if any(ft == t["table"] for ft, _, _ in filters)] or tables
-    # 数值列：优先命中薪资/金额语义，其次取整表数值列，封顶 3
-    num_cols: list[tuple[str, str, bool]] = []
-    for t in cand:
-        for c in t["num"]:
-            num_cols.append((t["table"], c, any(k in c.lower() for k in _PAY_KEYS)))
-    num_cols.sort(key=lambda x: (not x[2]))
-    num_cols = num_cols[:3]
-    if not num_cols:
-        return []
-    dims: list[dict[str, str]] = []
-    seen: set[str] = set()
-    if filters:
-        cond = " 且 ".join(
-            (f"{fc}={fv}" if fv else f"{fc}=问题中指定的取值")
-            for _, fc, fv in filters)
-        dims.append({"id": "filter", "question":
-                     f"筛选 {cond} 的目标记录（指向真实列，如 {filters[0][0]}.{filters[0][1]}）",
-                     "why": "先锁定问题要的人群/范围，后面的求和才有意义"})
-    for tbl, c, _ in num_cols:
-        _id = f"take_{c}"
-        while _id in seen:
-            _id += "_"
-        seen.add(_id)
-        dims.append({"id": _id, "question":
-                     f"取 {tbl}.{c} 的值（对每条筛选出的记录）",
-                     "why": "聚合的原材料，必须能直接查到真实数值"})
-    cols_expr = "、".join(f"{tbl}.{c}" for tbl, c, _ in num_cols)
-    dims.append({"id": "aggregate", "question":
-                 f"把筛选出的记录的 {cols_expr} 求和/合计，得到问题要的总数/总额",
-                 "why": "把原子取值组合成问题最终要的那一个数"})
-    return dims
+    return "\n".join(lines)
 
 
 def scaffold(question: str, scene_id: str = "A", *, llm: Callable | None = None,
@@ -415,11 +343,20 @@ def scaffold(question: str, scene_id: str = "A", *, llm: Callable | None = None,
         except Exception:
             db_path = ""
     path = _cache_path(scene_id, q, db_path)
+    # 卡住的维度（含轮数与判词）→ 失败账指纹。指纹变化 = 该重拆了，见下方缓存比对。
+    try:
+        _stuck, retries_fp = _retries_block(str(scene_id or "A"), q, db_path)
+    except Exception:
+        _stuck, retries_fp = "", ""
     if use_cache and path.exists():
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             dims = _clean_dims(data)
-            if dims:
+            # ⚠️ 失败账指纹比对（2026-10-26 补）：缓存里那份骨架是在当时的
+            # 失败账下拆的。只要某条卡住的维度又多试了一轮，指纹就变 —— 这份
+            # 旧骨架对现在的处境已经过期，必须带着新的失败账重拆一次（原版
+            # 「出题器看到 failed_tasks 换个题」的同构）。指纹没变就照旧命中。
+            if dims and str(data.get("retries_fp") or "") == retries_fp:
                 return {"dimensions": dims,
                         "expected_drifts": list(data.get("expected_drifts") or []),
                         "milestone": _clean_milestone(data, q),
@@ -439,26 +376,14 @@ def scaffold(question: str, scene_id: str = "A", *, llm: Callable | None = None,
     data = _parse(text)
     dims = _clean_dims(data)
     if not dims:
-        # 兜底：真实 DB 场景的复合/聚合题，LLM 没拆出维度时，用**真实库结构**
-        # 确定性地拆出原子维度（不靠 LLM 编，也不编库里不存在的列）。这是「消费
-        # 才可能合成技能」的前置——没有原子维度，里程碑永远无维可学。无 db_path
-        # （知识型场景）或非聚合题则不动，如实失败。
-        fb = _schema_decompose(q, _schema_struct(db_path)) if db_path else []
-        if fb:
-            out.update(dimensions=fb, expected_drifts=[],
-                       milestone=_clean_milestone({}, q),
-                       material_note="（LLM 未拆出维度，已用真实库结构兜底分解）",
-                       origin="schema_fallback", reason="")
-            try:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(json.dumps(
-                    {"question": q, "dimensions": fb, "milestone": {},
-                     "expected_drifts": [],
-                     "material_note": "schema_fallback"},
-                    ensure_ascii=False, indent=1), encoding="utf-8")
-            except Exception:
-                pass
-            return out
+        # ⚠️ 2026-10-26 拆掉「关键词兜底分解」（原 _schema_decompose）：它靠
+        # 三张关键词表（聚合意图词 / 「月」→month+date+period / 「薪」→salary+wage…）
+        # 把问题映射成维度 —— 那是**针对特定词面的硬编码**，与项目铁律冲突，而且
+        # 它正是「哪些员工在九月是活跃的？」这类**限定词库里根本落不了地**的错位
+        # 维度的源头之一。拆维度的活儿本就该由出题器（LLM）看着**实查到的库结构**
+        # 做（render_material 已经把 db_observation 喂进去了）。
+        # 现在：LLM 拆不出维度就**如实报 failed**，调用方（task_decompose.plan）
+        # 据此退回原版 decompose —— 不编、不猜（原版同构：拿不到就走原路）。
         out["reason"] = "LLM 输出里没有可用维度（解析失败/空列表）"
         return out
     drifts = [d for d in (data.get("expected_drifts") or []) if isinstance(d, dict)]
@@ -468,8 +393,12 @@ def scaffold(question: str, scene_id: str = "A", *, llm: Callable | None = None,
                origin="llm", reason="")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({**data, "question": q}, ensure_ascii=False,
-                                   indent=1), encoding="utf-8")
+        # retries_fp 随骨架一起落盘：下次进来比对它，判断这份骨架是不是还
+        # 对得上现在的失败账（见上面缓存比对处的注释）。
+        path.write_text(json.dumps({**data, "question": q,
+                                    "retries_fp": retries_fp},
+                                   ensure_ascii=False, indent=1),
+                        encoding="utf-8")
     except Exception:
         pass
     return out

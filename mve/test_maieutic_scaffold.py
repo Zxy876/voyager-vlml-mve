@@ -567,59 +567,125 @@ FAKE_SCHEMA = [
 ]
 
 
-def test_schema_decompose_splits_composite() -> None:
-    """真实库结构兜底分解（2026-10-25）：复合/聚合题必须拆出**指向真实列**的原子
-    维度（筛选 + 取数 + 聚合），绝不编库里不存在的列；无聚合意图/空结构则空手而归。
+def test_stuck_dims_signal() -> None:
+    """「这条维度试过几轮」的信号（2026-10-26 补，原版 failed_tasks 的同构）。
+
+    实测病根：`_iters` 每轮覆盖、rounds 恒为 1 → 系统不知道某维度已连挂 19 轮。
+    本信号只认两个执行结果：progress 账（闭合与否）+ iters 账（尝试轮数），
+    不做任何词面判断。已闭合的不算卡住；判词如实带出给下一轮出题器看。
     """
-    import maieutic_scaffold as M
-
-    q = "九月最后总共要给技术部员工发多少工钱"
-    dims = M._schema_decompose(q, FAKE_SCHEMA)
-    assert dims, "聚合题必须拆出维度"
-    ids = [d["id"] for d in dims]
-    assert len(ids) == len(set(ids)), f"维度 id 必须唯一：{ids}"
-    txt = " ".join(d["question"] for d in dims)
-    # 四类原子维度都在，且都锚定真实列
-    assert "技术部" in txt, txt                       # 筛选条件命中真实取值
-    assert "employees.base_salary" in txt, txt         # 取真实数值列
-    assert "allowance.amount" in txt, txt
-    assert "求和" in txt, txt                          # 聚合步骤
-    # 不编维度：非聚合问题 / 空结构 → 空
-    assert M._schema_decompose("什么是阿斯伯格", FAKE_SCHEMA) == [], \
-        "无聚合意图不得编造维度"
-    assert M._schema_decompose(q, []) == [], "空结构不得编造维度"
-    print("PASS  test_schema_decompose_splits_composite")
-
-
-def test_scaffold_db_fallback_when_llm_empty() -> None:
-    """llm 拆不出维度（dims=0）时，真实 DB 场景应走 schema 兜底（origin=schema_fallback
-    且维度锚定真实列）；知识型场景（无 db_path）则如实 failed，不编维度。"""
     import maieutic_scaffold as M
 
     tmp = Path(tempfile.mkdtemp())
     old = M.CKPT
-    orig_struct = M._schema_struct
     M.CKPT = tmp
-    M._schema_struct = lambda dp: FAKE_SCHEMA           # 不依赖 duckdb
     try:
-        a = M.scaffold("九月最后总共要给技术部员工发多少工钱", "B",
-                       llm=lambda m: "我不会", db_path="fake.db")
-        assert a["origin"] == "schema_fallback", a
-        assert a["dimensions"], a
-        txt = " ".join(d["question"] for d in a["dimensions"])
-        assert all(k in txt for k in ("技术部", "base_salary", "amount", "求和")), txt
-        # 缓存命中（兜底结果已落盘，下次不再调 LLM）
-        b = M.scaffold("九月最后总共要给技术部员工发多少工钱", "B",
-                       llm=lambda m: "我不会", db_path="fake.db")
-        assert b["origin"] == "cache", b
-        # 知识型场景（无 db_path）：LLM 空 → failed，不兜底不编维度
-        c = M.scaffold("另一句没有库的问题", "T", llm=lambda m: "我不会")
-        assert c["origin"] == "failed" and not c["dimensions"], c
+        q = "九月在职员工的基本工资和津贴合计是多少"
+        # 进度写在骨架缓存文件里，先落一份空骨架（同 test_progress_iterations_accumulate）
+        p = M._cache_path("B", q)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"dimensions": [], "milestone": {}}),
+                     encoding="utf-8")
+        # 已闭合的：不该出现在卡住清单里
+        M.save_progress("B", q, ["base_salary_sum"])
+        M.save_progress_iterations("B", q, {
+            "base_salary_sum": {"rounds": 5, "asked": "早过了"},
+            "emp_active": {"rounds": 3, "asked": "需要明确哪些员工在九月是活跃的"},
+            "total_salary": {"rounds": 1, "asked": "再试试"},
+        })
+        stuck = M._stuck_dims("B", q)
+        ids = [d for d, _n, _c in stuck]
+        assert ids == ["emp_active"], f"只有未闭合且轮数够的才算卡住：{stuck}"
+        assert stuck[0][1] == 3, stuck
+        assert "九月" in stuck[0][2], stuck        # 判词原话带出来
+        # 指纹 = id:轮数；轮数变化 → 指纹变化（下一轮据此重拆）
+        _txt, fp1 = M._retries_block("B", q)
+        assert "emp_active" in _txt and "已试 3 轮" in _txt, _txt
+        assert fp1 == "emp_active:3", fp1
+        M.save_progress_iterations("B", q, {
+            "emp_active": {"rounds": 6, "asked": "还是不行"},
+        })
+        _txt2, fp2 = M._retries_block("B", q)
+        assert fp2 != fp1, f"轮数变了指纹必须变：{fp1} → {fp2}"
     finally:
-        M._schema_struct = orig_struct
         M.CKPT = old
         shutil.rmtree(tmp, ignore_errors=True)
-    print("PASS  test_scaffold_db_fallback_when_llm_empty")
+    print("PASS  test_stuck_dims_signal")
+
+
+def test_scaffold_rebuilds_when_stuck_rounds_grow() -> None:
+    """骨架缓存按失败账指纹失效：某维度又多试一轮 → 旧骨架过期 → 重新拆。
+
+    这是原版「出题器看到 failed_tasks 就换个题」的同构物。有界：不是每轮都
+    重拆，只有卡住的维度又试够 RESCAFFOLD_AFTER_ROUNDS 轮才重拆一次。
+    """
+    import maieutic_scaffold as M
+
+    tmp = Path(tempfile.mkdtemp())
+    old = M.CKPT
+    M.CKPT = tmp
+    calls: list[str] = []
+
+    def _llm(messages, **_kw):
+        calls.append(" ".join(str(m.get("content") or "") for m in messages))
+        return json.dumps({"dimensions": [
+            {"id": "d1", "question": "一个维度", "why": "why"}],
+            "milestone": {"name": "m", "why": "why"},
+            "expected_drifts": []}, ensure_ascii=False)
+
+    q = "一句会被拆骨架的话"
+    try:
+        assert M.scaffold(q, "B", llm=_llm)["origin"] == "llm"
+        assert len(calls) == 1
+        # 失败账没变 → 命中缓存，不再调 LLM
+        assert M.scaffold(q, "B", llm=_llm)["origin"] == "cache"
+        assert len(calls) == 1, f"指纹没变不该重拆：{len(calls)} 次"
+        # 某维度卡够轮数 → 指纹变化 → 重拆（带着失败账）
+        M.save_progress_iterations("B", q, {
+            "d1": {"rounds": M.RESCAFFOLD_AFTER_ROUNDS, "asked": "判词原话"}})
+        r = M.scaffold(q, "B", llm=_llm)
+        assert r["origin"] == "llm", f"指纹变了必须重拆：{r}"
+        assert len(calls) == 2
+        # 失败账回了出题器：这一轮 LLM 收到的材料里带着卡住的维度、轮数与判词
+        assert "已试" in calls[-1] and "判词原话" in calls[-1], calls[-1][:200]
+    finally:
+        M.CKPT = old
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("PASS  test_scaffold_rebuilds_when_stuck_rounds_grow")
+
+
+def test_scaffold_llm_empty_is_failed_no_keyword_fallback() -> None:
+    """LLM 拆不出维度 → **如实 failed**，不再用关键词兜底编维度（2026-10-26 拆掉）。
+
+    旧的 `_schema_decompose` 靠三张关键词表（聚合意图词 /「月」→month+date+period
+    /「薪」→salary+wage…）把问题映射成维度 —— 那是针对词面的硬编码，正是
+    「哪些员工在九月是活跃的？」这类**限定词在库里落不了地**的错位维度的源头之一。
+    拆维度的活儿只能由出题器看着**实查到的库结构**做，拿不到就如实报 failed，
+    由调用方（task_decompose.plan）退回原版 decompose —— 不编、不猜。
+    """
+    import maieutic_scaffold as M
+
+    tmp = Path(tempfile.mkdtemp())
+    old = M.CKPT
+    M.CKPT = tmp
+    try:
+        # 有库场景：LLM 空 → failed + 空维度，**不再**冒出任何"编出来的"维度
+        a = M.scaffold("九月最后总共要给技术部员工发多少工钱", "B",
+                       llm=lambda m: "我不会", db_path="fake.db")
+        assert a["origin"] == "failed", a
+        assert not a["dimensions"], f"拆不出维度时不该编：{a['dimensions']}"
+        assert a["reason"], "失败原因要如实带出"
+        # 知识型场景（无 db_path）同样如实 failed
+        c = M.scaffold("另一句没有库的问题", "T", llm=lambda m: "我不会")
+        assert c["origin"] == "failed" and not c["dimensions"], c
+        # 死代码已删：关键词表与兜底函数不再存在
+        for dead in ("_schema_decompose", "_AGG_KEYWORDS", "_FILTER_COL_HINTS",
+                     "_PAY_KEYS", "_schema_struct"):
+            assert not hasattr(M, dead), f"{dead} 应已删除"
+    finally:
+        M.CKPT = old
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("PASS  test_scaffold_llm_empty_is_failed_no_keyword_fallback")
 
 
 def test_milestone_achieved_persist_and_readback() -> None:
@@ -719,8 +785,9 @@ def main() -> None:
     test_called_tools_parses_code()
     test_learning_must_fetch_consuming_may_answer()
     test_progress_iterations_accumulate()
-    test_schema_decompose_splits_composite()
-    test_scaffold_db_fallback_when_llm_empty()
+    test_stuck_dims_signal()
+    test_scaffold_rebuilds_when_stuck_rounds_grow()
+    test_scaffold_llm_empty_is_failed_no_keyword_fallback()
     test_milestone_achieved_persist_and_readback()
     test_milestone_lit_retry_criterion()
     print("\nALL PASS")

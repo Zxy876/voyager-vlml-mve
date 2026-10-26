@@ -203,6 +203,8 @@ async def _main() -> int:
     print("== ① judge=False（面板按钮入口）+ 全部维度未闭合 → 必须诚实报败 ==")
     _FakeAgent.last_success = False
     _FakeAgent.vacuous = False
+    # 闸门得给出判词（真闸门不过时必带 critique）；判词缺失的契约单独在 ⑤ 验。
+    _FakeAgent.last_gate_critique = "桩闸门追问：这条维度的清单没覆盖到"
     r = await learn_orchestrate.start_learning(
         QUESTION, SCENE, llm=_fake_llm, use_mcp=False)
     check("拆出了维度（走维度循环）",
@@ -295,6 +297,29 @@ async def _main() -> int:
     res4 = await actions.invoke(SCENE, "learned_dim_kills", mcp=_FakeMCP())
     check("invoke 仍重放判对后固化的原文",
           isinstance(res4, dict) and res4.get("_sql") == SQL, str(res4)[:80])
+
+    print("\n== ⑤ (success, critique) 不可分契约：判词缺失不许拿空话当下轮输入 ==")
+    # 原版 check_task_success 一次调用同时产出 success 与 critique
+    # （voyager.py:232-238），结构上不存在「判过但没判词」。MVE 的判词是三处
+    # 拼的，没有兜底时会判未闭合却不给理由 —— 下一轮拿空判词续学 = 原地打转
+    # （生产实测：4 步全「取到 1 行」、critique 为空）。契约：没判词 = 判定
+    # 没发生 → 如实记一行占位，**不写进 asked_q**。
+    _FakeAgent.last_success = False
+    _FakeAgent.last_gate_critique = ""          # 闸门没给理由
+    r5 = await learn_orchestrate.start_learning(
+        QUESTION2 + "（判词缺失）", SCENE, llm=_fake_llm, use_mcp=False)
+    check("判词缺失时仍诚实报败（不因没理由就放行）",
+          r5["status"] in ("failed", "partial"),
+          f"{r5['status']}｜{str(r5.get('why'))[:60]}")
+    _txt5 = json.dumps(r5.get("dimension_results") or {}, ensure_ascii=False)
+    check("判词缺失如实记成占位（不是空字符串）",
+          "没有产生判词" in _txt5, _txt5[:160])
+    its5 = _ms_progress()
+    _q5 = [it for it in its5
+           if str(it.get("asked") or "").find("没有产生判词") >= 0]
+    check("判词缺失 → asked_q 不写（不拿占位话当下轮追问）",
+          bool(_q5) and all(not (it.get("asked_q") or []) for it in _q5),
+          json.dumps([it.get("asked_q") for it in _q5], ensure_ascii=False)[:120])
 
     print()
     if FAIL:
