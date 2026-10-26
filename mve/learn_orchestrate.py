@@ -162,12 +162,6 @@ def _has_real(obs: list[dict[str, Any]]) -> bool:
         return any(o.get("ok") and int(o.get("rows") or 0) > 0 for o in obs)
 
 
-# 单个子任务（维度）的 rollout 上限 —— **抄原版** `action_agent_task_max_retries=4`
-# （voyager_original/voyager/voyager.py:30；:277-279 `done = 迭代数 >= 上限 or
-# success`）。到上限仍不闭合就跳过这条维度（curriculum.py:342 "Skipping to
-# next task"）—— 不是"再试一次看看"，原版就没有无限重试。
-SUBTASK_MAX_RETRIES = 4
-
 # 一次 rollout（跑一段取证代码）的墙钟上限。
 # 为什么不是默认的 30s（2026-10-20 实测致命点）：单次 MCP 调用自己就有 60s
 # 上限（local_agent.py:680），外层比内层短 → 工具还没回来就判超时，而超时又
@@ -1022,16 +1016,13 @@ async def _start_learning_impl(
                             if _t0:
                                 tools_map[_did] = _t0
                             continue
-                        # 原版重试机制（用户 2026-10-19 定，同 voyager.py:30
-                        # `action_agent_task_max_retries=4` + :277-279
-                        # `done = 迭代数 >= 上限 or success`）：每次把闸门带回的
-                        # **追问**当 critique 灌回 prompt（voyager.py:262-268
-                        # 迭代提示同款），**到上限仍不闭合就跳过这条维度**
-                        # （curriculum.py:342 "Skipping to next task"），
-                        # 不原地无限重试。
+                        # 维度的一次 attempt（原版一个 task 的 rollout）：
+                        # 步数上限 4 在 solve 内（见下方的原版同构说明），
+                        # 步与步之间的 critique 回灌也在 solve 内 —— 原版
+                        # voyager.py:262-268 的迭代提示同款，不另起外层重试。
                         ok1, crit1, obs1, r1 = False, "", [], {}
                         # 内层判定（真伪）末态：闸门（覆盖）与内层 critic（真伪）
-                        # 两个都过才闭合这条维度，见下方重试循环内的合并判定
+                        # 两个都过才闭合这条维度，见下方的合并判定
                         _inner_ok = False
                         # 追问历史回灌：这条维度上次（上一轮/上一次学这句话）
                         # 被问过什么、还差什么 —— 直接作为第一轮的输入，别让
@@ -1046,126 +1037,140 @@ async def _start_learning_impl(
                         # 内容 —— 失败项 ok=False，**不进材料**。闸门判的是「材料
                         # 有没有答到维度」，不是「模型写的文本像不像答案」。
                         _ev1: list[dict[str, Any]] = []
-                        for _t in range(SUBTASK_MAX_RETRIES):
-                            # ⚠️ 第二个返回值是**这一轮跑通的代码**（原版的
-                            # `program_code`）。以前写成 `obs1, _ =`，代码直接丢
-                            # 掉 → 知识型场景永远学不到技能（2026-10-20 定位）。
-                            # 场景数据题（db_path）走 VLMLActionAgent + SceneDBEnv
-                            # 写 SQL；本机题走 local_agent 写代码跑本机原语 ——
-                            # **两种后端都逐维度 solv，每维度闭合写一条技能**
-                            # （原版对每任务都拆，不区分知识/数据）。
-                            if is_local:
-                                obs1, code1 = await local_agent.solve(
-                                    _q1, local_dir, llm=llm, scene_id=scene,
-                                    avoid=_avoid, critique=str(crit1 or ""),
-                                    evidence=_ev1,
-                                    skills=skills, require_tools=True,
-                                    timeout=EXEC_TIMEOUT)
-                            else:
-                                obs1, code1 = await agent.solve(
-                                    _q1, skills=skills, grabs=grabs,
-                                    focus_tables=focus,
-                                    hints=_hint_ctx + [str(crit1 or "")])
-                                # 数据题路径：agent.solve 不收 evidence，它实取的 SQL
-                                # 结果不会进学习循环的 _ev1 材料账；但闸门
-                                # （check_task_success）靠 evidence 判「有没有取到
-                                # 真实内容」，否则会误报「一次都没取到内容」把维度判死。
-                                # 这里把 agent 实取的观察回填进 _ev1（与 local_agent
-                                # 路径同构：本地题是 local_agent 直接写 _ev1）。
-                                _ev1 = list(obs1)
-                                # 同样，agent 实取的观察**不带** data_sources（那是
-                                # local_agent 的 MCP 工具才填的字段）。不补的话
-                                # r1["execution"]["real_calls"] 恒为 0（行 813-815 只
-                                # 数带 data_sources 的观察），闸门 task_critic.py:169
-                                # 会误判「一次数据源都没调」把维度判死。照全局观察补
-                                # data_sources 的口径（1009-1013）：只给 ok 的观察补，
-                                # 标签用 env 自报（SceneDBEnv.data_source →
-                                # "scene_db:payroll.duckdb"）。
-                                _env_src: list[str] = []
-                                try:
-                                    _ds_fn = getattr(
-                                        getattr(agent, "env", None),
-                                        "data_source", None)
-                                    if callable(_ds_fn):
-                                        _v = str(_ds_fn() or "").strip()
-                                        if _v:
-                                            _env_src = [_v]
-                                except Exception:
-                                    _env_src = []
-                                if _env_src:
-                                    obs1 = [
-                                        dict(o, data_sources=list(
-                                            o.get("data_sources") or (
-                                                _env_src if o.get("ok") else [])))
-                                        for o in obs1]
-                            observations.extend(obs1)
-                            r1: dict[str, Any] = {
-                                "execution": {
-                                    "calls": len(obs1),
-                                    "real_calls": sum(
-                                        1 for o in obs1 if _has_real([o])
-                                        and (o.get("data_sources") or [])),
-                                    "rows": sum(int(o.get("rows") or 0)
-                                                for o in obs1 if o.get("ok")),
-                                    "data_sources": sorted(
-                                        {s for o in obs1
-                                         for s in (o.get("data_sources") or [])}),
-                                    "sql": "", "ok": _has_real(obs1)},
-                                "answer": _answer_text(obs1, ok_only=True),
-                                # 材料（代码剪裁的，不是模型自述的）交给
-                                # critic/闸门：没有材料 = 没取到内容，直接不闭合
-                                "evidence": _ev1,
-                                "status": "learned"}
+                        # ===== 原版同构：一个维度 = 一次 rollout，4 步封顶 =====
+                        # （voyager.py:277-279 `done = rollout_num_iter >=
+                        #   action_agent_task_max_retries(4) or success`；
+                        #  curriculum.py:342 失败即 "Skipping to next task"）
+                        # 2026-10-26 用户验收日志拍板「和原版做一样」：曾经的
+                        # SUBTASK_MAX_RETRIES=4 外层循环，每一轮是一次**完整
+                        # solve()**（自带 4 步 + 步内 critique 回灌——那本来就是
+                        # 原版 step 的机制，voyager.py:262-268），外层再套一层
+                        # 重试 = 单维度 16 步、双重重试，是原版 4 倍（实测交通
+                        # 补贴维度 3+ 个 solve 块连跑 4 分钟）。
+                        # 现在：一次 solve（4 步）封顶 → 闸门(覆盖) + 内层
+                        # critic(真伪) 双判定 → 不闭合进 failed_dims、跳过下一
+                        # 条维度；闸门追问写进 _iters，下一轮带着它再来
+                        # （原版 failed_tasks 的软重试语义，curriculum.py:184
+                        #  把 failed 列表给出题器看）。
+                        # ⚠️ 第二个返回值是**这一轮跑通的代码**（原版的
+                        # `program_code`）。以前写成 `obs1, _ =`，代码直接丢
+                        # 掉 → 知识型场景永远学不到技能（2026-10-20 定位）。
+                        # 场景数据题（db_path）走 VLMLActionAgent + SceneDBEnv
+                        # 写 SQL；本机题走 local_agent 写代码跑本机原语 ——
+                        # **两种后端都逐维度 solv，每维度闭合写一条技能**
+                        # （原版对每任务都拆，不区分知识/数据）。
+                        if is_local:
+                            obs1, code1 = await local_agent.solve(
+                                _q1, local_dir, llm=llm, scene_id=scene,
+                                avoid=_avoid, critique=str(crit1 or ""),
+                                evidence=_ev1,
+                                skills=skills, require_tools=True,
+                                timeout=EXEC_TIMEOUT)
+                        else:
+                            obs1, code1 = await agent.solve(
+                                _q1, skills=skills, grabs=grabs,
+                                focus_tables=focus,
+                                hints=_hint_ctx + [str(crit1 or "")])
+                            # 数据题路径：agent.solve 不收 evidence，它实取的 SQL
+                            # 结果不会进学习循环的 _ev1 材料账；但闸门
+                            # （check_task_success）靠 evidence 判「有没有取到
+                            # 真实内容」，否则会误报「一次都没取到内容」把维度判死。
+                            # 这里把 agent 实取的观察回填进 _ev1（与 local_agent
+                            # 路径同构：本地题是 local_agent 直接写 _ev1）。
+                            _ev1 = list(obs1)
+                            # 同样，agent 实取的观察**不带** data_sources（那是
+                            # local_agent 的 MCP 工具才填的字段）。不补的话
+                            # r1["execution"]["real_calls"] 恒为 0（行 813-815 只
+                            # 数带 data_sources 的观察），闸门 task_critic.py:169
+                            # 会误判「一次数据源都没调」把维度判死。照全局观察补
+                            # data_sources 的口径（1009-1013）：只给 ok 的观察补，
+                            # 标签用 env 自报（SceneDBEnv.data_source →
+                            # "scene_db:payroll.duckdb"）。
+                            _env_src: list[str] = []
                             try:
-                                import task_critic as _tc1
-                                # dimensions=[一个维度] → 走 maieutic_gate 闭合判定。
-                                # env_obs 必须一起给：闸门只核清单核不出口径幻觉，
-                                # 2026-10-26 实测 base_salary×overtime_hours 当加班费
-                                # 就是穿过只核清单的闸门入库的（164000 假数）——
-                                # 列×列合成新口径 = 假设费率，判据里点名它。
-                                ok1, crit1 = _tc1.check_task_success(
-                                    _q1, str(crit1 or ""), r1, dimensions=[_d],
-                                    env_obs=_env_obs_block(db_path))
-                            except Exception as e1:
-                                ok1, crit1 = False, f"critic 异常：{type(e1).__name__}: {e1}"
-                            # 内层判定（真伪）也是闭合条件 —— 2026-10-26 回归项目
-                            # 自己的「唯一判定」原则（内层 critic_check 带环境实查，
-                            # 是原版 rollout critic 的同构；闸门只管覆盖）。实测：
-                            # 闸门（flash 与 glm-4-plus 都试过）问「维度有没有被
-                            # 答到」，毒答案确实答出了一个数 → 放行；内层 critic
-                            # 两次实测 4/4 拒绝 base_salary×overtime_hours 费率
-                            # 幻觉。闸门过 + 内层过才闭合；内层没过就把它的判词
-                            # 并进 critique 重试（可操作的反馈，不是空话）。
-                            # local_agent 路径没有内层 critic，维持闸门口径。
-                            _inner_ok = True
-                            if not is_local:
-                                _inner_ok = bool(getattr(agent, "last_success", False))
-                                if not _inner_ok:
+                                _ds_fn = getattr(
+                                    getattr(agent, "env", None),
+                                    "data_source", None)
+                                if callable(_ds_fn):
+                                    _v = str(_ds_fn() or "").strip()
+                                    if _v:
+                                        _env_src = [_v]
+                            except Exception:
+                                _env_src = []
+                            if _env_src:
+                                obs1 = [
+                                    dict(o, data_sources=list(
+                                        o.get("data_sources") or (
+                                            _env_src if o.get("ok") else [])))
+                                    for o in obs1]
+                        observations.extend(obs1)
+                        r1: dict[str, Any] = {
+                            "execution": {
+                                "calls": len(obs1),
+                                "real_calls": sum(
+                                    1 for o in obs1 if _has_real([o])
+                                    and (o.get("data_sources") or [])),
+                                "rows": sum(int(o.get("rows") or 0)
+                                            for o in obs1 if o.get("ok")),
+                                "data_sources": sorted(
+                                    {s for o in obs1
+                                     for s in (o.get("data_sources") or [])}),
+                                "sql": "", "ok": _has_real(obs1)},
+                            "answer": _answer_text(obs1, ok_only=True),
+                            # 材料（代码剪裁的，不是模型自述的）交给
+                            # critic/闸门：没有材料 = 没取到内容，直接不闭合
+                            "evidence": _ev1,
+                            "status": "learned"}
+                        try:
+                            import task_critic as _tc1
+                            # dimensions=[一个维度] → 走 maieutic_gate 闭合判定。
+                            # env_obs 必须一起给：闸门只核清单核不出口径幻觉，
+                            # 2026-10-26 实测 base_salary×overtime_hours 当加班费
+                            # 就是穿过只核清单的闸门入库的（164000 假数）——
+                            # 列×列合成新口径 = 假设费率，判据里点名它。
+                            ok1, crit1 = _tc1.check_task_success(
+                                _q1, str(crit1 or ""), r1, dimensions=[_d],
+                                env_obs=_env_obs_block(db_path))
+                        except Exception as e1:
+                            ok1, crit1 = False, f"critic 异常：{type(e1).__name__}: {e1}"
+                        # 内层判定（真伪）也是闭合条件 —— 2026-10-26 回归项目
+                        # 自己的「唯一判定」原则（内层 critic_check 带环境实查，
+                        # 是原版 rollout critic 的同构；闸门只管覆盖）。实测：
+                        # 闸门（flash 与 glm-4-plus 都试过）问「维度有没有被
+                        # 答到」，毒答案确实答出了一个数 → 放行；内层 critic
+                        # 两次实测 4/4 拒绝 base_salary×overtime_hours 费率
+                        # 幻觉。闸门过 + 内层过才闭合；内层没过就把它的判词
+                        # 并进 critique 重试（可操作的反馈，不是空话）。
+                        # local_agent 路径没有内层 critic，维持闸门口径。
+                        _inner_ok = True
+                        if not is_local:
+                            _inner_ok = bool(getattr(agent, "last_success", False))
+                            if not _inner_ok:
+                                _icrit = ""
+                                try:
+                                    _icrit = str(getattr(
+                                        getattr(agent, "critic", None),
+                                        "last_critique", "") or "")
+                                except Exception:
                                     _icrit = ""
-                                    try:
-                                        _icrit = str(getattr(
-                                            getattr(agent, "critic", None),
-                                            "last_critique", "") or "")
-                                    except Exception:
-                                        _icrit = ""
-                                    if _icrit:
-                                        crit1 = (f"{crit1}；内层判官未过：{_icrit}"
-                                                 if crit1
-                                                 else f"内层判官未过：{_icrit}")
-                            if ok1 and _inner_ok:
-                                break
-                            # 超时 = 外部工具没回来（慢/被限流），**不是代码写错
-                            # 了** —— 原地重试毫无意义（原线程还在等，新线程又
-                            # 起），照原版 curriculum.py:342 "Skipping to next
-                            # task" 跳过这条维度，等下一轮（断点续学）再来。
-                            if any(bool(o.get("timed_out")) for o in obs1):
-                                crit1 = (f"上一次执行超时（>{int(EXEC_TIMEOUT)}s，"
-                                         "外部工具没回来：慢或被限流）—— 本轮跳过"
-                                         "这条维度，不原地重试")
-                                print(f"  · 执行超时 → 跳过本条维度（不重试）："
-                                      f"{_q1[:28]}", flush=True)
-                                _timed_out_dims += 1
-                                break
+                                if _icrit:
+                                    crit1 = (f"{crit1}；内层判官未过：{_icrit}"
+                                             if crit1
+                                             else f"内层判官未过：{_icrit}")
+                        # （闭合判定在下方：一次 attempt 后的单次判定）
+                        # 超时 = 外部工具没回来（慢/被限流），**不是代码写错
+                        # 了** —— 原地重试毫无意义（原线程还在等，新线程又
+                        # 起），照原版 curriculum.py:342 "Skipping to next
+                        # task" 跳过这条维度，等下一轮（断点续学）再来。
+                        if any(bool(o.get("timed_out")) for o in obs1):
+                            crit1 = (f"上一次执行超时（>{int(EXEC_TIMEOUT)}s，"
+                                     "外部工具没回来：慢或被限流）—— 本条维度"
+                                     "判未闭合，下一轮带追问历史续学")
+                            print(f"  · 执行超时 → 本条维度判未闭合（不重试）："
+                                  f"{_q1[:28]}", flush=True)
+                            _timed_out_dims += 1
+                            ok1 = False
+                            _inner_ok = False
                         if ok1 and _inner_ok:
                             learned_dims.append(_d)
                             a1 = str(r1.get("answer") or "").strip()
@@ -1214,7 +1219,7 @@ async def _start_learning_impl(
                         else:
                             failed_dims.append({
                                 "id": _did, "question": _q1,
-                                "attempts": SUBTASK_MAX_RETRIES,
+                                "attempts": 1,  # 一次 rollout 封顶（原版同口径；步数上限在 solve 内）
                                 "critique": str(crit1)[:200]})
                             # 失败的也要逐条可见：否则整轮跑完只看到"N 条没闭合"，
                             # 不知道是模型没调工具、还是工具本身报错（2026-10-20）

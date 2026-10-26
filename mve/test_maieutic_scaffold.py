@@ -257,13 +257,31 @@ def test_gate_log_reports_real_counts() -> None:
 
 
 def test_subtask_retries_then_skips() -> None:
-    """原版重试机制（用户 2026-10-19 定）：单维度最多 `SUBTASK_MAX_RETRIES`
-    次（原版 voyager.py:30 action_agent_task_max_retries=4），到上限仍不闭合就
-    **跳过这条维度**（curriculum.py:342 "Skipping to next task"），不无限重试。
+    """原版重试口径（用户 2026-10-26 复定照搬）：一个维度 = **一次
+    rollout**，步数上限 4 在 solve 内（voyager.py:277-279 `done =
+    rollout_num_iter >= action_agent_task_max_retries(4) or success`），
+    外层**不另起重试循环**。
+
+    曾经的 SUBTASK_MAX_RETRIES=4 外层循环 × solve 每轮 4 步 = 单维度 16
+    步、双重重试，是原版 4 倍（用户验收日志实证：交通补贴维度 3+ 个
+    solve 块连跑 4 分钟）。4 步内不闭合 → 进 failed_dims（attempts=1）
+    跳过下一维度（原版 curriculum.py:342 "Skipping to next task"），
+    闸门追问写进 _iters，下一轮带着它续学（原版 failed_tasks 软重试）。
     """
+    import inspect
     import learn_orchestrate as L
-    assert L.SUBTASK_MAX_RETRIES == 4, L.SUBTASK_MAX_RETRIES   # 抄原版，不是自造
-    print(f"PASS  test_subtask_retries_then_skips（上限={L.SUBTASK_MAX_RETRIES}）")
+    src = inspect.getsource(L)
+    # ① 外层重试循环已删：模块不再暴露 SUBTASK_MAX_RETRIES 常数
+    assert not hasattr(L, "SUBTASK_MAX_RETRIES"), L.SUBTASK_MAX_RETRIES
+    # ② 失败维度一次 attempt 记账（不是 4）
+    assert '"attempts": 1' in src, "失败维度应记 attempts=1（一次 rollout 封顶）"
+    # ③ 步数上限归位 solve 内：内层 4 步（同构原版 voyager.py:30）
+    import voyager_vlml.agents.action as A
+    _sig = inspect.signature(A.VLMLActionAgent.__init__)
+    assert _sig.parameters["task_max_retries"].default == 4, \
+        _sig.parameters["task_max_retries"].default
+    print("PASS  test_subtask_retries_then_skips（一次 rollout 4 步封顶即跳过，"
+          "无外层重试）")
 
 
 def test_one_closed_dimension_is_one_node() -> None:
