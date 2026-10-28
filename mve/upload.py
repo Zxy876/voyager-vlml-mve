@@ -38,6 +38,7 @@ import json
 import os
 import re
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -245,15 +246,33 @@ def _scene_db_path(scene_id: str) -> tuple[str, str, str]:
         return (dbp or str(Path(d) / "uploads.duckdb")), d, kind
 
 
+_CJK_COMPAT = re.compile(r"[\u2e80-\u2fdf\uf900-\ufaff]")
+
+
+def _fix_cjk(text: str) -> str:
+    """把「康熙部首 / CJK 兼容字」还原成正常汉字。
+
+    ⚠️ 2026-10-28 实测：用户那份 PDF 抽出来的正文是「五⽉的赛事（⼆模）」
+    —— ⽉ 是 U+2F49（康熙部首·月）、⼀ 是 U+2F00，不是「月」「一」。
+    人看着像正常字，模型读起来是形近怪字：「引用谁的歌词最多」直接答
+    「无法确定」。这类字是 PDF 字体 ToUnicode 映射到兼容区造成的。
+
+    只对这两段做 NFKC（**不要整篇 NFKC**：那会把全角「，」变成半角「,」，
+    对中文文本是无谓破坏）。
+    """
+    return _CJK_COMPAT.sub(lambda m: unicodedata.normalize("NFKC", m.group(0)),
+                           str(text or ""))
+
+
 def _read_text(path: str, limit: int = TEXT_STORE) -> str:
     """纯文本 → 文本（UTF-8 优先，退 GB18030 —— 中文文件常是 GBK 存的）。"""
     raw = Path(path).read_bytes()
     for enc in ("utf-8", "utf-8-sig", "gb18030"):
         try:
-            return raw.decode(enc)[:limit]
+            return _fix_cjk(raw.decode(enc))[:limit]
         except UnicodeDecodeError:
             continue
-    return raw.decode("utf-8", errors="replace")[:limit]
+    return _fix_cjk(raw.decode("utf-8", errors="replace"))[:limit]
 
 
 def _docx_text(path: str, limit: int = TEXT_STORE) -> str:
@@ -263,11 +282,15 @@ def _docx_text(path: str, limit: int = TEXT_STORE) -> str:
         xml = z.read("word/document.xml").decode("utf-8", errors="ignore")
     xml = re.sub(r"</w:p>", "\n", xml)          # 段落换行
     xml = re.sub(r"<w:tab[^>]*/>", "\t", xml)
-    return re.sub(r"<[^>]+>", "", xml)[:limit]
+    return _fix_cjk(re.sub(r"<[^>]+>", "", xml))[:limit]
 
 
 def _pdf_text(path: str, limit: int = TEXT_STORE) -> str:
-    """PDF → 文本（pypdf）。没装就如实报错，不假装解析出内容。"""
+    """PDF → 文本（pypdf）。没装就如实报错，不假装解析出内容。
+
+    ⚠️ 页数上限按**字数**收，不按页数拍死：原来写死「只读前 12 页」，
+    稍长一点的文集后面就整段丢了，而「引用谁的歌词最多」这类题必须通读。
+    """
     try:
         from pypdf import PdfReader
     except Exception as e:
@@ -275,14 +298,17 @@ def _pdf_text(path: str, limit: int = TEXT_STORE) -> str:
                            f"可把文件另存为 txt/md 再上传")
     reader = PdfReader(path)
     out: list[str] = []
-    for page in reader.pages[:12]:
+    total = 0
+    for page in reader.pages[:400]:             # 防呆上限，真正卡的是字数
         try:
-            out.append(page.extract_text() or "")
+            _t = page.extract_text() or ""
         except Exception:
             continue
-        if sum(len(x) for x in out) >= limit:
+        out.append(_t)
+        total += len(_t)
+        if total >= limit:
             break
-    return "\n".join(out)[:limit]
+    return _fix_cjk("\n".join(out))[:limit]
 
 
 def _image_text(path: str, limit: int = 2000) -> tuple[str, str]:
