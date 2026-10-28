@@ -56,6 +56,21 @@ def main() -> int:
     check("「一共要支付多少钱」配 allowance-only → 拒", bool(C._scope_guard(
         "九月份公司一共要支付多少钱", "SELECT SUM(amount) FROM allowance")))
 
+    print("== 1.5 主体守卫：公司口径 ≠ 部门口径 ==")
+    g = C._subject_guard("九月份公司一共要支付多少钱",
+                         "SELECT SUM(e.base_salary) FROM employees e "
+                         "WHERE e.dept='技术' AND e.active=true")
+    check("题面问公司、SQL 过滤技术部 → 拒（55000 事故）", bool(g))
+    check("拒绝原因点明主体口径", "主体口径不符" in g)
+    check("技术部题配部门过滤 → 放行", not C._subject_guard(
+        "技术部九月份总共要发多少钱",
+        "SELECT SUM(base_salary) FROM employees WHERE dept='技术'"))
+    check("公司题无部门过滤 → 放行", not C._subject_guard(
+        "九月份公司一共要支付多少钱",
+        "SELECT SUM(base_salary) FROM employees WHERE active=true"))
+    check("「公司所有人姓名」这类全称问法不误伤", not C._subject_guard(
+        "列出公司所有人姓名", "SELECT name FROM employees"))
+
     print("== 2. 数据题判定（决定答不出时走哪条路） ==")
     check("「工资发多少」是数据题", C._is_data_question("技术部九月份工资发多少钱"))
     check("「什么是强化学习」不是数据题", not C._is_data_question("什么是强化学习"))

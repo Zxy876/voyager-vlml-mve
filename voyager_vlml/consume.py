@@ -1196,6 +1196,12 @@ async def consume(
                                     f"{_label} 被口径守卫拒用：{_swhy[:140]}")
                                 _fails.append({"name": _label, "why": _swhy[:200]})
                                 continue
+                            _sjwhy = _subject_guard(question, _sql)
+                            if _sjwhy:
+                                reuse_errors.append(
+                                    f"{_label} 被主体守卫拒用：{_sjwhy[:140]}")
+                                _fails.append({"name": _label, "why": _sjwhy[:200]})
+                                continue
                             _rr = await _env.run_sql(_sql)
                             _d = _rr.get("data") or {}
                             if _rr.get("ok") and _d.get("rows"):
@@ -1312,6 +1318,11 @@ async def consume(
                         data = None
                         reuse_errors.append(
                             f"整段 SQL 被口径守卫拒用：{_swhy2[:140]}")
+                    _sjwhy2 = _subject_guard(question, code)
+                    if data is not None and _sjwhy2:
+                        data = None
+                        reuse_errors.append(
+                            f"整段 SQL 被主体守卫拒用：{_sjwhy2[:140]}")
         # ---- 维度覆盖守卫（合成题被单配方/单表答的确定性闸）----
         # 与 fan-out 闸同风格、同位置：不赌 LLM。本题拆成多维度（dims>=2）却只
         # 覆盖 1 张维度源表 → 合成题被单维度答掉（如"发多少工资"只答了基薪、
@@ -2696,6 +2707,33 @@ def _scope_guard(question: str, sql: str) -> str:
             f"但 SQL 里找不到{'、'.join(missing)}相关的表/列 —— "
             f"这个配方算的是别的口径，交出去就是把 A 口径的数说成 B 口径的答案"
             f"（真数 ≠ 对题）。要么换/组合覆盖该口径的配方，要么如实判不会")
+
+
+def _subject_guard(question: str, sql: str) -> str:
+    """SQL 配方复用前的确定性**主体守卫**（口径守卫的姊妹闸，2026-10-28）：
+
+    事故实证（用户截图追问「帮我算对不对」实查核账）：问「九月份**公司**
+    一共要支付多少钱」，配方答的是技术部在职基本工资 55000 —— 数是真的、
+    钱的口径也对（工资类），但**主体口径错**：题面问全公司，SQL 里却
+    WHERE dept='技术'。55000 被判 written/掌握✓ 又是一次「真数 ≠ 对题」。
+
+    判据（rule-based）：题面出现全称主体词（公司/全员/全体/所有人）而
+    SQL 带部门过滤 → 拒。反向（题面点名某部、SQL 无部门过滤）暂不做——
+    「题面提到技术部但问的是跨部门对比」这类合法情形会误杀，交给判官。
+    返回拒绝原因；'' = 通过。
+    """
+    _q = str(question or "")
+    _s = str(sql or "")
+    if not _q.strip() or not _s.strip():
+        return ""
+    _WIDE = ("公司", "全员", "全体", "所有人", "全部门", "各部门合计")
+    if not any(w in _q for w in _WIDE):
+        return ""
+    if re.search(r"\b(dept|department)\s*=\s*'[^']*'", _s, re.I):
+        return ("主体口径不符（主体守卫）：题面问的是全公司/全员，"
+                "SQL 里却过滤了某个部门 —— 交出去就是把一个部门的数说成"
+                "全公司的答案（真数 ≠ 对题）。去掉部门过滤，或如实判不会")
+    return ""
 
 
 def _is_data_question(question: str) -> bool:
