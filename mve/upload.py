@@ -216,7 +216,9 @@ def describe(scene_id: str) -> dict[str, Any]:
         try:
             rows = con.execute(
                 "SELECT table_name FROM information_schema.tables "
-                "WHERE table_schema='main' AND table_name LIKE 'up\\_%' "
+                # ⚠️ 别用 LIKE 'up\_%'：duckdb 的 LIKE 不认反斜杠转义（实测
+                # 会一个都匹配不到，2026-10-28 服务器踩到）。用 starts_with。
+                "WHERE table_schema='main' AND starts_with(table_name, 'up_') "
                 "ORDER BY table_name").fetchall()
         finally:
             con.close()
