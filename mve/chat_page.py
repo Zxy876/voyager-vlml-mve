@@ -702,6 +702,10 @@ if (!store.current){
 renderHist(); paint();
 loadModels();
 ta.focus();
+// 分享链：/mve/chat?q=问题 → 打开就自动问（也方便回归截图）。
+var urlQ = '';
+try { urlQ = new URLSearchParams(location.search).get('q') || ''; } catch(e) {}
+if (urlQ){ setTimeout(function(){ send(urlQ); }, 600); }
 </script>
 </body>
 </html>
