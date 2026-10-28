@@ -783,6 +783,84 @@ def _tools_in_code(code: str, scene_id: str = "") -> list[str]:
     return out
 
 
+async def _tool_line_fallback(question: str) -> dict[str, Any]:
+    """工具线兜底（第 4 步，DeepSeek 消费同构）：库场景答不出 → 联网取公开
+    资料、当场作答、用完即弃。
+
+    同构依据：DeepSeek 客户端消费架构 = 按需拉能力；MVE 库场景此前
+    「消费不接 MCP」（consume.py 场景库形态注释）是联网唯一真缺口。
+
+    claim 口径铁律（2026-10-28 拍板）：
+      · 联网取回的是 **claim**（有真值但未知）—— 答案必须带「工具线 claim」
+        标注，落库后才可升级 fact；
+      · **不入技能库、不进能力账、不计入学习曲线**（工具功劳不能算到学习
+        头上）—— 调用方保证（critic_ok=False → absorbed={} 恒成立）；
+      · 联网失败**不是"答一个像样的"**：没取到内容就如实报 note，绝不编造
+        （与 net_tools「取不到就如实抛错」同一条铁律）。
+    """
+    out: dict[str, Any] = {"used": False, "answer": "", "sources": [], "note": ""}
+    try:
+        import net_tools
+    except Exception as e:
+        out["note"] = f"联网原语不可用：{type(e).__name__}: {e}"
+        return out
+    import asyncio as _aio
+    # ① 搜索（同步函数 → 线程池，不堵事件循环）
+    try:
+        results = await _aio.to_thread(net_tools.web_search, question, 5)
+    except Exception as e:
+        out["note"] = (f"搜索失败（联网失败不是答一个像样的）："
+                       f"{type(e).__name__}: {str(e)[:140]}")
+        return out
+    results = [r for r in (results or [])
+               if str(r.get("url") or "").strip()][:3]
+    if not results:
+        out["note"] = "搜索没返回任何结果 —— 如实不答"
+        return out
+    out["sources"] = [{"title": str(r.get("title") or "")[:120],
+                       "url": str(r.get("url") or "")} for r in results]
+    # ② 取页正文（top 2）
+    pages: list[dict[str, str]] = []
+    for r in results[:2]:
+        try:
+            pg = await _aio.to_thread(net_tools.web_fetch, str(r["url"]))
+            if str(pg.get("text") or "").strip():
+                pages.append({"title": str(r.get("title") or "")[:120],
+                              "url": str(r.get("url") or ""),
+                              "text": str(pg["text"])[:5000]})
+        except Exception:
+            continue
+    if not pages:
+        out["note"] = "搜索有结果但页面正文都没取到 —— 如实不答"
+        return out
+    # ③ claim 综合：只准用取回的资料，缺了就说缺
+    material = "\n\n".join(
+        f"【资料{i+1}】{p['title']}\n{p['url']}\n{p['text']}"
+        for i, p in enumerate(pages))
+    try:
+        cj = chat_json(
+            [{"role": "system",
+              "content": ("你根据给出的联网资料回答问题。铁律：**只依据资料**；"
+                          "资料里没有的写「资料未提及」；绝不编造数字与事实。"
+                          "只返回 JSON："
+                          '{"answer": "基于资料的回答", "grounded": true/false}'
+                          "（grounded = 资料是否足以回答该问题）")},
+             {"role": "user",
+              "content": f"问题：{question}\n\n联网资料：\n{material[:9000]}"}],
+            temperature=0.0)
+        ans = str((cj or {}).get("answer") or "").strip()
+        if ans and bool((cj or {}).get("grounded", True)):
+            out["used"] = True
+            out["answer"] = ans
+        elif ans:
+            out["note"] = "资料不足以回答（grounded=false，如实不答）"
+        else:
+            out["note"] = "claim 综合没产出回答"
+    except Exception as e:
+        out["note"] = f"claim 综合失败：{type(e).__name__}: {str(e)[:140]}"
+    return out
+
+
 async def consume(
     question: str,
     *,
@@ -1694,6 +1772,24 @@ async def consume(
         answer = (str(answer).rstrip()
                   + "（⚠️ 未验证：本轮未通过 critic 判定，此数字不可信）")
 
+    # ---- 工具线兜底（第 4 步，DeepSeek 消费同构，2026-10-28 落地）----
+    # 库场景答不出（没取到真数 / 裁判硬伤）→ 作用域落 tool 线：联网取公开
+    # 资料、当场作答、用完即弃 —— claim（有真值但未知）。**不入技能库、
+    # 不进能力账、不计入学习曲线**（critic_ok=False → absorbed={} 恒成立，
+    # 工具功劳不会算到学习头上）。学习线照常 kick（on_miss），两条供给线
+    # 并行不互斥：库内可复现的归学习线，库外时变的归工具线。
+    tool_line: dict[str, Any] = {}
+    if (not critic_ok) and _scene_kind == "scene":
+        try:
+            tool_line = await _tool_line_fallback(question)
+        except Exception as e:  # pragma: no cover
+            tool_line = {"used": False, "answer": "", "sources": [],
+                         "note": f"工具线异常：{type(e).__name__}: {str(e)[:140]}"}
+        if tool_line.get("answer"):
+            answer = (str(tool_line["answer"]).rstrip()
+                      + "（⚠️ 工具线 claim：来自联网资料，未经库内验证；"
+                        "不进能力账、不计入学习曲线）")
+
     # ---- 答完了 → 这题进能力库 → 掌握（判据是"答没答出来"，不是覆盖率）----
     # 判据是"答没答出来"（取到数 + 给出了回答 + **critic 判过**），**不是**有没有
     # 整理成结构化事实 —— 答案是一张表时压不进 facts，但那也是答出来了，照样进能力库。
@@ -1778,6 +1874,10 @@ async def consume(
         # 作用域判定（2.5）：这句话归哪条供给线（learn/tool/inference）——
         # 面板与对账用；工具线接入后（第 4 步）据此分流。
         "scope_line": _scope_line(_scene_id),
+        # 工具线（第 4 步）：这轮有没有走联网兜底、取回了哪些来源、为什么没走成。
+        "tool_line_used": bool(tool_line.get("used")),
+        "tool_sources": (tool_line.get("sources") or [])[:5],
+        "tool_line_note": str(tool_line.get("note") or "")[:200],
         "cold_start": bool(absorbed.get("cold_start")),
         "node_status": str(absorbed.get("node_status") or ""),
         # —— 路由命中判定（双阈值，非人审）——

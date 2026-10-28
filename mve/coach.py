@@ -212,6 +212,10 @@ def _log_import(result: dict[str, Any]) -> None:
         # → coach_log 里 scope_line/referee_compared 全是空（白名单惯犯第 6 次）。
         "referee_compared": bool(result.get("referee_compared")),
         "scope_line": str(result.get("scope_line") or ""),
+        # 工具线（第 4 步）：联网兜底用了没有 + 来源——claim 披露必须可见。
+        "tool_line_used": bool(result.get("tool_line_used")),
+        "tool_sources": (result.get("tool_sources") or [])[:5],
+        "tool_line_note": str(result.get("tool_line_note") or "")[:200],
         # 裁判（VLML）独立那一路取了什么 —— 与 Voyager 那一路并列披露
         "referee_sql": result.get("referee_sql", ""),
         "referee_rows": int(result.get("referee_rows") or 0),
