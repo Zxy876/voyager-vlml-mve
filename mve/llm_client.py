@@ -44,6 +44,7 @@ def chat(
     temperature: float = 0.2,
     max_tokens: int = 2048,
     timeout: float = 90.0,
+    model: str = "",
     retries: int = 3,
 ) -> str:
     """带退避重试的 chat。
@@ -62,7 +63,7 @@ def chat(
                 f"{BASE_URL}/chat/completions",
                 headers={"Authorization": f"Bearer {API_KEY}",
                          "Content-Type": "application/json"},
-                json={"model": MODEL, "messages": messages,
+                json={"model": model or MODEL, "messages": messages,
                       "temperature": temperature, "max_tokens": max_tokens},
                 timeout=timeout,
             )

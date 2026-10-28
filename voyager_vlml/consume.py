@@ -3201,8 +3201,15 @@ def _fits_judge(question: str, sql: str, data: Any,
             f"数值列白名单（missing 只准从这里挑）：\n{_num_block}\n\n"
             f"库全貌（实查）：\n{obs}")
     try:
+        # 判官模型走 MVE_CRITIC_MODEL（同 task_critic.py:275 的契约：判官不能省
+        # 模型钱）。2026-10-29 实测踩到：判官用 flash 时**同一份技术部口径的
+        # SQL，第一轮正确退回（「只计算了技术部门」）、重填轮又放行**——
+        # 错误答案 57120 当确定句交了出去。判官档的活交给判官档的模型；
+        # env 不设则回落全局模型，行为不变。
+        import os as _osj
         cj = chat_json([{"role": "system", "content": sys_p},
-                        {"role": "user", "content": user}], temperature=0.0)
+                        {"role": "user", "content": user}], temperature=0.0,
+                       model=_osj.getenv("MVE_CRITIC_MODEL", ""))
     except Exception as e:
         print(f"  （作答对题判官不可用：{type(e).__name__}: {e} → 如实放行）")
         return {"ok": True, "why": f"判官不可用（如实放行）：{type(e).__name__}",
