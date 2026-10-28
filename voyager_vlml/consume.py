@@ -1202,6 +1202,12 @@ async def consume(
                                     f"{_label} 被主体守卫拒用：{_sjwhy[:140]}")
                                 _fails.append({"name": _label, "why": _sjwhy[:200]})
                                 continue
+                            _cwhy = _completeness_guard(question, _sql, _dbp)
+                            if _cwhy:
+                                reuse_errors.append(
+                                    f"{_label} 被完整性守卫拒用：{_cwhy[:140]}")
+                                _fails.append({"name": _label, "why": _cwhy[:200]})
+                                continue
                             _rr = await _env.run_sql(_sql)
                             _d = _rr.get("data") or {}
                             if _rr.get("ok") and _d.get("rows"):
@@ -1323,6 +1329,12 @@ async def consume(
                         data = None
                         reuse_errors.append(
                             f"整段 SQL 被主体守卫拒用：{_sjwhy2[:140]}")
+                    _cwhy2 = _completeness_guard(
+                        question, code, str((_prof or {}).get("db_path") or ""))
+                    if data is not None and _cwhy2:
+                        data = None
+                        reuse_errors.append(
+                            f"整段 SQL 被完整性守卫拒用：{_cwhy2[:140]}")
         # ---- 维度覆盖守卫（合成题被单配方/单表答的确定性闸）----
         # 与 fan-out 闸同风格、同位置：不赌 LLM。本题拆成多维度（dims>=2）却只
         # 覆盖 1 张维度源表 → 合成题被单维度答掉（如"发多少工资"只答了基薪、
@@ -2734,6 +2746,55 @@ def _subject_guard(question: str, sql: str) -> str:
                 "SQL 里却过滤了某个部门 —— 交出去就是把一个部门的数说成"
                 "全公司的答案（真数 ≠ 对题）。去掉部门过滤，或如实判不会")
     return ""
+
+
+def _completeness_guard(question: str, sql: str, db_path: str = "") -> str:
+    """SQL 配方复用前的确定性**完整性守卫**（口径/主体守卫的第三道，2026-10-28）：
+
+    事故实证（用户截图「帮我算对不对」实查核账）：问「技术部九月份**总共**
+    要发多少钱」，配方只算 SUM(base_salary)=55000，判 written/掌握✓ ——
+    钱的口径对（工资类）、主体对（技术部）、数是真的，但**组成不全**：
+    库里实查得到津贴表（技术部 9 月津贴 2120），「总共要发」应含
+    基本工资+津贴 = 57120。
+
+    判据全部可确定性核查（不赌 LLM）：
+      ① 题面是「全部要发」语义（总共/一共/总额/应发/发多少…）；
+      ② 题面**没有**自己限定窄口径（基本工资/底薪/base —— 问基本工资总额
+         是合法的窄口径题，不拦）；
+      ③ SQL 是工资类聚合（口径守卫已过），但无津贴类词、也无 total_pay/
+         gross 这类全含列；
+      ④ **db_observation 实查到库里有津贴/补贴表**（有才拦——没有津贴表
+         的场景，基本工资就是全部，不误杀）。
+    拒因进重采样反馈，驱动回填层把两部分组合起来（消费组合缺口的确定性
+    驱动力）。返回拒绝原因；'' = 通过。
+    """
+    _q = str(question or "")
+    _s = str(sql or "")
+    low = _s.lower()
+    if not _q.strip() or not low.strip():
+        return ""
+    if re.search(r"基本|基础|底薪|base", _q):
+        return ""                      # 题面自己限定了窄口径，合法
+    if not any(w in _q for w in ("总共", "一共", "总额", "合计", "应发",
+                                 "发多少", "要发", "支付", "总收入")):
+        return ""
+    if not re.search(r"salary|pay|wage|薪|工资", low):
+        return ""                      # 不是工资类 SQL，不归这道闸管
+    if re.search(r"allowance|bonus|subsidy|津贴|补贴|补助|奖金"
+                 r"|total_pay|total_comp|gross", low):
+        return ""                      # 已含津贴部分或全含列
+    if not str(db_path or "").strip():
+        return ""
+    try:
+        from curriculum_auto import db_observation
+        obs = str(db_observation(str(db_path)) or "").lower()
+    except Exception:
+        return ""                      # 实查不了 → 如实放行
+    if not any(w in obs for w in ("allowance", "津贴", "补贴", "奖金")):
+        return ""                      # 库里没有津贴类表 → 基本工资就是全部
+    return ("总额组成不全（完整性守卫）：库里有津贴/补贴表（db_observation "
+            "实查到），而「总共要发」的 SQL 只算了基本工资 —— 应当把基本工资"
+            "与津贴两部分组合相加，或如实说明口径只算了基本工资")
 
 
 def _is_data_question(question: str) -> bool:
