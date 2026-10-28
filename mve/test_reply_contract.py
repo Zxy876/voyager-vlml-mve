@@ -5,8 +5,11 @@
 事故 ②：「技术部九月份工资发多少钱」被答成津贴 2120 且判 written/掌握✓
         （数据全真、无幻觉，但答非所问 —— 用户原话「有局限性，答案也不对」）。
 
-抄 R1 的解法：最终结论 rule-based 对账（口径守卫）+ 答不了就换路
-（rejection sampling 同构：拒了重采样下一技能）+ 每句必有交代。
+抄 R1 的解法：答不了就换路（kick 学习）+ 每句必有交代 + **看全貌判对题**。
+⚠️ 2026-10-28 用户拍板：「不能这样写死守卫解决，而是…让 agent 看到全貌」——
+第一版曾用 `_scope_guard`/`_subject_guard`/`_completeness_guard` 三张业务词表
+硬拦，已全部删除；现在由 `_fits_judge`（题面 + SQL + 结果 + 整库全貌 + 技能库
+全库目录 → 判主体/口径/完整性）承担，词表写死**不许回归**（断言见第 4 节）。
 
 跑法：python mve/test_reply_contract.py（服务器无 pytest，同 test_*.py 口径）。
 """
@@ -36,40 +39,56 @@ def main() -> int:
     os.chdir(os.path.join(os.path.dirname(_HERE), "voyager_vlml"))
     import consume as C
 
-    print("== 1. 口径守卫：真数 ≠ 对题 ==")
-    g = C._scope_guard("技术部九月份工资发多少钱",
-                       "SELECT SUM(amount) AS total_allowance FROM allowance "
-                       "WHERE kind IN ('餐补','交通') AND month='2026-09'")
-    check("题面问工资、配方算津贴 → 拒", bool(g), str(g)[:50])
-    check("拒绝原因点明口径", "答非所问" in g and "工资" in g)
-    check("基薪+津贴的组合 SQL → 放行", not C._scope_guard(
-        "技术部九月份工资发多少钱",
-        "SELECT SUM(e.base_salary) + (SELECT SUM(a.amount) FROM allowance a) "
-        "FROM employees e WHERE e.dept='技术'"))
-    check("餐补/补贴题配 allowance → 放行", not C._scope_guard(
-        "技术部9月的餐补和交通补贴总额",
-        "SELECT SUM(amount) FROM allowance WHERE kind IN ('餐补','交通')"))
-    check("加班费配 overtime 列 → 放行", not C._scope_guard(
-        "技术部9月加班费发了多少", "SELECT SUM(total_ot_paid) FROM payroll"))
-    check("题面无钱词 → 不误伤", not C._scope_guard(
-        "列出所有员工姓名", "SELECT name FROM employees"))
-    check("「一共要支付多少钱」配 allowance-only → 拒", bool(C._scope_guard(
-        "九月份公司一共要支付多少钱", "SELECT SUM(amount) FROM allowance")))
+    print("== 1. 全貌判官 _fits_judge：真数 ≠ 对题 ==")
+    orig = C.chat_json
+    seen: list[list[dict]] = []
 
-    print("== 1.5 主体守卫：公司口径 ≠ 部门口径 ==")
-    g = C._subject_guard("九月份公司一共要支付多少钱",
-                         "SELECT SUM(e.base_salary) FROM employees e "
-                         "WHERE e.dept='技术' AND e.active=true")
-    check("题面问公司、SQL 过滤技术部 → 拒（55000 事故）", bool(g))
-    check("拒绝原因点明主体口径", "主体口径不符" in g)
-    check("技术部题配部门过滤 → 放行", not C._subject_guard(
-        "技术部九月份总共要发多少钱",
-        "SELECT SUM(base_salary) FROM employees WHERE dept='技术'"))
-    check("公司题无部门过滤 → 放行", not C._subject_guard(
-        "九月份公司一共要支付多少钱",
-        "SELECT SUM(base_salary) FROM employees WHERE active=true"))
-    check("「公司所有人姓名」这类全称问法不误伤", not C._subject_guard(
-        "列出公司所有人姓名", "SELECT name FROM employees"))
+    def _stub_ok(msgs, **k):
+        seen.append(msgs)
+        return {"ok": True, "why": "口径一致"}
+
+    try:
+        C.chat_json = _stub_ok
+        r = C._fits_judge(
+            "技术部九月份工资发多少钱",
+            "SELECT SUM(base_salary) AS total FROM employees WHERE dept='技术'",
+            {"rows": [{"total": 55000}], "columns": ["total"]},
+            "/root/mve/scene_data/B/payroll.duckdb")
+        check("判官判对 → ok", r["ok"] is True, r["why"][:30])
+        msgs = seen[-1]
+        sys_p = msgs[0]["content"]
+        user_p = msgs[1]["content"]
+        check("判官只问三件事（主体/口径/完整性）",
+              "主体" in sys_p and "口径" in sys_p and "完整性" in sys_p)
+        check("判官看得到实际 SQL", "SUM(base_salary)" in user_p)
+        check("判官看得到真实取回的行", "55000" in user_p)
+        check("判官拿到库全貌（表/列/取值）", "库全貌" in user_p)
+
+        C.chat_json = lambda *a, **k: {"ok": False,
+                                       "why": "题面问工资总额，SQL 只算了基本工资，缺津贴"}
+        r2 = C._fits_judge("技术部九月份总共要发多少钱",
+                           "SELECT SUM(base_salary) FROM employees WHERE dept='技术'",
+                           {"rows": [{"total": 55000}]}, "")
+        check("判官判片面 → 不 ok", r2["ok"] is False)
+        check("拒因原样带回（进重填反馈）", "缺津贴" in r2["why"])
+
+        def _boom(*a, **k):
+            raise RuntimeError("llm down")
+
+        C.chat_json = _boom
+        r3 = C._fits_judge("随便", "SELECT 1", {"rows": [{"x": 1}]}, "")
+        check("判官挂了 → 如实放行（绝不因故障拒掉答案）",
+              r3["ok"] is True and "如实放行" in r3["why"])
+    finally:
+        C.chat_json = orig
+
+    print("== 1.5 全貌供给（替代写死词表的两个来源） ==")
+    check("_catalog_block 空库路径 → 空串不抛", C._catalog_block("") == "")
+    check("_catalog_block 坏库路径 → 空串不抛（环境观察失败不阻塞）",
+          C._catalog_block("/nonexistent/x.duckdb") == "")
+    _cat, _all = C._scene_skill_catalog("no-such-scene-xyz")
+    check("_scene_skill_catalog 返回 (目录文本, 全库技能表)",
+          isinstance(_cat, str) and isinstance(_all, list))
 
     print("== 2. 数据题判定（决定答不出时走哪条路） ==")
     check("「工资发多少」是数据题", C._is_data_question("技术部九月份工资发多少钱"))
@@ -100,11 +119,24 @@ def main() -> int:
 
     print("== 4. 消费主流程接线 ==")
     src = open("consume.py", encoding="utf-8").read()
-    check("复用逐条过口径守卫", "_scope_guard(question, _sql)" in src)
-    check("整段 SQL 再兜一道口径守卫", "_scope_guard(question, code)" in src)
-    check("口径拒因进重采样反馈（_fails）",
-          src.index("_scope_guard(question, _sql)") < src.index('feedback=_fb'))
-    check("复用逐条也过单位守卫", "_unit_guard(_sql, question)" in src)
+    check("执行完先过全貌对题判官", "_fits_judge(question, code, data, _dbp)" in src)
+    check("solve 兜底路径也过判官",
+          "整段 SQL 被对题判官退回" in src)
+    check("判不过 → 带全库目录重填一轮", "catalog=_cat" in src and "_fb2" in src)
+    check("重填用技能库全库（不只命中的几条）",
+          "_scene_skill_catalog(_scene_id)" in src and "_all_sk or skills" in src)
+    check("重填后仍不过 → 当没答出来（走学习线）",
+          "重填后仍不对题" in src and "reused_skill = None" in src)
+    check("回填层收得到全库目录",
+          "catalog: str = \"\"" in src and "技能库全库目录" in src)
+    check("复用逐条仍过单位守卫（数据一致性，非业务口径）",
+          "_unit_guard(_sql, question)" in src)
+    # ⚠️ 用户 2026-10-28 拍板：「不能这样写死守卫解决」—— 业务词表写死不许回归。
+    # 判调用点/定义（docstring 里提到旧名做沿革说明是允许的）。
+    _biz_guards = ("_scope_guard", "_subject_guard", "_completeness_guard")
+    check("业务词表守卫已彻底删除（不许回归）",
+          not any((f"def {g}(" in src or f"{g}(question" in src
+                   or f"{g}(_sql" in src) for g in _biz_guards))
     check("答不出数据题 → 自动 kick_learning",
           "kick_learning(" in src and "_is_data_question(question)" in src)
     check("kick 注明同构语义（答不了就进入学习）", "进入学习" in src)

@@ -359,7 +359,8 @@ action.py:94 programs 注入；此前只挑一条写一条 SQL，合成题（bas
 
 
 def _refill_sql_multi(question: str, skills: list[dict[str, Any]], schema: str,
-                      db_path: str = "", feedback: str = "") -> dict[str, Any]:
+                      db_path: str = "", feedback: str = "",
+                      catalog: str = "") -> dict[str, Any]:
     """原版同构的多技能实例化：检索到的每条相关配方都回填成 SQL（不是只挑一条）。
 
     与 `_refill_sql` 同一地面真话（db_observation 实查取值清单 + schema），
@@ -368,6 +369,11 @@ def _refill_sql_multi(question: str, skills: list[dict[str, Any]], schema: str,
 
     `feedback`（2026-10-26）：上一轮回填/执行的报错清单（原版 step 的
     critique——环境报错是地面真话，喂回去 LLM 才修正得了，voyager.py:236-271）。
+
+    `catalog`（2026-10-28 用户拍板「让 agent 看到全貌」）：技能库**全库**目录。
+    检索只给命中的 top_k，模型就看不出「问总额 = 基薪配方 + 津贴配方」这种
+    组合关系（实测：命中 base_salary 一条 → 只算出 55000，漏 2120 津贴）。
+    给了全库目录，组合关系由模型自己看出来，不需要在代码里写死业务词表。
     """
     recipes = "\n\n".join(
         f"【配方 {i+1}｜topic={s.get('topic')}｜{s.get('name') or ''}】\n"
@@ -385,7 +391,11 @@ def _refill_sql_multi(question: str, skills: list[dict[str, Any]], schema: str,
     user = (
         f"当前这句话：\n{question}\n\n"
         f"已学会的配方：\n{recipes}\n\n"
-        f"当前库真实存在的表与列（只能引用这里出现的名字）：\n{schema[:6000]}\n\n"
+        + (f"[技能库全库目录 —— 库里已经学会的**全部**方法，上面只列了本题命中"
+           f"的几条。判断题面要的量需不需要**组合多条**（如总额 = 基本工资 + "
+           f"津贴）：需要就把对应方法也各实例化一条 SELECT，交给上层相加]\n"
+           f"{catalog[:3000]}\n\n" if catalog else "")
+        + f"当前库真实存在的表与列（只能引用这里出现的名字）：\n{schema[:6000]}\n\n"
         + (f"[环境观察（数据源真实的取值）——筛选字面量必须逐字取自这里，"
            f"清单里没有的写法不许出现在 SQL 里]：\n{ground[:5000]}\n\n"
            if ground else "")
@@ -1180,33 +1190,16 @@ async def consume(
                                     f"{_label} 被 fan-out 闸门拒用（JOIN 乘爆）：{_fwhy[:120]}")
                                 _fails.append({"name": _label, "why": _fwhy[:200]})
                                 continue
-                            # 单位守卫 + 口径守卫（R1 rule-based 同构）：真数
-                            # ≠ 对题 —— 题面问工资、配方算津贴，这种「数据全真
-                            # 的答非所问」必须在执行前拦下（2026-10-28 截图事故：
-                            # 2120 津贴被说成工资总额还判 written）。
+                            # 单位守卫（数据一致性，不是业务口径）：小时数当钱用
+                            # 是单位错觉，与「题面问什么」无关 —— 这类确定性
+                            # 检查保留。业务口径（主体/口径/完整性）不在这里判：
+                            # 交给执行后的全貌判官（_fits_judge），它看得到整库
+                            # 全貌，不需要把业务词表写死在代码里（2026-10-28）。
                             _uwhy = _unit_guard(_sql, question)
                             if _uwhy:
                                 reuse_errors.append(
                                     f"{_label} 被单位守卫拒用：{_uwhy[:120]}")
                                 _fails.append({"name": _label, "why": _uwhy[:200]})
-                                continue
-                            _swhy = _scope_guard(question, _sql)
-                            if _swhy:
-                                reuse_errors.append(
-                                    f"{_label} 被口径守卫拒用：{_swhy[:140]}")
-                                _fails.append({"name": _label, "why": _swhy[:200]})
-                                continue
-                            _sjwhy = _subject_guard(question, _sql)
-                            if _sjwhy:
-                                reuse_errors.append(
-                                    f"{_label} 被主体守卫拒用：{_sjwhy[:140]}")
-                                _fails.append({"name": _label, "why": _sjwhy[:200]})
-                                continue
-                            _cwhy = _completeness_guard(question, _sql, _dbp)
-                            if _cwhy:
-                                reuse_errors.append(
-                                    f"{_label} 被完整性守卫拒用：{_cwhy[:140]}")
-                                _fails.append({"name": _label, "why": _cwhy[:200]})
                                 continue
                             _rr = await _env.run_sql(_sql)
                             _d = _rr.get("data") or {}
@@ -1237,7 +1230,12 @@ async def consume(
                                                  db_path=_dbp, feedback=_fb)
                         if _mr2["items"]:
                             await _try_items(_mr2["items"], "重试")
-                    if _executed:
+                    _last_note: str = str(_mr.get("note") or "")
+
+                    def _do_merge() -> None:
+                        """把 _executed 合并成 data/code/obs（判官退回后要重来一遍）。"""
+                        nonlocal data, code, obs, reused_skill
+                        nonlocal _used_skills, _ans_skills
                         # 多技能结果合并（原版：agent 组合多条技能的产出交呈现层）：
                         # 每行标注来源技能，叙事层据此相加/组织；`rows` 键保住
                         # 下方真空防线的口径不变。
@@ -1264,7 +1262,7 @@ async def consume(
                         code = "\n;\n".join(_e["sql"] for _e in _executed)
                         _first = next((e["skill"] for e in _executed
                                        if e.get("skill")), None) or skills[0]
-                        reused_skill = {**dict(_first), "refill_note": _mr["note"],
+                        reused_skill = {**dict(_first), "refill_note": _last_note,
                                         "composed_of": [_e["name"]
                                                         for _e in _executed]}
                         _used_skills = [dict(e["skill"]) for e in _executed
@@ -1274,6 +1272,9 @@ async def consume(
                                 "rows": _e["rows"], "data": _e["data"],
                                 "data_sources": ["query_sql"]}
                                for _e in _executed]
+
+                    if _executed:
+                        _do_merge()
                     else:
                         reuse_errors.append(
                             "已检索到已学技能但复用未取到真数（回填/守卫/执行全败）")
@@ -1282,6 +1283,42 @@ async def consume(
                                              "消费不做合成，需驾驶舱 ▶ 启动 Voyager "
                                              "重学该里程碑（或补缺维度）"}
                         obs, code = [], ""
+                    # ---- 作答对题判官（**看全貌**判，不靠写死词表）----
+                    # 2026-10-28 用户拍板：「不能这样写死守卫解决，而是…让 agent
+                    # 看到全貌」。判官拿到「题面 + 实际 SQL + 取回结果 + 整库全貌
+                    # （表/列/真实取值）+ 技能库全库目录」，自己看出「工资 = 基本
+                    # 工资 + 津贴」这类合成关系 —— 业务口径不再写进代码。
+                    # 判不过 → 带着全貌与拒因重填一轮（原版 step 迭代同构）；仍
+                    # 不过就当没答出来（data=None 走学习线），绝不交片面数。
+                    if _executed:
+                        _fit = _fits_judge(question, code, data, _dbp)
+                        if not _fit["ok"]:
+                            reuse_errors.append(
+                                f"作答被对题判官退回：{_fit['why'][:160]}")
+                            print(f"  · 对题判官退回：{_fit['why'][:110]}"
+                                  f" → 带全库目录重填一轮", flush=True)
+                            _cat, _all_sk = _scene_skill_catalog(_scene_id)
+                            _fb2 = (f"- 上一轮结果被判官退回：{_fit['why']}\n"
+                                    f"- 技能库全库目录（可组合多条，别只看命中的）：\n"
+                                    f"{_cat or '（空）'}")
+                            try:
+                                _mr3 = _refill_sql_multi(
+                                    question, (_all_sk or skills), _schema,
+                                    db_path=_dbp, feedback=_fb2, catalog=_cat)
+                            except Exception as _e3:
+                                _mr3 = {"items": [], "note": str(_e3)}
+                            if _mr3["items"]:
+                                _executed.clear()
+                                _last_note = str(_mr3.get("note") or _last_note)
+                                await _try_items(_mr3["items"], "判官退回重填")
+                            if _executed:
+                                _do_merge()
+                                _fit = _fits_judge(question, code, data, _dbp)
+                            if not _fit["ok"]:
+                                data = None
+                                reused_skill = None
+                                reuse_errors.append(
+                                    f"重填后仍不对题：{_fit['why'][:160]}")
             else:
                 obs, code = await _la.solve(
                     question, _scene_dir, scene_id=_scene_id, skills=skills,
@@ -1316,25 +1353,17 @@ async def consume(
                 # 答案字面量当查询条件的坏配方写进技能库（2026-10-22 K 实测）。
                 elif not (data.get("rows") if isinstance(data, dict) else data):
                     data = None
-                if data is not None:
-                    # 口径守卫兜底（含 local-agent/重试产出的 SQL）：逐条守卫
-                    # 之后的最后一道确定性闸 —— 合并 SQL 整体也必须对题。
-                    _swhy2 = _scope_guard(question, code)
-                    if _swhy2:
+                if data is not None and not skills:
+                    # 无已学技能 → 现场 solve 出的 SQL：同一把对题判官（看全貌判
+                    # 主体/口径/完整性）。这里**不重填**：solve 已用掉内层 3 轮
+                    # 迭代，再回填性价比低 —— 直接当没答出来走学习线（宁可空手
+                    # 也不交片面数）。有 skills 时上面已判过，不重复花钱。
+                    _fit2 = _fits_judge(
+                        question, code, data, str((_prof or {}).get("db_path") or ""))
+                    if not _fit2["ok"]:
                         data = None
                         reuse_errors.append(
-                            f"整段 SQL 被口径守卫拒用：{_swhy2[:140]}")
-                    _sjwhy2 = _subject_guard(question, code)
-                    if data is not None and _sjwhy2:
-                        data = None
-                        reuse_errors.append(
-                            f"整段 SQL 被主体守卫拒用：{_sjwhy2[:140]}")
-                    _cwhy2 = _completeness_guard(
-                        question, code, str((_prof or {}).get("db_path") or ""))
-                    if data is not None and _cwhy2:
-                        data = None
-                        reuse_errors.append(
-                            f"整段 SQL 被完整性守卫拒用：{_cwhy2[:140]}")
+                            f"整段 SQL 被对题判官退回：{_fit2['why'][:140]}")
         # ---- 维度覆盖守卫（合成题被单配方/单表答的确定性闸）----
         # 与 fan-out 闸同风格、同位置：不赌 LLM。本题拆成多维度（dims>=2）却只
         # 覆盖 1 张维度源表 → 合成题被单维度答掉（如"发多少工资"只答了基薪、
@@ -2669,132 +2698,91 @@ def _unit_guard(sql: str, question: str) -> str:
             f"要答金额请改用金额列，或如实判该维度不可答")
 
 
-def _scope_guard(question: str, sql: str) -> str:
-    """SQL 配方复用前的确定性**口径守卫**（抄 R1 的 rule-based 判法，2026-10-28）：
+def _catalog_block(db_path: str, limit: int = 4000) -> str:
+    """库的全貌（实查表/列/真实取值）——给 agent 看，而不是给守卫写词表。
 
-    事故实证（用户截图，场景 B）：问「技术部九月份工资发多少钱」，检索命中
-    tech_allowance（津贴配方），回填出 SUM(amount) FROM allowance —— 数是
-    真的（守卫全过、无幻觉），但**答非所问**：题面问工资、配方算的是津贴。
-    更糟的是叙述层把 2120 津贴说成「工资发放总额」，还判 written/掌握✓。
-
-    LLM 判官防不住这个（数据真实、SQL 语法对、没假设业务参数），R1 的解法
-    是**最终答案 rule-based 对账**——这里同构：题面的钱词归一个口径类，
-    SQL 里必须出现同类的表/列词，对不上就拒。词表是语言层常识（与
-    _unit_guard 的钱词同性质），不是业务参数假设。
-
-    返回拒绝原因；'' = 通过。题面没有钱词 → 放行（不误伤）。
+    2026-10-28 用户拍板方向：「不能这样写死守卫解决，而是…让 agent 看到
+    全貌」。全貌的来源就是原版环境观察面（curriculum_auto.db_observation，
+    出题器/攻略层/critic 三方共用的同一份实查渲染）。
     """
-    _q = str(question or "")
-    _s = str(sql or "").lower()
-    if not _q.strip() or not _s.strip():
-        return ""
-    # 口径类：题面词 → SQL 词。顺序 = 特指优先（「工资里的津贴」判津贴类）。
-    _CLASSES = (
-        ("扣款", ("扣", "罚款", "缺勤扣", "处罚"),
-         ("deduct", "penal", "fine", " deduction", "扣")),
-        ("加班费", ("加班",),
-         ("overtime", "total_ot", "_ot_", "加班")),
-        ("津贴补贴", ("津贴", "补贴", "补助", "餐补", "交通补", "奖金",
-                      "提成", "佣金"),
-         ("allowance", "bonus", "subsidy", "commission", "津贴", "补贴",
-          "补助", "奖金")),
-        ("工资", ("工资", "薪水", "薪酬", "薪", "应发", "实发", "收入",
-                  "待遇", "发多少钱", "发多少", "要发", "支付", "报酬"),
-         ("salary", "pay", "wage", "income", "compensation", "薪",
-          "工资", "酬")),
-    )
-    want: list[str] = []
-    for _label, _qwords, _ in _CLASSES:
-        if any(w in _q for w in _qwords):
-            want.append(_label)
-    if not want:
-        return ""
-    # 题面提到的每个口径类，SQL 里都得有同类的表/列词 —— 缀哪类就缺哪类。
-    missing = [lb for lb in want
-               if not any(w in _s for w in dict(
-                   (c[0], c[2]) for c in _CLASSES)[lb])]
-    if not missing:
-        return ""
-    return (f"答非所问（口径守卫）：题面问的是「{'、'.join(want)}」，"
-            f"但 SQL 里找不到{'、'.join(missing)}相关的表/列 —— "
-            f"这个配方算的是别的口径，交出去就是把 A 口径的数说成 B 口径的答案"
-            f"（真数 ≠ 对题）。要么换/组合覆盖该口径的配方，要么如实判不会")
-
-
-def _subject_guard(question: str, sql: str) -> str:
-    """SQL 配方复用前的确定性**主体守卫**（口径守卫的姊妹闸，2026-10-28）：
-
-    事故实证（用户截图追问「帮我算对不对」实查核账）：问「九月份**公司**
-    一共要支付多少钱」，配方答的是技术部在职基本工资 55000 —— 数是真的、
-    钱的口径也对（工资类），但**主体口径错**：题面问全公司，SQL 里却
-    WHERE dept='技术'。55000 被判 written/掌握✓ 又是一次「真数 ≠ 对题」。
-
-    判据（rule-based）：题面出现全称主体词（公司/全员/全体/所有人）而
-    SQL 带部门过滤 → 拒。反向（题面点名某部、SQL 无部门过滤）暂不做——
-    「题面提到技术部但问的是跨部门对比」这类合法情形会误杀，交给判官。
-    返回拒绝原因；'' = 通过。
-    """
-    _q = str(question or "")
-    _s = str(sql or "")
-    if not _q.strip() or not _s.strip():
-        return ""
-    _WIDE = ("公司", "全员", "全体", "所有人", "全部门", "各部门合计")
-    if not any(w in _q for w in _WIDE):
-        return ""
-    if re.search(r"\b(dept|department)\s*=\s*'[^']*'", _s, re.I):
-        return ("主体口径不符（主体守卫）：题面问的是全公司/全员，"
-                "SQL 里却过滤了某个部门 —— 交出去就是把一个部门的数说成"
-                "全公司的答案（真数 ≠ 对题）。去掉部门过滤，或如实判不会")
-    return ""
-
-
-def _completeness_guard(question: str, sql: str, db_path: str = "") -> str:
-    """SQL 配方复用前的确定性**完整性守卫**（口径/主体守卫的第三道，2026-10-28）：
-
-    事故实证（用户截图「帮我算对不对」实查核账）：问「技术部九月份**总共**
-    要发多少钱」，配方只算 SUM(base_salary)=55000，判 written/掌握✓ ——
-    钱的口径对（工资类）、主体对（技术部）、数是真的，但**组成不全**：
-    库里实查得到津贴表（技术部 9 月津贴 2120），「总共要发」应含
-    基本工资+津贴 = 57120。
-
-    判据全部可确定性核查（不赌 LLM）：
-      ① 题面是「全部要发」语义（总共/一共/总额/应发/发多少…）；
-      ② 题面**没有**自己限定窄口径（基本工资/底薪/base —— 问基本工资总额
-         是合法的窄口径题，不拦）；
-      ③ SQL 是工资类聚合（口径守卫已过），但无津贴类词、也无 total_pay/
-         gross 这类全含列；
-      ④ **db_observation 实查到库里有津贴/补贴表**（有才拦——没有津贴表
-         的场景，基本工资就是全部，不误杀）。
-    拒因进重采样反馈，驱动回填层把两部分组合起来（消费组合缺口的确定性
-    驱动力）。返回拒绝原因；'' = 通过。
-    """
-    _q = str(question or "")
-    _s = str(sql or "")
-    low = _s.lower()
-    if not _q.strip() or not low.strip():
-        return ""
-    if re.search(r"基本|基础|底薪|base", _q):
-        return ""                      # 题面自己限定了窄口径，合法
-    if not any(w in _q for w in ("总共", "一共", "总额", "合计", "应发",
-                                 "发多少", "要发", "支付", "总收入")):
-        return ""
-    if not re.search(r"salary|pay|wage|薪|工资", low):
-        return ""                      # 不是工资类 SQL，不归这道闸管
-    if re.search(r"allowance|bonus|subsidy|津贴|补贴|补助|奖金"
-                 r"|total_pay|total_comp|gross", low):
-        return ""                      # 已含津贴部分或全含列
     if not str(db_path or "").strip():
         return ""
     try:
         from curriculum_auto import db_observation
-        obs = str(db_observation(str(db_path)) or "").lower()
+        return str(db_observation(str(db_path)) or "")[:limit]
     except Exception:
-        return ""                      # 实查不了 → 如实放行
-    if not any(w in obs for w in ("allowance", "津贴", "补贴", "奖金")):
-        return ""                      # 库里没有津贴类表 → 基本工资就是全部
-    return ("总额组成不全（完整性守卫）：库里有津贴/补贴表（db_observation "
-            "实查到），而「总共要发」的 SQL 只算了基本工资 —— 应当把基本工资"
-            "与津贴两部分组合相加，或如实说明口径只算了基本工资")
+        return ""
+
+
+def _scene_skill_catalog(scene_id: str, limit: int = 40) -> tuple[str, list[dict]]:
+    """技能库全貌：(给模型看的目录文本, 全部技能 dict)。
+
+    ⚠️ 为什么要给全库而不是只给检索命中的几条（2026-10-28 事故）：
+    问「技术部总共要发多少钱」时检索只命中 base_salary 配方，模型据此只算出
+    55000 —— 它**看不见**库里还有「津贴」配方，「工资 = 基本工资 + 津贴」这个
+    合成关系就没人告诉它。给全库目录 + 允许组合，比写死「总额必须含津贴」的
+    词表靠谱（后者是把业务口径硬编码进代码）。
+    """
+    try:
+        import skill_store
+        raw = list((skill_store._load_raw().get("skills") or {}).values())
+    except Exception:
+        return "", []
+    mine = [x for x in raw
+            if not scene_id or str(x.get("scene_id") or "") in ("", scene_id)]
+    if not mine:
+        return "", []
+    lines = []
+    for x in mine[:limit]:
+        nm = str(x.get("name") or "")
+        tp = str(x.get("topic") or "")
+        tx = " ".join(str(x.get("text") or "").split())[:90]
+        lines.append(f"- {nm}（topic={tp}）：{tx}")
+    return "\n".join(lines), mine
+
+
+def _fits_judge(question: str, sql: str, data: Any,
+                db_path: str = "") -> dict[str, Any]:
+    """作答对题判官（**看全貌**判，不靠写死词表）。
+
+    替代 _scope_guard/_subject_guard/_completeness_guard 三张词表：它把
+    「题面 + 实际执行的 SQL + 取回的结果 + 库的真实全貌」一起给判官，只问
+    三件事：主体对不对（全公司 vs 某部门）、口径对不对（工资 vs 津贴）、
+    完整不完整（题面说"总共"就要覆盖库里存在的全部组成部分）。
+
+    判官不可用（LLM 挂了）→ 如实放行（ok=True + why 注明），绝不因为判官
+    故障把正确答案拒掉。返回 {"ok": bool, "why": str}。
+    """
+    rows = None
+    if isinstance(data, dict):
+        rows = data.get("rows")
+    try:
+        preview = json.dumps(rows[:8], ensure_ascii=False)[:1200] if rows else \
+            str(data)[:800]
+    except Exception:
+        preview = str(data)[:800]
+    obs = _catalog_block(db_path, 3500)
+    sys_p = (
+        "你是核对员。给你题面、实际执行的 SQL、取回的结果、以及库里真实存在"
+        "的表/列/取值全貌。判断「这组 SQL + 结果是不是真的回答了题面」，只看三件事：\n"
+        "① 主体：题面问的是谁/什么范围（全公司？某个部门？某个人？），SQL 的"
+        "过滤条件必须是同一个主体；\n"
+        "② 口径：题面问的量是哪一种（工资总额？某项津贴？加班费？人数？），"
+        "SQL 聚合的列必须就是它；\n"
+        "③ 完整性：题面说「总共/一共/总额/全部/应发」时，结果必须覆盖全貌里"
+        "存在的各组成部分；但题面自己限定了窄口径（如「基本工资」）时，只算"
+        "那部分就是对的。\n"
+        '只返回 JSON：{"ok": true/false, "why": "一句话说清哪里不对；对就写口径一致"}')
+    user = (f"题面：{question}\n\nSQL：\n{str(sql)[:1500]}\n\n"
+            f"结果（前几行）：\n{preview}\n\n库全貌（实查）：\n{obs}")
+    try:
+        cj = chat_json([{"role": "system", "content": sys_p},
+                        {"role": "user", "content": user}], temperature=0.0)
+    except Exception as e:
+        print(f"  （作答对题判官不可用：{type(e).__name__}: {e} → 如实放行）")
+        return {"ok": True, "why": f"判官不可用（如实放行）：{type(e).__name__}"}
+    ok = True if not isinstance(cj, dict) else bool(cj.get("ok", True))
+    return {"ok": ok, "why": str((cj or {}).get("why") or "")[:300]}
 
 
 def _is_data_question(question: str) -> bool:
