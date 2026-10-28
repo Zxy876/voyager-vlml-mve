@@ -63,6 +63,27 @@ def main() -> int:
         check("判官看得到实际 SQL", "SUM(base_salary)" in user_p)
         check("判官看得到真实取回的行", "55000" in user_p)
         check("判官拿到库全貌（表/列/取值）", "库全貌" in user_p)
+        check("完整性只准依据全貌（不许用常识补表）",
+              "不许当成" in sys_p and "别用行业常识" in sys_p)
+
+        # 多技能编排：逐条渲染，别让判官把拼起来的 SQL 误读成「同一条少算了」
+        C._fits_judge("技术部九月份总共要发多少钱", "", {},
+                      "", items=[
+                          {"name": "tech_dept_base_salaries",
+                           "sql": "SELECT SUM(base_salary) FROM employees "
+                                  "WHERE dept='技术'",
+                           "data": {"rows": [{"t": 55000}],
+                                    "columns": ["t"]}},
+                          {"name": "tech_dept_allowances",
+                           "sql": "SELECT SUM(amount) FROM allowance",
+                           "data": {"rows": [{"t": 2120}], "columns": ["t"]}}])
+        _u = seen[-1][1]["content"]
+        _s = seen[-1][0]["content"]
+        check("多条 SQL 逐条渲染（带来源配方名）",
+              "SQL 1" in _u and "SQL 2" in _u and "tech_dept_allowances" in _u)
+        check("逐条各自配自己的结果", "55000" in _u and "2120" in _u)
+        check("告知判官「上层负责合并」，别要求单条答完整题",
+              "由上层合并/相加" in _u and "不要要求单条 SQL" in _s)
 
         C.chat_json = lambda *a, **k: {"ok": False,
                                        "why": "题面问工资总额，SQL 只算了基本工资，缺津贴"}

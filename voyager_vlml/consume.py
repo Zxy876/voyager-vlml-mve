@@ -1291,7 +1291,8 @@ async def consume(
                     # 判不过 → 带着全貌与拒因重填一轮（原版 step 迭代同构）；仍
                     # 不过就当没答出来（data=None 走学习线），绝不交片面数。
                     if _executed:
-                        _fit = _fits_judge(question, code, data, _dbp)
+                        _fit = _fits_judge(question, code, data, _dbp,
+                                              items=_executed)
                         if not _fit["ok"]:
                             reuse_errors.append(
                                 f"作答被对题判官退回：{_fit['why'][:160]}")
@@ -1325,7 +1326,8 @@ async def consume(
                                     not in _prev_sql]
                             if _executed:
                                 _do_merge()
-                                _fit = _fits_judge(question, code, data, _dbp)
+                                _fit = _fits_judge(question, code, data, _dbp,
+                                              items=_executed)
                             if not _fit["ok"]:
                                 data = None
                                 reused_skill = None
@@ -2754,13 +2756,24 @@ def _scene_skill_catalog(scene_id: str, limit: int = 40) -> tuple[str, list[dict
 
 
 def _fits_judge(question: str, sql: str, data: Any,
-                db_path: str = "") -> dict[str, Any]:
+                db_path: str = "",
+                items: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """作答对题判官（**看全貌**判，不靠写死词表）。
 
     替代 _scope_guard/_subject_guard/_completeness_guard 三张词表：它把
     「题面 + 实际执行的 SQL + 取回的结果 + 库的真实全貌」一起给判官，只问
     三件事：主体对不对（全公司 vs 某部门）、口径对不对（工资 vs 津贴）、
-    完整不完整（题面说"总共"就要覆盖库里存在的全部组成部分）。
+    完整不完整（题面说"总共"就要覆盖**库里实际存在**的全部组成部分）。
+
+    `items`：逐条执行的账（[{name, sql, data}]）—— 多技能编排时**逐条**渲染
+    （每条 SQL 配自己的结果），否则判官看拼在一起的 SQL 会误读成「同一条
+    SQL 少算了」（2026-10-28 实测：说「津贴没算上所有员工」，其实子查询里
+    已经按 dept 过滤了）。
+
+    ⚠️ 完整性只准拿**库全貌**当依据：全貌里没有的表/列/取值类别（比如没有
+    bonus 表）**不许假设存在** —— 与出题器规则 8「库里没有的费率/税率不许
+    假设」同一条铁律。否则判官会凭常识编出「还有住房补贴/奖金没算」，
+    把正确答案一路怼死（2026-10-28 实测过）。
 
     判官不可用（LLM 挂了）→ 如实放行（ok=True + why 注明），绝不因为判官
     故障把正确答案拒掉。返回 {"ok": bool, "why": str}。
@@ -2774,21 +2787,43 @@ def _fits_judge(question: str, sql: str, data: Any,
     except Exception:
         preview = str(data)[:800]
     obs = _catalog_block(db_path, 3500)
+    if items:
+        _blocks = []
+        for _i, _e in enumerate(items[:6], 1):
+            _d = _e.get("data") or {}
+            _rr = _d.get("rows") or []
+            try:
+                _rp = json.dumps(_rr[:6], ensure_ascii=False)[:700]
+            except Exception:
+                _rp = str(_rr)[:700]
+            _blocks.append(
+                f"【SQL {_i}｜来源配方 {_e.get('name') or '?'}】\n"
+                f"{str(_e.get('sql') or '')[:800]}\n"
+                f"→ {len(_rr)} 行：{_rp}")
+        sql_block = ("本次作答由以下 %d 条 SELECT 组成（各条结果由上层合并/"
+                     "相加，**不是**一条 SQL 要包办全部）：\n\n%s"
+                     % (len(items), "\n\n".join(_blocks)))
+    else:
+        sql_block = f"SQL：\n{str(sql)[:1500]}\n\n结果（前几行）：\n{preview}"
     sys_p = (
-        "你是核对员。给你题面、实际执行的 SQL、取回的结果、以及库里真实存在"
+        "你是核对员。给你题面、实际执行的 SQL 与取回的结果、以及库里真实存在"
         "的表/列/取值全貌。判断「这组 SQL + 结果是不是真的回答了题面」，只看三件事：\n"
         "① 主体：题面问的是谁/什么范围（全公司？某个部门？某个人？），SQL 的"
         "过滤条件必须是同一个主体；\n"
         "② 口径：题面问的量是哪一种（工资总额？某项津贴？加班费？人数？），"
         "SQL 聚合的列必须就是它；\n"
-        "③ 完整性：题面说「总共/一共/总额/全部/应发」时，结果必须覆盖全貌里"
-        "存在的各组成部分；但题面自己限定了窄口径（如「基本工资」）时，只算"
-        "那部分就是对的。⚠️ 某组成部分在库里**没有可算的列**（如只有加班"
-        "小时数、没有加班费率/加班金额列）→ 它本来就不可计算，缺它不算不"
-        "完整，这种情况 ok 可以为 true，why 里注明「该项无可用列」即可。\n"
+        "③ 完整性：题面说「总共/一共/总额/全部/应发」时，结果必须覆盖**库全貌"
+        "里实际存在**的各组成部分；但题面自己限定了窄口径（如「基本工资」）时，"
+        "只算那部分就是对的。\n"
+        "⚠️ 硬约束（违反即作废）：判断组成部分有没有缺，**只能**看库全貌里列出的"
+        "表/列/取值。全貌里没有的表、列、津贴类别、奖金项目 → 一律不许当成"
+        "「应该存在但没算」；库里没有费率/单价列 → 该量本来就算不出来，缺它不算"
+        "不完整。别用行业常识补全貌里没有的东西。\n"
+        "⚠️ 多条 SQL 时，每条只负责题面的一部分（上层负责合并/相加），不要要求"
+        "单条 SQL 自己答完整题。\n"
         '只返回 JSON：{"ok": true/false, "why": "一句话说清哪里不对；对就写口径一致"}')
-    user = (f"题面：{question}\n\nSQL：\n{str(sql)[:1500]}\n\n"
-            f"结果（前几行）：\n{preview}\n\n库全貌（实查）：\n{obs}")
+    user = (f"题面：{question}\n\n{sql_block}\n\n"
+            f"库全貌（实查，判断组成部分只准依据它）：\n{obs}")
     try:
         cj = chat_json([{"role": "system", "content": sys_p},
                         {"role": "user", "content": user}], temperature=0.0)
