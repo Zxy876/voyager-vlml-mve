@@ -1371,11 +1371,36 @@ async def consume(
         if data is None and not skills:
             answer = ("⚠️ 未学：本题里程碑尚未被学习跑过，检索不到已学技能 —— "
                       "已标记交给课程规划拆解学习（驾驶舱 ▶ 启动 Voyager 学完即可复用）。")
+        # ---- 工具线兜底（第 4 步，DeepSeek 消费同构，2026-10-28 落地）----
+        # 库场景取不到数（data is None：库里没有能回答的数据 / 未学）→ 作用域
+        # 落 tool 线：联网取公开资料、当场作答、用完即弃 —— claim（有真值但
+        # 未知）。**不入技能库、不进能力账、不计入学习曲线**（能力账闸门要求
+        # data is not None，工具线答案恒进不去）。学习线照常 kick，两条供给线
+        # 并行：库内可复现的归学习线，库外时变的归工具线。
+        tool_line: dict[str, Any] = {}
+        if data is None and _scene_kind == "scene":
+            try:
+                tool_line = await _tool_line_fallback(question)
+            except Exception as e:  # pragma: no cover
+                tool_line = {"used": False, "answer": "", "sources": [],
+                             "note": (f"工具线异常：{type(e).__name__}: "
+                                      f"{str(e)[:140]}")}
+            if tool_line.get("answer"):
+                answer = (str(tool_line["answer"]).rstrip()
+                          + "（⚠️ 工具线 claim：来自联网资料，未经库内验证；"
+                            "不进能力账、不计入学习曲线）")
         base = {
             "question": question, "mode": "voyager_consume",
             "topic_id": topic_id, "topic_hit": hit,
             "source": "human_import", "validated_target": False,
             "root_scene": _scene_id, "scene_kind": _scene_kind,
+            # 作用域 + 工具线披露（2.5/第 4 步）：场景分支不跑 VLML 裁判对照，
+            # referee_compared 恒 False（面板显示「未对照」而非「有硬伤」）。
+            "scope_line": _scope_line(_scene_id),
+            "referee_compared": False,
+            "tool_line_used": bool(tool_line.get("used")),
+            "tool_sources": (tool_line.get("sources") or [])[:5],
+            "tool_line_note": str(tool_line.get("note") or "")[:200],
             "route_decision": str(route_info.get("decision") or ""),
             "route_score": int(route_info.get("max_score") or 0),
             "route_matched_on": str(route_info.get("matched_on") or ""),
