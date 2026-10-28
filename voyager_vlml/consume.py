@@ -1346,6 +1346,50 @@ async def consume(
                 nar = {"ok": False, "why": f"{type(e).__name__}: {e}"}
             if nar.get("ok") and str(nar.get("answer") or "").strip():
                 answer = str(nar["answer"])
+                # ---- R1 同构：叙述层数字对账（rule-based，不花 LLM）----
+                # R1 不给叙述设判官，只 rule-based 判**最终答案**：数字必须
+                # 能从证据逐字指认（boxed 匹配同构）；不过 → 重采样一次
+                # （rejection sampling 同构）→ 仍不过就降级原始数据平铺。
+                # 83240.5 事故（20.5 小时被叙述成「20.5 元加班费」）死在这关。
+                _sum_auth = (len((reused_skill or {}).get("composed_of") or []) > 1
+                             or len(_executed) > 1 or len(_used_skills) > 1)
+                _ok_n, _why_n = _nar.verify_answer_numbers(
+                    answer, data, sum_auth=_sum_auth)
+                if not _ok_n:
+                    _nar_note2 = (_nar_note
+                                  + "；⚠️ 上一版答案里有数据对不上的数字（"
+                                  + _why_n[:90] + "）——只准原样引用数据里出现"
+                                    "的数字；合计只准相加金额列的值，"
+                                    "时长/数量列的值不许当金额")
+                    _a2 = ""
+                    try:
+                        _nar2 = _nar.narrate_answer(question, data,
+                                                    note=_nar_note2)
+                        _a2 = str(_nar2.get("answer") or "").strip()
+                    except Exception:
+                        _nar2 = {}
+                    if _nar2.get("ok") and _a2:
+                        _ok2, _why2 = _nar.verify_answer_numbers(
+                            _a2, data, sum_auth=_sum_auth)
+                        if _ok2:
+                            answer = _a2
+                            nar = _nar2
+                    if not (answer and _nar.verify_answer_numbers(
+                            answer, data, sum_auth=_sum_auth)[0]):
+                        # 重采样仍不过 → 降级：原始数据平铺（可核、无修辞），
+                        # 叙述作废并留痕 —— 展示层只给可验证的结论（R1：
+                        # think 隐藏、只展示 answer 的同构）。
+                        try:
+                            answer = json.dumps(data, ensure_ascii=False,
+                                                indent=1)[:4000]
+                        except Exception:
+                            answer = str(data)[:4000]
+                        try:
+                            nar.setdefault("caveats", []).append(
+                                "⚠️ 未验证：叙述层数字与数据对不上（"
+                                + _why_n[:120] + "），已退回原始数据平铺")
+                        except Exception:
+                            pass
         # 这段代码到底调了哪些抓手（披露用；不含纯计算，见 `_tools_in_code`）
         _mve_traj = _tools_in_code(code, _scene_id)
         # 完成判定（2026-10-25 用户拍板）：消费侧 **LLM critic 判定删除**——

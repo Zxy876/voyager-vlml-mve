@@ -384,3 +384,109 @@ def narrate_answer(question: str, data: Any, *, note: str = "") -> dict[str, Any
                      "url": valid[n].get("url") or ""} for n in picks],
     })
     return out
+
+
+# ---------------------------------------------------------------------------
+# 叙述层数字对账（2026-10-28，抄 DeepSeek R1 的 rule-based 口径）
+# ---------------------------------------------------------------------------
+# R1 怎么解决「叙述/推理层不可信」：**不给叙述设 LLM 判官**，只 rule-based
+# 判**最终答案**——accuracy（权重 1.0）= boxed 答案逐字匹配，答案里的数字
+# 对不上就不给分；不过关的采样被淘汰重来（rejection sampling）。叙述自由
+# 发挥的部分被隔离在 <think> 里，**用户看到的只有可验证的结论**。
+#
+# MVE 同构（免训练版）：narrative 就是「think」——自由文本、会顺手把
+# 20.5 小时说成 20.5 元（2026-10-28 场景 B 实测：83240.5 = 81000 基薪 +
+# 2120 津贴 + 20.5「加班费」，20.5 其实是 overtime_hours 的**小时数**）。
+# 抄法：答案里的每个数字必须能从**取回的数据**逐字指认（verbatim），
+# 或是被授权的「金额列相加」（相加授权来自多技能编排，且只许金额列——
+# 时长/数量列的值不许进金额组合）。对不上 → 重采样一次（R1 的 rejection
+# sampling 同构）→ 仍不过就降级为原始数据平铺（可核、无修辞）。
+
+# 非金额列的键面特征（与 consume._unit_guard 同一张单位表——别复制成两份口径）
+_NON_MONEY_KEY_UNITS = ("hours", "days", "count", "num", "rate",
+                        "小时", "天数", "次数", "数量", "率")
+
+
+def _collect_evidence(data: Any, acc: list[float], money: list[float]) -> None:
+    """递归收集证据数值：全部值进 acc；**金额语义键**下的值另进 money。"""
+    if isinstance(data, dict):
+        for k, v in data.items():
+            ks = str(k).lower()
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, (int, float)):
+                fv = float(v)
+                if fv == fv:                      # NaN 防御
+                    acc.append(fv)
+                    if not any(u in ks for u in _NON_MONEY_KEY_UNITS):
+                        money.append(fv)
+            else:
+                _collect_evidence(v, acc, money)
+    elif isinstance(data, (list, tuple)):
+        for v in data:
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, (int, float)):
+                fv = float(v)
+                if fv == fv:
+                    acc.append(fv)
+            else:
+                _collect_evidence(v, acc, money)
+
+
+def _subset_sum_representable(target: float, vals: list[float],
+                              tol: float = 0.01, max_n: int = 12) -> bool:
+    """target 能否由 vals 的某个子集（≤max_n 个）相加得到（容差 tol）。"""
+    vs = [round(v, 4) for v in vals if v != 0][:max_n]
+    reach = {0.0}
+    for v in vs:
+        reach |= {round(s + v, 4) for s in reach}
+        reach = {s for s in reach if s <= target + tol}
+    return any(abs(target - s) <= tol for s in reach)
+
+
+def verify_answer_numbers(answer: str, data: Any, *,
+                          sum_auth: bool = False) -> tuple[bool, str]:
+    """叙述层数字对账（rule-based，不花 LLM）。
+
+    答案（最终 answer，R1 的 boxed 同构物）里每个数字必须：
+      a) 原样出现在取回的数据里（verbatim），或
+      b) sum_auth=True 时，等于**金额列**证据值的某个子集之和
+        （多技能编排授权了「把组成部分相加」，但只许金额列 —— 20.5 小时
+        淮「20.5 元加班费」的事故就死在这一条）。
+    日期（2026-09 / 2026年）与引用编号 [1] 不算答案数字，先剥掉再对。
+    返回 (ok, why)：why = 第一个对不上的数字及理由（空串 = 通过）。
+    """
+    text = str(answer or "")
+    # 剥掉引用编号与日期（这些数字不是「答案数值」）——「9月」的 9 也不许
+    # 被当成答案数值对账（实测误杀「技术部9月应发…」）
+    text = re.sub(r"\[\d+\]", " ", text)
+    text = re.sub(r"\b(?:19|20)\d{2}\s*[-/年.]\s*\d{1,2}(?:\s*[-/月.]\s*\d{1,2})?[日]?", " ", text)
+    text = re.sub(r"(?<![\d.])\d{1,2}\s*月", " ", text)
+    text = re.sub(r"(?<![\d.])\d{1,2}\s*[日号]", " ", text)
+    found = re.findall(r"\d[\d,]*(?:\.\d+)?", text)
+    if not found:
+        return True, ""
+    acc: list[float] = []
+    money: list[float] = []
+    _collect_evidence(data, acc, money)
+    missing: list[str] = []
+    for raw in found[:40]:
+        try:
+            v = float(raw.replace(",", ""))
+        except ValueError:
+            continue
+        tol = max(0.01, abs(v) * 1e-6)
+        if any(abs(v - e) <= tol for e in acc):
+            continue
+        if sum_auth and _subset_sum_representable(v, money):
+            continue
+        missing.append(raw)
+        if len(missing) >= 5:
+            break
+    if missing:
+        return False, ("答案里的数字 " + "、".join(missing)
+                       + " 在取回的数据里指认不了"
+                       + ("（金额相加也拼不出来——可能混入了非金额列的值）"
+                          if sum_auth else ""))
+    return True, ""
