@@ -911,6 +911,7 @@ async def consume(
     # 域外问题却在任何地方都看不到痕迹（2026-10-18 实测特斯拉问题踩中）。
     # 学习触发结果（未命中才有）：面板导入历史据此显示「已启动后台学习」。
     learn_kick: dict[str, Any] = {"kicked": False, "why": ""}
+    inference_used = False        # inference 兜底（句句有回复的最后一层）
     miss_info: dict[str, Any] = {}
     try:
         if str(route_info.get("decision") or "") == "REJECTED":
@@ -1179,6 +1180,22 @@ async def consume(
                                     f"{_label} 被 fan-out 闸门拒用（JOIN 乘爆）：{_fwhy[:120]}")
                                 _fails.append({"name": _label, "why": _fwhy[:200]})
                                 continue
+                            # 单位守卫 + 口径守卫（R1 rule-based 同构）：真数
+                            # ≠ 对题 —— 题面问工资、配方算津贴，这种「数据全真
+                            # 的答非所问」必须在执行前拦下（2026-10-28 截图事故：
+                            # 2120 津贴被说成工资总额还判 written）。
+                            _uwhy = _unit_guard(_sql, question)
+                            if _uwhy:
+                                reuse_errors.append(
+                                    f"{_label} 被单位守卫拒用：{_uwhy[:120]}")
+                                _fails.append({"name": _label, "why": _uwhy[:200]})
+                                continue
+                            _swhy = _scope_guard(question, _sql)
+                            if _swhy:
+                                reuse_errors.append(
+                                    f"{_label} 被口径守卫拒用：{_swhy[:140]}")
+                                _fails.append({"name": _label, "why": _swhy[:200]})
+                                continue
                             _rr = await _env.run_sql(_sql)
                             _d = _rr.get("data") or {}
                             if _rr.get("ok") and _d.get("rows"):
@@ -1287,6 +1304,14 @@ async def consume(
                 # 答案字面量当查询条件的坏配方写进技能库（2026-10-22 K 实测）。
                 elif not (data.get("rows") if isinstance(data, dict) else data):
                     data = None
+                if data is not None:
+                    # 口径守卫兜底（含 local-agent/重试产出的 SQL）：逐条守卫
+                    # 之后的最后一道确定性闸 —— 合并 SQL 整体也必须对题。
+                    _swhy2 = _scope_guard(question, code)
+                    if _swhy2:
+                        data = None
+                        reuse_errors.append(
+                            f"整段 SQL 被口径守卫拒用：{_swhy2[:140]}")
         # ---- 维度覆盖守卫（合成题被单配方/单表答的确定性闸）----
         # 与 fan-out 闸同风格、同位置：不赌 LLM。本题拆成多维度（dims>=2）却只
         # 覆盖 1 张维度源表 → 合成题被单维度答掉（如"发多少工资"只答了基薪、
@@ -1325,10 +1350,29 @@ async def consume(
         # 没取到 → 还是没学会。同样**不自动后台学**（2026-10-19 用户改设计）：
         # 这条问题已在场景学习账上（coach_log 判读 = 没答出来），人点驾驶舱
         # 「▶ 启动 Voyager」时 scene_learn.py 会排到它 —— 每轮落 run_log 可见。
-        if data is None:
+        if data is None and _is_data_question(question):
+            # 自动拉起学习（2026-10-28 用户改设计，原 2026-10-19「只人工触发」
+            # 作废）：「发送新的对话内容，就顺带拉取一个新的学习流程」—— 同构
+            # R1「答不了就进入思考」：MVE 答不了数据题就**进入学习**，回复里
+            # 明说「正在学」。kick_learning 自带同题去重，不怕连问。
+            try:
+                import learn_orchestrate as _lo2
+                _kk = _lo2.kick_learning(
+                    question, _scene_id,
+                    reason="消费没答出来（未学/口径不符/真空）—— 新对话顺带拉起学习")
+                learn_kick = {
+                    "kicked": bool(_kk.get("kicked")),
+                    "manual": not bool(_kk.get("kicked")),
+                    "why": ("已自动拉起后台学习（学完再问同一句即可复用）"
+                            if _kk.get("kicked") else
+                            f"自动学习没拉起：{_kk.get('why') or '未知'}——"
+                            "可在驾驶舱 ▶ 启动 Voyager 人工触发")}
+            except Exception as _ke:
+                learn_kick = {"kicked": False, "manual": True,
+                              "why": f"自动学习拉起失败：{type(_ke).__name__}: {_ke}"}
+        elif data is None:
             learn_kick = {"kicked": False, "manual": True,
-                          "why": "没取到结果（能力还没学会）—— 学习等你在驾驶舱点"
-                                 "「▶ 启动 Voyager」触发"}
+                          "why": "非数据题（概念/解释类），无需学习流程"}
         answer = ""
         # 叙事层：取到的数是**素材**，答案得是人话。
         # 同构猫娘的「参考资料 → 回答」（config/prompts/prompts_knowledge.py:31-36
@@ -1422,27 +1466,57 @@ async def consume(
             answer = (str(answer).rstrip()
                       + "（⚠️ 未验证：本轮未通过 critic 判定，此数字不可信）")
         # 未学（检索不到已学技能）：不答、只标记交给课程规划，明确告知人。
-        if data is None and not skills:
-            answer = ("⚠️ 未学：本题里程碑尚未被学习跑过，检索不到已学技能 —— "
-                      "已标记交给课程规划拆解学习（驾驶舱 ▶ 启动 Voyager 学完即可复用）。")
-        # ---- 工具线兜底（第 4 步，DeepSeek 消费同构，2026-10-28 落地）----
-        # 库场景取不到数（data is None：库里没有能回答的数据 / 未学）→ 作用域
-        # 落 tool 线：联网取公开资料、当场作答、用完即弃 —— claim（有真值但
-        # 未知）。**不入技能库、不进能力账、不计入学习曲线**（能力账闸门要求
-        # data is not None，工具线答案恒进不去）。学习线照常 kick，两条供给线
-        # 并行：库内可复现的归学习线，库外时变的归工具线。
+        if data is None and not skills and _is_data_question(question):
+            answer = ("⚠️ 未学：这道题还没学过，检索不到已学配方 —— 不编数。"
+                      + ("已自动拉起后台学习，学完再问同一句即可复用。"
+                         if learn_kick.get("kicked") else
+                         "学习未自动拉起，可在驾驶舱 ▶ 启动 Voyager 人工学。"))
+        # ---- 句句有回复（R1 客户端同构，2026-10-28）----
+        # 三层，按题型分流（用户截图两事故的收敛：
+        #   ①「什么是强化学习」句句无回复；② 工资题被答成津贴还判 written）：
+        #   · 内部数据题（题面找数 + 路由命中本场景）答不出 → 绝不联网、绝不
+        #     推断 —— 联网搜"技术部工资"只会搜到垃圾，模型推断就是编数；
+        #     如实交代判官结论 + 已派学习（上面已 kick）。
+        #   · 非数据题（是什么/为什么）→ 先 inference（同 DeepSeek 客户端：
+        #     联网默认关，知识题模型直接答，标「模型推断」）；模型自评不知 →
+        #     工具线 claim。
+        #   · 外部时变数据题（路由没命中本场景的"多少"题，如汇率）→ 工具线。
         tool_line: dict[str, Any] = {}
-        if data is None and _scene_kind == "scene":
-            try:
-                tool_line = await _tool_line_fallback(question)
-            except Exception as e:  # pragma: no cover
-                tool_line = {"used": False, "answer": "", "sources": [],
-                             "note": (f"工具线异常：{type(e).__name__}: "
-                                      f"{str(e)[:140]}")}
-            if tool_line.get("answer"):
-                answer = (str(tool_line["answer"]).rstrip()
-                          + "（⚠️ 工具线 claim：来自联网资料，未经库内验证；"
-                            "不进能力账、不计入学习曲线）")
+        _internal_hit = (str(route_info.get("decision") or "")
+                         in ("HIGH_CONFIDENCE", "MEDIUM_CONFIDENCE")
+                         or bool(skills))
+        _no_reply = (data is None and not str(answer or "").strip())
+        if _no_reply and _is_data_question(question) and _internal_hit:
+            pass                       # 上面已有「未学/不会」交代 + 已派学习
+        elif _no_reply:
+            if not _is_data_question(question):
+                _inf = _inference_answer(question)
+                if _inf.get("used"):
+                    answer = (str(_inf["answer"]).rstrip()
+                              + "（⚠️ 模型推断：未从环境取数验证；不入库、"
+                                "不计入学习曲线）")
+                    inference_used = True
+            if not str(answer or "").strip():
+                try:
+                    tool_line = await _tool_line_fallback(question)
+                except Exception as e:  # pragma: no cover
+                    tool_line = {"used": False, "answer": "", "sources": [],
+                                 "note": (f"工具线异常：{type(e).__name__}: "
+                                          f"{str(e)[:140]}")}
+                if tool_line.get("answer"):
+                    answer = (str(tool_line["answer"]).rstrip()
+                              + "（⚠️ 工具线 claim：来自联网资料，未经库内验证；"
+                                "不进能力账、不计入学习曲线）")
+        if _no_reply and not str(answer or "").strip():
+            # 兜底的兜底：inference / 工具线都没产出 —— 也必须句句有回复，
+            # 判官结论与局限原样交代（用户 2026-10-28：判官可以看到局限性）。
+            _lim = (str(critic_why or "")
+                    or "；".join(str(x) for x in reuse_errors[-2:])
+                    or str((tool_line.get("note") or "")))
+            answer = ("这题这轮没答出来 —— 不编数。"
+                      + (f"判官结论：{_lim[:220]} " if _lim.strip() else "")
+                      + ("已自动拉起后台学习。" if learn_kick.get("kicked")
+                         else "可到面板查看判定明细。"))
         base = {
             "question": question, "mode": "voyager_consume",
             "topic_id": topic_id, "topic_hit": hit,
@@ -1455,6 +1529,9 @@ async def consume(
             "tool_line_used": bool(tool_line.get("used")),
             "tool_sources": (tool_line.get("sources") or [])[:5],
             "tool_line_note": str(tool_line.get("note") or "")[:200],
+            # inference 兜底（句句有回复）：模型推断层用没用 —— 与工具线
+            # claim 同级的披露，面板/对话页据此挂「模型推断」标注。
+            "inference_used": bool(inference_used),
             "route_decision": str(route_info.get("decision") or ""),
             "route_score": int(route_info.get("max_score") or 0),
             "route_matched_on": str(route_info.get("matched_on") or ""),
@@ -2527,6 +2604,104 @@ def _unit_guard(sql: str, question: str) -> str:
     return (f"聚合目标列 {','.join(bad)} 的单位是数量/时长（小时/天数），"
             f"而题面问的是金额 —— 库里没有换算费率，不许假设（单位守卫）。"
             f"要答金额请改用金额列，或如实判该维度不可答")
+
+
+def _scope_guard(question: str, sql: str) -> str:
+    """SQL 配方复用前的确定性**口径守卫**（抄 R1 的 rule-based 判法，2026-10-28）：
+
+    事故实证（用户截图，场景 B）：问「技术部九月份工资发多少钱」，检索命中
+    tech_allowance（津贴配方），回填出 SUM(amount) FROM allowance —— 数是
+    真的（守卫全过、无幻觉），但**答非所问**：题面问工资、配方算的是津贴。
+    更糟的是叙述层把 2120 津贴说成「工资发放总额」，还判 written/掌握✓。
+
+    LLM 判官防不住这个（数据真实、SQL 语法对、没假设业务参数），R1 的解法
+    是**最终答案 rule-based 对账**——这里同构：题面的钱词归一个口径类，
+    SQL 里必须出现同类的表/列词，对不上就拒。词表是语言层常识（与
+    _unit_guard 的钱词同性质），不是业务参数假设。
+
+    返回拒绝原因；'' = 通过。题面没有钱词 → 放行（不误伤）。
+    """
+    _q = str(question or "")
+    _s = str(sql or "").lower()
+    if not _q.strip() or not _s.strip():
+        return ""
+    # 口径类：题面词 → SQL 词。顺序 = 特指优先（「工资里的津贴」判津贴类）。
+    _CLASSES = (
+        ("扣款", ("扣", "罚款", "缺勤扣", "处罚"),
+         ("deduct", "penal", "fine", " deduction", "扣")),
+        ("加班费", ("加班",),
+         ("overtime", "total_ot", "_ot_", "加班")),
+        ("津贴补贴", ("津贴", "补贴", "补助", "餐补", "交通补", "奖金",
+                      "提成", "佣金"),
+         ("allowance", "bonus", "subsidy", "commission", "津贴", "补贴",
+          "补助", "奖金")),
+        ("工资", ("工资", "薪水", "薪酬", "薪", "应发", "实发", "收入",
+                  "待遇", "发多少钱", "发多少", "要发", "支付", "报酬"),
+         ("salary", "pay", "wage", "income", "compensation", "薪",
+          "工资", "酬")),
+    )
+    want: list[str] = []
+    for _label, _qwords, _ in _CLASSES:
+        if any(w in _q for w in _qwords):
+            want.append(_label)
+    if not want:
+        return ""
+    # 题面提到的每个口径类，SQL 里都得有同类的表/列词 —— 缀哪类就缺哪类。
+    missing = [lb for lb in want
+               if not any(w in _s for w in dict(
+                   (c[0], c[2]) for c in _CLASSES)[lb])]
+    if not missing:
+        return ""
+    return (f"答非所问（口径守卫）：题面问的是「{'、'.join(want)}」，"
+            f"但 SQL 里找不到{'、'.join(missing)}相关的表/列 —— "
+            f"这个配方算的是别的口径，交出去就是把 A 口径的数说成 B 口径的答案"
+            f"（真数 ≠ 对题）。要么换/组合覆盖该口径的配方，要么如实判不会")
+
+
+def _is_data_question(question: str) -> bool:
+    """题面在不在**找数据**（rule-based，R1「会不会答」的对称面）。
+
+    找数据的题：环境答不出 = 不会 —— 绝不联网编、绝不推断编，如实交代 +
+    拉学习。不找数据的题（是什么/为什么/怎么）：模型知识可答（标 inference），
+    联网资料可证（标 claim）—— 同 DeepSeek 客户端：联网默认关，知识题直接答。
+    """
+    _q = str(question or "").lower()
+    _DATA_WORDS = ("多少", "几", "总额", "总共", "一共", "总和", "合计",
+                   "平均", "均值", "最大", "最小", "最高", "最低", "排名",
+                   "哪些", "列表", "数量", "占比", "比例", "增长率",
+                   "how many", "how much", "sum", "count", "average",
+                   "total", "list")
+    return any(w in _q for w in _DATA_WORDS)
+
+
+def _inference_answer(question: str) -> dict[str, Any]:
+    """inference 兜底（句句有回复的最后一层）：模型凭自身知识回答。
+
+    同 DeepSeek 客户端的知识题回答：不用环境、不联网，答完**必须**带
+    「模型推断」标注 —— 未验证、不入库、不计入学习曲线（inference 线的
+    既有口径）。自评 grounded=false（自己都不知道）就如实不答。
+    """
+    out: dict[str, Any] = {"used": False, "answer": "", "note": ""}
+    try:
+        cj = chat_json(
+            [{"role": "system",
+              "content": ("凭你自己的知识回答用户问题——这不是从任何数据环境"
+                          "取的数。如果问题需要具体/实时的数据而你无法确知，"
+                          "grounded 必须为 false。只返回 JSON："
+                          '{"answer": "回答", "grounded": true/false}')},
+             {"role": "user", "content": str(question)}],
+            temperature=0.2)
+        ans = str((cj or {}).get("answer") or "").strip()
+        if ans and bool((cj or {}).get("grounded", True)):
+            out["used"] = True
+            out["answer"] = ans
+        elif ans:
+            out["note"] = "模型自评不足以回答（grounded=false，如实不答）"
+        else:
+            out["note"] = "inference 没产出回答"
+    except Exception as e:
+        out["note"] = f"inference 失败：{type(e).__name__}: {str(e)[:140]}"
+    return out
 
 
 def _fanout_guard(sql: str, db_path: str) -> str:

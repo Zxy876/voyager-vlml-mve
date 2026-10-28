@@ -3996,13 +3996,28 @@ def _openai_answer(res: dict, sid: str, prev: str) -> tuple[str, str, dict]:
     import chat_page as _cp
     ans = str(res.get("answer") or "").strip()
     if not ans:
+        # 句句有回复 + 判官可见（用户 2026-10-28：判官可以看到局限性）：
+        # 没答出来时把判官结论 / 局限 / 学习状态原样交代，不写"见判定披露"
+        # 这种让人再去别处查的话。
         why = "；".join(str(x) for x in (res.get("errors") or [])[:2])
-        ans = ("（MVE 这轮没答出来"
-               + (f"：{why[:160]}" if why else "：见判定披露")
-               + "）—— 已标记交给学习/工具线，可先在面板看判定明细。")
+        bits = ["（MVE 这轮没答出来 —— 不编数。"]
+        if res.get("critic_note"):
+            bits.append(f"判官结论：{str(res['critic_note'])[:220]}")
+        elif why:
+            bits.append(f"原因：{why[:160]}")
+        if res.get("learn_kicked"):
+            bits.append("已自动拉起后台学习，学完再问同一句即可复用。")
+        else:
+            bits.append("可到面板查看判定明细。")
+        bits.append("）")
+        ans = " ".join(bits)
     # 披露进正文：OpenAI 客户端只看 content，可验证性必须随答案走。
     tail = [f"场景 {sid or prev or 'A'}",
             f"判定 {res.get('judgment_result') or '—'}"]
+    if res.get("learn_kicked"):
+        tail.append("已派学习")
+    if res.get("inference_used"):
+        tail.append("模型推断")
     if res.get("used_skills"):
         tail.append("复用技能 " + "、".join(
             str(x.get("name") or "") for x in res["used_skills"][:4]))
@@ -4027,6 +4042,8 @@ def _openai_answer(res: dict, sid: str, prev: str) -> tuple[str, str, dict]:
              "mastered": bool(res.get("mastered")),
              "scope_line": res.get("scope_line"),
              "tool_line_used": bool(res.get("tool_line_used")),
+             "inference_used": bool(res.get("inference_used")),
+             "learn_kicked": bool(res.get("learn_kicked")),
              "scene": sid or prev,
              "topic_id": res.get("topic_id"),
              "skill": skill}

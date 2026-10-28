@@ -106,6 +106,15 @@ def reasoning_text(res: dict[str, Any] | None, *, scene_id: str = "",
     if jr:
         m = "掌握 ✓" if res.get("mastered") else "未掌握"
         L.append(f"判定：{jr}；{m}。")
+    if res.get("learn_kicked"):
+        L.append("这道题我还没学会 —— 已自动拉起后台学习（同构 R1「答不了"
+                 "就进入思考」：MVE 答不了数据题就进入学习），学完再问同一句"
+                 "即可复用。")
+    elif res.get("learn_kick_note"):
+        L.append(f"学习状态：{str(res['learn_kick_note'])[:160]}")
+    if res.get("inference_used"):
+        L.append("这一答来自模型自身知识（inference 线）：未经环境验证，"
+                 "不入库、不计入学习曲线。")
     if res.get("skipped"):
         L.append("跳过原因：" + str(res.get("skipped"))[:300])
     if res.get("tool_line_used"):
@@ -531,6 +540,8 @@ function tagRow(x){
   t('判定 ' + (jr || '未知'), jr === 'written' ? 'ok' : 'warn');
   t(x.mastered ? '掌握 ✓' : '未掌握', x.mastered ? 'ok' : '');
   if (x.tool_line_used) t('工具线 claim', 'warn');
+  if (x.inference_used) t('模型推断', 'warn');
+  if (x.learn_kicked) t('已派学习', 'warn');
   t('供给线 ' + (x.scope_line || '?'), x.scope_line === 'learn' ? 'ok' : 'warn');
   if (x.skill) t('复用 ' + x.skill, 'ok');
   if (x.topic_id) t(x.topic_id);

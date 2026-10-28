@@ -216,6 +216,9 @@ def _log_import(result: dict[str, Any]) -> None:
         "tool_line_used": bool(result.get("tool_line_used")),
         "tool_sources": (result.get("tool_sources") or [])[:5],
         "tool_line_note": str(result.get("tool_line_note") or "")[:200],
+        # inference 兜底（句句有回复，2026-10-28）：模型推断层用没用。
+        # ⚠️ 白名单惯犯第 7 次预防：consume 里写了不透传 = coach_log 永远空。
+        "inference_used": bool(result.get("inference_used")),
         # 裁判（VLML）独立那一路取了什么 —— 与 Voyager 那一路并列披露
         "referee_sql": result.get("referee_sql", ""),
         "referee_rows": int(result.get("referee_rows") or 0),
