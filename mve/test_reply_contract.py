@@ -157,6 +157,37 @@ def main() -> int:
                                "SELECT SUM(amount) FROM allowance", {}, "",
                                fails=_F)
             check("判官确认失败项不可算 → 放行", r9["ok"] is True, r9["why"][:60])
+
+            # 缺口闸：失败项碰的表没有任何成功条目覆盖 → 真缺（不吃判官的「无关」）
+            _F2 = [{"name": "allowance_total", "sql":
+                    "SELECT SUM(amount) FROM allowance WHERE month='2026-09'",
+                    "why": "BinderException: month 列不存在"}]
+            C.chat_json = _rec({"subject_ok": True, "measure_ok": True,
+                                "missing": [], "failed_ok": True,
+                                "why": "失败项与题面无关"})
+            r10 = C._fits_judge(
+                "九月份公司一共要支付多少钱", "", {},
+                "", items=[{"name": "base", "sql":
+                            "SELECT SUM(base_salary) FROM employees",
+                            "data": {"rows": [{"t": 133500}]}}],
+                fails=_F2)
+            check("失败表无成功条目覆盖 → 不算答完整（133500 漏津贴事故）",
+                  r10["ok"] is False and "allowance" in r10["gap_tables"],
+                  str(r10["gap_tables"]))
+            check("缺口写进拒因", "组成部分缺失" in r10["why"])
+            C.chat_json = _rec({"subject_ok": True, "measure_ok": True,
+                                "missing": [], "failed_ok": True,
+                                "why": "同表的干净配方已取到数"})
+            r11 = C._fits_judge(
+                "", "", {}, "",
+                items=[{"name": "base", "sql":
+                        "SELECT SUM(base_salary) FROM employees",
+                        "data": {"rows": [{"t": 133500}]}}],
+                fails=[{"name": "base_bad", "sql":
+                        "SELECT SUM(base_salary) FROM employees WHERE x='幻觉'",
+                        "why": "字面量守卫拒"}])
+            check("失败表已被成功条目覆盖 → 不算缺口",
+                  r11["ok"] is True and r11["gap_tables"] == [])
         finally:
             C._numeric_columns = _orig_nums
 

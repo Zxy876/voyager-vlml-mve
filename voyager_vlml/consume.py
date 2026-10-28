@@ -1182,13 +1182,13 @@ async def consume(
                             if _gwhy:
                                 reuse_errors.append(
                                     f"{_label} 被字面量守卫拒用（幻觉取值）：{_gwhy[:120]}")
-                                _fails.append({"name": _label, "why": _gwhy[:200]})
+                                _fails.append({"name": _label, "sql": _sql, "why": _gwhy[:200]})
                                 continue
                             _fwhy = _fanout_guard(_sql, _dbp)
                             if _fwhy:
                                 reuse_errors.append(
                                     f"{_label} 被 fan-out 闸门拒用（JOIN 乘爆）：{_fwhy[:120]}")
-                                _fails.append({"name": _label, "why": _fwhy[:200]})
+                                _fails.append({"name": _label, "sql": _sql, "why": _fwhy[:200]})
                                 continue
                             # 单位守卫（数据一致性，不是业务口径）：小时数当钱用
                             # 是单位错觉，与「题面问什么」无关 —— 这类确定性
@@ -1199,7 +1199,7 @@ async def consume(
                             if _uwhy:
                                 reuse_errors.append(
                                     f"{_label} 被单位守卫拒用：{_uwhy[:120]}")
-                                _fails.append({"name": _label, "why": _uwhy[:200]})
+                                _fails.append({"name": _label, "sql": _sql, "why": _uwhy[:200]})
                                 continue
                             _rr = await _env.run_sql(_sql)
                             _d = _rr.get("data") or {}
@@ -1212,7 +1212,7 @@ async def consume(
                                 _why = str(_rr.get("error") or "0 行")[:200]
                                 reuse_errors.append(
                                     f"{_label} 回填后没取到真数：{_why[:120]}")
-                                _fails.append({"name": _label, "why": _why})
+                                _fails.append({"name": _label, "sql": _sql, "why": _why})
 
                     await _try_items(_mr["items"], "首轮")
                     if not _executed and _fails:
@@ -2918,12 +2918,29 @@ def _fits_judge(question: str, sql: str, data: Any,
     # 这是 7950 事故的机械修复：一轮里 3 条配方 2 条执行报错，判官只看
     # 「成功的那 1 条」说过关了，最后交出去一个残缺的总数。
     _fail_ok = bool(cj.get("failed_ok", not _fails))
+    # ---- 缺口闸（确定性，schema 级，不看业务词）----
+    # 失败项碰到的表，如果**没有任何成功条目**覆盖到，那张表的数据就是真缺了
+    # （实测：公司总额题里 allowance 那条 BinderException，judge 还说「失败项
+    # 与题面无关」→ 交 133500 漏 3600）。反过来，失败项的表已被别的成功条目
+    # 覆盖（如某条配方带幻觉取值被守卫拒，但同表的干净配方成功了）→ 不算缺口。
+    _gap: list[str] = []
+    if _fails:
+        try:
+            _et: set[str] = set()
+            for _e in (items or []):
+                _et |= _sql_tables(str(_e.get("sql") or ""))
+            _ft: set[str] = set()
+            for _f in _fails:
+                _ft |= _sql_tables(str(_f.get("sql") or ""))
+            _gap = sorted(_ft - _et)
+        except Exception:
+            _gap = []
     _asked = [str(m).strip() for m in (cj.get("missing") or []) if str(m).strip()]
     # 只采信白名单里真有的列 —— 判官凭常识编出来的「缺奖金/缺补贴」在这里
     # 被机械地否掉（不是靠提示词求它别编）。读不到 schema 时退回旧行为。
     _real = [m for m in _asked if m in set(_nums)] if _nums else _asked
     why = str(cj.get("why") or "")[:300]
-    ok = sub and mea and _fail_ok and not _real
+    ok = sub and mea and _fail_ok and not _real and not _gap
     if sub and mea and _asked and not _real:
         why = (why + "｜（点名的缺失项 " + "、".join(_asked[:3])
                + " 不在库里真实数值列中 —— 按全貌放行）")[:300]
@@ -2933,7 +2950,10 @@ def _fits_judge(question: str, sql: str, data: Any,
         why = (why + "｜本轮有配方取数失败（"
                + "、".join(str(f.get("name") or "?") for f in _fails[:3])
                + "），不算答完整")[:300]
-    return {"ok": ok, "why": why, "missing": _real}
+    if _gap:
+        why = (why + "｜这些表这轮没取到数、也没有别的条目覆盖："
+               + "、".join(_gap[:4]) + " —— 组成部分缺失")[:300]
+    return {"ok": ok, "why": why, "missing": _real, "gap_tables": _gap}
 
 
 
