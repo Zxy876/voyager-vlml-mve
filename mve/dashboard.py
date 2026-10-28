@@ -2932,8 +2932,118 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return {}
 
+    # ---- OpenAI 兼容层（2026-10-28，DeepSeek 客户端式消费 MVE 学习能力）----
+    # 为什么走 OpenAI 协议：DeepSeek 客户端、LobeChat、NextChat、猫娘、任何
+    # SDK 都认这一套（DeepSeek 开放平台本身就是 OpenAI 兼容）。MVE 只要把
+    # 「学习能力」包装成一个 model，外部就不再需要知道场景/技能/守卫的存在。
+    #   model 名选场景：mve（当前场景）/ mve:B / mve:C / 直接 B
+    #   端点：{base}/v1/models、{base}/v1/chat/completions
+    # 安全：设了环境变量 MVE_API_KEY 就要求 Bearer 认证（8443 在公网上）。
+    def _openai_models(self) -> None:
+        models = []
+        try:
+            import scenes as _sc3
+            for it in (_sc3.list_scenes() or []):
+                sid = str((it or {}).get("id") or "")
+                if sid:
+                    models.append({
+                        "id": f"mve:{sid}", "object": "model",
+                        "owned_by": "mve",
+                        "description": str((it or {}).get("name") or "")[:60],
+                    })
+        except Exception:
+            pass
+        models.append({"id": "mve", "object": "model", "owned_by": "mve",
+                       "description": "MVE 学习能力（当前场景）"})
+        self._json(200, {"object": "list", "data": models})
+
+    def _openai_chat(self, payload: dict) -> None:
+        key = os.environ.get("MVE_API_KEY", "").strip()
+        if key:
+            auth = str(self.headers.get("Authorization") or "").strip()
+            if auth != f"Bearer {key}":
+                self._json(401, {"error": {"message": "invalid api key",
+                                           "type": "invalid_request_error"}})
+                return
+        msgs = payload.get("messages") or []
+        q = ""
+        for m in reversed(msgs if isinstance(msgs, list) else []):
+            if isinstance(m, dict) and str(m.get("role")) == "user":
+                c = m.get("content")
+                if isinstance(c, list):
+                    c = " ".join(str(x.get("text") or "") for x in c
+                                 if isinstance(x, dict))
+                q = str(c or "").strip()
+                break
+        if not q:
+            self._json(400, {"error": {"message": "messages 里没有 user 内容",
+                                       "type": "invalid_request_error"}})
+            return
+        model = str(payload.get("model") or "mve").strip()
+        sid = model.split(":", 1)[1].strip().upper() if ":" in model else (
+            model.upper() if model.upper() in ("A", "B", "C", "D", "E", "F") else "")
+        _prev = ""
+        try:
+            import scenes as _sc4
+            _prev = str(_sc4.current_scene_id() or "A")
+            if sid and sid != _prev:
+                _sc4.switch_scene(sid)
+        except Exception:
+            sid = ""
+        try:
+            import asyncio as _aio
+            import coach as _coach_mod
+            res = _aio.run(_coach_mod.explain(q, voyager=True))
+        except Exception as e:
+            res = {"ok": False, "answer": "",
+                   "errors": [f"{type(e).__name__}: {e}"]}
+        finally:
+            try:
+                import scenes as _sc5
+                if _prev and sid and sid != _prev:
+                    _sc5.switch_scene(_prev)
+            except Exception:
+                pass
+        ans = str(res.get("answer") or "").strip()
+        if not ans:
+            why = "；".join(str(x) for x in (res.get("errors") or [])[:2])
+            ans = ("（MVE 这轮没答出来"
+                   + (f"：{why[:160]}" if why else "：见判定披露")
+                   + "）—— 已标记交给学习/工具线，可先在面板看判定明细。")
+        # 披露进正文：OpenAI 客户端只看 content，可验证性必须随答案走。
+        tail = [f"场景 {sid or _prev or 'A'}",
+                f"判定 {res.get('judgment_result') or '—'}"]
+        if res.get("used_skills"):
+            tail.append("复用技能 " + "、".join(
+                str(x.get("name") or "") for x in res["used_skills"][:4]))
+        if res.get("tool_line_used"):
+            tail.append("工具线（联网 claim）")
+        content = ans + "\n\n—— MVE｜" + "｜".join(tail)
+        import time as _ts
+        now = int(_ts.time())
+        self._json(200, {
+            "id": f"chatcmpl-mve-{now}",
+            "object": "chat.completion",
+            "created": now,
+            "model": model,
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": content}}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0,
+                      "total_tokens": 0},
+            # 非标准扩展字段：自动识别它的客户端零成本忽略；人和脚本可对账。
+            "x_mve": {"judgment_result": res.get("judgment_result"),
+                      "mastered": bool(res.get("mastered")),
+                      "scope_line": res.get("scope_line"),
+                      "tool_line_used": bool(res.get("tool_line_used")),
+                      "scene": sid or _prev,
+                      "topic_id": res.get("topic_id")},
+        })
+
     def do_GET(self) -> None:  # noqa: N802
         path = _strip_prefix(self.path.split("?")[0])
+        if path in ("/v1/models", "/models"):
+            self._openai_models()
+            return
         if path in ("/", "/index.html"):
             body = _html().encode("utf-8")
             ctype = "text/html; charset=utf-8"
@@ -3035,6 +3145,14 @@ class Handler(BaseHTTPRequestHandler):
         """
         path = _strip_prefix(self.path.split("?")[0])
         payload = self._payload()
+
+        # OpenAI 兼容（DeepSeek 客户端式消费）：模型列表 + 作答
+        if path in ("/v1/models", "/models"):
+            self._openai_models()
+            return
+        if path in ("/v1/chat/completions", "/chat/completions"):
+            self._openai_chat(payload)
+            return
 
         if path == "/api/preview":
             try:
