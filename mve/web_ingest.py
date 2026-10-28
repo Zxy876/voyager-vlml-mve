@@ -155,7 +155,13 @@ def _eid(item: str, attribute: str, value: str) -> str:
 
 
 def save_docs(scene_id: str, query: str, results: list[dict[str, Any]]) -> int:
-    """原始资料入库（按 url 去重：同一页只留一次，但 query 仍各记一行）。"""
+    """原始资料入库（**按 url 去重**：同一个页面只留一行，query 记最后一次）。
+
+    ⚠️ 2026-10-28 实测踩到：原来按 (query, url) 去重，同一个页面被不同关键词
+    搜到就存成好几行；学习侧拿 `web_docs JOIN web_facts ON url` 一算，每行事实
+    被放大成 N 行 —— 8 条引用数成了 14 条（75120 乘爆的同款形状）。资料是
+    「有哪些页面」，页面本来就该唯一。
+    """
     db = _db(scene_id)
     ensure(db)
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -167,9 +173,7 @@ def save_docs(scene_id: str, query: str, results: list[dict[str, Any]]) -> int:
             if not url.startswith("http"):
                 continue
             try:
-                con.execute(
-                    f"DELETE FROM {DOCS} WHERE query = ? AND url = ?",
-                    [str(query), url])
+                con.execute(f"DELETE FROM {DOCS} WHERE url = ?", [url])
                 con.execute(
                     f"INSERT INTO {DOCS} VALUES (?, ?, ?, ?, ?)",
                     [str(query), str(r.get("title") or "")[:200], url,
