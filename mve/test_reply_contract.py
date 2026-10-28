@@ -129,6 +129,34 @@ def main() -> int:
             C.chat_json = lambda *a, **k: {"ok": True, "why": "老契约"}
             r7 = C._fits_judge("随便", "SELECT 1", {}, "")
             check("老契约（只给 ok/why）仍兼容", r7["ok"] is True)
+
+            # 7950 事故：一轮里 3 条配方 2 条执行报错，判官只看成功的那条就
+            # 说过关了 → 交出残缺总数。有失败项时必须判官**明确认可**才放行。
+            _F = [{"name": "total_salary", "why": "month 列不存在"},
+                  {"name": "overtime_pay", "why": "月份 列不存在"}]
+
+            def _rec(resp):
+                def _f(msgs, **k):
+                    seen.append(msgs)
+                    return resp
+                return _f
+
+            C.chat_json = _rec({"subject_ok": True, "measure_ok": True,
+                                "missing": [], "why": "口径一致"})
+            r8 = C._fits_judge("九月份公司一共要支付多少钱",
+                               "SELECT SUM(amount) FROM allowance", {}, "",
+                               fails=_F)
+            check("有取数失败又没明确认可 → 不放行（7950 事故）",
+                  r8["ok"] is False and "取数失败" in r8["why"], r8["why"][:70])
+            check("失败项写进判官上下文",
+                  "total_salary" in seen[-1][1]["content"])
+            C.chat_json = _rec({"subject_ok": True, "measure_ok": True,
+                                "missing": [], "failed_ok": True,
+                                "why": "失败的是加班费，库里无费率"})
+            r9 = C._fits_judge("九月份公司一共要支付多少钱",
+                               "SELECT SUM(amount) FROM allowance", {}, "",
+                               fails=_F)
+            check("判官确认失败项不可算 → 放行", r9["ok"] is True, r9["why"][:60])
         finally:
             C._numeric_columns = _orig_nums
 

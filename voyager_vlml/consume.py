@@ -1292,16 +1292,26 @@ async def consume(
                     # 不过就当没答出来（data=None 走学习线），绝不交片面数。
                     if _executed:
                         _fit = _fits_judge(question, code, data, _dbp,
-                                              items=_executed)
+                                           items=_executed, fails=_fails)
                         if not _fit["ok"]:
                             reuse_errors.append(
                                 f"作答被对题判官退回：{_fit['why'][:160]}")
                             print(f"  · 对题判官退回：{_fit['why'][:110]}"
                                   f" → 带全库目录重填一轮", flush=True)
                             _cat, _all_sk = _scene_skill_catalog(_scene_id)
-                            _fb2 = (f"- 上一轮结果被判官退回：{_fit['why']}\n"
-                                    f"- 技能库全库目录（可组合多条，别只看命中的）：\n"
-                                    f"{_cat or '（空）'}")
+                            _fb_lines = [f"- 上一轮结果被判官退回：{_fit['why']}"]
+                            if _fails:
+                                # 执行报错也是地面真话，必须一起喂回去：
+                                # 只说「缺了津贴」而没说「你写的 month 列不存在」，
+                                # 重填会照着同一个错再写一遍（2026-10-28 实测）。
+                                _fb_lines.append("- 上一轮这些配方取数失败"
+                                                 "（照着改，列名以 schema 为准）：")
+                                _fb_lines += [f"  · {f['name']}：{f['why'][:160]}"
+                                              for f in _fails[:5]]
+                            _fb_lines.append("- 技能库全库目录（可组合多条，"
+                                             "别只看命中的）：")
+                            _fb_lines.append(f"{_cat or '（空）'}")
+                            _fb2 = "\n".join(_fb_lines)
                             try:
                                 _mr3 = _refill_sql_multi(
                                     question, (_all_sk or skills), _schema,
@@ -1325,6 +1335,7 @@ async def consume(
                                                ensure_ascii=False, sort_keys=True)
                                     for e in _prev}
                                 _executed.clear()
+                                _fails.clear()
                                 _last_note = str(_mr3.get("note") or _last_note)
                                 await _try_items(_mr3["items"], "判官退回重填")
                                 _executed[:] = _prev + [
@@ -1338,7 +1349,7 @@ async def consume(
                             if _executed:
                                 _do_merge()
                                 _fit = _fits_judge(question, code, data, _dbp,
-                                              items=_executed)
+                                                   items=_executed, fails=_fails)
                             if not _fit["ok"]:
                                 data = None
                                 reused_skill = None
@@ -2803,7 +2814,8 @@ def _numeric_columns(db_path: str, limit: int = 80) -> list[str]:
 
 def _fits_judge(question: str, sql: str, data: Any,
                 db_path: str = "",
-                items: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+                items: list[dict[str, Any]] | None = None,
+                fails: list[dict[str, str]] | None = None) -> dict[str, Any]:
     """作答对题判官（**看全貌**判，不靠写死词表）。
 
     替代 _scope_guard/_subject_guard/_completeness_guard 三张词表：它把
@@ -2854,10 +2866,17 @@ def _fits_judge(question: str, sql: str, data: Any,
                      % (len(items), "\n\n".join(_blocks)))
     else:
         sql_block = f"SQL：\n{str(sql)[:1500]}\n\n结果（前几行）：\n{preview}"
+    _fails = [f for f in (fails or []) if isinstance(f, dict)]
+    if _fails:
+        sql_block += ("\n\n⚠️ 本轮这些配方**取数失败**（它们的结果不在上面 —— "
+                      "题面若需要它们，这份作答就是不完整的）：\n"
+                      + "\n".join(f"- {f.get('name') or '?'}："
+                                  f"{str(f.get('why') or '')[:160]}"
+                                  for f in _fails[:5]))
     sys_p = (
         "你是核对员。给你题面、实际执行的 SQL 与取回的结果、库里真实存在的"
-        "表/列/取值全貌、以及**数值列白名单**。判断「这组 SQL + 结果是不是真的"
-        "回答了题面」，分三项各自表态：\n"
+        "表/列/取值全貌、**数值列白名单**，以及本轮取数失败的配方。判断"
+        "「这组 SQL + 结果是不是真的回答了题面」，分四项各自表态：\n"
         "① subject_ok 主体：题面问的是谁/什么范围（全公司？某个部门？某个"
         "人？），SQL 的过滤条件必须是同一个主体；\n"
         "② measure_ok 口径：题面问的量是哪一种（工资总额？某项津贴？加班费？"
@@ -2865,13 +2884,17 @@ def _fits_judge(question: str, sql: str, data: Any,
         "③ missing 完整性：题面说「总共/一共/总额/全部/应发」时，结果要覆盖"
         "库里**实际存在**的各组成部分。缺了哪一项，就把那一项对应的列写进 "
         "missing —— 格式必须是白名单里逐字存在的 `表.列`。\n"
+        "④ failed_ok 失败是否可接受：本轮有配方取数失败时，只有当你确认"
+        "「这些失败项与题面无关、或在库里本来就不可计算」才写 true；"
+        "拿不准就写 false（宁可不答，也不交片面数）。没有失败项时写 true。\n"
         "⚠️ 硬约束：missing 只准从白名单里挑；想不出具体列（只是「感觉应该还"
         "有别的奖金/补贴」）就留空数组 []。库里没有费率/单价列 → 该量本来就"
         "不可计算，缺它不算不完整。别用行业常识补全貌里没有的东西。\n"
         "⚠️ 多条 SQL 时，每条只负责题面的一部分（上层负责合并/相加），不要要求"
         "单条 SQL 自己答完整题。\n"
         "只返回 JSON：{\"subject_ok\": true/false, \"measure_ok\": true/false, "
-        "\"missing\": [\"表.列\"], \"why\": \"一句话说清哪里不对；对就写口径一致\"}")
+        "\"missing\": [\"表.列\"], \"failed_ok\": true/false, "
+        "\"why\": \"一句话说清哪里不对；对就写口径一致\"}")
     user = (f"题面：{question}\n\n{sql_block}\n\n"
             f"数值列白名单（missing 只准从这里挑）：\n{_num_block}\n\n"
             f"库全貌（实查）：\n{obs}")
@@ -2891,17 +2914,25 @@ def _fits_judge(question: str, sql: str, data: Any,
                 "why": str(cj.get("why") or "")[:300], "missing": []}
     sub = bool(cj.get("subject_ok", True))
     mea = bool(cj.get("measure_ok", True))
+    # 有取数失败时，判官必须**明确认可**才能放行（不给字段 = 不认可）。
+    # 这是 7950 事故的机械修复：一轮里 3 条配方 2 条执行报错，判官只看
+    # 「成功的那 1 条」说过关了，最后交出去一个残缺的总数。
+    _fail_ok = bool(cj.get("failed_ok", not _fails))
     _asked = [str(m).strip() for m in (cj.get("missing") or []) if str(m).strip()]
     # 只采信白名单里真有的列 —— 判官凭常识编出来的「缺奖金/缺补贴」在这里
     # 被机械地否掉（不是靠提示词求它别编）。读不到 schema 时退回旧行为。
     _real = [m for m in _asked if m in set(_nums)] if _nums else _asked
     why = str(cj.get("why") or "")[:300]
-    ok = sub and mea and not _real
+    ok = sub and mea and _fail_ok and not _real
     if sub and mea and _asked and not _real:
         why = (why + "｜（点名的缺失项 " + "、".join(_asked[:3])
                + " 不在库里真实数值列中 —— 按全貌放行）")[:300]
     elif _real:
         why = (why + "｜实查确认缺失：" + "、".join(_real[:3]))[:300]
+    if not _fail_ok and _fails:
+        why = (why + "｜本轮有配方取数失败（"
+               + "、".join(str(f.get("name") or "?") for f in _fails[:3])
+               + "），不算答完整")[:300]
     return {"ok": ok, "why": why, "missing": _real}
 
 
