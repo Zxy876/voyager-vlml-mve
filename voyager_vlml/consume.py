@@ -1243,15 +1243,20 @@ async def consume(
                                       or _it["name"]
                                       or str((skills[0] if skills else {})
                                              .get("name") or "配方"))
-                            # 一条配方 = 一条账：同名的成功账已存在就不许再来
-                            # 一个变体（2026-10-28 实测：重填轮把 allowance_total
-                            # 又实例化了一个技术部口径的变体，公司口径 3600 和
-                            # 部门口径 2120 同时进合并数据 —— 叙事层拿到两笔
-                            # 对不上的账，答案当轮就乱了）。
-                            if any(e.get("name") == _label for e in _executed):
+                            # 防重复按**结果签名**判，不按配方名判。
+                            # 2026-10-28 那版按配方名挡（防同一配方两个变体
+                            # 重复相加），但 2026-10-29 实测它把**合法的另一个
+                            # 槽位**也挡了：重填层想补「全公司」口径的
+                            # tech_base_salary 实例化，被「该配方已有一条成功
+                            # 账」跳过 —— 判官只能拒，整题空手。同一份 SQL =
+                            # 同一份结果，才叫重复；不同槽位（技术部 vs 全公司）
+                            # 是不同的账，该放行。
+                            _sig = " ".join(str(_sql or "").split()).lower()
+                            if any(" ".join(str(e.get("sql") or "").split()).lower()
+                                   == _sig for e in _executed):
                                 reuse_errors.append(
-                                    f"{_label} 在重填轮给出了另一个变体 —— "
-                                    f"该配方已有一条成功账，跳过不重复计")
+                                    f"{_label} 的这份 SQL 与已有账逐字相同"
+                                    f" —— 同一结果不重复计")
                                 continue
                             _gwhy = _sql_literal_guard(_sql, _dbp)
                             if _gwhy:
@@ -3134,6 +3139,13 @@ def _fits_judge(question: str, sql: str, data: Any,
     一条是硬机制，不靠提示词自觉。全貌里没有的表/列/津贴类别/奖金项目
     一律不许假设存在（与出题器规则 8「库里没有的费率/税率不许假设」同源）。
 
+    ⚠️ 2026-10-29 用户拍板「我们做的是 ai infra，不应该为任何数据口径写死
+    守卫，参考 DeepSeek」：原在这里的确定性「缺口闸」（失败 SQL 的表没被
+    覆盖 + hours/days/count 词表豁免「数量列」）整体删除 —— 「是不是钱、
+    缺不缺组成部分」是数据口径，写死在代码里换个库就失效。主体/口径/完整
+    性/失败项要不要紧，全部由判官（MVE_CRITIC_MODEL 档，看全貌）判；代码
+    只保留上面那条**存在性事实核对**（查 schema，不是判口径）与真空防线。
+
     判官不可用（LLM 挂了）→ 如实放行（ok=True + why 注明），绝不因为判官
     故障把正确答案拒掉。返回 {"ok": bool, "why": str, "missing": [列]}。
     """
@@ -3225,60 +3237,31 @@ def _fits_judge(question: str, sql: str, data: Any,
     mea = bool(cj.get("measure_ok", True))
     # ⚠️ 判官对「失败项要不要紧」的意见**不进 ok**（2026-10-28 两次实测它都
     # 不可靠：一会儿说无关的 allowance「与题面无关」→ 交 133500 漏 3600，
-    # 一会儿把技术部口径说成全公司）。失败项要不要紧由下面的**缺口闸**用
-    # schema + 单位判——确定性，不看业务词。
-    # ---- 缺口闸（确定性，schema 级 + 单位级，不看业务词）----
-    # 失败项碰到的表，如果**没有任何成功条目**覆盖到，且这条失败 SQL 想算的
-    # 是「能当钱用的量」（聚合目标不是纯数量/时长列），那它就是真缺了。
-    # 反例豁免：失败 SQL 只聚合 hours/days/count 这类数量列（如加班小时）——
-    # 它就算跑通了也变不成钱（库里没有费率），缺它不算不完整（同出题器
-    # 规则 8：库里没有的费率不许假设）。另一豁免：失败项的表已被别的成功
-    # 条目覆盖（同表的干净配方成功了）。
-    _gap: list[str] = []
-    if _fails:
-        try:
-            _et: set[str] = set()
-            for _e in (items or []):
-                _et |= _sql_tables(str(_e.get("sql") or ""))
-            for _f in _fails:
-                _fs = str(_f.get("sql") or "")
-                _ft = _sql_tables(_fs) - _et
-                if not _ft:
-                    continue
-                # 这条失败 SQL 的聚合目标里有没有「非数量」列？
-                # ⚠️ 只取 `SUM(` 之后的**第一个标识符**，不要求紧跟 `)` ——
-                # 2026-10-28 实测：失败的那条是 `SUM(overtime_hours * 100)`
-                # （凭空费率），带 `*` 的写法匹配不上，_aggs 空 → 被当成
-                # 「不知道算什么」→ 判成缺口 → 多花一轮重填，判词还写
-                # 「attendance 组成部分缺失」。认得出源列是小时就不用补它。
-                _aggs = re.findall(
-                    r"\b(?:SUM|AVG)\s*\(\s*([A-Za-z_\u4e00-\u9fff][\w\u4e00-\u9fff.]*)",
-                    _fs, re.I)
-                _qty = ("hours", "days", "count", "num", "小时", "天数",
-                        "次数", "数量")
-                _money_able = [c for c in _aggs
-                               if not any(u in c.lower() for u in _qty)]
-                if _aggs and not _money_able:
-                    continue          # 全是数量列 → 跑通了也变不成钱，不是缺口
-                _gap.extend(sorted(_ft))
-        except Exception:
-            _gap = []
-        _gap = sorted(set(_gap))
+    # ---- 完整性 / 失败项要不要紧：**全权交判官**（2026-10-29 用户拍板）----
+    # 「我们做的是 ai infra，不应该为任何数据口径写死守卫，参考 DeepSeek。」
+    # 上一版这里有一道确定性「缺口闸」：失败 SQL 碰到的表没被成功条目覆盖、
+    # 且聚合目标「能当钱用」（用 hours/days/count/小时/天数… 词表豁免数量列）
+    # → 判缺口。那套「是不是钱」的判断就是数据口径，写死在代码里 —— 换个库
+    # （列名不叫 hours、单位是「件」「人次」）就失效或误伤；而且它跟判官抢
+    # 判定权。现在：代码只做**存在性事实核对**（判官点名的缺失列必须在白名单
+    # 里真有 —— 这是查 schema，不是判口径）；主体、口径、完整性、失败项要不要
+    # 紧，全部由判官（MVE_CRITIC_MODEL 档）看着全貌自己判。
     _asked = [str(m).strip() for m in (cj.get("missing") or []) if str(m).strip()]
     # 只采信白名单里真有的列 —— 判官凭常识编出来的「缺奖金/缺补贴」在这里
     # 被机械地否掉（不是靠提示词求它别编）。读不到 schema 时退回旧行为。
     _real = [m for m in _asked if m in set(_nums)] if _nums else _asked
+    _needed = any(bool(f.get("needed")) for f in (cj.get("failed") or [])
+                  if isinstance(f, dict))
     why = str(cj.get("why") or "")[:300]
-    ok = sub and mea and not _real and not _gap
+    ok = sub and mea and not _real and not _needed
     if sub and mea and _asked and not _real:
         why = (why + "｜（点名的缺失项 " + "、".join(_asked[:3])
                + " 不在库里真实数值列中 —— 按全貌放行）")[:300]
     elif _real:
         why = (why + "｜实查确认缺失：" + "、".join(_real[:3]))[:300]
-    if _gap:
-        why = (why + "｜这些表这轮没取到数、也没有别的条目覆盖："
-               + "、".join(_gap[:4]) + " —— 组成部分缺失")[:300]
-    return {"ok": ok, "why": why, "missing": _real, "gap_tables": _gap}
+    if _needed:
+        why = (why + "｜判官认为本轮取数失败的配方里有题面需要的项")[:400]
+    return {"ok": ok, "why": why, "missing": _real}
 
 
 
