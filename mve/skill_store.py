@@ -317,6 +317,7 @@ def add(
     code: str = "",
     source_scene: str = "default",
     exact_only: bool = False,
+    r: float = -1.0,
 ) -> tuple[str, str]:
     """写一条技能。返回 (动作, key)，动作 ∈ added / rewritten / skipped。
 
@@ -388,8 +389,22 @@ def add(
         # 一字未变 → 走 skipped 分支 → 技能库里一直是旧源码 → 模型照旧 dig
         # 到分子 3 就交上来（3 ≠ 50.0）。文字相同不代表内容相同。
         stale_code = bool(code) and code != str(s.get("code") or "")
+        # ⭐ 组内择优（2026-10-28 第 2 步 B）：重写通道只在**新 r 更高**时才
+        # 接受新 code——防止同维度后续尝试把已验证的更优版本改坏（天授诊断
+        # 实测 214→68 漂移：没有"保留最优"机制时，改坏了也不回退）。
+        # r 缺省 -1（老条目/未带 r 的调用方）→ 不拦，行为与旧版一致。
+        _new_r = float(r)
+        _old_r = float(s.get("r", -1.0))
+        r_regression = (_new_r >= 0 and _old_r >= 0 and _new_r < _old_r)
         if similarity(text, s.get("text", "")) >= SKIP_THRESHOLD and not stale_code:
             data["skipped"] += 1
+            _save(data)
+            return "skipped", best_key
+        if stale_code and r_regression:
+            # 新代码更差：保留旧 code 与旧 r，其余文本字段照常更新
+            data["skipped"] += 1
+            s["text"] = text
+            s["updated"] = now
             _save(data)
             return "skipped", best_key
         hist = list(s.get("history") or [])
@@ -404,8 +419,10 @@ def add(
         s.setdefault("source_scene", str(source_scene or "default"))
         if blueprint:
             s["blueprint"] = blueprint
-        if code:
+        if code and not r_regression:
             s["code"] = code
+        if _new_r >= 0 and (_old_r < 0 or _new_r >= _old_r):
+            s["r"] = _new_r          # r 只升不降（择优语义）
         data["rewrites"] += 1
         _save(data)
         return "rewritten", best_key
@@ -418,6 +435,7 @@ def add(
         "source_scene": str(source_scene or "default"),
         "blueprint": dict(blueprint or {}),
         "code": str(code or ""),
+        **({"r": float(r)} if r >= 0 else {}),
     }
     data["added"] += 1
     _save(data)
@@ -468,8 +486,13 @@ def retrieve(
         if _vec_mode and key in embs:
             # 原版 chroma：相似度盲取 top_k（没有题目/词面门槛，:122-130）；
             # 「不是同一个量」由回填层规则 0 与守卫拦，不在检索层硬卡。
+            # ⭐ r 进索引（2026-10-28 第 2 步 A）：向量模式补质量项——旧版这里
+            # score = sim 纯语义，质量项 0.6*(ok/hits) 只在词面回退路径生效，
+            # 假技能（JOIN 乘爆 75120）与真技能在向量空间几乎无法区分。
+            # r 是入库时验证沉淀的标量（reward.compute_r），语义上与词面路径
+            # 的 ok/hits 同类：都是「这条经验被验证过多可信」。
             sim = _cosine(qvec, embs[key])
-            score = sim
+            score = sim + 0.3 * max(float(s.get("r", -1.0)), 0.0)
         else:
             sim = similarity(query, f"{s.get('name','')} {s.get('text','')}")
             same_topic = s.get("topic") == topic

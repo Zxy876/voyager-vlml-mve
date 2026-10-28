@@ -337,7 +337,9 @@ def _run_one(q: str, scene: str, *, context: str = "",
         else:
             try:
                 import task_critic
-                success, critique2 = task_critic.check_task_success(q, context, r)
+                from reward import scene_has_env as _she
+                success, critique2 = task_critic.check_task_success(
+                    q, context, r, has_env=_she(scene))
             except Exception as e:
                 success, critique2 = False, f"critic 失败：{type(e).__name__}: {e}"
         info.update(task=q, success=bool(success),

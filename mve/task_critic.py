@@ -36,21 +36,26 @@ import json
 import re
 from typing import Any
 
-# 题面里出现这些词 = 这题要的是**具体数据**（文件/库/统计/时效），
-# 没取到真数就是没完成。反之（养育/方法/解释类）= 知识型，交给 LLM 判。
-_DATA_HINTS = re.compile(
-    r"(\.json|\.csv|\.db|\.duckdb|\.xlsx|\.parquet|\.txt|文件|目录|表|库|"
-    r"多少|几个|几次|几成|排名|排行|统计|平均|总和|合计|最高|最低|最大|最小|"
-    r"增长|下降|比例|占比|分布|趋势|频率|行数|记录|条目|字段|列名|"
-    r"sql|SQL|查询|检索|数据库|"
-    r"最新|最近|今年|今天|现在|当前|实时|热门|推荐|榜单|star|stars)"
-)
+# ⭐ 2026-10-28 用户拍板：砍掉「知识型/数据型」题面分型（task_critic.py:51-52
+# docstring 自认「原版没有这一档」）。分型权威从**题面词面**（42 词正则，可被
+# 换个说法绕过，consume.py:2193 实测漏判）移到**环境**：有没有可指认的数据源
+# （scene_profile.kind ∈ vlml/scene/local，见 reward.scene_has_env）。
+#   有环境 → 一律要求取数（真空防线对全部题生效——local 场景 read_file 也算取数）
+#   无环境 → 不要求取数，LLM 判出的 success 只代表「模型自洽」，标未验证
+#             （r 上限 0.1，inference 不高优入库——reward.compute_r 实现）
+# 原版 Voyager 的 critic 判的是**任务目标有没有达成**，不是"有没有查库"——
+# 「阿斯伯格怎么养育」在无环境场景仍可判，但产物是 inference 而非 fact。
 
 
-def needs_data(question: str) -> bool:
-    """这题是不是「必须取数才算完成」的数据型任务（原版没有这一档，MVE 的
-    真空防线需要它：不区分题型就要求取数 = 把知识型问答全判死）。"""
-    return bool(_DATA_HINTS.search(str(question or "")))
+def needs_data(question: str, has_env: bool = False) -> bool:
+    """这题是否「必须取数才算完成」——2026-10-28 起只看**环境**，不看题面。
+
+    has_env=True（场景有可指认数据源）→ True：真空防线生效。
+    has_env=False（无环境）→ False：不要求取数（判官只判自洽，产物标未验证）。
+    `question` 形参保留是为了调用点兼容，词面分型已废弃（_DATA_HINTS 已删）。
+    """
+    del question                      # 词面判据已死，明示不用
+    return bool(has_env)
 
 _SYSTEM = """你是 Voyager 的 critic：评估一个助手有没有完成给定的任务。
 
@@ -61,12 +66,14 @@ _SYSTEM = """你是 Voyager 的 critic：评估一个助手有没有完成给定
 判定口径（照原版：只看任务目标有没有达成）：
 - 任务要求达到或超过 → success=true；没达到 → success=false，并且必须给 critique
   告诉它差在哪、下一步怎么改（critique 会被拼进它的下一次尝试，别写空话）。
-- 两类任务要分开看：
-  · **数据型**任务（题面要求具体文件/库/统计/排名/时效事实）：必须有**真实取回
+- 两类任务要分开看（分型由**环境**决定，由调用方传入，不看题面措辞）：
+  · **有环境**的任务（场景配了数据源或本机文件/原语）：必须有**真实取回
     的数据**支撑。只给结论、没取数、取回空表或与任务无关 → success=false。
-  · **知识型**任务（怎么养育/如何理解/为什么、方法或解释类）：不要求取数。
+  · **无环境**的任务（没有可指认的数据源）：不要求取数。
     答案切题、有依据、不自相矛盾、不编造具体数字/来源 → success=true；
     空话套话、答非所问、编造事实 → success=false 并指出缺什么。
+    注意：无环境判出的 success 只代表「模型自洽」，不代表事实正确——
+    上层会把它标为未验证（inference）。
 - 只看任务目标，不看代码写得漂不漂亮。
 - **答案对数**（原版 critic.txt 的例题口径：拿背包里 `'oak_log':2` 对照
   "Mine 3 wood logs"）：答案里的每个具体数字都必须能从「观察」里的**真实
@@ -137,12 +144,17 @@ def check_task_success(task: str, context: str, result: dict[str, Any], *,
                        llm=None, max_retries: int = 5,
                        dimensions: list[dict[str, Any]] | None = None,
                        env_obs: str = "",
-                       prior_questions: list[str] | None = None
+                       prior_questions: list[str] | None = None,
+                       has_env: bool = False
                        ) -> tuple[bool, str]:
     """返回 (success, critique)。照原版：出错 → (False, "")；其余交 LLM 判。
 
-    唯一的硬门槛是**数据型任务的真空**（题面要数据、却一个数据源都没调），
-    知识型任务不再要求取数 —— 否则「阿斯伯格孩子怎么养育」这种问题永远判死。
+    ⭐ 出口统一沉淀 **r**（reward.compute_r）——调用方不用自己算，从
+    result["r"] 拿标量即可（r 进 progress.codes → 组内择优 → 索引排序）。
+
+    `has_env` = 场景有没有可指认的数据源（reward.scene_has_env(scene_id)）。
+    有环境 → 真空防线对全部题生效；无环境 → 不要求取数，产物是 inference。
+    （2026-10-28 砍「知识型/数据型」词面分型，分型权威 = 环境。）
 
     `dimensions` = Maieutic 追问骨架出的维度清单（{"id","question","why"}）。
     给了 → **交给 `maieutic_gate` 判闸门**（照 spec-examiner 的闭合口径：
@@ -151,6 +163,26 @@ def check_task_success(task: str, context: str, result: dict[str, Any], *,
     `prior_questions` = 本次闭合已问过的追问 → 透传闸门防重复问（同构
     spec-examiner 的 priorIterations；步级闸门每步都判，不给历史会重复问）。
     """
+    success, critique = _check_task_success_impl(
+        task, context, result, llm=llm, max_retries=max_retries,
+        dimensions=dimensions, env_obs=env_obs,
+        prior_questions=prior_questions, has_env=has_env)
+    try:
+        from reward import compute_r
+        result["r"] = compute_r(result, success, has_env)
+    except Exception:
+        pass
+    return success, critique
+
+
+def _check_task_success_impl(task: str, context: str, result: dict[str, Any], *,
+                             llm=None, max_retries: int = 5,
+                             dimensions: list[dict[str, Any]] | None = None,
+                             env_obs: str = "",
+                             prior_questions: list[str] | None = None,
+                             has_env: bool = False
+                             ) -> tuple[bool, str]:
+    """check_task_success 的实现体（r 的沉淀在包装层统一做）。"""
     ex = result.get("execution") or {}
     real = int(ex.get("real_calls") or 0)
     answer = str(result.get("answer") or "").strip()
@@ -171,7 +203,7 @@ def check_task_success(task: str, context: str, result: dict[str, Any], *,
             why = "；".join([f for f in fails if f][:3]) or "没有调用任何工具"
             return False, (f"一次都没取到内容（{why}）—— 换关键词或换来源重来；"
                            "不许拿报错或记忆当答案")[:300]
-    if needs_data(task) and real <= 0:
+    if needs_data(task, has_env) and real <= 0:
         # 区分「一次都没调」与「调了但全是空值」——这两件事要模型改的方向完全不同。
         # 2026-10-23 工资场景实测：4 次调用各返回 1 行、SUM 全是 NULL（LEFT JOIN
         # 没匹配 + `+ al.amount` 让 NULL 传染），判词却写「一次数据源都没调」，

@@ -210,15 +210,17 @@ def test_vacuum_enforcement() -> None:
     print("PASS  test_vacuum_enforcement：真调数据源放行（ok=True, data_sources=",
           obs2[0]["data_sources"], "）")
 
-    # 3) 知识型问题（不需要数据）不取数也放行 —— 成败交给 critic 判，
-    #    不再一刀切"必须取数"（2026-10-19 用户实测：养育类问题被判死 4 次）
+    # 3) 无环境场景（空目录）不取数也放行 —— 成败交给 critic 判，产物标
+    #    inference（2026-10-28 砍词面分型：分型权威 = 环境；同题在**有环境**
+    #    的场景会被真空防线拦——见上面第 1 段）。
+    d3 = Path(tempfile.mkdtemp())          # 空目录 = 无环境
     f3 = _Fake()
     f3.push('```python\nRESULT = {"answer": "结构化养育建议：明确规则、视觉化日程、情绪共情"}\n```')
-    obs3, _ = asyncio.run(L.solve("阿斯伯格孩子怎么养育？", str(d),
+    obs3, _ = asyncio.run(L.solve("阿斯伯格孩子怎么养育？", str(d3),
                                   llm=f3, max_iters=1))
     assert obs3 and obs3[0]["ok"] is True, json.dumps(obs3, ensure_ascii=False)
     assert obs3[0].get("evidence") == "knowledge", obs3[0].get("evidence")
-    print("PASS  test_vacuum_enforcement：知识型问题不取数也放行（evidence=knowledge）")
+    print("PASS  test_vacuum_enforcement：无环境场景不取数也放行（evidence=knowledge）")
 
 
 def main() -> None:

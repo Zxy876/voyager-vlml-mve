@@ -575,13 +575,18 @@ def load_progress_codes(scene_id: str, question: str) -> dict[str, dict[str, str
             out[str(c["id"])] = {"question": str(c.get("question") or ""),
                                  "code": str(c.get("code") or ""),
                                  "answer": str(c.get("answer") or ""),
-                                 "tools": list(c.get("tools") or [])}
+                                 "tools": list(c.get("tools") or []),
+                                 "r": float(c.get("r", -1.0))}
     return out
 
 
 def save_progress_codes(scene_id: str, question: str,
                         codes: list[dict[str, Any]]) -> None:
-    """把这一轮跑通的代码写进进度（与已闭合维度 id 同存一份）。"""
+    """把这一轮跑通的代码写进进度（与已闭合维度 id 同存一份）。
+
+    2026-10-28 起 codes 条目带 **r**（reward.compute_r 的标量）——断点续学
+    复用这份账时能分清哪条候选更可信（组内择优的账本基础）。
+    """
     if not codes:
         return
     path = _cache_path(scene_id, question)
@@ -591,13 +596,14 @@ def save_progress_codes(scene_id: str, question: str,
     pr = data.get("progress")
     if not isinstance(pr, dict):
         pr = {}
-    merged: dict[str, dict[str, str]] = {}
+    merged: dict[str, dict[str, Any]] = {}
     for c in (pr.get("codes") or []):
         if isinstance(c, dict) and str(c.get("id") or ""):
             merged[str(c["id"])] = {"question": str(c.get("question") or ""),
                                     "code": str(c.get("code") or ""),
                                     "answer": str(c.get("answer") or ""),
-                                    "tools": list(c.get("tools") or [])}
+                                    "tools": list(c.get("tools") or []),
+                                    "r": float(c.get("r", -1.0))}
     for c in codes:                       # 本轮新跑的覆盖旧的
         cid = str(c.get("id") or "").strip()
         if cid and (str(c.get("code") or "").strip()
@@ -606,9 +612,11 @@ def save_progress_codes(scene_id: str, question: str,
                            "code": str(c.get("code") or ""),
                            "answer": str(c.get("answer") or "")[:800],
                            "tools": [str(x) for x in (c.get("tools") or [])
-                                     if str(x).strip()]}
+                                     if str(x).strip()],
+                           "r": float(c.get("r", -1.0))}
     pr["codes"] = [{"id": k, "question": v["question"], "code": v["code"],
-                    "answer": v["answer"], "tools": v["tools"]}
+                    "answer": v["answer"], "tools": v["tools"],
+                    "r": v["r"]}
                    for k, v in merged.items()]
     data["progress"] = pr
     try:

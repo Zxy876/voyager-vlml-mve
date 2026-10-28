@@ -208,18 +208,23 @@ def test_recipe_requires_real_fetch() -> None:
 
 
 def test_needs_data() -> None:
-    """题面分型：数据型 vs 知识型（决定要不要把"没取数"判死）。"""
+    """环境分型（2026-10-28 砍词面分类）：has_env 决定要不要把"没取数"判死。"""
     import task_critic as T
-    assert T.needs_data("projects.json 中哪些项目的 2026 年 stars 比 2025 年多？")
-    assert T.needs_data("库里有多少行记录？")
-    assert T.needs_data("2026 年最热门的 AI 开源项目有哪些？")
-    assert not T.needs_data("阿斯伯格孩子怎么养育？")
-    assert not T.needs_data("如何理解孩子的情绪崩溃？")
+    # 分型权威 = 环境，不看题面：同一句话，有环境就要取数，无环境就不要求
+    assert T.needs_data("阿斯伯格孩子怎么养育？", has_env=True)
+    assert T.needs_data("projects.json 中哪些项目 star 多？", has_env=True)
+    assert not T.needs_data("阿斯伯格孩子怎么养育？", has_env=False)
+    assert not T.needs_data("projects.json 中哪些项目 star 多？", has_env=False)
+    # 旧签名（不传 has_env）向后兼容 = 无环境口径
+    assert not T.needs_data("库里有多少行记录？")
+    # 词面正则已删
+    assert not hasattr(T, "_DATA_HINTS")
     print("PASS  test_needs_data")
 
 
 def test_knowledge_vs_data_judge() -> None:
-    """知识型：没取数也交 LLM 判（原版就是 LLM 判）；数据型：没取数直接失败。"""
+    """无环境：没取数也交 LLM 判（产物标 inference，r ≤ 0.1）；
+    有环境：没取数直接失败（真空防线对全部题生效）。"""
     import task_critic as T
     calls: list[int] = []
 
@@ -227,21 +232,22 @@ def test_knowledge_vs_data_judge() -> None:
         calls.append(1)
         return '{"reasoning":"答案切题且有依据","success":true,"critique":""}'
 
-    # 知识型 + 有答案 + 没数据源 → 叫 LLM，判成功
+    # 无环境 + 有答案 + 没数据源 → 叫 LLM，判成功；r = 0.1（inference 上限）
+    res1 = {"execution": {"ok": False, "real_calls": 0, "calls": 1, "rows": 0},
+            "answer": "结构化养育建议：明确规则、视觉化日程、情绪共情……"}
     ok, crit = T.check_task_success(
-        "阿斯伯格孩子怎么养育？", "知识型问题",
-        {"execution": {"ok": False, "real_calls": 0, "calls": 1, "rows": 0},
-         "answer": "结构化养育建议：明确规则、视觉化日程、情绪共情……"},
-        llm=llm_ok)
+        "阿斯伯格孩子怎么养育？", "无环境问题", res1,
+        llm=llm_ok, has_env=False)
     assert ok is True and len(calls) == 1, (ok, calls)
+    assert res1.get("r") == 0.1, f"inference 的 r 应为 0.1，得到 {res1.get('r')}"
 
-    # 数据型 + 有答案 + 没数据源 → 直接失败，不叫 LLM（真空防线保持）
+    # 有环境 + 有答案 + 没数据源 → 直接失败，不叫 LLM（真空防线保持）
     calls.clear()
     ok2, crit2 = T.check_task_success(
-        "projects.json 里 star 增长最多的是哪个？", "数据型",
+        "projects.json 里 star 增长最多的是哪个？", "有环境",
         {"execution": {"ok": False, "real_calls": 0, "calls": 1, "rows": 0},
          "answer": "Ollama（凭记忆）"},
-        llm=llm_ok)
+        llm=llm_ok, has_env=True)
     assert ok2 is False and calls == [], (ok2, calls)
     assert "数据" in crit2
     print("PASS  test_knowledge_vs_data_judge")

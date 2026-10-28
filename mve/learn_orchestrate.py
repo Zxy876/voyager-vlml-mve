@@ -288,7 +288,10 @@ def learn_milestone_skills(scene_id: str, topic_id: str, question: str,
                            # 第二次导入同一问题时掌握度涨的那一分能解释。
                            "import_id": str(import_id or ""),
                            "tools": list(item.get("tools") or [])},
-                source_scene=str(scene_id or "A"))
+                source_scene=str(scene_id or "A"),
+                # ⭐ 组内择优（第 2 步 B）：维度闭合时 critic 沉淀的 r 随技能
+                # 入库；同维度重写时 r 更高才接受新 code（skill_store.add 内拦）
+                r=float(item.get("r", -1.0)))
             if key:
                 out["added"].append({"key": key, "action": _act, "dim": did})
         except Exception as e:
@@ -423,6 +426,10 @@ async def learn_milestone_composite(scene_id: str, topic_id: str, question: str,
         _act, key = skill_store.add(
             topic_id, "milestone", text, code=code, source="learn",
             exact_only=True,
+            # 组合技能的 r = 组成维度 r 的均值（全部无 r 时 -1，不计入择优）
+            r=(lambda _rs: round(sum(_rs) / len(_rs), 3) if _rs else -1.0)(
+                [float(d.get("r", -1.0)) for d in (dim_codes or [])
+                 if float(d.get("r", -1.0)) >= 0]),
             blueprint={"from": "maieutic_milestone_composite",
                        "milestone": str(milestone_name or ""),
                        "question": str(question or ""),
@@ -1210,12 +1217,14 @@ async def _start_learning_impl(
                                 # 口径幻觉，2026-10-26 实测 base_salary ×
                                 # overtime_hours 当加班费穿过只核清单的闸门入库
                                 # （164000 假数）——列×列合成新口径 = 假设费率。
+                                import reward as _rw
                                 ok1, crit1 = _tc1.check_task_success(
                                     _q1, str(crit1 or ""), r1, dimensions=[_d],
                                     env_obs=_env_obs_block(db_path),
                                     prior_questions=list(
                                         (_iters.get(_did) or {}).get("asked_q")
-                                        or []))
+                                        or []),
+                                    has_env=_rw.scene_has_env(scene))
                             except Exception as e1:
                                 ok1, crit1 = False, f"critic 异常：{type(e1).__name__}: {e1}"
                         else:
@@ -1293,7 +1302,11 @@ async def _start_learning_impl(
                                               "code": str(code1 or ""),
                                               "answer": str(a1 or ""),
                                               "tools": list(tools_map.get(_did)
-                                                            or [])})
+                                                            or []),
+                                              # critic 出口沉淀的标量 reward
+                                              # （task_critic 包装层写进 r1["r"]）
+                                              # → 断点续学账本 + 入库择优都用它
+                                              "r": float(r1.get("r", -1.0))})
                             # 最小技能单位 = **一枚节点 = 闭合一个（维度）问题**
                             # （用户 2026-10-19 定）：闭合一条就落一条，不等整个
                             # 任务闭合 —— 否则 8/9 那种 partial 会因为 ⑤' 提前
@@ -1613,7 +1626,9 @@ async def _start_learning_impl(
                 # 参数（费率/汇率…）必须能在这份清单里指认，指认不了 = 不可答，
                 # 不许把编造的参数当已验证（实测 150 元费率幻觉就是这样放行的）。
                 _ctx = str(context or "") + _env_obs_block(db_path)
-                _ok, _crit = task_critic.check_task_success(question, _ctx, out)
+                import reward as _rw
+                _ok, _crit = task_critic.check_task_success(
+                    question, _ctx, out, has_env=_rw.scene_has_env(scene))
             except Exception as e:
                 _ok, _crit = bool(real), f"critic 异常：{type(e).__name__}: {e}"
             out["critic"] = {"success": bool(_ok), "critique": str(_crit or ""),

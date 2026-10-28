@@ -628,9 +628,16 @@ async def solve(question: str, scene_dir: str, *, llm=None,
         # 判失败**（题面要文件/库/统计/时效）——「阿斯伯格孩子怎么养育」这类知识
         # 型问题本来就没有数据可取，一刀切会把它们全部判死（2026-10-19 实测连判
         # 4 次 no_data）。知识型交 critic 用 LLM 判（照原版 critic.py 的口径）。
+        # 真空成功：代码跑通、RESULT 非空，却一次数据源都没调。**只对有环境
+        # 的任务判失败**（2026-10-28 砍词面分型：分型权威 = 环境，scene_dir
+        # 里有文件 = 本机即数据源）。无环境（空目录）不要求取数——「养育类」
+        # 在无环境场景交给 critic 判自洽（照原版 critic.py 的口径）。
         try:
             import task_critic as _tc
-            _needs_data = _tc.needs_data(question)
+            from pathlib import Path as _P
+            _has_env = bool(str(scene_dir or "").strip()) and any(
+                _P(str(scene_dir)).iterdir())
+            _needs_data = _tc.needs_data(question, has_env=_has_env)
         except Exception:
             _needs_data = True
         # 真空成功：代码跑通、RESULT 非空，却一次数据源都没调。
@@ -639,10 +646,10 @@ async def solve(question: str, scene_dir: str, *, llm=None,
         #     primitive，凭记忆写完就交的东西进不了技能库（用户 2026-10-20）。
         if (not err and res.get("ok") and data is not None and not tracer
                 and (_needs_data or (require_tools and _can_fetch))):
-            err = ("这题要具体数据（文件/库/统计/时效），但没调用任何数据源"
-                   "（list_files/read_file/read_json/query_sql/web_search/"
-                   "web_fetch/mcp_*）——答案疑似凭训练记忆编造，不算完成；"
-                   "请调用数据源取真实数据再作答"
+            err = ("场景里有可指认的数据源（本机文件/库），但这轮没调用任何"
+                   "数据源（list_files/read_file/read_json/query_sql/"
+                   "web_search/web_fetch/mcp_*）——答案疑似凭训练记忆编造，"
+                   "不算完成；请调用数据源取真实数据再作答"
                    + ("（**学习环节**：没取证就写答案 = 这轮不算学会，也不会"
                       "被记成技能和图谱上的能力）" if require_tools else ""))
         # 命中即复用：给了技能却不调用 → 带评语重写一次（不无限循环，最后一轮
