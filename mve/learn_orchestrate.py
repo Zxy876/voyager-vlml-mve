@@ -1285,6 +1285,22 @@ async def _start_learning_impl(
                         if _crit_missing:
                             crit1 = ("（本轮没有产生判词：闸门与内层 critic 都未给出"
                                      "理由 —— 如实记录，判未闭合，不带入下一轮追问）")
+                        # ---- r 沉淀（数据路径，2026-10-28 服务器实测补漏）----
+                        # check_task_success（内含 compute_r 包装层）只在
+                        # is_local 分支被调；数据路径判定权在内层 critic + 闸门，
+                        # 判完从不算 r → r1 恒无 "r" → dim_codes 全 -1.0 →
+                        # 入库口 r >= 0 不成立 → r 字段整体缺失，组内择优与
+                        # 索引排序（0.3*r）全空转（learn_74c71ce2 四条技能
+                        # 实证）。这里与 is_local 分支同口径补算：判定已定
+                        # （ok1 含超时修正），配方载体从实跑代码补进执行账。
+                        try:
+                            import reward as _rw_r
+                            r1["execution"]["sql"] = str(code1 or "")
+                            r1["r"] = _rw_r.compute_r(
+                                r1, bool(ok1 and _inner_ok),
+                                _rw_r.scene_has_env(scene))
+                        except Exception:
+                            pass
                         if ok1 and _inner_ok:
                             learned_dims.append(_d)
                             a1 = str(r1.get("answer") or "").strip()
