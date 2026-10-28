@@ -34,6 +34,7 @@ R1 / DeepSeek 客户端的形状是：用户把文件**交给**模型（拖进�
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -42,6 +43,69 @@ from typing import Any
 
 MAX_BYTES = 32 * 1024 * 1024        # 32MB（面板/客户端都按这个拦）
 SUPPORTED = {".csv", ".tsv", ".json", ".jsonl", ".ndjson", ".xlsx", ".xls"}
+
+
+def _meta_path(scene_id: str) -> Path:
+    _db, sdir, _kind = _scene_db_path(scene_id)
+    return Path(sdir) / "uploads_meta.json"
+
+
+def _load_meta(scene_id: str) -> list[dict[str, Any]]:
+    p = _meta_path(scene_id)
+    try:
+        obj = json.loads(p.read_text(encoding="utf-8"))
+        return obj if isinstance(obj, list) else []
+    except Exception:
+        return []
+
+
+def _save_meta(scene_id: str, items: list[dict[str, Any]]) -> None:
+    """原子写（tmp + os.replace）—— 同 scenes.json 的铁律，别留半个 JSON。"""
+    p = _meta_path(scene_id)
+    tmp = p.with_suffix(".json.tmp")
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(items[-20:], ensure_ascii=False, indent=1),
+                       encoding="utf-8")
+        os.replace(tmp, p)
+    except Exception:
+        try:
+            tmp.unlink()
+        except Exception:
+            pass
+
+
+def context_block(scene_id: str, max_rows: int = 12) -> str:
+    """把「用户上传过的文件」渲染成**上下文块**（R1 客户端式的文件注入）。
+
+    用户 2026-10-28：「上传文件的时候要像 R1 客户端一样当作上下文输入（这个
+    可以防一堆暴雷；比写死一堆 prompt 强）」。
+
+    为什么这比写 prompt 强：模型看到的是**这份文件真实的前几行/列名/行数**，
+    列名与取值不用猜、不用在代码里列业务词；缺列/写错值这类暴雷在第一步就
+    没有发生的理由。块里同时如实标注「是否已接入本场景库」——没接入的（如
+    VLML 域场景）只当上下文看，别指望能查。
+    """
+    items = _load_meta(scene_id)
+    if not items:
+        return ""
+    lines = ["【用户上传的文件（真实内容，优先按它作答）】"]
+    for it in items[-4:]:
+        tb = str(it.get("table") or "")
+        vis = "已接入本场景库，可直接查询" if it.get("visible") \
+            else "仅作上下文（未接入本场景库，查不到）"
+        lines.append(f"- {it.get('name')} → 表 {tb}（{it.get('rows')} 行；{vis}）")
+        cols = it.get("columns") or []
+        if cols:
+            lines.append(f"  列：{', '.join(str(c) for c in cols)}")
+        rows = (it.get("sample") or [])[:max_rows]
+        if rows:
+            try:
+                lines.append("  真实前几行："
+                             + json.dumps(rows, ensure_ascii=False)[:1200])
+            except Exception:
+                pass
+    return "\n".join(lines)[:3000]
 
 
 def _safe_stem(name: str) -> str:
@@ -193,6 +257,21 @@ def ingest(scene_id: str, filename: str, blob: bytes) -> dict[str, Any]:
         out.update(ok=True, table=table, rows=int(n), columns=_cols,
                    sample=[dict(zip(_cols, map(str, r))) for r in sample],
                    db_path=db_path, file=str(src))
+        # 记一份**上下文元数据**（文件名/列/前 20 行真值）：R1 客户端式地把
+        # 文件当上下文注入用（2026-10-28 用户拍板），不靠写死 prompt。
+        try:
+            _more = con.execute(f"SELECT * FROM {_q(table)} LIMIT 20").fetchall()
+            _items = [x for x in _load_meta(scene_id)
+                      if str(x.get("table") or "") != table]
+            _items.append({
+                "name": name, "table": table, "rows": int(n), "columns": _cols,
+                "sample": [dict(zip(_cols, map(str, r))) for r in _more],
+                "visible": bool(out.get("visible")),
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            })
+            _save_meta(scene_id, _items)
+        except Exception:
+            pass
     except Exception as e:
         out["why"] = f"落表失败：{type(e).__name__}: {e}"
     finally:

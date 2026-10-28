@@ -360,7 +360,7 @@ action.py:94 programs 注入；此前只挑一条写一条 SQL，合成题（bas
 
 def _refill_sql_multi(question: str, skills: list[dict[str, Any]], schema: str,
                       db_path: str = "", feedback: str = "",
-                      catalog: str = "") -> dict[str, Any]:
+                      catalog: str = "", file_context: str = "") -> dict[str, Any]:
     """原版同构的多技能实例化：检索到的每条相关配方都回填成 SQL（不是只挑一条）。
 
     与 `_refill_sql` 同一地面真话（db_observation 实查取值清单 + schema），
@@ -390,7 +390,12 @@ def _refill_sql_multi(question: str, skills: list[dict[str, Any]], schema: str,
             ground = ""
     user = (
         f"当前这句话：\n{question}\n\n"
-        f"已学会的配方：\n{recipes}\n\n"
+        # R1 客户端式：用户上传的文件**原文进上下文**（列名/行数/真实前几行）。
+        # 用户 2026-10-28：「上传文件的时候要像 R1 客户端一样当作上下文输入
+        # （这个可以防一堆暴雷；比写死一堆 prompt 强）」——模型看到真实内容，
+        # 就不用猜列名/取值，也不用在代码里列业务词。
+        + (f"{file_context}\n\n" if file_context else "")
+        + f"已学会的配方：\n{recipes}\n\n"
         + (f"[技能库全库目录 —— 库里已经学会的**全部**方法，上面只列了本题命中"
            f"的几条。判断题面要的量需不需要**组合多条**（如总额 = 基本工资 + "
            f"津贴）：需要就把对应方法也各实例化一条 SELECT，交给上层相加]\n"
@@ -899,6 +904,18 @@ async def consume(
     except Exception:
         pass
 
+    # ---- ⓪ 上传文件当上下文（R1 客户端式）----
+    # 用户 2026-10-28：「上传文件的时候要像 R1 客户端一样当作上下文输入」。
+    # 库里的全貌（db_observation）只给「表/列/取值集合」，给不了**行级**形状；
+    # 上传时的真实前几行在这里进上下文 —— 回填层看得到真实列名与取值，
+    # 不用猜、也不用在代码里写业务词。
+    _file_ctx = ""
+    try:
+        import upload as _upl
+        _file_ctx = str(_upl.context_block(_scene_id) or "")
+    except Exception:
+        _file_ctx = ""
+
     # ---- ① 归题（找评分点）----
     topic_id, hit, task = _infer(question)
 
@@ -1137,7 +1154,23 @@ async def consume(
         if reused_skill is None:
             if _scene_kind == "scene":
                 _dbp = str((_prof or {}).get("db_path") or "")
-                if not skills:
+                if not skills and _file_ctx:
+                    # 有上传文件当上下文、但本题还没学过：**先现场答一次**。
+                    # R1 客户端拿到文件就能读，不会先要求「学过」；MVE 同理
+                    # ——文件已经把表/列/真实取值摆在上下文里，让 agent 直接
+                    # 写 SQL 试一次，成不成由后面对题判官与真空防线收口。
+                    # （2026-10-28 用户：「上传文件要像 R1 一样当上下文输入，
+                    #  这个可以防一堆暴雷」）
+                    print("  · 未学但有上传文件上下文 → 现场作答一次", flush=True)
+                    obs, code = await _la.solve(
+                        question, _scene_dir, scene_id=_scene_id,
+                        skills=skills, timeout=_consume_timeout(0))
+                    real = [o for o in obs
+                            if o.get("ok") and o.get("data") is not None]
+                    data = (real[-1].get("data") if real else None)
+                    if data is not None:
+                        _ans_skills = []
+                elif not skills:
                     # 未学（索引不到已学技能）：不合成、不答，标记交给课程规划。
                     # 设计边界（用户 2026-10-25）：消费侧不做合成，只检索复用；
                     # 检索不到说明里程碑没跑过，应由学习侧拆解完成。
@@ -1149,7 +1182,8 @@ async def consume(
                     obs, code = [], ""
                 else:
                     _mr = _refill_sql_multi(question, skills, _schema,
-                                            db_path=_dbp)
+                                            db_path=_dbp,
+                                            file_context=_file_ctx)
                     if not _mr["items"]:
                         reuse_errors.append(
                             f"检索到 {len(skills)} 条已学技能但回填层没实例化出任何"
@@ -1245,7 +1279,8 @@ async def consume(
                         print(f"  · 复用首轮全败（{len(_fails)} 条）→ 报错当 critique "
                               f"重试一轮（原版 step 迭代同构）", flush=True)
                         _mr2 = _refill_sql_multi(question, skills, _schema,
-                                                 db_path=_dbp, feedback=_fb)
+                                                 db_path=_dbp, feedback=_fb,
+                                                 file_context=_file_ctx)
                         if _mr2["items"]:
                             await _try_items(_mr2["items"], "重试")
                     _last_note: str = str(_mr.get("note") or "")
@@ -1333,7 +1368,8 @@ async def consume(
                             try:
                                 _mr3 = _refill_sql_multi(
                                     question, (_all_sk or skills), _schema,
-                                    db_path=_dbp, feedback=_fb2, catalog=_cat)
+                                    db_path=_dbp, feedback=_fb2, catalog=_cat,
+                                    file_context=_file_ctx)
                             except Exception as _e3:
                                 _mr3 = {"items": [], "note": str(_e3)}
                             if _mr3["items"]:
