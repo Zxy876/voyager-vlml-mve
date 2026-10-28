@@ -36,6 +36,31 @@ from typing import Any
 
 DOCS = "web_docs"
 EVID = "web_evidence"
+FACTS = "web_facts"
+
+
+def _refresh_facts(db_path: str) -> None:
+    """把 EAV 账本摊成**一张说人话的宽表**（列名就是属性名本身）。
+
+    ⚠️ 2026-10-28 实测踩到：只留 `web_evidence(item, attribute, value)` 时，
+    学习侧学出来的 SQL 是 `SELECT attribute AS singer ... GROUP BY singer`
+    —— 它把 attribute（字面量 '歌手'）当成了歌手名，GROUP BY 一个常量列，
+    取到 1 行 (歌手, 16) 还"有值"，于是被判完成。
+    人整理资料不会这么存：查完就是一张 `(片段, 歌手, 来源)` 的表。
+
+    所以用 DuckDB 的 PIVOT 按 attribute 的**实际取值**摊列（不写死任何业务词）：
+      item / source_url / confidence / confirmed / 歌手 / …
+    视图不行（PIVOT 值要从数据里取，DuckDB 明确禁止），所以物化成表，
+    每次写证据/确认后刷新。
+    """
+    con = _connect(db_path, write=True)
+    try:
+        con.execute(
+            f"CREATE OR REPLACE TABLE {FACTS} AS SELECT * FROM (PIVOT {EVID} "
+            f"ON attribute USING first(value) "
+            f"GROUP BY item, source_url, confidence, confirmed)")
+    finally:
+        con.close()
 
 
 def _db(scene_id: str) -> str:
@@ -147,6 +172,11 @@ def save_evidence(scene_id: str, rows: list[dict[str, Any]],
             n += 1
     finally:
         con.close()
+    if n:
+        try:
+            _refresh_facts(db)      # 摊成宽表，学习侧才看得到「歌手」这一列
+        except Exception:
+            pass
     return n
 
 
@@ -163,22 +193,28 @@ def confirm(scene_id: str, ids: list[str] | None = None,
     db = _db(scene_id)
     ensure(db)
     con = _connect(db, write=True)
+    got = 0
     try:
         if ids:
             con.executemany(
                 f"UPDATE {EVID} SET confirmed = TRUE, confirmed_by = ? "
                 f"WHERE id = ?", [[by, str(i)] for i in ids])
-            got = con.execute(
-                f"SELECT COUNT(*) FROM {EVID} WHERE confirmed").fetchone()[0]
-            return int(got)
-        con.execute(
-            f"UPDATE {EVID} SET confirmed = TRUE, confirmed_by = ? "
-            f"WHERE question = ?", [by, str(question)[:400]])
-        return int(con.execute(
-            f"SELECT COUNT(*) FROM {EVID} WHERE question = ? AND confirmed",
-            [str(question)[:400]]).fetchone()[0])
+            got = int(con.execute(
+                f"SELECT COUNT(*) FROM {EVID} WHERE confirmed").fetchone()[0])
+        else:
+            con.execute(
+                f"UPDATE {EVID} SET confirmed = TRUE, confirmed_by = ? "
+                f"WHERE question = ?", [by, str(question)[:400]])
+            got = int(con.execute(
+                f"SELECT COUNT(*) FROM {EVID} WHERE question = ? AND confirmed",
+                [str(question)[:400]]).fetchone()[0])
     finally:
         con.close()
+    try:
+        _refresh_facts(db)          # confirmed 变了，宽表要跟着刷
+    except Exception:
+        pass
+    return got
 
 
 def pending(scene_id: str, limit: int = 50) -> list[dict[str, Any]]:
