@@ -1308,9 +1308,21 @@ async def consume(
                             except Exception as _e3:
                                 _mr3 = {"items": [], "note": str(_e3)}
                             if _mr3["items"]:
+                                # ⚠️ 判官说的是「缺一部分」，不是「全错」：
+                                # 上一轮已取到真数的条目必须留着（清掉=把对的也
+                                # 扔了 → 第二轮三条全被字面量守卫拒 → 空手。
+                                # 2026-10-28 实测：首轮 基薪+津贴 已执行成功、判官
+                                # 只指出缺加班费，清表后整题退回 fetched_empty）。
+                                _prev = list(_executed)
+                                _prev_sql = {" ".join(str(e["sql"]).split()).lower()
+                                             for e in _prev}
                                 _executed.clear()
                                 _last_note = str(_mr3.get("note") or _last_note)
                                 await _try_items(_mr3["items"], "判官退回重填")
+                                _executed[:] = _prev + [
+                                    e for e in _executed
+                                    if " ".join(str(e["sql"]).split()).lower()
+                                    not in _prev_sql]
                             if _executed:
                                 _do_merge()
                                 _fit = _fits_judge(question, code, data, _dbp)
@@ -2771,7 +2783,9 @@ def _fits_judge(question: str, sql: str, data: Any,
         "SQL 聚合的列必须就是它；\n"
         "③ 完整性：题面说「总共/一共/总额/全部/应发」时，结果必须覆盖全貌里"
         "存在的各组成部分；但题面自己限定了窄口径（如「基本工资」）时，只算"
-        "那部分就是对的。\n"
+        "那部分就是对的。⚠️ 某组成部分在库里**没有可算的列**（如只有加班"
+        "小时数、没有加班费率/加班金额列）→ 它本来就不可计算，缺它不算不"
+        "完整，这种情况 ok 可以为 true，why 里注明「该项无可用列」即可。\n"
         '只返回 JSON：{"ok": true/false, "why": "一句话说清哪里不对；对就写口径一致"}')
     user = (f"题面：{question}\n\nSQL：\n{str(sql)[:1500]}\n\n"
             f"结果（前几行）：\n{preview}\n\n库全貌（实查）：\n{obs}")
