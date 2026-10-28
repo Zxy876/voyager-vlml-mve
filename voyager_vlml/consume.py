@@ -1211,6 +1211,14 @@ async def consume(
                                     f"{_label} 被单位守卫拒用：{_uwhy[:120]}")
                                 _fails.append({"name": _label, "sql": _sql, "why": _uwhy[:200]})
                                 continue
+                            # 费率守卫（确定性）：乘以库里指认不了的常量 =
+                            # 假设费率（SUM(overtime_hours)*100 事故，2026-10-28）。
+                            _rwhy = _rate_guard(_sql, _dbp)
+                            if _rwhy:
+                                reuse_errors.append(
+                                    f"{_label} 被费率守卫拒用：{_rwhy[:120]}")
+                                _fails.append({"name": _label, "sql": _sql, "why": _rwhy[:200]})
+                                continue
                             _rr = await _env.run_sql(_sql)
                             _d = _rr.get("data") or {}
                             if _rr.get("ok") and _d.get("rows"):
@@ -2689,6 +2697,42 @@ def _sql_literal_guard(sql: str, db_path: str) -> str:
         return (f"SQL 字面量 '{t}' 在数据源实查清单里指认不了"
                 f"（库里没有这个取值）—— 大概率是幻觉取值，拒绝入库")
     return ""
+
+
+def _rate_guard(sql: str, db_path: str = "") -> str:
+    """费率守卫（确定性）：SQL 里**乘以常量** = 假设了一个库里不存在的费率。
+
+    铁律同源（出题器规则 8 / 记忆铁律「库里没有的费率/汇率/税率不许假设」）。
+    2026-10-28 实测：`SUM(overtime_hours) * 100 AS total_overtime_pay` 跑通并
+    进了「公司一共要支付多少钱」的答案 —— 100 元/小时是编的，库里只有
+    overtime_hours（小时数），没有任何费率列。字面量守卫只看 WHERE 里的
+    取值，管不到 SELECT 表达式里的乘数，这里补上。
+
+    判据：乘号旁的数字常量，必须能在数据源实查清单里逐字指认；指认不了
+    就是假设的费率/系数，拒。0/1（恒等/取整）豁免。
+    """
+    _s = str(sql or "").strip()
+    if not _s or "*" not in _s:
+        return ""
+    lits = [a or b for a, b in re.findall(
+        r"\*\s*(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*\*", _s)]
+    if not lits:
+        return ""
+    ground = _catalog_block(db_path, 20000) or ""
+    bad: list[str] = []
+    for lit in lits:
+        try:
+            if float(lit) in (0.0, 1.0):
+                continue
+        except ValueError:
+            continue
+        if not re.search(r"(?<![\d.])" + re.escape(lit) + r"(?![\d.])", ground):
+            bad.append(lit)
+    if not bad:
+        return ""
+    return (f"SQL 出现乘以常量 {','.join(bad)} —— 这是假设的费率/系数"
+            f"（数据源实查清单里指认不了）。库里没有的费率不许假设；"
+            f"该量不可计算就如实不答")
 
 
 def _unit_guard(sql: str, question: str) -> str:

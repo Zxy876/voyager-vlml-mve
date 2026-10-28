@@ -270,6 +270,15 @@ def main() -> int:
           "catalog: str = \"\"" in src and "技能库全库目录" in src)
     check("复用逐条仍过单位守卫（数据一致性，非业务口径）",
           "_unit_guard(_sql, question)" in src)
+    check("复用逐条仍过费率守卫（SUM(小时)*100 事故）",
+          "_rate_guard(_sql, _dbp)" in src)
+    g = C._rate_guard("SELECT SUM(overtime_hours) * 100 AS t FROM attendance", "")
+    check("乘以库里指认不了的常量 → 拒（假设费率）",
+          bool(g) and "不许假设" in g, g[:50])
+    g2 = C._rate_guard("SELECT SUM(amount) FROM allowance", "")
+    check("无乘法 → 放行", g2 == "")
+    g3 = C._rate_guard("SELECT SUM(amount) * 1.0 FROM allowance", "")
+    check("乘 1（恒等）→ 放行", g3 == "")
     # ⚠️ 用户 2026-10-28 拍板：「不能这样写死守卫解决」—— 业务词表写死不许回归。
     # 判调用点/定义（docstring 里提到旧名做沿革说明是允许的）。
     _biz_guards = ("_scope_guard", "_subject_guard", "_completeness_guard")
