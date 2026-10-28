@@ -1317,13 +1317,24 @@ async def consume(
                                 _prev = list(_executed)
                                 _prev_sql = {" ".join(str(e["sql"]).split()).lower()
                                              for e in _prev}
+                                # 结果内容一样 = 同一条账（换了个写法），不许
+                                # 重复计进合并（实测重填出了第二份 allowance →
+                                # 判官看到「SQL 3 和 SQL 4 重复计算了餐补」）。
+                                _prev_sig = {
+                                    json.dumps((e.get("data") or {}).get("rows"),
+                                               ensure_ascii=False, sort_keys=True)
+                                    for e in _prev}
                                 _executed.clear()
                                 _last_note = str(_mr3.get("note") or _last_note)
                                 await _try_items(_mr3["items"], "判官退回重填")
                                 _executed[:] = _prev + [
                                     e for e in _executed
                                     if " ".join(str(e["sql"]).split()).lower()
-                                    not in _prev_sql]
+                                    not in _prev_sql
+                                    and json.dumps(
+                                        (e.get("data") or {}).get("rows"),
+                                        ensure_ascii=False, sort_keys=True)
+                                    not in _prev_sig]
                             if _executed:
                                 _do_merge()
                                 _fit = _fits_judge(question, code, data, _dbp,
@@ -2755,28 +2766,64 @@ def _scene_skill_catalog(scene_id: str, limit: int = 40) -> tuple[str, list[dict
     return "\n".join(lines), mine
 
 
+def _numeric_columns(db_path: str, limit: int = 80) -> list[str]:
+    """库里所有**数值列**（`表.列`）—— 判官判「完整性」时的唯一合法候选集。
+
+    为什么需要它（2026-10-28 实测）：光给判官一份全貌文字，它会凭行业常识
+    补出「还有住房补贴、通讯补贴、奖金没算」，把正确答案一路怼死。把候选
+    收窄成 schema 里真实存在的数值列，它就只能指认「employees.base_salary
+    没算」这种能被实查证伪的缺口 —— 这是**schema 白名单**，不是业务词表
+    （不写死任何业务口径，换库换场景自动跟着变）。
+
+    读不到（库被锁/无 duckdb）→ 返回 []，判官退回纯全貌模式（如实放行）。
+    """
+    if not str(db_path or "").strip():
+        return []
+    try:
+        import duckdb
+        con = duckdb.connect(str(db_path), read_only=True)
+        try:
+            rows = con.execute(
+                "SELECT table_name, column_name, data_type "
+                "FROM information_schema.columns "
+                "WHERE table_schema = 'main' "
+                "ORDER BY table_name, ordinal_position").fetchall()
+        finally:
+            con.close()
+    except Exception:
+        return []
+    out: list[str] = []
+    for t, c, ty in rows:
+        _ty = str(ty or "").lower()
+        if any(k in _ty for k in ("int", "decimal", "double", "real",
+                                  "numeric", "float")):
+            out.append(f"{t}.{c}")
+    return out[:limit]
+
+
 def _fits_judge(question: str, sql: str, data: Any,
                 db_path: str = "",
                 items: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """作答对题判官（**看全貌**判，不靠写死词表）。
 
     替代 _scope_guard/_subject_guard/_completeness_guard 三张词表：它把
-    「题面 + 实际执行的 SQL + 取回的结果 + 库的真实全貌」一起给判官，只问
-    三件事：主体对不对（全公司 vs 某部门）、口径对不对（工资 vs 津贴）、
-    完整不完整（题面说"总共"就要覆盖**库里实际存在**的全部组成部分）。
+    「题面 + 实际执行的 SQL + 取回的结果 + 库的真实全貌 + 数值列白名单」
+    一起给判官，只问三件事：主体对不对（全公司 vs 某部门）、口径对不对
+    （工资 vs 津贴）、完整不完整（题面说"总共"就要覆盖**库里实际存在**的
+    各组成部分）。
 
     `items`：逐条执行的账（[{name, sql, data}]）—— 多技能编排时**逐条**渲染
     （每条 SQL 配自己的结果），否则判官看拼在一起的 SQL 会误读成「同一条
     SQL 少算了」（2026-10-28 实测：说「津贴没算上所有员工」，其实子查询里
     已经按 dept 过滤了）。
 
-    ⚠️ 完整性只准拿**库全貌**当依据：全貌里没有的表/列/取值类别（比如没有
-    bonus 表）**不许假设存在** —— 与出题器规则 8「库里没有的费率/税率不许
-    假设」同一条铁律。否则判官会凭常识编出「还有住房补贴/奖金没算」，
-    把正确答案一路怼死（2026-10-28 实测过）。
+    ⚠️ 完整性只准拿**库全貌 + 数值列白名单**当依据：判官点名的缺失项必须
+    是白名单里真有的 `表.列`，否则代码侧直接**不采信**（当它没缺）—— 这
+    一条是硬机制，不靠提示词自觉。全貌里没有的表/列/津贴类别/奖金项目
+    一律不许假设存在（与出题器规则 8「库里没有的费率/税率不许假设」同源）。
 
     判官不可用（LLM 挂了）→ 如实放行（ok=True + why 注明），绝不因为判官
-    故障把正确答案拒掉。返回 {"ok": bool, "why": str}。
+    故障把正确答案拒掉。返回 {"ok": bool, "why": str, "missing": [列]}。
     """
     rows = None
     if isinstance(data, dict):
@@ -2786,7 +2833,9 @@ def _fits_judge(question: str, sql: str, data: Any,
             str(data)[:800]
     except Exception:
         preview = str(data)[:800]
-    obs = _catalog_block(db_path, 3500)
+    obs = _catalog_block(db_path, 3200)
+    _nums = _numeric_columns(db_path)
+    _num_block = ("、".join(_nums) if _nums else "（读不到 schema —— 完整性问题一律不采信）")
     if items:
         _blocks = []
         for _i, _e in enumerate(items[:6], 1):
@@ -2806,32 +2855,55 @@ def _fits_judge(question: str, sql: str, data: Any,
     else:
         sql_block = f"SQL：\n{str(sql)[:1500]}\n\n结果（前几行）：\n{preview}"
     sys_p = (
-        "你是核对员。给你题面、实际执行的 SQL 与取回的结果、以及库里真实存在"
-        "的表/列/取值全貌。判断「这组 SQL + 结果是不是真的回答了题面」，只看三件事：\n"
-        "① 主体：题面问的是谁/什么范围（全公司？某个部门？某个人？），SQL 的"
-        "过滤条件必须是同一个主体；\n"
-        "② 口径：题面问的量是哪一种（工资总额？某项津贴？加班费？人数？），"
-        "SQL 聚合的列必须就是它；\n"
-        "③ 完整性：题面说「总共/一共/总额/全部/应发」时，结果必须覆盖**库全貌"
-        "里实际存在**的各组成部分；但题面自己限定了窄口径（如「基本工资」）时，"
-        "只算那部分就是对的。\n"
-        "⚠️ 硬约束（违反即作废）：判断组成部分有没有缺，**只能**看库全貌里列出的"
-        "表/列/取值。全貌里没有的表、列、津贴类别、奖金项目 → 一律不许当成"
-        "「应该存在但没算」；库里没有费率/单价列 → 该量本来就算不出来，缺它不算"
-        "不完整。别用行业常识补全貌里没有的东西。\n"
+        "你是核对员。给你题面、实际执行的 SQL 与取回的结果、库里真实存在的"
+        "表/列/取值全貌、以及**数值列白名单**。判断「这组 SQL + 结果是不是真的"
+        "回答了题面」，分三项各自表态：\n"
+        "① subject_ok 主体：题面问的是谁/什么范围（全公司？某个部门？某个"
+        "人？），SQL 的过滤条件必须是同一个主体；\n"
+        "② measure_ok 口径：题面问的量是哪一种（工资总额？某项津贴？加班费？"
+        "人数？），SQL 聚合的列必须就是它；\n"
+        "③ missing 完整性：题面说「总共/一共/总额/全部/应发」时，结果要覆盖"
+        "库里**实际存在**的各组成部分。缺了哪一项，就把那一项对应的列写进 "
+        "missing —— 格式必须是白名单里逐字存在的 `表.列`。\n"
+        "⚠️ 硬约束：missing 只准从白名单里挑；想不出具体列（只是「感觉应该还"
+        "有别的奖金/补贴」）就留空数组 []。库里没有费率/单价列 → 该量本来就"
+        "不可计算，缺它不算不完整。别用行业常识补全貌里没有的东西。\n"
         "⚠️ 多条 SQL 时，每条只负责题面的一部分（上层负责合并/相加），不要要求"
         "单条 SQL 自己答完整题。\n"
-        '只返回 JSON：{"ok": true/false, "why": "一句话说清哪里不对；对就写口径一致"}')
+        "只返回 JSON：{\"subject_ok\": true/false, \"measure_ok\": true/false, "
+        "\"missing\": [\"表.列\"], \"why\": \"一句话说清哪里不对；对就写口径一致\"}")
     user = (f"题面：{question}\n\n{sql_block}\n\n"
-            f"库全貌（实查，判断组成部分只准依据它）：\n{obs}")
+            f"数值列白名单（missing 只准从这里挑）：\n{_num_block}\n\n"
+            f"库全貌（实查）：\n{obs}")
     try:
         cj = chat_json([{"role": "system", "content": sys_p},
                         {"role": "user", "content": user}], temperature=0.0)
     except Exception as e:
         print(f"  （作答对题判官不可用：{type(e).__name__}: {e} → 如实放行）")
-        return {"ok": True, "why": f"判官不可用（如实放行）：{type(e).__name__}"}
-    ok = True if not isinstance(cj, dict) else bool(cj.get("ok", True))
-    return {"ok": ok, "why": str((cj or {}).get("why") or "")[:300]}
+        return {"ok": True, "why": f"判官不可用（如实放行）：{type(e).__name__}",
+                "missing": []}
+    if not isinstance(cj, dict):
+        return {"ok": True, "why": "", "missing": []}
+    # 兼容老契约（只给 ok/why 的判官输出）：没有三项字段时按 ok 判。
+    _has3 = any(k in cj for k in ("subject_ok", "measure_ok", "missing"))
+    if not _has3:
+        return {"ok": bool(cj.get("ok", True)),
+                "why": str(cj.get("why") or "")[:300], "missing": []}
+    sub = bool(cj.get("subject_ok", True))
+    mea = bool(cj.get("measure_ok", True))
+    _asked = [str(m).strip() for m in (cj.get("missing") or []) if str(m).strip()]
+    # 只采信白名单里真有的列 —— 判官凭常识编出来的「缺奖金/缺补贴」在这里
+    # 被机械地否掉（不是靠提示词求它别编）。读不到 schema 时退回旧行为。
+    _real = [m for m in _asked if m in set(_nums)] if _nums else _asked
+    why = str(cj.get("why") or "")[:300]
+    ok = sub and mea and not _real
+    if sub and mea and _asked and not _real:
+        why = (why + "｜（点名的缺失项 " + "、".join(_asked[:3])
+               + " 不在库里真实数值列中 —— 按全貌放行）")[:300]
+    elif _real:
+        why = (why + "｜实查确认缺失：" + "、".join(_real[:3]))[:300]
+    return {"ok": ok, "why": why, "missing": _real}
+
 
 
 def _is_data_question(question: str) -> bool:

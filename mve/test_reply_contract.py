@@ -64,7 +64,10 @@ def main() -> int:
         check("判官看得到真实取回的行", "55000" in user_p)
         check("判官拿到库全貌（表/列/取值）", "库全貌" in user_p)
         check("完整性只准依据全貌（不许用常识补表）",
-              "不许当成" in sys_p and "别用行业常识" in sys_p)
+              "missing 只准从白名单里挑" in sys_p
+              and "别用行业常识补全貌里没有的东西" in sys_p)
+        check("判官拿到数值列白名单（缺口的唯一合法候选集）",
+              "数值列白名单" in user_p)
 
         # 多技能编排：逐条渲染，别让判官把拼起来的 SQL 误读成「同一条少算了」
         C._fits_judge("技术部九月份总共要发多少钱", "", {},
@@ -92,6 +95,42 @@ def main() -> int:
                            {"rows": [{"total": 55000}]}, "")
         check("判官判片面 → 不 ok", r2["ok"] is False)
         check("拒因原样带回（进重填反馈）", "缺津贴" in r2["why"])
+
+        # 完整性缺口的机械裁决：只有 schema 白名单里真有的列才算「缺」
+        # （防判官凭常识编「还有奖金/住房补贴没算」把正确答案怼死，2026-10-28）
+        _orig_nums = C._numeric_columns
+        try:
+            C._numeric_columns = lambda p, limit=80: [
+                "employees.base_salary", "allowance.amount"]
+            C.chat_json = lambda *a, **k: {
+                "subject_ok": True, "measure_ok": True,
+                "missing": ["bonus.amount", "住房补贴"],
+                "why": "没有包含奖金和住房补贴"}
+            r4 = C._fits_judge("技术部九月份总共要发多少钱",
+                               "SELECT SUM(base_salary) FROM employees", {}, "")
+            check("点名的缺口不在库里 → 不采信、如实放行",
+                  r4["ok"] is True and "按全貌放行" in r4["why"], r4["why"][:60])
+            check("采信的缺口表为空", r4["missing"] == [])
+            C.chat_json = lambda *a, **k: {
+                "subject_ok": True, "measure_ok": True,
+                "missing": ["allowance.amount"],
+                "why": "漏了津贴"}
+            r5 = C._fits_judge("技术部九月份总共要发多少钱",
+                               "SELECT SUM(base_salary) FROM employees", {}, "")
+            check("缺口是库里真实数值列 → 采信、退回",
+                  r5["ok"] is False and "allowance.amount" in r5["why"])
+            C.chat_json = lambda *a, **k: {"subject_ok": False,
+                                           "measure_ok": True, "missing": [],
+                                           "why": "题面问公司、SQL 只算技术部"}
+            r6 = C._fits_judge("九月份公司一共要支付多少钱",
+                               "SELECT SUM(base_salary) FROM employees "
+                               "WHERE dept='技术'", {}, "")
+            check("主体错 → 退回（55000 事故）", r6["ok"] is False)
+            C.chat_json = lambda *a, **k: {"ok": True, "why": "老契约"}
+            r7 = C._fits_judge("随便", "SELECT 1", {}, "")
+            check("老契约（只给 ok/why）仍兼容", r7["ok"] is True)
+        finally:
+            C._numeric_columns = _orig_nums
 
         def _boom(*a, **k):
             raise RuntimeError("llm down")
