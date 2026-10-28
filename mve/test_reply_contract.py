@@ -140,7 +140,9 @@ def main() -> int:
 
     print("== 4. 消费主流程接线 ==")
     src = open("consume.py", encoding="utf-8").read()
-    check("执行完先过全貌对题判官", "_fits_judge(question, code, data, _dbp)" in src)
+    check("执行完先过全貌对题判官",
+          "_fits_judge(question, code, data, _dbp" in src
+          and "items=_executed" in src)
     check("solve 兜底路径也过判官",
           "整段 SQL 被对题判官退回" in src)
     check("判不过 → 带全库目录重填一轮", "catalog=_cat" in src and "_fb2" in src)
