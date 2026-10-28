@@ -60,8 +60,8 @@ def _q(ident: str) -> str:
     return '"' + str(ident).replace('"', '""') + '"'
 
 
-def _scene_db_path(scene_id: str) -> tuple[str, str]:
-    """(落库路径, 场景目录)。取场景自己的库；没有就 uploads.duckdb。"""
+def _scene_db_path(scene_id: str) -> tuple[str, str, str]:
+    """(落库路径, 场景目录, kind)。取场景自己的库；没有就 uploads.duckdb。"""
     import scene_profile
     prof = scene_profile.profile(scene_id) or {}
     d = str(prof.get("scene_dir") or "") or scene_profile.scene_dir(scene_id)
@@ -70,9 +70,9 @@ def _scene_db_path(scene_id: str) -> tuple[str, str]:
     if dbp and kind in ("scene", "vlml"):
         # VLML 域（场景 A）不往里写：那是另一个数据域，混进去等于破了场景隔离。
         if kind == "vlml":
-            return str(Path(d) / "uploads.duckdb"), d
-        return dbp, d
-    return str(Path(d) / "uploads.duckdb"), d
+            return str(Path(d) / "uploads.duckdb"), d, kind
+        return dbp, d, kind
+    return str(Path(d) / "uploads.duckdb"), d, kind
 
 
 def _xlsx_to_csv(src: str, dst: str) -> str:
@@ -137,7 +137,12 @@ def ingest(scene_id: str, filename: str, blob: bytes) -> dict[str, Any]:
         out["why"] = f"文件太大（{len(blob)//1024//1024}MB > 32MB）"
         return out
 
-    db_path, sdir = _scene_db_path(scene_id)
+    db_path, sdir, kind = _scene_db_path(scene_id)
+    # agent 能不能「看见」这张表：落库路径 == 场景真正的数据源（kind=scene）
+    # 才看得见；VLML 域落的是 uploads.duckdb，而 agent 查的是 VLML 库 ——
+    # 必须如实告诉人「看不见」，不然就会出现「导入了却答不对」的迷惑
+    # （2026-10-28 用户实测踩到：在场景 A 上传，表进了 A 的 uploads.duckdb）。
+    out["visible"] = (kind == "scene")
     updir = Path(sdir) / "uploads"
     try:
         updir.mkdir(parents=True, exist_ok=True)
@@ -206,7 +211,7 @@ def ingest(scene_id: str, filename: str, blob: bytes) -> dict[str, Any]:
 
 def describe(scene_id: str) -> dict[str, Any]:
     """列本场景已有的上传表（面板展示/自检用）。"""
-    db_path, _ = _scene_db_path(scene_id)
+    db_path, _, _ = _scene_db_path(scene_id)
     out: dict[str, Any] = {"db_path": db_path, "tables": []}
     if not Path(db_path).exists():
         return out

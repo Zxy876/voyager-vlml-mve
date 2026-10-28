@@ -1178,6 +1178,16 @@ async def consume(
                                       or _it["name"]
                                       or str((skills[0] if skills else {})
                                              .get("name") or "配方"))
+                            # 一条配方 = 一条账：同名的成功账已存在就不许再来
+                            # 一个变体（2026-10-28 实测：重填轮把 allowance_total
+                            # 又实例化了一个技术部口径的变体，公司口径 3600 和
+                            # 部门口径 2120 同时进合并数据 —— 叙事层拿到两笔
+                            # 对不上的账，答案当轮就乱了）。
+                            if any(e.get("name") == _label for e in _executed):
+                                reuse_errors.append(
+                                    f"{_label} 在重填轮给出了另一个变体 —— "
+                                    f"该配方已有一条成功账，跳过不重复计")
+                                continue
                             _gwhy = _sql_literal_guard(_sql, _dbp)
                             if _gwhy:
                                 reuse_errors.append(
@@ -1473,6 +1483,9 @@ async def consume(
                     # 相加或者做什么，也算能力」）。
                     _nar_note += ("；下面各「来源技能」条目是这句话问的总量的"
                                   "组成部分，允许相加汇总，逐个来源编号都标上")
+                _nar_note += ("；⚠️ 列名是 hours/天数/次数 这类数量/时长的值"
+                              "**不是钱**，绝不许写成「××元的加班费/扣款」——"
+                              "库里没有费率，这笔钱就不存在")
                 nar = _nar.narrate_answer(question, data,
                                           note=_nar_note)
             except Exception as e:      # 连 import 都失败也不许影响取数结果
@@ -2860,7 +2873,7 @@ def _fits_judge(question: str, sql: str, data: Any,
     _fails = [f for f in (fails or []) if isinstance(f, dict)]
     if _fails:
         sql_block += ("\n\n⚠️ 本轮这些配方**取数失败**（它们的结果不在上面 —— "
-                      "题面若需要它们，这份作答就是不完整的）：\n"
+                      "逐个表态是否影响本题）：\n"
                       + "\n".join(f"- {f.get('name') or '?'}："
                                   f"{str(f.get('why') or '')[:160]}"
                                   for f in _fails[:5]))
@@ -2869,22 +2882,24 @@ def _fits_judge(question: str, sql: str, data: Any,
         "表/列/取值全貌、**数值列白名单**，以及本轮取数失败的配方。判断"
         "「这组 SQL + 结果是不是真的回答了题面」，分四项各自表态：\n"
         "① subject_ok 主体：题面问的是谁/什么范围（全公司？某个部门？某个"
-        "人？），SQL 的过滤条件必须是同一个主体；\n"
+        "人？）—— **逐条**检查每条 SQL 的 WHERE：只要有一条把范围缩小到题面"
+        "之外的子集（题面问全公司、SQL 却过滤了某个部门），subject_ok 就是 "
+        "false；\n"
         "② measure_ok 口径：题面问的量是哪一种（工资总额？某项津贴？加班费？"
         "人数？），SQL 聚合的列必须就是它；\n"
         "③ missing 完整性：题面说「总共/一共/总额/全部/应发」时，结果要覆盖"
         "库里**实际存在**的各组成部分。缺了哪一项，就把那一项对应的列写进 "
         "missing —— 格式必须是白名单里逐字存在的 `表.列`。\n"
-        "④ failed_ok 失败是否可接受：本轮有配方取数失败时，只有当你确认"
-        "「这些失败项与题面无关、或在库里本来就不可计算」才写 true；"
-        "拿不准就写 false（宁可不答，也不交片面数）。没有失败项时写 true。\n"
+        "④ failed 逐项表态：对每个取数失败的配方单独回答 needed（题面需要它、"
+        "缺了它答案就不对 → true；与题面无关、或库里本来没有费率/单价列根本"
+        "算不出 → false）。拿不准就写 true（宁可不答，也不交片面数）。\n"
         "⚠️ 硬约束：missing 只准从白名单里挑；想不出具体列（只是「感觉应该还"
-        "有别的奖金/补贴」）就留空数组 []。库里没有费率/单价列 → 该量本来就"
-        "不可计算，缺它不算不完整。别用行业常识补全貌里没有的东西。\n"
+        "有别的奖金/补贴」）就留空数组 []。别用行业常识补全貌里没有的东西。\n"
         "⚠️ 多条 SQL 时，每条只负责题面的一部分（上层负责合并/相加），不要要求"
         "单条 SQL 自己答完整题。\n"
         "只返回 JSON：{\"subject_ok\": true/false, \"measure_ok\": true/false, "
-        "\"missing\": [\"表.列\"], \"failed_ok\": true/false, "
+        "\"missing\": [\"表.列\"], "
+        "\"failed\": [{\"name\": \"配方名\", \"needed\": true/false}], "
         "\"why\": \"一句话说清哪里不对；对就写口径一致\"}")
     user = (f"题面：{question}\n\n{sql_block}\n\n"
             f"数值列白名单（missing 只准从这里挑）：\n{_num_block}\n\n"
@@ -2905,42 +2920,53 @@ def _fits_judge(question: str, sql: str, data: Any,
                 "why": str(cj.get("why") or "")[:300], "missing": []}
     sub = bool(cj.get("subject_ok", True))
     mea = bool(cj.get("measure_ok", True))
-    # 有取数失败时，判官必须**明确认可**才能放行（不给字段 = 不认可）。
-    # 这是 7950 事故的机械修复：一轮里 3 条配方 2 条执行报错，判官只看
-    # 「成功的那 1 条」说过关了，最后交出去一个残缺的总数。
-    _fail_ok = bool(cj.get("failed_ok", not _fails))
-    # ---- 缺口闸（确定性，schema 级，不看业务词）----
-    # 失败项碰到的表，如果**没有任何成功条目**覆盖到，那张表的数据就是真缺了
-    # （实测：公司总额题里 allowance 那条 BinderException，judge 还说「失败项
-    # 与题面无关」→ 交 133500 漏 3600）。反过来，失败项的表已被别的成功条目
-    # 覆盖（如某条配方带幻觉取值被守卫拒，但同表的干净配方成功了）→ 不算缺口。
+    # ⚠️ 判官对「失败项要不要紧」的意见**不进 ok**（2026-10-28 两次实测它都
+    # 不可靠：一会儿说无关的 allowance「与题面无关」→ 交 133500 漏 3600，
+    # 一会儿把技术部口径说成全公司）。失败项要不要紧由下面的**缺口闸**用
+    # schema + 单位判——确定性，不看业务词。
+    # ---- 缺口闸（确定性，schema 级 + 单位级，不看业务词）----
+    # 失败项碰到的表，如果**没有任何成功条目**覆盖到，且这条失败 SQL 想算的
+    # 是「能当钱用的量」（聚合目标不是纯数量/时长列），那它就是真缺了。
+    # 反例豁免：失败 SQL 只聚合 hours/days/count 这类数量列（如加班小时）——
+    # 它就算跑通了也变不成钱（库里没有费率），缺它不算不完整（同出题器
+    # 规则 8：库里没有的费率不许假设）。另一豁免：失败项的表已被别的成功
+    # 条目覆盖（同表的干净配方成功了）。
     _gap: list[str] = []
     if _fails:
         try:
             _et: set[str] = set()
             for _e in (items or []):
                 _et |= _sql_tables(str(_e.get("sql") or ""))
-            _ft: set[str] = set()
             for _f in _fails:
-                _ft |= _sql_tables(str(_f.get("sql") or ""))
-            _gap = sorted(_ft - _et)
+                _fs = str(_f.get("sql") or "")
+                _ft = _sql_tables(_fs) - _et
+                if not _ft:
+                    continue
+                # 这条失败 SQL 的聚合目标里有没有「非数量」列？
+                _aggs = re.findall(
+                    r"\b(?:SUM|AVG)\s*\(\s*([\w\u4e00-\u9fff.]+)\s*\)",
+                    _fs, re.I)
+                _qty = ("hours", "days", "count", "num", "小时", "天数",
+                        "次数", "数量")
+                _money_able = [c for c in _aggs
+                               if not any(u in c.lower() for u in _qty)]
+                if _aggs and not _money_able:
+                    continue          # 全是数量列 → 跑通了也变不成钱，不是缺口
+                _gap.extend(sorted(_ft))
         except Exception:
             _gap = []
+        _gap = sorted(set(_gap))
     _asked = [str(m).strip() for m in (cj.get("missing") or []) if str(m).strip()]
     # 只采信白名单里真有的列 —— 判官凭常识编出来的「缺奖金/缺补贴」在这里
     # 被机械地否掉（不是靠提示词求它别编）。读不到 schema 时退回旧行为。
     _real = [m for m in _asked if m in set(_nums)] if _nums else _asked
     why = str(cj.get("why") or "")[:300]
-    ok = sub and mea and _fail_ok and not _real and not _gap
+    ok = sub and mea and not _real and not _gap
     if sub and mea and _asked and not _real:
         why = (why + "｜（点名的缺失项 " + "、".join(_asked[:3])
                + " 不在库里真实数值列中 —— 按全貌放行）")[:300]
     elif _real:
         why = (why + "｜实查确认缺失：" + "、".join(_real[:3]))[:300]
-    if not _fail_ok and _fails:
-        why = (why + "｜本轮有配方取数失败（"
-               + "、".join(str(f.get("name") or "?") for f in _fails[:3])
-               + "），不算答完整")[:300]
     if _gap:
         why = (why + "｜这些表这轮没取到数、也没有别的条目覆盖："
                + "、".join(_gap[:4]) + " —— 组成部分缺失")[:300]

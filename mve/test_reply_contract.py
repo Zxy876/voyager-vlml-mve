@@ -131,9 +131,11 @@ def main() -> int:
             check("老契约（只给 ok/why）仍兼容", r7["ok"] is True)
 
             # 7950 事故：一轮里 3 条配方 2 条执行报错，判官只看成功的那条就
-            # 说过关了 → 交出残缺总数。有失败项时必须判官**明确认可**才放行。
-            _F = [{"name": "total_salary", "why": "month 列不存在"},
-                  {"name": "overtime_pay", "why": "月份 列不存在"}]
+            # 说过关了 → 交出残缺总数。失败项要不要紧**不信任判官**（两次
+            # 实测它都不一致），由缺口闸按 schema+单位判。
+            _F = [{"name": "total_salary", "sql":
+                   "SELECT SUM(base_salary) FROM employees WHERE month='2026-09'",
+                   "why": "month 列不存在"}]
 
             def _rec(resp):
                 def _f(msgs, **k):
@@ -142,21 +144,37 @@ def main() -> int:
                 return _f
 
             C.chat_json = _rec({"subject_ok": True, "measure_ok": True,
-                                "missing": [], "why": "口径一致"})
+                                "missing": [],
+                                "failed": [{"name": "total_salary",
+                                            "needed": False}],
+                                "why": "口径一致"})
             r8 = C._fits_judge("九月份公司一共要支付多少钱",
                                "SELECT SUM(amount) FROM allowance", {}, "",
                                fails=_F)
-            check("有取数失败又没明确认可 → 不放行（7950 事故）",
-                  r8["ok"] is False and "取数失败" in r8["why"], r8["why"][:70])
+            check("判官说失败项无关也不采信：缺口闸拦（7950 事故）",
+                  r8["ok"] is False and "employees" in r8["gap_tables"],
+                  str(r8["gap_tables"]))
             check("失败项写进判官上下文",
                   "total_salary" in seen[-1][1]["content"])
+
+            # 失败 SQL 只聚合数量/时长列（加班小时）→ 跑通了也变不成钱
+            # （库里无费率），缺它不算不完整 —— 缺口闸的单位豁免。
             C.chat_json = _rec({"subject_ok": True, "measure_ok": True,
-                                "missing": [], "failed_ok": True,
-                                "why": "失败的是加班费，库里无费率"})
-            r9 = C._fits_judge("九月份公司一共要支付多少钱",
-                               "SELECT SUM(amount) FROM allowance", {}, "",
-                               fails=_F)
-            check("判官确认失败项不可算 → 放行", r9["ok"] is True, r9["why"][:60])
+                                "missing": [], "why": "口径一致"})
+            r9 = C._fits_judge(
+                "技术部九月份总共要发多少钱", "", {},
+                "", items=[{"name": "base", "sql":
+                            "SELECT SUM(base_salary) FROM employees",
+                            "data": {"rows": [{"t": 55000}]}},
+                           {"name": "allow", "sql":
+                            "SELECT SUM(amount) FROM allowance",
+                            "data": {"rows": [{"t": 2120}]}}],
+                fails=[{"name": "overtime_pay", "sql":
+                        "SELECT SUM(overtime_hours) FROM attendance",
+                        "why": "BinderException"}])
+            check("失败项只算小时数（无费率）→ 不算缺口，放行",
+                  r9["ok"] is True and r9["gap_tables"] == [],
+                  str(r9["gap_tables"]))
 
             # 缺口闸：失败项碰的表没有任何成功条目覆盖 → 真缺（不吃判官的「无关」）
             _F2 = [{"name": "allowance_total", "sql":

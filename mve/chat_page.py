@@ -627,7 +627,12 @@ $('fileInput').onchange = function(ev){
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({scene_id: sid, name: f.name, data_b64: b64(fr.result)})
     }).then(function(r){ return r.json(); }).then(function(d){
-      if (d.ok){
+      if (d.ok && d.visible === false){
+        noteMsg('⚠️ 文件已落盘，但**这个场景的 agent 看不见它**（场景 ' + sid +
+                ' 是 VLML 域，查的是另一个库）。\n\n' +
+                '请把顶部模型切到你要问的场景（如 mve:B），再重新上传 —— ' +
+                '上传跟着当前选中的场景走。');
+      } else if (d.ok){
         noteMsg('✅ 已导入 **' + d.table + '**（' + d.rows + ' 行 / ' +
                 (d.columns || []).length + ' 列）到场景 ' + sid + ' 的库。\n\n' +
                 '列：`' + (d.columns || []).join('`, `') + '`\n\n' +
