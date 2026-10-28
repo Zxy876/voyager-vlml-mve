@@ -407,31 +407,30 @@ _NON_MONEY_KEY_UNITS = ("hours", "days", "count", "num", "rate",
                         "小时", "天数", "次数", "数量", "率")
 
 
-def _collect_evidence(data: Any, acc: list[float], money: list[float]) -> None:
-    """递归收集证据数值：全部值进 acc；**金额语义键**下的值另进 money。"""
+def _collect_evidence(data: Any, acc: list[float], money: list[float],
+                      money_ok: bool = True) -> None:
+    """递归收集证据数值：全部值进 acc；**金额语义键**下的值另进 money。
+
+    金额语义沿键**穿透列表/嵌套**（合并行的「值」键下常是 [81000.0] 这种
+    列表——服务器实测把正确的 83120=81000+2120 误杀过，就因为金额语义
+    没穿过去）；遇到非金额键（hours/days/count/…）则整个子树都不算金额。
+    """
     if isinstance(data, dict):
         for k, v in data.items():
-            ks = str(k).lower()
-            if isinstance(v, bool):
-                continue
-            if isinstance(v, (int, float)):
-                fv = float(v)
-                if fv == fv:                      # NaN 防御
-                    acc.append(fv)
-                    if not any(u in ks for u in _NON_MONEY_KEY_UNITS):
-                        money.append(fv)
-            else:
-                _collect_evidence(v, acc, money)
+            _mok = money_ok and not any(u in str(k).lower()
+                                        for u in _NON_MONEY_KEY_UNITS)
+            _collect_evidence(v, acc, money, _mok)
     elif isinstance(data, (list, tuple)):
         for v in data:
-            if isinstance(v, bool):
-                continue
-            if isinstance(v, (int, float)):
-                fv = float(v)
-                if fv == fv:
-                    acc.append(fv)
-            else:
-                _collect_evidence(v, acc, money)
+            _collect_evidence(v, acc, money, money_ok)
+    elif isinstance(data, bool):
+        return
+    elif isinstance(data, (int, float)):
+        fv = float(data)
+        if fv == fv:                              # NaN 防御
+            acc.append(fv)
+            if money_ok:
+                money.append(fv)
 
 
 def _subset_sum_representable(target: float, vals: list[float],

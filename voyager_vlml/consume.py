@@ -1214,9 +1214,19 @@ async def consume(
                         # 下方真空防线的口径不变。
                         _merged: list[Any] = []
                         for _e in _executed:
+                            # list 行还原列名（执行层 run_sql 带 columns）——
+                            # 叙述守卫的单位语义靠**列名**活着，丢列名的
+                            # 「值」行会让 20.5 小时混进金额相加（2026-10-28）。
+                            _cols = [str(c) for c in
+                                     ((_e.get("data") or {}).get("columns")
+                                      or [])]
                             for _row in (_e["data"].get("rows") or []):
                                 if isinstance(_row, dict):
                                     _merged.append({"来源技能": _e["name"], **_row})
+                                elif (isinstance(_row, (list, tuple)) and _cols
+                                      and len(_row) == len(_cols)):
+                                    _merged.append({"来源技能": _e["name"],
+                                                    **dict(zip(_cols, _row))})
                                 else:
                                     _merged.append({"来源技能": _e["name"],
                                                     "值": _row})

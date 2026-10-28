@@ -71,6 +71,14 @@ def main() -> int:
     ok8, _ = verify_answer_numbers("合计 120.5 元", data2, sum_auth=True)
     check("100（金额）+20.5（小时）拼不出 → 拒", not ok8)
 
+    print("== 4.5 金额语义穿透「值」列表（服务器实测误杀修复）==")
+    data3 = {"rows": [{"来源技能": "tech_base_salary", "值": [81000.0]},
+                      {"来源技能": "tech_allowance", "值": [2120.0]}]}
+    ok9, _ = verify_answer_numbers("合计 83120 元。", data3, sum_auth=True)
+    check("81000+2120 经「值」列表 → 83120 放行", ok9)
+    ok10, _ = verify_answer_numbers("基薪 81000。", data3, sum_auth=False)
+    check("穿透后 verbatim 仍放行", ok10)
+
     print("== 5. consume 接线 ==")
     import inspect
     import voyager_vlml.consume as C
