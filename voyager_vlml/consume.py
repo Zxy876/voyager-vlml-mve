@@ -1416,21 +1416,12 @@ async def consume(
                     _nd = len(_msd)
             except Exception:
                 pass
-            # 多技能编排缺口闸（确定性，2026-10-26）：合成题（dims>=2）但执行
-            # 成功的技能只覆盖 1 张源表、且没有复合配方兜底 → 组成部分没齐
-            # （3600=只算津贴 / 264000=只算加班 / 133500=只算基薪，同款）。
-            # 不交片面数，标记去学。多条原子技能都执行到（表并集>=2）或复合
-            # 配方命中（自身覆盖整题）→ 放行交叙事层相加。
-            if _nd >= 2 and _executed:
-                _et: set[str] = set()
-                for _e in _executed:
-                    _et |= _sql_tables(_e["sql"])
-                _has_comp = any(str((e.get("skill") or {}).get("name") or "")
-                                == "milestone" for e in _executed)
-                if len(_et) < 2 and not _has_comp:
-                    _coverage_why = (f"合成题（{_nd} 维）只执行到 {len(_et)} 张源表的"
-                                     f"原子技能，组成部分不齐 —— 不交片面数，标记去学")
-                    data = None
+            # ⚠️ 原来这里还有一条 `dims>=2 却只执行到 1 张源表 → 拦` 的硬规则，
+            # 2026-10-28 删掉：维度 ≠ 表。单表多维度题（如上传表里
+            # 「技术部(维1) 2026Q3(维2) 的奖金(维3)」全在 up_季度奖金 一张表）
+            # 被它误判成「组成部分不齐」，明明一条 SQL 就答全了。真正的判据
+            # 是「本题各维度技能所涉源表」覆盖没覆盖（_answer_is_partial 的第
+            # 二段：同一个源 = 谈不上组合漏维），加上 _fits_judge 的全貌判官。
             _partial, _cwhy = _answer_is_partial(code, _ans_skills, _nd)
             if _partial:
                 _coverage_why = _cwhy
