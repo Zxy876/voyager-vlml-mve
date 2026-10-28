@@ -24,8 +24,28 @@ import os
 import pathlib
 import re
 import socket
+import threading
+import time
 import urllib.request
 from typing import Any
+
+# 节流 + 退避（2026-10-28 实测踩到）：一次 16 条串行搜索，智谱 web-search-pro
+# 直接 429、DuckDuckGo 也限流，只回来 2 条。工具线越"勤快"越拿不到东西。
+#   · 最小间隔 1.2s：别把搜索当本地函数连打；
+#   · 撞 429/限流退避重试（2s → 5s → 10s），仍失败才如实抛错。
+_MIN_GAP = 1.2
+_RETRY_WAITS = (2.0, 5.0, 10.0)
+_throttle_lock = threading.Lock()
+_last_search_at = 0.0
+
+
+def _throttle() -> None:
+    global _last_search_at
+    with _throttle_lock:
+        gap = _MIN_GAP - (time.time() - _last_search_at)
+        if gap > 0:
+            time.sleep(gap)
+        _last_search_at = time.time()
 
 _UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36")
@@ -98,11 +118,31 @@ def _http_get(url: str, timeout: int = _TIMEOUT) -> tuple[int, bytes]:
 # 原语
 # ---------------------------------------------------------------------------
 def web_search(query: str, max_results: int = 5) -> list[dict[str, Any]]:
-    """联网搜索。返回 [{"title","url","snippet"}]，snippet 是**正文片段**。
+    """联网搜索（带节流与退避）。返回 [{"title","url","snippet"}]。
 
     后端顺序：智谱 web-search-pro（厂商侧抓取，摘要即正文片段）→ DuckDuckGo
     html/lite（免 key 兜底）。全失败就抛错（调用方如实报），**不返回编造的结果**。
+
+    ⚠️ 撞限流要退避，不要原地重打（2026-10-28 实测：连打 16 次只回来 2 条）。
+    调用方（工具线/多跳）应把**取回的结果落库**（web_ingest），别隔一会儿
+    又问同一句 —— 那正是「联网资料存进数据源」要解决的问题。
     """
+    last: Exception | None = None
+    for i in range(len(_RETRY_WAITS) + 1):
+        _throttle()
+        try:
+            return _search_once(query, max_results)
+        except _NoBackend:
+            raise
+        except Exception as e:      # 限流/超时/解析不出 —— 退避再来
+            last = e
+            if i < len(_RETRY_WAITS):
+                time.sleep(_RETRY_WAITS[i])
+    raise last if last else RuntimeError("联网搜索失败")
+
+
+def _search_once(query: str, max_results: int = 5) -> list[dict[str, Any]]:
+    """单次搜索（不节流、不重试；web_search 负责这两件事）。"""
     q = str(query or "").strip()
     if not q:
         raise ValueError("搜索词是空的")
