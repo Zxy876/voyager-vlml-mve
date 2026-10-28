@@ -798,7 +798,7 @@ def _tools_in_code(code: str, scene_id: str = "") -> list[str]:
     return out
 
 
-async def _tool_line_fallback(question: str) -> dict[str, Any]:
+async def _tool_line_fallback(question: str, context: str = "") -> dict[str, Any]:
     """工具线兜底（第 4 步，DeepSeek 消费同构）：库场景答不出 → 联网取公开
     资料、当场作答、用完即弃。
 
@@ -861,7 +861,9 @@ async def _tool_line_fallback(question: str) -> dict[str, Any]:
                           '{"answer": "基于资料的回答", "grounded": true/false}'
                           "（grounded = 资料是否足以回答该问题）")},
              {"role": "user",
-              "content": f"问题：{question}\n\n联网资料：\n{material[:9000]}"}],
+              # 上传的文件是这次的上下文：先按文件答，联网资料是补充。
+              "content": ((str(context).strip() + "\n\n") if str(context or "").strip() else "")
+                         + f"问题：{question}\n\n联网资料：\n{material[:9000]}"}],
             temperature=0.0)
         ans = str((cj or {}).get("answer") or "").strip()
         if ans and bool((cj or {}).get("grounded", True)):
@@ -1167,7 +1169,8 @@ async def consume(
                     print("  · 未学但有上传文件上下文 → 现场作答一次", flush=True)
                     obs, code = await _la.solve(
                         question, _scene_dir, scene_id=_scene_id,
-                        skills=skills, timeout=_consume_timeout(0))
+                        skills=skills, timeout=_consume_timeout(0),
+                        context=_file_ctx)
                     real = [o for o in obs
                             if o.get("ok") and o.get("data") is not None]
                     data = (real[-1].get("data") if real else None)
@@ -1281,8 +1284,13 @@ async def consume(
                                         for _f in _fails[:5])
                         print(f"  · 复用首轮全败（{len(_fails)} 条）→ 报错当 critique "
                               f"重试一轮（原版 step 迭代同构）", flush=True)
+                        # 重试必须带上**全貌**（表/列/真实取值）：只给报错
+                        # 不给取值，模型会把「津贴」当成 allowance.kind 的取值
+                        # 再写一遍（2026-10-28 实测：kind='津贴' 被字面量守卫
+                        # 连拒两轮 → 整题真空；库里真实取值是 餐补/交通）。
                         _mr2 = _refill_sql_multi(question, skills, _schema,
                                                  db_path=_dbp, feedback=_fb,
+                                                 catalog=_catalog_block(_dbp),
                                                  file_context=_file_ctx)
                         if _mr2["items"]:
                             await _try_items(_mr2["items"], "重试")
@@ -1447,7 +1455,10 @@ async def consume(
                     # 技能都是一次真实联网/MCP 取数（一次 web_search 5~20s），
                     # 命中的题一次合成 5 条 → 30s 默认值把整次重放判死
                     # （trace 里 5 条技能全进了、一条都没跑回来 →"执行超时"）。
-                    timeout=_consume_timeout(len(skills or [])))
+                    timeout=_consume_timeout(len(skills or [])),
+                    # 上传的文件就是这次的上下文（DeepSeek 客户端同构）：
+                    # 本机/场景 solve 也看得见它，不是只有 SQL 回填层看得见。
+                    context=_file_ctx)
                 real = [o for o in obs
                         if o.get("ok") and o.get("data") is not None]
                 data = (real[-1].get("data") if real else None)
@@ -1656,7 +1667,11 @@ async def consume(
             answer = (str(answer).rstrip()
                       + "（⚠️ 未验证：本轮未通过 critic 判定，此数字不可信）")
         # 未学（检索不到已学技能）：不答、只标记交给课程规划，明确告知人。
-        if data is None and not skills and _is_data_question(question):
+        # ⚠️ 有上传文件当上下文时**不写"未学"**：文件就在手里，DeepSeek
+        # 客户端拿到文件也照样读（2026-10-28 用户：「上下文是上传文件」）。
+        # 让它落到下面的 inference 分支按文件作答，并如实标注来源。
+        if (data is None and not skills and _is_data_question(question)
+                and not _file_ctx):
             answer = ("⚠️ 未学：这道题还没学过，检索不到已学配方 —— 不编数。"
                       + ("已自动拉起后台学习，学完再问同一句即可复用。"
                          if learn_kick.get("kicked") else
@@ -1676,19 +1691,29 @@ async def consume(
                          in ("HIGH_CONFIDENCE", "MEDIUM_CONFIDENCE")
                          or bool(skills))
         _no_reply = (data is None and not str(answer or "").strip())
-        if _no_reply and _is_data_question(question) and _internal_hit:
+        # ⚠️ 只有**没有已学技能**时才让文件顶上去作答：有技能说明这题该走
+        # 库，取数失败就该如实说没答出来，绝不能拿上传文件里的数顶替
+        # （2026-10-28 实测：残留的上传把公司总额答成 22600）。
+        _file_as_source = bool(_file_ctx) and not skills
+        if (_no_reply and _is_data_question(question) and _internal_hit
+                and not _file_as_source):
             pass                       # 上面已有「未学/不会」交代 + 已派学习
         elif _no_reply:
-            if not _is_data_question(question):
-                _inf = _inference_answer(question)
+            # 有上传文件 → 数据题也先读文件（文件就是上下文）；没文件才只答
+            # 知识题。标注分两种：按文件作答 vs 模型推断，别混成一句。
+            if _file_as_source or not _is_data_question(question):
+                _inf = _inference_answer(question, context=_file_ctx)
                 if _inf.get("used"):
                     answer = (str(_inf["answer"]).rstrip()
-                              + "（⚠️ 模型推断：未从环境取数验证；不入库、"
-                                "不计入学习曲线）")
+                              + ("（⚠️ 按你上传的文件作答：内容来自文件本身，"
+                                 "未经库内验证；不入库、不计入学习曲线）"
+                                 if _file_as_source else
+                                 "（⚠️ 模型推断：未从环境取数验证；不入库、"
+                                 "不计入学习曲线）"))
                     inference_used = True
             if not str(answer or "").strip():
                 try:
-                    tool_line = await _tool_line_fallback(question)
+                    tool_line = await _tool_line_fallback(question, context=_file_ctx)
                 except Exception as e:  # pragma: no cover
                     tool_line = {"used": False, "answer": "", "sources": [],
                                  "note": (f"工具线异常：{type(e).__name__}: "
@@ -2157,7 +2182,7 @@ async def consume(
         if not _is_data_question(question):
             # 非数据题先 inference（同 DeepSeek 客户端：联网默认关，知识题
             # 模型直接答，标「模型推断」）；模型自评不知 → 工具线 claim。
-            _inf_v = _inference_answer(question)
+            _inf_v = _inference_answer(question, context=_file_ctx)
             if _inf_v.get("used"):
                 answer = (str(_inf_v["answer"]).rstrip()
                           + "（⚠️ 模型推断：未从环境取数验证；不入库、"
@@ -2165,7 +2190,7 @@ async def consume(
                 inference_used = True
         if not str(answer or "").strip():
             try:
-                tool_line = await _tool_line_fallback(question)
+                tool_line = await _tool_line_fallback(question, context=_file_ctx)
             except Exception as e:  # pragma: no cover
                 tool_line = {"used": False, "answer": "", "sources": [],
                              "note": f"工具线异常：{type(e).__name__}: {str(e)[:140]}"}
@@ -3237,7 +3262,7 @@ def _is_data_question(question: str) -> bool:
     return any(w in _q for w in _DATA_WORDS)
 
 
-def _inference_answer(question: str) -> dict[str, Any]:
+def _inference_answer(question: str, context: str = "") -> dict[str, Any]:
     """inference 兜底（句句有回复的最后一层）：模型凭自身知识回答。
 
     同 DeepSeek 客户端的知识题回答：不用环境、不联网，答完**必须**带
@@ -3252,7 +3277,11 @@ def _inference_answer(question: str) -> dict[str, Any]:
                           "取的数。如果问题需要具体/实时的数据而你无法确知，"
                           "grounded 必须为 false。只返回 JSON："
                           '{"answer": "回答", "grounded": true/false}')},
-             {"role": "user", "content": str(question)}],
+             # 用户上传的文件就是这次的上下文（DeepSeek 客户端同构）：
+             # 带文件的知识题 = 读文件作答；没有文件才是纯模型知识。
+             {"role": "user",
+              "content": (str(context).strip() + "\n\n问题：" + str(question)
+                          if str(context or "").strip() else str(question))}],
             temperature=0.2)
         ans = str((cj or {}).get("answer") or "").strip()
         if ans and bool((cj or {}).get("grounded", True)):

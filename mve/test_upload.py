@@ -44,7 +44,7 @@ def main() -> int:
     check("标识符会被引起来（中文表名必须）", U._q("up_技术") == '"up_技术"')
 
     print("== 2. 拒收口径（不假装成功） ==")
-    r = U.ingest("B", "x.txt", b"hello")
+    r = U.ingest("B", "x.zip", b"hello")
     check("不支持的后缀 → ok=False", not r["ok"] and "不支持的后缀" in r["why"])
     r = U.ingest("B", "x.csv", b"")
     check("空文件 → ok=False", not r["ok"] and "空的" in r["why"])
@@ -104,6 +104,53 @@ def main() -> int:
             assert scene_profile  # 只是引用一下，避免 lint 报未使用
         finally:
             U._scene_db_path = orig
+
+    print("== 4. 文件即上下文（DeepSeek 客户端同构：多模态带进输入文本） ==")
+    tmp2 = tempfile.mkdtemp(prefix="mve_ctx_")
+    db2 = os.path.join(tmp2, "t.duckdb")
+    orig2 = U._scene_db_path
+    try:
+        U._scene_db_path = lambda sid: (db2, tmp2, "scene")
+        # ① 纯文本：内容要能原样读出来（GBK 也要认）
+        md = "# 九月说明\n本月技术部 3 人在职，津贴合计 2120 元。\n".encode("utf-8")
+        r = U.ingest("B", "九月说明.md", md)
+        check("md → 当上下文（不落表）", r["ok"] and r.get("kind") == "text",
+              f"{r.get('kind')}｜{r.get('why', '')[:50]}")
+        check("文本内容抽出来了", "2120" in str(r.get("text") or ""),
+              str(r.get("text"))[:60])
+        gbk = "九月津贴合计 3600 元".encode("gb18030")
+        r2 = U.ingest("B", "九月.txt", gbk)
+        check("GBK 文本也能读", r2["ok"] and "3600" in str(r2.get("text") or ""),
+              str(r2.get("why", ""))[:60])
+        # ② docx：zip 解 <w:t>（零依赖）
+        import zipfile
+        docx = os.path.join(tmp2, "t.docx")
+        with zipfile.ZipFile(docx, "w") as z:
+            z.writestr("word/document.xml",
+                       "<w:document><w:body><w:p><w:r><w:t>技术部在职 3 人</w:t>"
+                       "</w:r></w:p></w:body></w:document>")
+        r3 = U.ingest("B", "说明.docx", open(docx, "rb").read())
+        check("docx → 抽出正文", r3["ok"] and "技术部在职 3 人" in str(r3.get("text") or ""),
+              str(r3.get("why", ""))[:60])
+        # ③ 图片：没配视觉模型就如实说看不了，不编图里有什么
+        png = (b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+        old_vis = os.environ.pop("MVE_VISION_MODEL", "")
+        try:
+            r4 = U.ingest("B", "截图.png", png)
+        finally:
+            if old_vis:
+                os.environ["MVE_VISION_MODEL"] = old_vis
+        check("图片没视觉模型 → ok 但如实标注看不了",
+              r4["ok"] and r4.get("kind") == "image"
+              and "看不了图" in str(r4.get("note") or ""),
+              str(r4.get("note"))[:60])
+        # ④ context_block：三种来源都渲染成**文本**（模型能直接读）
+        blk = U.context_block("B")
+        check("上下文块带文件名", "九月说明.md" in blk and "截图.png" in blk, blk[:80])
+        check("上下文块里有真实文本", "2120" in blk, "")
+        check("上下文块不假装图片有内容", "看不了图" in blk)
+    finally:
+        U._scene_db_path = orig2
 
     print(f"== 结果：{PASS} 过 / {FAIL} 挂 ==")
     return 1 if FAIL else 0

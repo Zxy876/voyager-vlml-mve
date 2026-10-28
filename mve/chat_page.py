@@ -351,7 +351,7 @@ button{font-family:inherit}
       <textarea id="q" rows="1" placeholder="给 MVE 发送消息，例如：技术部 9 月的餐补和交通补贴总额是多少？"></textarea>
       <div class="row">
         <button class="attach" id="attach" title="上传文件（CSV / JSON / Excel）——导入后这个场景就能查到它">📎</button>
-        <input type="file" id="fileInput" hidden accept=".csv,.tsv,.json,.jsonl,.ndjson,.xlsx,.xls">
+        <input type="file" id="fileInput" hidden accept=".csv,.tsv,.json,.jsonl,.ndjson,.xlsx,.xls,.txt,.md,.markdown,.log,.pdf,.docx,.png,.jpg,.jpeg,.webp,.gif">
         <span class="hint">Enter 发送 · Shift+Enter 换行</span>
         <button class="send" id="send" title="发送">↑</button>
         <button class="stop" id="stop">■ 停止生成</button>

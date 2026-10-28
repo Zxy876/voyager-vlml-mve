@@ -1,32 +1,31 @@
 #!/usr/bin/env python3
-"""外置上传模块：把人给的文件变成**场景数据库里的表**，让 agent 看得见。
+"""外置上传模块：把用户给的文件变成**模型输入里的上下文**（DeepSeek 客户端同构）。
 
-为什么要这个东西（2026-10-28 用户拍板）
-------------------------------------
-用户原话：「不能这样写死守卫解决，而是做 r1 客户端的多模态上传文件那些
-外置模块来让 agent 看到全貌」。
+为什么是「上下文」而不是「落表」（2026-10-28 用户四次纠正的收敛点）
+--------------------------------------------------------------------
+用户原话依次是：「上传文件的时候要像 R1 客户端一样当作上下文输入」→
+「上下文是上传文件（多模态带进输入文本里的）和 DeepSeek 客户端同构」。
 
-R1 / DeepSeek 客户端的形状是：用户把文件**交给**模型（拖进去 / 点回形针），
-模型看的是文件本身，而不是靠提示词里写死的业务词表猜。MVE 对应物就是这里：
+DeepSeek 客户端的真相是：**文件先被转成文本，拼进这次请求的输入**——
+表格转成「列名 + 若干真行」，文档转成正文片段，图片交给多模态模型转写。
+模型看到的是**这一次对话里的内容**，跟它能不能查库、库在哪里无关。
 
-    文件（csv/tsv/json/jsonl/xlsx） → 场景 duckdb 里的一张表 → 进 schema_block
-    与 curriculum_auto.db_observation 的**全貌** → 出题器/回填层/判官全部
-    自动看得见（不用改一行业务代码）
+所以这里分两条通道，都通向同一个 `context_block()`：
 
-与既有结构的关系
-----------------
-· 落库位置 = `scene_profile.profile(sid)["db_path"]`（场景自己的库）。
-  消费/学习两侧都从这个 profile 取库，所以上传完**不需要重启、不需要改配置**，
-  下一次提问就看得见新表（这是「看到全貌」的实际兑现方式）。
-· 场景还没有库（kind=local/missing）→ 落到 `<场景目录>/uploads.duckdb`，
-  它就是该场景唯一的 duckdb，profile 的 glob 会自动选中它。
-· 场景是 VLML 域（场景 A）→ 不往 VLML 库里写（那是另一个数据域的东西），
-  落到 `uploads.duckdb` 并如实告知「要让它成为数据源，请把场景 data_source
-  指到这个文件」。
+  表格类（csv/tsv/json/xlsx）→ 落成本场景 duckdb 的一张 `up_<名>` 表
+      ⇒ 既进 context_block（列名 + 真前几行），也进 schema/全貌（能真查）
+  文本/文档/图片（txt/md/pdf/docx/png/jpg…）→ 抽出文本片段进 context_block
+      ⇒ 只当上下文（查不了库），但模型**看得见内容**，不是只知道文件名
+
+`context_block(scene_id)` 就是「把这次要带进模型输入的上下文」渲染成一段文本：
+消费侧的 SQL 回填、本机/场景 solve、知识类 inference、联网工具线都会拼它。
+没有上传文件就返回空串（无上下文 = 纯模型知识，行为不变）。
 
 边界（诚实）
 -----------
-· xlsx/xls 需要 openpyxl；没装就如实报错让人另存 CSV，不假装解析成功。
+· PDF 需要 pypdf，docx 直接解 zip（无额外依赖）；缺库就如实报错，不假装解析。
+· 图片：配了 `MVE_VISION_MODEL`（如 glm-4v-flash）才转写；没配就如实标注
+  「当前模型看不了图」——不编造图里有什么。
 · 表名统一 `up_<文件名>`，重复上传同名文件 = 覆盖（CREATE OR REPLACE）。
 · 写库要独占锁：duckdb 同一时刻「一个写进程 或 多个只读进程」。面板的连接
   是每查询一开一关（scene_db.py），所以这里带重试；真锁不上就如实报错。
@@ -34,6 +33,7 @@ R1 / DeepSeek 客户端的形状是：用户把文件**交给**模型（拖进�
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -42,7 +42,15 @@ from pathlib import Path
 from typing import Any
 
 MAX_BYTES = 32 * 1024 * 1024        # 32MB（面板/客户端都按这个拦）
-SUPPORTED = {".csv", ".tsv", ".json", ".jsonl", ".ndjson", ".xlsx", ".xls"}
+SUPPORTED_TABULAR = {".csv", ".tsv", ".json", ".jsonl", ".ndjson",
+                     ".xlsx", ".xls"}
+SUPPORTED_TEXT = {".txt", ".md", ".markdown", ".log", ".csvx", ".yaml",
+                  ".yml", ".ini", ".conf", ".sql", ".py"}
+SUPPORTED_DOC = {".pdf", ".docx"}
+SUPPORTED_IMAGE = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+SUPPORTED = (SUPPORTED_TABULAR | SUPPORTED_TEXT | SUPPORTED_DOC
+             | SUPPORTED_IMAGE)
+TEXT_LIMIT = 6000          # 单个文本文件注入上下文的上限（字符）
 
 
 def _meta_path(scene_id: str) -> Path:
@@ -75,37 +83,76 @@ def _save_meta(scene_id: str, items: list[dict[str, Any]]) -> None:
             pass
 
 
-def context_block(scene_id: str, max_rows: int = 12) -> str:
-    """把「用户上传过的文件」渲染成**上下文块**（R1 客户端式的文件注入）。
+def _fresh(items: list[dict[str, Any]], minutes: int) -> list[dict[str, Any]]:
+    """只留**最近这一次对话**的上传（DeepSeek 语义：文件属于本次会话）。
 
-    用户 2026-10-28：「上传文件的时候要像 R1 客户端一样当作上下文输入（这个
-    可以防一堆暴雷；比写死一堆 prompt 强）」。
-
-    为什么这比写 prompt 强：模型看到的是**这份文件真实的前几行/列名/行数**，
-    列名与取值不用猜、不用在代码里列业务词；缺列/写错值这类暴雷在第一步就
-    没有发生的理由。块里同时如实标注「是否已接入本场景库」——没接入的（如
-    VLML 域场景）只当上下文看，别指望能查。
+    ⚠️ 2026-10-28 实测事故：早期把上传当「永久上下文」，场景 B 里一份测试
+    残留的 `工资明细.csv` 把之后每道题的 SQL 都带歪（回填层看到「优先按它
+    作答」就改查 `up_` 表），公司总额被答成 22600。文件一旦过期就**只留着
+    表**（还能查），但不再自动进上下文 —— 要用就重新传一次。
     """
-    items = _load_meta(scene_id)
+    if minutes <= 0:
+        return list(items)
+    cut = time.time() - minutes * 60
+    out = []
+    for it in items:
+        try:
+            ts = time.mktime(time.strptime(str(it.get("ts") or ""),
+                                           "%Y-%m-%dT%H:%M:%S"))
+        except Exception:
+            continue                      # 没有时间戳的老记录 = 过期
+        if ts >= cut:
+            out.append(it)
+    return out
+
+
+def context_block(scene_id: str, max_rows: int = 12,
+                  fresh_minutes: int = 30) -> str:
+    """把「用户上传过的文件」渲染成**上下文块**（DeepSeek 客户端的文件注入）。
+
+    用户 2026-10-28：「上传文件的时候要像 R1 客户端一样当作上下文输入」/
+    「上下文是上传文件（多模态带进输入文本里的）」。
+
+    三种来源都渲染成**文本**（模型能直接读的东西），不是只有表名：
+      · 表格 → 表名 + 列名 + 真实前几行（还能真查，标注「已接入本场景库」）；
+      · 文本/文档 → 正文开头几段；
+      · 图片 → 视觉模型转写的文字（没配就如实说看不了图）。
+    """
+    items = _fresh(_load_meta(scene_id), fresh_minutes)
     if not items:
         return ""
-    lines = ["【用户上传的文件（真实内容，优先按它作答）】"]
+    lines = ["【用户这次上传的文件（真实内容，优先按它作答）】"]
     for it in items[-4:]:
-        tb = str(it.get("table") or "")
-        vis = "已接入本场景库，可直接查询" if it.get("visible") \
-            else "仅作上下文（未接入本场景库，查不到）"
-        lines.append(f"- {it.get('name')} → 表 {tb}（{it.get('rows')} 行；{vis}）")
-        cols = it.get("columns") or []
-        if cols:
-            lines.append(f"  列：{', '.join(str(c) for c in cols)}")
-        rows = (it.get("sample") or [])[:max_rows]
-        if rows:
-            try:
-                lines.append("  真实前几行："
-                             + json.dumps(rows, ensure_ascii=False)[:1200])
-            except Exception:
-                pass
-    return "\n".join(lines)[:3000]
+        _kind = str(it.get("kind") or "table")
+        _name = it.get("name")
+        if _kind == "table":
+            tb = str(it.get("table") or "")
+            vis = "已接入本场景库，可直接查询" if it.get("visible") \
+                else "仅作上下文（未接入本场景库，查不到）"
+            lines.append(f"- {_name} → 表 {tb}（{it.get('rows')} 行；{vis}）")
+            cols = it.get("columns") or []
+            if cols:
+                lines.append(f"  列：{', '.join(str(c) for c in cols)}")
+            rows = (it.get("sample") or [])[:max_rows]
+            if rows:
+                try:
+                    lines.append("  真实前几行："
+                                 + json.dumps(rows, ensure_ascii=False)[:1200])
+                except Exception:
+                    pass
+            continue
+        # 文本 / 图片：内容本身就是上下文（多模态已转成文本）
+        _txt = str(it.get("text") or "")
+        _note = str(it.get("note") or "")
+        _hint = "文本" if _kind == "text" else "图片"
+        lines.append(f"- {_name}（{_hint}，{len(_txt)} 字"
+                     + (f"；{_note}" if _note else "") + "）")
+        if _txt:
+            lines.append("  内容：")
+            lines.append(_txt[:1800])
+        elif _note:
+            lines.append(f"  （没有可读内容：{_note}）")
+    return "\n".join(lines)[:6000]
 
 
 def _safe_stem(name: str) -> str:
@@ -137,6 +184,108 @@ def _scene_db_path(scene_id: str) -> tuple[str, str, str]:
             return str(Path(d) / "uploads.duckdb"), d, kind
         return dbp, d, kind
     return str(Path(d) / "uploads.duckdb"), d, kind
+
+
+def _read_text(path: str, limit: int = TEXT_LIMIT) -> str:
+    """纯文本 → 文本（UTF-8 优先，退 GB18030 —— 中文文件常是 GBK 存的）。"""
+    raw = Path(path).read_bytes()
+    for enc in ("utf-8", "utf-8-sig", "gb18030"):
+        try:
+            return raw.decode(enc)[:limit]
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")[:limit]
+
+
+def _docx_text(path: str, limit: int = TEXT_LIMIT) -> str:
+    """docx → 文本（docx 就是 zip，取 word/document.xml 的 <w:t>，零依赖）。"""
+    import zipfile
+    with zipfile.ZipFile(path) as z:
+        xml = z.read("word/document.xml").decode("utf-8", errors="ignore")
+    xml = re.sub(r"</w:p>", "\n", xml)          # 段落换行
+    xml = re.sub(r"<w:tab[^>]*/>", "\t", xml)
+    return re.sub(r"<[^>]+>", "", xml)[:limit]
+
+
+def _pdf_text(path: str, limit: int = TEXT_LIMIT) -> str:
+    """PDF → 文本（pypdf）。没装就如实报错，不假装解析出内容。"""
+    try:
+        from pypdf import PdfReader
+    except Exception as e:
+        raise RuntimeError(f"读 PDF 需要 pypdf（{type(e).__name__}）——"
+                           f"可把文件另存为 txt/md 再上传")
+    reader = PdfReader(path)
+    out: list[str] = []
+    for page in reader.pages[:12]:
+        try:
+            out.append(page.extract_text() or "")
+        except Exception:
+            continue
+        if sum(len(x) for x in out) >= limit:
+            break
+    return "\n".join(out)[:limit]
+
+
+def _image_text(path: str, limit: int = 2000) -> tuple[str, str]:
+    """图片 → 文字（多模态通路）。返回 (文本, 说明)。
+
+    用户 2026-10-28：「上下文是上传文件（**多模态**带进输入文本里的）」——
+    所以图片要变成文字进上下文，而不是只记个文件名。没配视觉模型
+    （`MVE_VISION_MODEL`，如 glm-4v-flash）就如实说看不了，不编图里有什么。
+    """
+    model = os.getenv("MVE_VISION_MODEL", "").strip()
+    if not model:
+        return "", "当前模型看不了图（未配置 MVE_VISION_MODEL）"
+    try:
+        import httpx
+        from llm_client import API_KEY, BASE_URL
+        b64 = base64.b64encode(Path(path).read_bytes()).decode()
+        suf = (Path(path).suffix.lower().lstrip(".") or "png").replace("jpg", "jpeg")
+        r = httpx.post(
+            f"{BASE_URL}/chat/completions",
+            headers={"Authorization": f"Bearer {API_KEY}"},
+            json={"model": model, "temperature": 0.0, "max_tokens": 1500,
+                  "messages": [{"role": "user", "content": [
+                      {"type": "image_url",
+                       "image_url": {"url": f"data:image/{suf};base64,{b64}"}},
+                      {"type": "text",
+                       "text": "把这张图里的内容原样转成文字（表格用 markdown 表格），"
+                               "不要解释、不要补充。"}]}]},
+            timeout=90.0)
+        r.raise_for_status()
+        t = str(((r.json().get("choices") or [{}])[0]
+                 .get("message") or {}).get("content") or "").strip()
+        return (t[:limit], f"已用 {model} 转写") if t else \
+            ("", f"{model} 没返回内容")
+    except Exception as e:
+        return "", f"图片转写失败（{type(e).__name__}: {str(e)[:80]}）"
+
+
+def _ingest_as_context(scene_id: str, name: str, path: str, ext: str,
+                       out: dict[str, Any]) -> dict[str, Any]:
+    """非表格文件：抽出文本 → 存进上下文元数据（不落表）。"""
+    kind = "image" if ext in SUPPORTED_IMAGE else "text"
+    note = ""
+    try:
+        if ext in SUPPORTED_IMAGE:
+            txt, note = _image_text(path)
+        elif ext == ".pdf":
+            txt = _pdf_text(path)
+        elif ext == ".docx":
+            txt = _docx_text(path)
+        else:
+            txt = _read_text(path)
+    except Exception as e:
+        out["why"] = str(e)
+        return out
+    items = [x for x in _load_meta(scene_id) if str(x.get("name")) != name]
+    items.append({"name": name, "kind": kind, "chars": len(txt), "text": txt,
+                  "note": note, "visible": False,
+                  "ts": time.strftime("%Y-%m-%dT%H:%M:%S")})
+    _save_meta(scene_id, items)
+    out.update(ok=True, kind=kind, chars=len(txt), note=note, visible=False,
+               table="", text=txt[:300])
+    return out
 
 
 def _xlsx_to_csv(src: str, dst: str) -> str:
@@ -201,6 +350,10 @@ def ingest(scene_id: str, filename: str, blob: bytes) -> dict[str, Any]:
         out["why"] = f"文件太大（{len(blob)//1024//1024}MB > 32MB）"
         return out
 
+    try:
+        _drop_expired(scene_id)          # 过期的旧上传不留在库里污染 schema
+    except Exception:
+        pass
     db_path, sdir, kind = _scene_db_path(scene_id)
     # agent 能不能「看见」这张表：落库路径 == 场景真正的数据源（kind=scene）
     # 才看得见；VLML 域落的是 uploads.duckdb，而 agent 查的是 VLML 库 ——
@@ -221,6 +374,10 @@ def ingest(scene_id: str, filename: str, blob: bytes) -> dict[str, Any]:
     except Exception as e:
         out["why"] = f"写文件失败：{e}"
         return out
+
+    # 文本/文档/图片：转成文本进上下文（DeepSeek 同构），不落表。
+    if ext in (SUPPORTED_TEXT | SUPPORTED_DOC | SUPPORTED_IMAGE):
+        return _ingest_as_context(scene_id, name, str(src), ext, out)
 
     read_path = str(src)
     tmp_csv = ""
@@ -264,7 +421,8 @@ def ingest(scene_id: str, filename: str, blob: bytes) -> dict[str, Any]:
             _items = [x for x in _load_meta(scene_id)
                       if str(x.get("table") or "") != table]
             _items.append({
-                "name": name, "table": table, "rows": int(n), "columns": _cols,
+                "name": name, "kind": "table", "table": table,
+                "rows": int(n), "columns": _cols,
                 "sample": [dict(zip(_cols, map(str, r))) for r in _more],
                 "visible": bool(out.get("visible")),
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -286,6 +444,72 @@ def ingest(scene_id: str, filename: str, blob: bytes) -> dict[str, Any]:
             except Exception:
                 pass
     return out
+
+
+def _drop_tables(db_path: str, names: list[str]) -> list[str]:
+    """把上传表从库里删掉（原文件还在 <场景>/uploads/ 里，可重新上传）。"""
+    names = [n for n in names if str(n).startswith("up_")]
+    if not names or not Path(db_path).exists():
+        return []
+    import duckdb
+    con = _connect_write(db_path)
+    done = []
+    try:
+        for n in names:
+            try:
+                con.execute(f"DROP TABLE IF EXISTS {_q(n)}")
+                done.append(n)
+            except Exception:
+                continue
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+    return done
+
+
+def clear(scene_id: str, drop_tables: bool = True) -> dict[str, Any]:
+    """清掉本场景的上传上下文（默认连表一起删）。
+
+    设计口径（2026-10-28 用户：「上下文是上传文件…和 DeepSeek 客户端同构」）：
+    文件属于**那一次对话**。过期后如果只从上下文里摘掉、表还留在库里，它就会
+    一直出现在 schema/全貌里 —— 实测回填层会改查 `up_工资明细` 而不是
+    `employees`，公司总额题直接答废。所以过期即清表（原文件仍在 uploads/，
+    想用重新传一次）。
+    """
+    items = _load_meta(scene_id)
+    db_path, _sdir, _kind = _scene_db_path(scene_id)
+    dropped: list[str] = []
+    if drop_tables and items:
+        try:
+            dropped = _drop_tables(db_path,
+                                   [str(x.get("table") or "") for x in items])
+        except Exception as e:
+            return {"ok": False, "why": f"{type(e).__name__}: {e}"}
+    p = _meta_path(scene_id)
+    try:
+        if p.exists():
+            p.unlink()
+        return {"ok": True, "cleared": True, "dropped": dropped}
+    except Exception as e:
+        return {"ok": False, "why": f"{type(e).__name__}: {e}", "dropped": dropped}
+
+
+def _drop_expired(scene_id: str, minutes: int = 30) -> list[str]:
+    """上传时顺手清理过期的旧上传（清表 + 从 meta 摘掉）。
+
+    只在**写路径**（ingest）里做：读路径每次提问都去写库会撞 duckdb 的锁。
+    """
+    items = _load_meta(scene_id)
+    fresh = _fresh(items, minutes)
+    if len(fresh) == len(items):
+        return []
+    gone = [x for x in items if x not in fresh]
+    db_path, _sdir, _kind = _scene_db_path(scene_id)
+    dropped = _drop_tables(db_path, [str(x.get("table") or "") for x in gone])
+    _save_meta(scene_id, fresh)
+    return dropped
 
 
 def describe(scene_id: str) -> dict[str, Any]:

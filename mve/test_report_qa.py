@@ -77,6 +77,15 @@ CASES = [
     # 不带上下文：这里**没有**真值可比 —— 要验的恰恰是「不许编一个数出来」
     {"ctx": "", "q": "什么是强化学习", "truth": None,
      "note": "无环境的知识题：要有回复、要说清是推断，不许假装查到了数据"},
+    # 带**上传文件**（不是库）：DeepSeek 客户端的形态 —— 文件内容进上下文,
+    # 问文件里的事实，答案必须来自文件而不是凭记忆。
+    {"ctx": "E", "q": "九月说明这份文件里，技术部九月的津贴合计是多少",
+     "upload": ("九月说明.md",
+                "技术部九月说明\n\n本月技术部在职 3 人，九月津贴合计 2120 元。\n"
+                "（备注：公司整体九月津贴合计 3600 元，含财务 500、销售 980。）\n"
+                .encode("utf-8")),
+     "truth_const": 2120.0, "truth_from": "上传的文件内容",
+     "note": "文件即上下文：真值来自文件正文（不是库、不是记忆）"},
 ]
 
 
@@ -113,6 +122,16 @@ def run_case(C, case: dict, idx: int) -> None:
     tag = f"上下文={'场景 ' + ctx if ctx else '无'}"
     print(f"\n== 用例 {idx}｜{tag}｜{q} ==")
     os.environ["MVE_SCENE"] = ctx or "A"
+    if case.get("upload"):
+        # 先把文件「交给模型」（落进上下文），再问 —— DeepSeek 客户端的顺序
+        _nm, _blob = case["upload"]
+        try:
+            import upload as _u
+            _ur = _u.ingest(ctx, _nm, _blob)
+            check(f"文件已进上下文（{_nm}）", bool(_ur.get("ok")),
+                  str(_ur.get("why") or _ur.get("kind") or "")[:80])
+        except Exception as e:
+            check(f"文件已进上下文（{_nm}）", False, f"{type(e).__name__}: {e}")
     expect = None
     if case.get("truth"):
         try:
@@ -122,6 +141,10 @@ def run_case(C, case: dict, idx: int) -> None:
                   f"{type(e).__name__}: {e}")
             return
         print(f"  真值（现场查库）：{expect:,.2f}　{case.get('note') or ''}")
+    elif case.get("truth_const") is not None:
+        expect = float(case["truth_const"])
+        print(f"  真值（{case.get('truth_from') or '用例给定'}）：{expect:,.2f}"
+              f"　{case.get('note') or ''}")
     try:
         r = asyncio.run(C.consume(q))
     except Exception:
@@ -160,9 +183,13 @@ def run_case(C, case: dict, idx: int) -> None:
     except Exception:
         hit = f"{expect:.2f}" in ans.replace(",", "")
     check(f"答到真值 {expect:,.2f}", hit, ans[:120])
-    # ④ 交付口径：真答出来了，不是「未验证/没学过」糊过去
-    check("判读为 written（真答出来）", jr == "written",
-          jr + "｜" + str(r.get("critic_note") or r.get("skipped") or "")[:90])
+    if case.get("truth_const") is not None:
+        # 文件上下文作答：口径是「按文件答、说清来源」，不是判 written
+        check("标注了来源（按上传的文件作答）", "上传的文件" in ans, ans[-60:])
+    else:
+        # 交付口径：真答出来了，不是「未验证/没学过」糊过去
+        check("判读为 written（真答出来）", jr == "written",
+              jr + "｜" + str(r.get("critic_note") or r.get("skipped") or "")[:90])
 
 
 def main() -> int:

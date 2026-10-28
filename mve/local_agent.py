@@ -381,6 +381,7 @@ async def solve(question: str, scene_dir: str, *, llm=None,
                 require_skills: bool = False,
                 timeout: float = 30.0,
                 evidence: list[dict[str, Any]] | None = None,
+                context: str = "",
                 ) -> tuple[list[dict[str, Any]], str]:
     """写代码 → 跑 → 看结果；失败带反馈重写。返回 (观察列表, 最后一段代码)。
 
@@ -604,7 +605,11 @@ async def solve(question: str, scene_dir: str, *, llm=None,
                    if _fx else "")
                 + "代码必须长这样（先取证，再据实组织；参数照上面签名的名字传）：\n"
                 "```python\n" + _code_ex + "\n```\n")
-        user = (f"问题：{question}\n\n{inv_txt}\n" + fetch_txt
+        user = (f"问题：{question}\n\n{inv_txt}\n"
+                # 用户上传的文件 = 这次请求的上下文（DeepSeek 客户端同构）：
+                # 文件内容就在这里，别去猜、也别假装查过库。
+                + (f"{context}\n\n" if str(context or "").strip() else "")
+                + fetch_txt
                 + dim_txt + avoid_txt
                 + (f"\n上一轮没通过 critic 检查，它的评语（务必针对它改）：{critique}\n"
                    if critique else "")
