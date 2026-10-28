@@ -279,6 +279,13 @@ def main() -> int:
     check("无乘法 → 放行", g2 == "")
     g3 = C._rate_guard("SELECT SUM(amount) * 1.0 FROM allowance", "")
     check("乘 1（恒等）→ 放行", g3 == "")
+    # ⚠️ 2026-10-28 用户拍板：**测试方法要和「在 DeepSeek 里问报表、让它分析
+    # 报表」同构** —— 不再用「手工造 _executed 列表断言内部函数返回 137100」
+    # 这种自搭桩的测法（那测的是我写的函数，不是「人问一句、它答对了没」）。
+    # 端到端的问报表回归线见 mve/test_report_qa.py（真实库 + 自然语言问句 +
+    # 期望数值），这里只保留接线/契约断言。
+    check("问报表端到端测试存在（R1/DeepSeek 同构的验证方式）",
+          os.path.exists(os.path.join(_HERE, "test_report_qa.py")))
     # ⚠️ 用户 2026-10-28 拍板：「不能这样写死守卫解决」—— 业务词表写死不许回归。
     # 判调用点/定义（docstring 里提到旧名做沿革说明是允许的）。
     _biz_guards = ("_scope_guard", "_subject_guard", "_completeness_guard")

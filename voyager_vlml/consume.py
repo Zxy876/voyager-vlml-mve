@@ -1093,6 +1093,9 @@ async def consume(
         # _used_skills 是它们的技能元数据（面板 used_skills 披露用）。
         _executed: list[dict[str, Any]] = []
         _used_skills: list[dict[str, Any]] = []
+        # 合并时算出的「各来源金额」与「合计」（确定性算术；_do_merge 里填）。
+        _money_kv: list[tuple[str, float]] = []
+        _total: float | None = None
         if _scene_kind == "scene":
             # ---- 场景库形态的配方复用：**回填**，不原样重放（2026-10-23 用户
             # 定「不要把数值写死，把算法积累成技能」）----
@@ -1289,6 +1292,7 @@ async def consume(
                         """把 _executed 合并成 data/code/obs（判官退回后要重来一遍）。"""
                         nonlocal data, code, obs, reused_skill
                         nonlocal _used_skills, _ans_skills
+                        nonlocal _money_kv, _total
                         # 多技能结果合并（原版：agent 组合多条技能的产出交呈现层）：
                         # 每行标注来源技能，叙事层据此相加/组织；`rows` 键保住
                         # 下方真空防线的口径不变。
@@ -1300,18 +1304,39 @@ async def consume(
                             _cols = [str(c) for c in
                                      ((_e.get("data") or {}).get("columns")
                                       or [])]
+                            # 别名不撒谎（2026-10-28 用户截图事故）：配方写
+                            # `SUM(overtime_hours) AS overtime_pay` 时，输出列
+                            # 名看着是钱、来源列其实是小时 —— 合并时把这种列
+                            # 改成「<来源列>（数量/时长，不是钱）」，下游
+                            # （叙事对账 _collect_evidence、合计、人眼）就都
+                            # 不会再把它当金额。
+                            _q = _qty_outputs(str(_e.get("sql") or ""))
                             for _row in (_e["data"].get("rows") or []):
                                 if isinstance(_row, dict):
-                                    _merged.append({"来源技能": _e["name"], **_row})
+                                    _pair = dict(_row)
                                 elif (isinstance(_row, (list, tuple)) and _cols
                                       and len(_row) == len(_cols)):
-                                    _merged.append({"来源技能": _e["name"],
-                                                    **dict(zip(_cols, _row))})
+                                    _pair = dict(zip(_cols, _row))
                                 else:
                                     _merged.append({"来源技能": _e["name"],
                                                     "值": _row})
+                                    continue
+                                _fixed = {_k: _v for _k, _v in _pair.items()
+                                          if _k not in _q}
+                                for _k, _v in _pair.items():
+                                    if _k in _q:
+                                        _fixed[f"{_q[_k]}（数量/时长，不是钱）"] = _v
+                                _merged.append({"来源技能": _e["name"], **_fixed})
+                        # 合计**在这里算好**（确定性算术，不交给叙事 LLM 做加法，
+                        # 也不交给它挑「哪几个是钱」）：数据里带一个「合计」，
+                        # 叙事照着说就行，对账也认得出这个数。
+                        _money_kv = _money_parts(_executed)
+                        _total = (round(sum(v for _, v in _money_kv), 2)
+                                  if len(_money_kv) > 1 else None)
                         data = {"rows": _merged,
                                 "sources": [_e["name"] for _e in _executed]}
+                        if _total is not None:
+                            data = {"合计（各金额来源相加）": _total, **data}
                         code = "\n;\n".join(_e["sql"] for _e in _executed)
                         _first = next((e["skill"] for e in _executed
                                        if e.get("skill")), None) or skills[0]
@@ -1527,33 +1552,19 @@ async def consume(
                     # 相加或者做什么，也算能力」）。
                     _nar_note += ("；下面各「来源技能」条目是这句话问的总量的"
                                   "组成部分，允许相加汇总，逐个来源编号都标上")
-                    # 合计**算好喂给它**（确定性算术，不依赖 LLM 做加法）：
-                    # 2026-10-28 实测叙事层三次把「合计」写成其中一项
-                    # （133500 而不是 137100）。每个来源取第一条的金额列值。
-                    _parts: list[float] = []
-                    for _e in _executed:
-                        _rows = (_e.get("data") or {}).get("rows") or []
-                        if not _rows:
-                            continue
-                        _r0 = _rows[0]
-                        _pairs = (_r0.items() if isinstance(_r0, dict)
-                                  else [])
-                        for _k, _v in _pairs:
-                            _kl = str(_k).lower()
-                            if any(u in _kl for u in ("hour", "day", "count",
-                                                      "num", "小时", "天数",
-                                                      "次数", "数量")):
-                                continue
-                            try:
-                                _parts.append(float(_v))
-                            except Exception:
-                                continue
-                            break
-                    _parts = [p for p in _parts if p]
-                    if len(_parts) > 1:
-                        _nar_note += (f"；各来源金额相加 = {sum(_parts):.2f} ——"
-                                      f" 题面问的是合计/总额时**必须**用这个数，"
-                                      f"不许只报其中一项")
+                    # 合计**已经算好**（在 _do_merge 里，确定性算术）：这里只
+                    # 把结果和「哪些是钱」告诉叙事层，不让它自己挑、自己加。
+                    # 2026-10-28 实测：让它自己加 → 三次把合计写成其中一项
+                    # （133500 而不是 137100），还把小时数当钱加成 134903.5。
+                    if _total is not None:
+                        _kv_txt = " + ".join(f"{_v:,.2f}" for _n, _v in _money_kv)
+                        _nar_note += (f"；各来源金额相加 = {_total:,.2f}"
+                                      f"（{_kv_txt}）—— 题面问的是合计/总额时"
+                                      f"**必须**用这个数，不许只报其中一项，"
+                                      f"也不许自己另算一个合计")
+                    else:
+                        _nar_note += ("；数据里没有可相加的金额（各来源不是钱，"
+                                      "或只有一项）—— 题面问合计时如实说算不出来")
                 _nar_note += ("；⚠️ 列名是 hours/天数/次数 这类数量/时长的值"
                               "**不是钱**，绝不许写成「××元的加班费/扣款」——"
                               "库里没有费率，这笔钱就不存在")
@@ -1607,6 +1618,22 @@ async def consume(
                                 + _why_n[:120] + "），已退回原始数据平铺")
                         except Exception:
                             pass
+            # ---- 合计类问句的确定性终判（R1 同构：rule-based 判最终结论）----
+            # 叙事层的活儿只剩「把话说顺」：合计对不对，不再由它决定。
+            # 2026-10-28 三轮实测它把合计写成其中一项（133500 vs 137100），
+            # 还有一轮自己加了小时数（134903.5）—— 代码算好的数它不引用，
+            # 那就换成代码拼的那句。数字逐项可指认，谁也没得编。
+            if (_total is not None
+                    and not _mentions_value(answer, _total)):
+                _by_code = _total_answer(_total, _money_kv)
+                try:
+                    nar["caveats"] = list(nar.get("caveats") or []) + [
+                        "合计由代码相加得到（叙事层没引用这个数，已改用代码结论）"]
+                    nar["answer"] = _by_code
+                except Exception:
+                    nar = {"ok": True, "answer": _by_code,
+                           "caveats": ["合计由代码相加得到（叙事层没引用它）"]}
+                answer = _by_code
         # 这段代码到底调了哪些抓手（披露用；不含纯计算，见 `_tools_in_code`）
         _mve_traj = _tools_in_code(code, _scene_id)
         # 完成判定（2026-10-25 用户拍板）：消费侧 **LLM critic 判定删除**——
@@ -2798,6 +2825,117 @@ def _rate_guard(sql: str, db_path: str = "") -> str:
             f"该量不可计算就如实不答")
 
 
+# ---- 金额 / 数量 的单位语义（确定性，只认**数据层的列**，不认题面词表）----
+# 2026-10-28 用户截图事故链（总额交 133500、还冒出「43.50 元加班费」）的总
+# 根因是**别名会撒谎**：配方写 `SUM(overtime_hours) AS overtime_pay` —— 输出
+# 列名看着像钱，聚合的**来源列**其实是小时。所以判据只能落在「聚合的来源列」
+# 上，绝不能落在别名上；别名一信，43.5 小时就被当成 43.5 元加进公司总额。
+#
+# ⚠️ 用户 2026-10-28 再次拍板：**不允许硬编码**。所以这里只做两件纯机制的事
+# ——① 把别名还原成真实来源列；② 数量列的值不进合计。判「这题问的是不是钱」
+# 「该不该相加」一概不靠题面词表：数据里给了什么就是什么，业务口径交给
+# `_fits_judge` 看全貌判。
+#
+# `_QTY_UNITS` 是**单位**词（hours/天数/次数），不是业务词（部门/津贴/工资）：
+# 库里没有单位元信息，列名是唯一可确定性读取的证据源。
+_QTY_UNITS = ("hours", "days", "count", "num", "qty", "小时", "天数",
+              "次数", "数量")
+
+
+def _qty_outputs(sql: str) -> dict[str, str]:
+    """SQL 投影里「聚合来源列是数量/时长」的输出列 → 真实来源列。
+
+    `SUM(overtime_hours) AS overtime_pay` → `{"overtime_pay": "overtime_hours"}`。
+    这张表就是「别名不撒谎」的执行处：合并/合计/叙事都靠它把「看着像钱的
+    小时数」打回非金额。解析不到别名时用来源列本身当键。
+    """
+    _s = str(sql or "")
+    out: dict[str, str] = {}
+    for m in re.finditer(
+            r"\b(?:SUM|AVG)\s*\(\s*([A-Za-z_\u4e00-\u9fff][\w\u4e00-\u9fff.]*)"
+            r"\s*\)\s*(?:AS\s+([A-Za-z_\u4e00-\u9fff][\w\u4e00-\u9fff]*))?",
+            _s, re.I):
+        col = m.group(1)
+        alias = m.group(2) or ""
+        if not any(u in col.lower() for u in _QTY_UNITS):
+            continue
+        if alias.upper() in ("FROM", "WHERE", "GROUP", "ORDER", "HAVING",
+                            "LIMIT", "AND", "OR"):
+            alias = ""
+        out[alias or col] = col
+    return out
+
+
+def _entry_pairs(entry: dict[str, Any]) -> list[tuple[str, Any]]:
+    """一条执行结果的首行 (列名, 值) —— dict 行与 list 行两种返回形态都要认。
+
+    ⚠️ 2026-10-28 实测坑：`run_sql` 的 rows 多数是 **list**（列名在 columns
+    里），只按 dict 取 key 会让「合计」整段算不出来（合计注进 note 里，但
+    data 里没有那个数 → 叙述对账判它指认不了 → 整题退化成原始 JSON）。
+    """
+    _d = entry.get("data") or {}
+    _rows = _d.get("rows") or []
+    if not _rows:
+        return []
+    _r0 = _rows[0]
+    if isinstance(_r0, dict):
+        return [(str(k), v) for k, v in _r0.items()]
+    _cols = [str(c) for c in (_d.get("columns") or [])]
+    if _cols and isinstance(_r0, (list, tuple)) and len(_r0) == len(_cols):
+        return list(zip(_cols, _r0))
+    return []
+
+
+def _money_parts(executed: list[dict[str, Any]]) -> list[tuple[str, float]]:
+    """各条目里「这笔钱」的值：跳过数量/时长列（按来源列判，不按别名）。
+
+    返回 [(来源技能名, 金额)]。同一来源只取第一个金额列（一条配方 = 一笔账）。
+    """
+    out: list[tuple[str, float]] = []
+    for _e in (executed or []):
+        _q = _qty_outputs(str(_e.get("sql") or ""))
+        for _k, _v in _entry_pairs(_e):
+            _kl = str(_k)
+            if any(u in _kl.lower() for u in _QTY_UNITS):
+                continue
+            if _kl in _q:                       # 别名是钱、来源列是小时 → 跳过
+                continue
+            if isinstance(_v, bool):
+                continue
+            try:
+                _fv = float(_v)
+            except (TypeError, ValueError):
+                continue
+            out.append((str(_e.get("name") or ""), _fv))
+            break
+    return out
+
+
+# 「合计」不再靠问句关键词触发：多技能编排（composed_of>1）本身就是「这组
+# 条目是同一个总量的组成部分」（既有设计语义，2026-10-25 用户拍板），数据里
+# 有 ≥2 个金额来源就该有合计。代码只算数，不猜题意。
+
+
+def _total_answer(total: float, parts: list[tuple[str, float]]) -> str:
+    """合计的确定性答法（代码拼，不经 LLM）：数字可逐项指认，不会被改口径。"""
+    _items = "、".join(f"{_n} {_v:,.2f} 元" for _n, _v in parts if _v)
+    return f"合计 {total:,.2f} 元（{_items}）"
+
+
+def _mentions_value(answer: str, value: float) -> bool:
+    """答案里说到这个数没有（与叙述对账用同一把剥时间的尺子）。"""
+    try:
+        import narrator as _n
+        return bool(_n.mentions_value(answer, value))
+    except Exception:
+        # 叙事模块不可用（缺依赖等）不该让整题挂掉：退回朴素包含判断
+        _s = re.sub(r"[,，\s]", "", str(answer or ""))
+        for cand in (f"{value:.2f}", f"{value:.1f}", str(int(value))):
+            if cand.lstrip("0") and cand in _s:
+                return True
+        return False
+
+
 def _unit_guard(sql: str, question: str) -> str:
     """SQL 配方入库前的确定性**单位守卫**（2.5 步落地，2026-10-28 服务器实测）：
     聚合目标是「数量/时长」列，而题面问的是**钱** —— 小时数/天数当金额用的
@@ -2824,14 +2962,11 @@ def _unit_guard(sql: str, question: str) -> str:
               "pay", "salary", "wage", "income", "cost", "fee", "amount")
     if not any(w in _q.lower() for w in _MONEY):
         return ""
-    _UNITS = ("hours", "days", "count", "num_", "_num", "hours", "days",
-              "小时", "天数", "次数", "数量")
     # 聚合目标列：SUM(col) / AVG(col) / sum(col) —— 排除 COUNT（它天生就是数量）。
     aggs = re.findall(r"\b(?:SUM|AVG)\s*\(\s*([A-Za-z_\u4e00-\u9fff][\w\u4e00-\u9fff.]*)\s*\)",
                       _s, re.I)
     bad = [c for c in aggs
-           if any(u in c.lower() for u in ("hours", "days", "count",
-                                           "小时", "天数", "次数", "数量"))]
+           if any(u in c.lower() for u in _QTY_UNITS)]
     if not bad:
         return ""
     # ③ 有乘法 = 可能把单位换算成钱（col * rate）→ 不算单位幻觉，放行。
@@ -3050,8 +3185,13 @@ def _fits_judge(question: str, sql: str, data: Any,
                 if not _ft:
                     continue
                 # 这条失败 SQL 的聚合目标里有没有「非数量」列？
+                # ⚠️ 只取 `SUM(` 之后的**第一个标识符**，不要求紧跟 `)` ——
+                # 2026-10-28 实测：失败的那条是 `SUM(overtime_hours * 100)`
+                # （凭空费率），带 `*` 的写法匹配不上，_aggs 空 → 被当成
+                # 「不知道算什么」→ 判成缺口 → 多花一轮重填，判词还写
+                # 「attendance 组成部分缺失」。认得出源列是小时就不用补它。
                 _aggs = re.findall(
-                    r"\b(?:SUM|AVG)\s*\(\s*([\w\u4e00-\u9fff.]+)\s*\)",
+                    r"\b(?:SUM|AVG)\s*\(\s*([A-Za-z_\u4e00-\u9fff][\w\u4e00-\u9fff.]*)",
                     _fs, re.I)
                 _qty = ("hours", "days", "count", "num", "小时", "天数",
                         "次数", "数量")

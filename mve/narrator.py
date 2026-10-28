@@ -444,6 +444,49 @@ def _subset_sum_representable(target: float, vals: list[float],
     return any(abs(target - s) <= tol for s in reach)
 
 
+def strip_non_answer_numbers(text: str) -> str:
+    """剥掉「不是答案数值」的数字：引用编号 [1]、日期/月份/日、季度、年份。
+
+    2026-10-28 用户截图事故时抽出来的独立函数：叙述对账（verify_answer_numbers）
+    与「合计有没有说到」的检查（consume 侧 rule-based 终判）都要用**同一把**
+    剥除尺子，两边各写一份必然漂移。
+    """
+    t = str(text or "")
+    # 剥掉引用编号与日期（这些数字不是「答案数值」）——「9月」的 9 也不许
+    # 被当成答案数值对账（实测误杀「技术部9月应发…」）
+    t = re.sub(r"\[\d+\]", " ", t)
+    t = re.sub(r"\b(?:19|20)\d{2}\s*[-/年.]\s*\d{1,2}(?:\s*[-/月.]\s*\d{1,2})?[日]?", " ", t)
+    t = re.sub(r"(?<![\d.])\d{1,2}\s*月", " ", t)
+    t = re.sub(r"(?<![\d.])\d{1,2}\s*[日号]", " ", t)
+    # 2026Q3 / Q3 —— 季度标记也是「时间」，不是答案数值。实测（2026-10-28）：
+    # 「技术部 2026Q3 的奖金总额为 2000 元」被 2026 卡死 → 判「数字指认不了」
+    # → 答案退化成原始 JSON 平铺（2000 明明就在数据里）。先剥时间再对账。
+    t = re.sub(r"\b(?:19|20)\d{2}\s*[Qq]\s*[1-4]\b", " ", t)
+    t = re.sub(r"\b[Qq]\s*[1-4]\b", " ", t)
+    t = re.sub(r"第\s*[1-4]\s*季度", " ", t)
+    # 光秃秃的年份也是时间（「2026 年第三季度」），不是答案数值。
+    t = re.sub(r"(?<![\d.])(?:19|20)\d{2}\s*年", " ", t)
+    return t
+
+
+def numbers_in_text(text: str) -> list[float]:
+    """一段话里的**答案数值**（已剥掉时间/引用编号）。"""
+    out: list[float] = []
+    for raw in re.findall(r"\d[\d,]*(?:\.\d+)?", strip_non_answer_numbers(text)):
+        try:
+            out.append(float(raw.replace(",", "")))
+        except ValueError:
+            continue
+    return out
+
+
+def mentions_value(text: str, value: float) -> bool:
+    """答案里有没有「这个数」（金额允许千分位；容差 0.01）。"""
+    v = float(value)
+    tol = max(0.01, abs(v) * 1e-6)
+    return any(abs(x - v) <= tol for x in numbers_in_text(text))
+
+
 def verify_answer_numbers(answer: str, data: Any, *,
                           sum_auth: bool = False) -> tuple[bool, str]:
     """叙述层数字对账（rule-based，不花 LLM）。
@@ -456,21 +499,7 @@ def verify_answer_numbers(answer: str, data: Any, *,
     日期（2026-09 / 2026年）与引用编号 [1] 不算答案数字，先剥掉再对。
     返回 (ok, why)：why = 第一个对不上的数字及理由（空串 = 通过）。
     """
-    text = str(answer or "")
-    # 剥掉引用编号与日期（这些数字不是「答案数值」）——「9月」的 9 也不许
-    # 被当成答案数值对账（实测误杀「技术部9月应发…」）
-    text = re.sub(r"\[\d+\]", " ", text)
-    text = re.sub(r"\b(?:19|20)\d{2}\s*[-/年.]\s*\d{1,2}(?:\s*[-/月.]\s*\d{1,2})?[日]?", " ", text)
-    text = re.sub(r"(?<![\d.])\d{1,2}\s*月", " ", text)
-    text = re.sub(r"(?<![\d.])\d{1,2}\s*[日号]", " ", text)
-    # 2026Q3 / Q3 —— 季度标记也是「时间」，不是答案数值。实测（2026-10-28）：
-    # 「技术部 2026Q3 的奖金总额为 2000 元」被 2026 卡死 → 判「数字指认不了」
-    # → 答案退化成原始 JSON 平铺（2000 明明就在数据里）。先剥时间再对账。
-    text = re.sub(r"\b(?:19|20)\d{2}\s*[Qq]\s*[1-4]\b", " ", text)
-    text = re.sub(r"\b[Qq]\s*[1-4]\b", " ", text)
-    text = re.sub(r"第\s*[1-4]\s*季度", " ", text)
-    # 光秃秃的年份也是时间（「2026 年第三季度」），不是答案数值。
-    text = re.sub(r"(?<![\d.])(?:19|20)\d{2}\s*年", " ", text)
+    text = strip_non_answer_numbers(answer)
     found = re.findall(r"\d[\d,]*(?:\.\d+)?", text)
     if not found:
         return True, ""
