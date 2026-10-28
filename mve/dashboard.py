@@ -2992,8 +2992,15 @@ class Handler(BaseHTTPRequestHandler):
             sid = ""
         try:
             import asyncio as _aio
-            import coach as _coach_mod
-            res = _aio.run(_coach_mod.explain(q, voyager=True))
+            # 与面板 /api/coach 同一条消费通路：consume()（技能库重放 +
+            # 工具线兜底 + 叙述对账）。⚠️ 别接 coach.explain——那是 VLML
+            # 老路（不经场景 duckdb，实测在场景 B 里查 A 的库）。
+            from pathlib import Path as _Path2
+            _root2 = str(_Path2(__file__).resolve().parents[1])
+            if _root2 not in sys.path:
+                sys.path.insert(0, _root2)
+            import voyager_vlml.consume as _consume2
+            res = _aio.run(_consume2.consume(q))
         except Exception as e:
             res = {"ok": False, "answer": "",
                    "errors": [f"{type(e).__name__}: {e}"]}
