@@ -289,6 +289,10 @@ button{font-family:inherit}
       resize:none;font-family:inherit;font-size:14.5px;line-height:1.7;max-height:180px;
       min-height:26px;padding:2px 0}
 .composer .row{display:flex;align-items:center;gap:8px}
+.composer .attach{width:30px;height:30px;border-radius:50%;border:1px solid var(--line);
+  background:var(--panel-2);color:var(--ink);cursor:pointer;font-size:14px;line-height:1}
+.composer .attach:hover{border-color:var(--accent)}
+.composer .attach.up{opacity:.5;cursor:default}
 .composer .hint{font-size:11.5px;color:var(--dim2)}
 .composer .send{margin-left:auto;width:34px;height:34px;border-radius:50%;border:0;
       background:var(--accent);color:#fff;font-size:16px;cursor:pointer;display:grid;
@@ -346,6 +350,8 @@ button{font-family:inherit}
     <div class="composer">
       <textarea id="q" rows="1" placeholder="给 MVE 发送消息，例如：技术部 9 月的餐补和交通补贴总额是多少？"></textarea>
       <div class="row">
+        <button class="attach" id="attach" title="上传文件（CSV / JSON / Excel）——导入后这个场景就能查到它">📎</button>
+        <input type="file" id="fileInput" hidden accept=".csv,.tsv,.json,.jsonl,.ndjson,.xlsx,.xls">
         <span class="hint">Enter 发送 · Shift+Enter 换行</span>
         <button class="send" id="send" title="发送">↑</button>
         <button class="stop" id="stop">■ 停止生成</button>
@@ -526,7 +532,7 @@ function msgNode(m){
   txt.innerHTML = md(m.content || '');
   wrap.appendChild(txt);
   if (m.x) wrap.appendChild(tagRow(m.x));
-  wrap.appendChild(actRow(m));
+  if (!m.note) wrap.appendChild(actRow(m));
   return wrap;
 }
 function tagRow(x){
@@ -584,6 +590,65 @@ ta.addEventListener('keydown', function(e){
 $('newChat').onclick = function(){ newSession(); ta.focus(); };
 sendBtn.onclick = send;
 stopBtn.onclick = function(){ if (abort) abort.abort(); };
+
+/* ---------------- 外置上传模块（R1 客户端的「把文件交给它」） ----------------
+   为什么在前端做入口、在后端落表：用户拍板「...做 r1 客户端的多模态上传文件
+   那些外置模块来让 agent 看到全貌」。文件进了场景库 = 进了 schema_block 与
+   db_observation 的全貌，出题/回填/判官下一次提问就都看得见，不用改业务代码。 */
+function sceneIdOf(m){
+  var s = String(m || '');
+  var i = s.indexOf(':');
+  return i >= 0 ? s.slice(i + 1) : '';
+}
+function b64(buf){
+  var bytes = new Uint8Array(buf), out = '', step = 0x8000;
+  for (var i = 0; i < bytes.length; i += step){
+    out += String.fromCharCode.apply(null, bytes.subarray(i, i + step));
+  }
+  return btoa(out);
+}
+function noteMsg(text){
+  var s = cur() || newSession();
+  s.messages.push({role: 'ai', content: text, note: true, ts: Date.now()});
+  save(); paint();
+}
+$('attach').onclick = function(){ $('fileInput').click(); };
+$('fileInput').onchange = function(ev){
+  var f = (ev.target.files || [])[0];
+  if (!f) return;
+  var btn = $('attach');
+  btn.classList.add('up'); btn.textContent = '⏳';
+  var fr = new FileReader();
+  fr.onload = function(){
+    var sid = sceneIdOf((cur() && cur().model) || model) || 'A';
+    noteMsg('📎 正在导入 `' + f.name + '`（' + Math.round(f.size / 1024) +
+            ' KB）到场景 ' + sid + ' …');
+    fetch(P + '/api/upload', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({scene_id: sid, name: f.name, data_b64: b64(fr.result)})
+    }).then(function(r){ return r.json(); }).then(function(d){
+      if (d.ok){
+        noteMsg('✅ 已导入 **' + d.table + '**（' + d.rows + ' 行 / ' +
+                (d.columns || []).length + ' 列）到场景 ' + sid + ' 的库。\n\n' +
+                '列：`' + (d.columns || []).join('`, `') + '`\n\n' +
+                '现在直接问它就查得到 —— 这张表和库里其它表一样进全貌，' +
+                '不写死任何业务词。');
+      } else {
+        noteMsg('⚠️ 导入失败：' + (d.why || '未知原因'));
+      }
+    }).catch(function(e){
+      noteMsg('⚠️ 导入失败：' + e.message);
+    }).then(function(){
+      btn.classList.remove('up'); btn.textContent = '📎';
+      ev.target.value = '';
+    });
+  };
+  fr.onerror = function(){
+    noteMsg('⚠️ 读不了这个文件');
+    btn.classList.remove('up'); btn.textContent = '📎';
+  };
+  fr.readAsArrayBuffer(f);
+};
 
 function send(text){
   if (busy) return;

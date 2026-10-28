@@ -108,6 +108,10 @@ def main() -> int:
         ("深浅色切换", 'id="themeBtn"'),
         ("输入框", 'id="q"'),
         ("免责声明", "内容由 MVE 生成"),
+        # 外置上传模块（R1 客户端的回形针）
+        ("上传按钮", 'id="attach"'),
+        ("文件选择（只收表格/JSON）", 'id="fileInput"'),
+        ("上传走后端 /api/upload", "'/api/upload'"),
     ]:
         check(name, needle in h)
     check("流式解析（读 ReadableStream）", "getReader()" in h)
@@ -141,6 +145,15 @@ def main() -> int:
     _code = "\n".join(ln.split("#")[0] for ln in src_ask.splitlines())
     check("不接 coach.explain 老路", "coach.explain" not in _code)
     check("模型后缀切场景后还原", "switch_scene" in src_ask)
+
+    print("== 7. 上传路由（外置模块落表 → 进全貌） ==")
+    src_post = inspect.getsource(D.Handler.do_POST)
+    check("POST /api/upload 已注册", '"/api/upload"' in src_post)
+    check("上传走 upload.ingest（落成场景库里的表）",
+          "upload as _up" in src_post and "ingest(" in src_post)
+    check("base64 解码（JSON 协议，不用废弃的 cgi 表单）",
+          "b64decode" in src_post)
+    check("上传结果带场景归属", 'r["scene_id"] = sid' in src_post)
 
     print(f"== 结果：{PASS} 过 / {FAIL} 挂 ==")
     return 1 if FAIL else 0

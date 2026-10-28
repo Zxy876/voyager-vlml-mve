@@ -3253,6 +3253,46 @@ class Handler(BaseHTTPRequestHandler):
             self._openai_chat(payload)
             return
 
+        # ---- 外置上传模块（R1 客户端式的「把文件交给它」）----
+        # 2026-10-28 用户拍板：「不能这样写死守卫解决，而是做 r1 客户端的
+        # 多模态上传文件那些外置模块来让 agent 看到全貌」。
+        # 协议刻意用 JSON+base64（不用 multipart）：面板/客户端/curl 都好发，
+        # 也避开标准库里已废弃的 cgi 表单解析。
+        if path in ("/api/upload", "/api/files"):
+            try:
+                import base64 as _b64
+
+                import upload as _up
+                import scenes as _sc4
+                sid = str(payload.get("scene_id") or payload.get("scene")
+                          or "").strip() or _sc4.current_scene_id()
+                name = str(payload.get("name") or "").strip()
+                raw = payload.get("data_b64") or payload.get("data") or ""
+                if not raw:
+                    self._json(400, {"ok": False, "why": "没有文件内容（data_b64）"})
+                    return
+                if len(raw) > _up.MAX_BYTES * 2:
+                    self._json(413, {"ok": False, "why": "文件太大（>32MB）"})
+                    return
+                blob = _b64.b64decode(str(raw))
+                r = _up.ingest(sid, name, blob)
+                r["scene_id"] = sid
+                self._json(200 if r.get("ok") else 400, r)
+            except Exception as e:
+                self._json(500, {"ok": False,
+                                 "why": f"{type(e).__name__}: {e}"[:300]})
+            return
+        if path in ("/api/upload/list", "/api/files/list"):
+            try:
+                import upload as _up2
+                import scenes as _sc5
+                sid = str(payload.get("scene_id") or "").strip() \
+                    or _sc5.current_scene_id()
+                self._json(200, _up2.describe(sid))
+            except Exception as e:
+                self._json(500, {"error": f"{type(e).__name__}: {e}"[:300]})
+            return
+
         if path == "/api/preview":
             try:
                 import tasks
