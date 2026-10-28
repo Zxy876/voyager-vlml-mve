@@ -61,6 +61,17 @@ def main() -> int:
         "2026-09 技术部基薪 81000 元 [1]。", data, sum_auth=False)
     check("日期 + [1] 引用不误杀", ok5)
 
+    # 季度标记也是时间（2026-10-28 实测：「技术部 2026Q3 的奖金总额为 2000 元」
+    # 被 2026 卡死 → 答案退化成原始 JSON 平铺，2000 明明就在数据里）
+    _dq = {"rows": [{"来源技能": "bonus_sum", "total_bonus": 2000}]}
+    ok5b, why5b = verify_answer_numbers("技术部 2026Q3 的奖金总额为 2000 元。", _dq)
+    check("2026Q3 不误杀", ok5b, why5b[:40])
+    ok5c, why5c = verify_answer_numbers(
+        "技术部 2026 年第三季度奖金合计 2,000.00 元 [1]", _dq)
+    check("「2026 年第三季度」不误杀", ok5c, why5c[:40])
+    ok5d, _ = verify_answer_numbers("技术部 Q3 奖金 3000 元", _dq)
+    check("时间剥掉后真错的数仍然拦（3000）", not ok5d)
+
     print("== 4. 边界 ==")
     ok6, _ = verify_answer_numbers("没有数字的答案。", data)
     check("无数字 → 放行", ok6)

@@ -463,6 +463,14 @@ def verify_answer_numbers(answer: str, data: Any, *,
     text = re.sub(r"\b(?:19|20)\d{2}\s*[-/年.]\s*\d{1,2}(?:\s*[-/月.]\s*\d{1,2})?[日]?", " ", text)
     text = re.sub(r"(?<![\d.])\d{1,2}\s*月", " ", text)
     text = re.sub(r"(?<![\d.])\d{1,2}\s*[日号]", " ", text)
+    # 2026Q3 / Q3 —— 季度标记也是「时间」，不是答案数值。实测（2026-10-28）：
+    # 「技术部 2026Q3 的奖金总额为 2000 元」被 2026 卡死 → 判「数字指认不了」
+    # → 答案退化成原始 JSON 平铺（2000 明明就在数据里）。先剥时间再对账。
+    text = re.sub(r"\b(?:19|20)\d{2}\s*[Qq]\s*[1-4]\b", " ", text)
+    text = re.sub(r"\b[Qq]\s*[1-4]\b", " ", text)
+    text = re.sub(r"第\s*[1-4]\s*季度", " ", text)
+    # 光秃秃的年份也是时间（「2026 年第三季度」），不是答案数值。
+    text = re.sub(r"(?<![\d.])(?:19|20)\d{2}\s*年", " ", text)
     found = re.findall(r"\d[\d,]*(?:\.\d+)?", text)
     if not found:
         return True, ""
