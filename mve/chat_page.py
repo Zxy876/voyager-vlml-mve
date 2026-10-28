@@ -627,7 +627,16 @@ $('fileInput').onchange = function(ev){
       method: 'POST', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({scene_id: sid, name: f.name, data_b64: b64(fr.result)})
     }).then(function(r){ return r.json(); }).then(function(d){
-      if (d.ok && d.visible === false){
+      if (d.ok && (d.kind === 'text' || d.kind === 'image')){
+        // 文档/图片 = 上下文注入（DeepSeek 同构）：内容已转成文本进输入，
+        // 与「能不能查库」无关 —— 不该再吓唬人「agent 看不见它」。
+        noteMsg('✅ **' + f.name + '** 已作为上下文注入（' +
+                (d.kind === 'image' ? '图片' : '文本') +
+                (d.chars ? '，' + d.chars + ' 字' : '') +
+                '，场景 ' + sid + '）。\n\n' +
+                (d.note ? '⚠️ ' + d.note + '\n\n' : '') +
+                '直接问文件里的内容就行 —— 答案会标注「按你上传的文件作答」。');
+      } else if (d.ok && d.visible === false){
         noteMsg('⚠️ 文件已落盘，但**这个场景的 agent 看不见它**（场景 ' + sid +
                 ' 是 VLML 域，查的是另一个库）。\n\n' +
                 '请把顶部模型切到你要问的场景（如 mve:B），再重新上传 —— ' +
