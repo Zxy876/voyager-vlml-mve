@@ -914,9 +914,23 @@ async def consume(
     _file_ctx = ""
     try:
         import upload as _upl
-        _file_ctx = str(_upl.context_block(_scene_id) or "")
+        # ⚠️ **必须把 question 传进去**：文件是「这一次请求的上下文」，不是
+        # 永久贴纸。全文动辄几十万字（场景 G 的 17KB PDF 只是小的），一次
+        # 全塞进输入会撑爆窗口也稀释注意力 —— DeepSeek 客户端同样只放得下
+        # 一个上下文窗口。所以按**这一句话**去文件里挑相关段落（upload._pick_text），
+        # 开头永远保留（文档的摘要/目录通常在前面）。
+        _file_ctx = str(_upl.context_block(_scene_id, question=question) or "")
     except Exception:
         _file_ctx = ""
+
+    # 本场景数据源里有哪些表（空库 = 还没东西可查）。用来区分两种「没答出来」：
+    # 库是空的（先去读上下文/文件）vs 库有数据但技能没覆盖（该去学）。
+    _scene_tables: list[str] = []
+    try:
+        import scene_profile as _sp
+        _scene_tables = list(_sp.source_tables(_scene_id) or [])
+    except Exception:
+        _scene_tables = []
 
     # ---- ① 归题（找评分点）----
     topic_id, hit, task = _infer(question)
@@ -1159,7 +1173,18 @@ async def consume(
         if reused_skill is None:
             if _scene_kind == "scene":
                 _dbp = str((_prof or {}).get("db_path") or "")
-                if not skills and _file_ctx:
+                if not _scene_tables and _file_ctx:
+                    # 数据源里**一张表都没有**（文档/PDF 类场景）→ 没有可查的东西，
+                    # 别写 SQL。文件就是这次请求的上下文，直接读它作答 ——
+                    # DeepSeek 客户端拿到一本 PDF 也只会读，不会先要一张表。
+                    # （不写 SQL 不是「刻意跳过」：没有表就没有可执行的查询，
+                    #   硬跑只会拿一串 "Table xxx does not exist" 当"没答出来"。）
+                    reuse_errors.append(
+                        f"本场景数据源里还没有表"
+                        f"（{Path(_dbp).name if _dbp else '—'}）→ 无 SQL 可写，"
+                        f"改按上传的文件作答")
+                    obs, code = [], ""
+                elif not skills and _file_ctx:
                     # 有上传文件当上下文、但本题还没学过：**先现场答一次**。
                     # R1 客户端拿到文件就能读，不会先要求「学过」；MVE 同理
                     # ——文件已经把表/列/真实取值摆在上下文里，让 agent 直接
@@ -1691,10 +1716,14 @@ async def consume(
                          in ("HIGH_CONFIDENCE", "MEDIUM_CONFIDENCE")
                          or bool(skills))
         _no_reply = (data is None and not str(answer or "").strip())
-        # ⚠️ 只有**没有已学技能**时才让文件顶上去作答：有技能说明这题该走
-        # 库，取数失败就该如实说没答出来，绝不能拿上传文件里的数顶替
-        # （2026-10-28 实测：残留的上传把公司总额答成 22600）。
-        _file_as_source = bool(_file_ctx) and not skills
+        # ⚠️ DeepSeek 客户端的优先级只有一条：**这次请求带了什么上下文，
+        # 就按什么答**。库/技能取到数 → 用库（结构化、可复现，更好）；
+        # 库取不到数 → 文件就在上下文里，读它，并如实标注「按你上传的文件
+        # 作答（未经库内验证）」。之前把条件收窄成「没有技能才准用文件」，
+        # 实测（2026-10-28 截图）：场景 G 文件已注入、但路由命中旧图谱节点
+        # → 宁可 fetched_empty 也不读文件 —— 那不是谨慎，是没同构。
+        # （残留上传顶替正确答案的问题已在源头解决：过期上传连表清掉。）
+        _file_as_source = bool(_file_ctx)
         if (_no_reply and _is_data_question(question) and _internal_hit
                 and not _file_as_source):
             pass                       # 上面已有「未学/不会」交代 + 已派学习
@@ -3270,18 +3299,35 @@ def _inference_answer(question: str, context: str = "") -> dict[str, Any]:
     既有口径）。自评 grounded=false（自己都不知道）就如实不答。
     """
     out: dict[str, Any] = {"used": False, "answer": "", "note": ""}
+    _ctx = str(context or "").strip()
+    # ⚠️ 带文件和不带文件是**两种题**，提示词不能共用一句：
+    #   · 不带文件 = 纯模型知识（同 DeepSeek 客户端「联网默认关，知识题直接答」）；
+    #   · 带文件   = 阅读理解（同 DeepSeek 客户端带附件提问）。这时候再要求
+    #     「凭你自己的知识回答」，模型会把「文件里有答案」也判成不 grounded →
+    #     明明读得到却说不知道（2026-10-28 场景 G 实测：「引用谁的歌词最多」
+    #     文件 6000 字已在上下文里，仍答 fetched_empty）。
+    if _ctx:
+        _sys = ("用户这次请求带了文件内容（就在下面）。请**依据这份文件**回答，"
+                "不要编造文件里没有的事实。规则：\n"
+                "① 需要统计/计数（谁最多、几次、哪些）时，逐条数清楚再给结论，"
+                "并写出你数到的条目；\n"
+                "② 文件里引用了歌词/诗句/名句但没写来源时，可以用你自己的知识判断"
+                "它出自哪首歌、谁的作品，但必须说明「这部分是我按已有知识判断的」；\n"
+                "③ 文件里确实找不到依据才 grounded=false。\n"
+                '只返回 JSON：{"answer": "回答", "grounded": true/false}')
+    else:
+        _sys = ("凭你自己的知识回答用户问题——这不是从任何数据环境"
+                "取的数。如果问题需要具体/实时的数据而你无法确知，"
+                "grounded 必须为 false。只返回 JSON："
+                '{"answer": "回答", "grounded": true/false}')
     try:
         cj = chat_json(
-            [{"role": "system",
-              "content": ("凭你自己的知识回答用户问题——这不是从任何数据环境"
-                          "取的数。如果问题需要具体/实时的数据而你无法确知，"
-                          "grounded 必须为 false。只返回 JSON："
-                          '{"answer": "回答", "grounded": true/false}')},
+            [{"role": "system", "content": _sys},
              # 用户上传的文件就是这次的上下文（DeepSeek 客户端同构）：
              # 带文件的知识题 = 读文件作答；没有文件才是纯模型知识。
              {"role": "user",
-              "content": (str(context).strip() + "\n\n问题：" + str(question)
-                          if str(context or "").strip() else str(question))}],
+              "content": (f"【文件内容】\n{_ctx}\n\n【问题】{question}"
+                          if _ctx else str(question))}],
             temperature=0.2)
         ans = str((cj or {}).get("answer") or "").strip()
         if ans and bool((cj or {}).get("grounded", True)):

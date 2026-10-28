@@ -50,7 +50,9 @@ SUPPORTED_DOC = {".pdf", ".docx"}
 SUPPORTED_IMAGE = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 SUPPORTED = (SUPPORTED_TABULAR | SUPPORTED_TEXT | SUPPORTED_DOC
              | SUPPORTED_IMAGE)
-TEXT_LIMIT = 6000          # 单个文本文件注入上下文的上限（字符）
+TEXT_STORE = 400_000       # 单个文件**存**多少字（全文尽量留，别只留开头）
+TEXT_BUDGET = 40_000       # 每次提问往上下文里**放**多少字（DeepSeek 同构：
+                           # 在模型窗口内就整篇放，超了按问句选相关段落）
 
 
 def _meta_path(scene_id: str) -> Path:
@@ -106,8 +108,53 @@ def _fresh(items: list[dict[str, Any]], minutes: int) -> list[dict[str, Any]]:
     return out
 
 
+def _pick_text(text: str, question: str, budget: int) -> str:
+    """整篇放得下就整篇；放不下就按**问句关键词**挑相关段落 + 保留开头。
+
+    DeepSeek 客户端的做法是「文件内容进上下文，模型自己读」；模型窗口装得下
+    就整篇给，装不下才检索。这里同构：先按段落切，按与问句的词面重合打分，
+    取分数高的填满预算；开头永远保留（文档的标题/前言常定义术语）。
+    """
+    body = str(text or "")
+    if len(body) <= budget:
+        return body
+    _head = body[:2000]
+    # 段落切（空行/换行都算），丢掉太短的碎片
+    parts = [x.strip() for x in re.split(r"\n{1,}", body) if len(x.strip()) >= 40]
+    _qs = set(re.findall(r"[\u4e00-\u9fff]{2,4}|[A-Za-z]{3,}",
+                         str(question or "").lower()))
+    scored = []
+    for i, seg in enumerate(parts):
+        low = seg.lower()
+        score = sum(1 for q in _qs if q in low)
+        scored.append((score, i, seg))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    out = [_head]
+    used = len(_head)
+    for score, _i, seg in scored:
+        if used + len(seg) > budget:
+            continue
+        if score == 0 and used > budget * 0.6:
+            break
+        out.append(seg)
+        used += len(seg)
+    return "\n…\n".join(out)[:budget]
+
+
+def _item_text(it: dict[str, Any]) -> str:
+    """取一条上传项的全文：优先 sidecar 文本文件（存的是全文），退回 meta 里的。"""
+    p = str(it.get("text_path") or "")
+    if p and Path(p).exists():
+        try:
+            return Path(p).read_text(encoding="utf-8")
+        except Exception:
+            pass
+    return str(it.get("text") or "")
+
+
 def context_block(scene_id: str, max_rows: int = 12,
-                  fresh_minutes: int = 30) -> str:
+                  fresh_minutes: int = 30, question: str = "",
+                  budget: int = TEXT_BUDGET) -> str:
     """把「用户上传过的文件」渲染成**上下文块**（DeepSeek 客户端的文件注入）。
 
     用户 2026-10-28：「上传文件的时候要像 R1 客户端一样当作上下文输入」/
@@ -122,6 +169,7 @@ def context_block(scene_id: str, max_rows: int = 12,
     if not items:
         return ""
     lines = ["【用户这次上传的文件（真实内容，优先按它作答）】"]
+    _budget_left = budget          # 多个文件就按顺序分预算，别让第一个吃干
     for it in items[-4:]:
         _kind = str(it.get("kind") or "table")
         _name = it.get("name")
@@ -142,17 +190,20 @@ def context_block(scene_id: str, max_rows: int = 12,
                     pass
             continue
         # 文本 / 图片：内容本身就是上下文（多模态已转成文本）
-        _txt = str(it.get("text") or "")
+        _all = _item_text(it)
         _note = str(it.get("note") or "")
         _hint = "文本" if _kind == "text" else "图片"
-        lines.append(f"- {_name}（{_hint}，{len(_txt)} 字"
+        lines.append(f"- {_name}（{_hint}，共 {len(_all)} 字"
                      + (f"；{_note}" if _note else "") + "）")
-        if _txt:
-            lines.append("  内容：")
-            lines.append(_txt[:1800])
+        if _all:
+            _piece = _pick_text(_all, question, max(2000, _budget_left))
+            _budget_left = max(0, _budget_left - len(_piece))
+            lines.append("  内容" + ("（节选，与问题相关的段落）"
+                                     if len(_piece) < len(_all) else "") + "：")
+            lines.append(_piece)
         elif _note:
             lines.append(f"  （没有可读内容：{_note}）")
-    return "\n".join(lines)[:6000]
+    return "\n".join(lines)[:budget + 2000]
 
 
 def _safe_stem(name: str) -> str:
@@ -194,7 +245,7 @@ def _scene_db_path(scene_id: str) -> tuple[str, str, str]:
         return (dbp or str(Path(d) / "uploads.duckdb")), d, kind
 
 
-def _read_text(path: str, limit: int = TEXT_LIMIT) -> str:
+def _read_text(path: str, limit: int = TEXT_STORE) -> str:
     """纯文本 → 文本（UTF-8 优先，退 GB18030 —— 中文文件常是 GBK 存的）。"""
     raw = Path(path).read_bytes()
     for enc in ("utf-8", "utf-8-sig", "gb18030"):
@@ -205,7 +256,7 @@ def _read_text(path: str, limit: int = TEXT_LIMIT) -> str:
     return raw.decode("utf-8", errors="replace")[:limit]
 
 
-def _docx_text(path: str, limit: int = TEXT_LIMIT) -> str:
+def _docx_text(path: str, limit: int = TEXT_STORE) -> str:
     """docx → 文本（docx 就是 zip，取 word/document.xml 的 <w:t>，零依赖）。"""
     import zipfile
     with zipfile.ZipFile(path) as z:
@@ -215,7 +266,7 @@ def _docx_text(path: str, limit: int = TEXT_LIMIT) -> str:
     return re.sub(r"<[^>]+>", "", xml)[:limit]
 
 
-def _pdf_text(path: str, limit: int = TEXT_LIMIT) -> str:
+def _pdf_text(path: str, limit: int = TEXT_STORE) -> str:
     """PDF → 文本（pypdf）。没装就如实报错，不假装解析出内容。"""
     try:
         from pypdf import PdfReader
@@ -286,13 +337,27 @@ def _ingest_as_context(scene_id: str, name: str, path: str, ext: str,
     except Exception as e:
         out["why"] = str(e)
         return out
+    # 全文落 sidecar（.txt）：meta 只留预览，避免 17KB→几百 KB 的 JSON，
+    # 也让「整篇进上下文/按问句选段」有原文可读（2026-10-28：6000 字截断
+    # 让「引用谁的歌词最多」这种要通读全文的题根本没法答）。
+    txt_path = ""
+    try:
+        side = Path(path).with_suffix(".txt")
+        side.write_text(txt, encoding="utf-8")
+        txt_path = str(side)
+    except Exception:
+        txt_path = ""
     items = [x for x in _load_meta(scene_id) if str(x.get("name")) != name]
-    items.append({"name": name, "kind": kind, "chars": len(txt), "text": txt,
-                  "note": note, "visible": False,
-                  "ts": time.strftime("%Y-%m-%dT%H:%M:%S")})
+    _rec = {"name": name, "kind": kind, "chars": len(txt),
+            "text_path": txt_path, "preview": txt[:400],
+            "note": note, "visible": False,
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    if len(txt) <= 2000:                 # 小文件仍整个存进 meta（方便调试/老逻辑）
+        _rec["text"] = txt
+    items.append(_rec)
     _save_meta(scene_id, items)
     out.update(ok=True, kind=kind, chars=len(txt), note=note, visible=False,
-               table="", text=txt[:300])
+               table="", text=txt[:300], text_path=txt_path)
     return out
 
 
