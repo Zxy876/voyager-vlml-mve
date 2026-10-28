@@ -207,6 +207,11 @@ def _log_import(result: dict[str, Any]) -> None:
         "same_metric": bool(result.get("same_metric")),
         "voyager_sound": bool(result.get("voyager_sound")),
         "judged": bool(result.get("judged")),
+        # 三态披露（2.5）：False = 裁判没对照上，上面三个 bool 无意义（面板看它）。
+        # ⚠️ 必须进白名单 —— 2026-10-28 实测：consume 里明明带了，这里没透传
+        # → coach_log 里 scope_line/referee_compared 全是空（白名单惯犯第 6 次）。
+        "referee_compared": bool(result.get("referee_compared")),
+        "scope_line": str(result.get("scope_line") or ""),
         # 裁判（VLML）独立那一路取了什么 —— 与 Voyager 那一路并列披露
         "referee_sql": result.get("referee_sql", ""),
         "referee_rows": int(result.get("referee_rows") or 0),
