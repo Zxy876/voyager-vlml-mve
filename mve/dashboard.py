@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -2916,6 +2917,10 @@ LEARN_JOB: dict = {"running": False, "question": "", "started_at": 0.0,
 
 
 class Handler(BaseHTTPRequestHandler):
+    # HTTP/1.1：SSE 的分块编码（Transfer-Encoding: chunked）在 1.0 下无效，
+    # 而流式回答必须能"边算边发"。普通接口仍逐个带 Content-Length，不受影响。
+    protocol_version = "HTTP/1.1"
+
     def _send(self, code: int, body: bytes, ctype: str) -> None:
         self.send_response(code)
         self.send_header("Content-Type", ctype)
@@ -2937,15 +2942,23 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return {}
 
-    # ---- OpenAI 兼容层（2026-10-28，DeepSeek 客户端式消费 MVE 学习能力）----
+    # ---- OpenAI 兼容层（2026-10-28，完全照 DeepSeek R1 客户端的协议面）----
     # 为什么走 OpenAI 协议：DeepSeek 客户端、LobeChat、NextChat、猫娘、任何
     # SDK 都认这一套（DeepSeek 开放平台本身就是 OpenAI 兼容）。MVE 只要把
     # 「学习能力」包装成一个 model，外部就不再需要知道场景/技能/守卫的存在。
     #   model 名选场景：mve（当前场景）/ mve:B / mve:C / 直接 B
     #   端点：{base}/v1/models、{base}/v1/chat/completions
+    # 与 R1 逐项对位（这是"照抄"的部分，不是自创）：
+    #   delta.reasoning_content —— DeepSeek 官方 API 的思考通道名，原样照用；
+    #       MVE 里填的是**执行轨迹**（命中哪条技能、回填出的 SQL、实查几行、
+    #       核对结论、判定），与 R1 的 <think> 是同一个位置：过程收进去、
+    #       用户只看可验证结论。
+    #   stream=true —— SSE 逐字下发（R1 客户端就是这么渲染的）。
+    #   其它字段：id/object/created/model/choices/usage/finish_reason 齐套。
     # 安全：设了环境变量 MVE_API_KEY 就要求 Bearer 认证（8443 在公网上）。
     def _openai_models(self) -> None:
         models = []
+        samples = _samples_by_scene()
         try:
             import scenes as _sc3
             for it in (_sc3.list_scenes() or []):
@@ -2955,11 +2968,13 @@ class Handler(BaseHTTPRequestHandler):
                         "id": f"mve:{sid}", "object": "model",
                         "owned_by": "mve",
                         "description": str((it or {}).get("name") or "")[:60],
+                        "samples": samples.get(sid, []),
                     })
         except Exception:
             pass
         models.append({"id": "mve", "object": "model", "owned_by": "mve",
-                       "description": "MVE 学习能力（当前场景）"})
+                       "description": "MVE 学习能力（当前场景）",
+                       "samples": []})
         self._json(200, {"object": "list", "data": models})
 
     def _openai_chat(self, payload: dict) -> None:
@@ -2987,14 +3002,116 @@ class Handler(BaseHTTPRequestHandler):
         model = str(payload.get("model") or "mve").strip()
         sid = model.split(":", 1)[1].strip().upper() if ":" in model else (
             model.upper() if model.upper() in ("A", "B", "C", "D", "E", "F") else "")
-        _prev = ""
+        prev = ""
         try:
             import scenes as _sc4
-            _prev = str(_sc4.current_scene_id() or "A")
-            if sid and sid != _prev:
-                _sc4.switch_scene(sid)
+            prev = str(_sc4.current_scene_id() or "A")
         except Exception:
             sid = ""
+        if payload.get("stream"):
+            self._openai_stream(q, model, sid, prev)
+            return
+        res = self._mve_ask(q, sid, prev)
+        content, reasoning, x = _openai_answer(res, sid, prev)
+        now = int(time.time())
+        self._json(200, {
+            "id": f"chatcmpl-mve-{now}",
+            "object": "chat.completion",
+            "created": now,
+            "model": model,
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": content,
+                                     # R1 同名字段：思考过程与最终答案分开送。
+                                     "reasoning_content": reasoning}}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0,
+                      "total_tokens": 0},
+            # 非标准扩展字段：自动识别它的客户端零成本忽略；人和脚本可对账。
+            "x_mve": x,
+        })
+
+    # ---- SSE（R1 客户端就是靠它把答案"打"出来的）----
+    def _sse_headers(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+
+    def _chunk(self, data: bytes) -> None:
+        """HTTP/1.1 分块编码：不先算总长度，边算边发（SSE 必须这样）。"""
+        self.wfile.write(("%x\r\n" % len(data)).encode("ascii") + data + b"\r\n")
+        self.wfile.flush()
+
+    def _chunk_end(self) -> None:
+        self.wfile.write(b"0\r\n\r\n")
+        self.wfile.flush()
+
+    def _sse_comment(self, text: str) -> None:
+        self._chunk((": " + text + "\n\n").encode("utf-8"))
+
+    def _sse_delta(self, rid: str, model: str, *, role: str = "",
+                   reasoning_content: str = "", content: str = "",
+                   finish: str = "", x: dict | None = None) -> None:
+        delta: dict[str, Any] = {}
+        if role:
+            delta["role"] = role
+        if reasoning_content:
+            delta["reasoning_content"] = reasoning_content
+        if content:
+            delta["content"] = content
+        obj: dict[str, Any] = {
+            "id": rid, "object": "chat.completion.chunk",
+            "created": int(time.time()), "model": model,
+            "choices": [{"index": 0, "delta": delta,
+                         "finish_reason": finish or None}],
+        }
+        if x:
+            obj["x_mve"] = x
+        self._chunk(("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n")
+                    .encode("utf-8"))
+
+    def _openai_stream(self, q: str, model: str, sid: str, prev: str) -> None:
+        """先心跳、后逐字：消费要 20~60 秒，干等会让客户端超时判死。"""
+        import threading
+        box: dict[str, Any] = {}
+
+        def _work() -> None:
+            box["res"] = self._mve_ask(q, sid, prev)
+
+        th = threading.Thread(target=_work, daemon=True)
+        th.start()
+        rid = f"chatcmpl-mve-{int(time.time())}"
+        try:
+            self._sse_headers()
+            self._sse_delta(rid, model, role="assistant")
+            while th.is_alive():
+                self._sse_comment("keep-alive")
+                th.join(5)
+            res = box.get("res") or {}
+            content, reasoning, x = _openai_answer(res, sid, prev)
+            for piece in _split_chunks(reasoning, 26):
+                self._sse_delta(rid, model, reasoning_content=piece)
+                time.sleep(0.012)
+            for piece in _split_chunks(content, 16):
+                self._sse_delta(rid, model, content=piece)
+                time.sleep(0.012)
+            self._sse_delta(rid, model, finish="stop", x=x)
+            self._chunk(b"data: [DONE]\n\n")
+            self._chunk_end()
+        except (BrokenPipeError, ConnectionResetError):
+            # 人点了「停止生成」——消费线程自己跑完落账，这里只是不再写。
+            pass
+
+    def _mve_ask(self, q: str, sid: str, prev: str) -> dict:
+        """跑一次消费并还原场景。返回 consume() 的结果（异常也包成结果）。"""
+        try:
+            import scenes as _sc
+            if sid and sid != prev:
+                _sc.switch_scene(sid)
+        except Exception:
+            pass
         try:
             import asyncio as _aio
             # 与面板 /api/coach 同一条消费通路：consume()（技能库重放 +
@@ -3005,51 +3122,17 @@ class Handler(BaseHTTPRequestHandler):
             if _root2 not in sys.path:
                 sys.path.insert(0, _root2)
             import voyager_vlml.consume as _consume2
-            res = _aio.run(_consume2.consume(q))
+            return _aio.run(_consume2.consume(q))
         except Exception as e:
-            res = {"ok": False, "answer": "",
-                   "errors": [f"{type(e).__name__}: {e}"]}
+            return {"ok": False, "answer": "",
+                    "errors": [f"{type(e).__name__}: {e}"]}
         finally:
             try:
                 import scenes as _sc5
-                if _prev and sid and sid != _prev:
-                    _sc5.switch_scene(_prev)
+                if prev and sid and sid != prev:
+                    _sc5.switch_scene(prev)
             except Exception:
                 pass
-        ans = str(res.get("answer") or "").strip()
-        if not ans:
-            why = "；".join(str(x) for x in (res.get("errors") or [])[:2])
-            ans = ("（MVE 这轮没答出来"
-                   + (f"：{why[:160]}" if why else "：见判定披露")
-                   + "）—— 已标记交给学习/工具线，可先在面板看判定明细。")
-        # 披露进正文：OpenAI 客户端只看 content，可验证性必须随答案走。
-        tail = [f"场景 {sid or _prev or 'A'}",
-                f"判定 {res.get('judgment_result') or '—'}"]
-        if res.get("used_skills"):
-            tail.append("复用技能 " + "、".join(
-                str(x.get("name") or "") for x in res["used_skills"][:4]))
-        if res.get("tool_line_used"):
-            tail.append("工具线（联网 claim）")
-        content = ans + "\n\n—— MVE｜" + "｜".join(tail)
-        import time as _ts
-        now = int(_ts.time())
-        self._json(200, {
-            "id": f"chatcmpl-mve-{now}",
-            "object": "chat.completion",
-            "created": now,
-            "model": model,
-            "choices": [{"index": 0, "finish_reason": "stop",
-                         "message": {"role": "assistant", "content": content}}],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0,
-                      "total_tokens": 0},
-            # 非标准扩展字段：自动识别它的客户端零成本忽略；人和脚本可对账。
-            "x_mve": {"judgment_result": res.get("judgment_result"),
-                      "mastered": bool(res.get("mastered")),
-                      "scope_line": res.get("scope_line"),
-                      "tool_line_used": bool(res.get("tool_line_used")),
-                      "scene": sid or _prev,
-                      "topic_id": res.get("topic_id")},
-        })
 
     def do_GET(self) -> None:  # noqa: N802
         path = _strip_prefix(self.path.split("?")[0])
@@ -3896,198 +3979,93 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+def _split_chunks(text: str, size: int):
+    """按长度切片（SSE 逐字下发用）。"""
+    t = str(text or "")
+    for i in range(0, len(t), size):
+        yield t[i:i + size]
+
+
+def _openai_answer(res: dict, sid: str, prev: str) -> tuple[str, str, dict]:
+    """把 consume() 的结果翻成 OpenAI 响应的三件套：content / reasoning / x_mve。
+
+    reasoning 走 reasoning_content 通道（DeepSeek R1 的字段名）——
+    MVE 没有"思维链"，但有**执行轨迹**：命中哪条技能、回填的 SQL、实查几行、
+    核对结论、判定。这是同一位置的东西：过程收进去，答案只留可验证的结论。
+    """
+    import chat_page as _cp
+    ans = str(res.get("answer") or "").strip()
+    if not ans:
+        why = "；".join(str(x) for x in (res.get("errors") or [])[:2])
+        ans = ("（MVE 这轮没答出来"
+               + (f"：{why[:160]}" if why else "：见判定披露")
+               + "）—— 已标记交给学习/工具线，可先在面板看判定明细。")
+    # 披露进正文：OpenAI 客户端只看 content，可验证性必须随答案走。
+    tail = [f"场景 {sid or prev or 'A'}",
+            f"判定 {res.get('judgment_result') or '—'}"]
+    if res.get("used_skills"):
+        tail.append("复用技能 " + "、".join(
+            str(x.get("name") or "") for x in res["used_skills"][:4]))
+    if res.get("tool_line_used"):
+        tail.append("工具线（联网 claim）")
+    content = ans + "\n\n—— MVE｜" + "｜".join(tail)
+
+    scene_id = sid or prev or "A"
+    label = ""
+    try:
+        import scenes as _sc
+        for it in (_sc.list_scenes() or []):
+            if str((it or {}).get("id") or "") == scene_id:
+                label = str((it or {}).get("name") or "")
+    except Exception:
+        pass
+    reasoning = _cp.reasoning_text(res, scene_id=scene_id, scene_label=label)
+    skill = ""
+    if res.get("used_skills"):
+        skill = "、".join(str(x.get("name") or "") for x in res["used_skills"][:3])
+    x_mve = {"judgment_result": res.get("judgment_result"),
+             "mastered": bool(res.get("mastered")),
+             "scope_line": res.get("scope_line"),
+             "tool_line_used": bool(res.get("tool_line_used")),
+             "scene": sid or prev,
+             "topic_id": res.get("topic_id"),
+             "skill": skill}
+    return content, reasoning, x_mve
+
+
+def _samples_by_scene(limit: int = 3) -> dict[str, list[str]]:
+    """各场景「最近问过且答得出来」的问题，给对话页当示例。
+
+    ⚠️ 不硬编码题面：示例必须来自真实消费账（coach_log 里判定 written 的），
+    否则页面就会教用户问一些这套库根本答不出的题。
+    """
+    out: dict[str, list[str]] = {}
+    try:
+        import scenes as _sc
+        for it in (_sc.list_scenes() or []):
+            sid = str((it or {}).get("id") or "")
+            if not sid:
+                continue
+            qs: list[str] = []
+            for rec in reversed(panel_data._human_imports(80, sid)):
+                q = str(rec.get("question") or "").strip()
+                if not q or q in qs:
+                    continue
+                if str(rec.get("judgment_result") or "") != "written":
+                    continue
+                qs.append(q[:80])
+                if len(qs) >= limit:
+                    break
+            out[sid] = qs
+    except Exception:
+        pass
+    return out
+
+
 def _chat_html() -> str:
-    """对话页：OpenAI 兼容端点的最小客户端（前缀注入同主面板）。"""
-    if not PREFIX:
-        return CHAT_HTML
-    return CHAT_HTML.replace(
-        "<head>", '<head>\n<script>window.MVE_PREFIX="%s";</script>' % PREFIX, 1)
-
-
-# 对话页（2026-10-28）：DeepSeek 客户端式消费的最短路径——不用装任何客户端，
-# 打开 /mve/chat 就能问。它只是 /v1/chat/completions 的一层壳，判定口径与
-# 面板 /api/coach 完全一致（都是 consume()），不新造第二把尺子。
-CHAT_HTML = r"""<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MVE 对话</title>
-<style>
-  :root{
-    color-scheme: light;
-    --bg:#f6f7f9; --panel:#fff; --line:#e3e6ea; --ink:#1b1f24;
-    --dim:#6b7280; --accent:#2563eb; --warn:#b45309; --bad:#b91c1c; --ok:#15803d;
-    font-family:"PingFang SC","Microsoft YaHei",system-ui,sans-serif;
-  }
-  *{box-sizing:border-box}
-  html,body{height:100%}
-  body{margin:0;background:var(--bg);color:var(--ink);display:flex;flex-direction:column}
-  header{display:flex;align-items:center;gap:12px;padding:12px 18px;background:var(--panel);
-         border-bottom:1px solid var(--line);flex-wrap:wrap}
-  header h1{font-size:15px;margin:0;font-weight:600}
-  header .hint{font-size:12px;color:var(--dim)}
-  select{margin-left:auto;padding:6px 10px;border:1px solid var(--line);border-radius:8px;
-         background:#fff;font-size:13px;max-width:52vw}
-  main{flex:1;min-height:0;overflow-y:auto;padding:20px 18px}
-  .wrap{max-width:780px;margin:0 auto;display:flex;flex-direction:column;gap:14px}
-  .msg{display:flex;gap:10px;align-items:flex-start}
-  .msg.me{flex-direction:row-reverse}
-  .who{width:26px;height:26px;border-radius:8px;flex:0 0 auto;display:grid;
-       place-items:center;font-size:12px;font-weight:600;color:#fff;background:#94a3b8}
-  .msg.me .who{background:var(--accent)}
-  .bubble{padding:10px 13px;border-radius:12px;background:var(--panel);
-          border:1px solid var(--line);font-size:14px;line-height:1.65;
-          white-space:pre-wrap;word-break:break-word;max-width:calc(100% - 56px)}
-  .msg.me .bubble{background:#eef3ff;border-color:#d6e2ff}
-  .msg.err .bubble{color:var(--bad);border-color:#f2c4c4;background:#fdf1f1}
-  .meta{margin-top:9px;display:flex;flex-wrap:wrap;gap:6px}
-  .tag{font-size:11px;padding:2px 7px;border-radius:999px;border:1px solid var(--line);
-       color:var(--dim);background:#fafbfc}
-  .tag.ok{color:var(--ok);border-color:#bfe3c9;background:#f1fbf4}
-  .tag.warn{color:var(--warn);border-color:#f0dcae;background:#fdf9ee}
-  .tag.bad{color:var(--bad);border-color:#f2c4c4;background:#fdf1f1}
-  footer{padding:12px 18px 16px;background:var(--panel);border-top:1px solid var(--line)}
-  .box{max-width:780px;margin:0 auto;display:flex;gap:8px;align-items:flex-end}
-  textarea{flex:1;resize:none;min-height:44px;max-height:140px;padding:11px 12px;
-           border:1px solid var(--line);border-radius:12px;font-size:14px;line-height:1.5;
-           font-family:inherit;outline:none}
-  textarea:focus{border-color:var(--accent)}
-  button{padding:0 18px;height:44px;border:0;border-radius:12px;background:var(--accent);
-         color:#fff;font-size:14px;cursor:pointer}
-  button:disabled{background:#a9bce6;cursor:default}
-  .tip{max-width:780px;margin:8px auto 0;font-size:11px;color:var(--dim);
-       display:flex;gap:14px;flex-wrap:wrap}
-</style>
-</head>
-<body>
-<header>
-  <h1>MVE 对话</h1>
-  <span class="hint">技能库重放 + 环境实查，不是模型自由发挥</span>
-  <select id="model" title="选场景"></select>
-</header>
-<main><div class="wrap" id="list"></div></main>
-<footer>
-  <div class="box">
-    <textarea id="q" rows="1" placeholder="像问 DeepSeek 一样问它，例如：技术部9月的餐补和交通补贴总额是多少？"></textarea>
-    <button id="send">发送</button>
-  </div>
-  <div class="tip">
-    <span>Enter 发送 · Shift+Enter 换行</span>
-    <span id="stat"></span>
-  </div>
-</footer>
-<script>
-var P = window.MVE_PREFIX || '';
-var list = document.getElementById('list');
-var main = document.querySelector('main');
-var ta = document.getElementById('q');
-var btn = document.getElementById('send');
-var sel = document.getElementById('model');
-var stat = document.getElementById('stat');
-var history = [];
-var busy = false;
-
-function scrollDown(){ main.scrollTop = main.scrollHeight; }
-
-fetch(P + '/v1/models').then(function(r){ return r.json(); }).then(function(d){
-  (d.data || []).forEach(function(m){
-    var o = document.createElement('option');
-    o.value = m.id;
-    o.textContent = m.id + (m.description ? ' · ' + m.description : '');
-    sel.appendChild(o);
-  });
-}).catch(function(e){ stat.textContent = '模型列表加载失败：' + e.message; });
-
-function add(role, text){
-  var wrap = document.createElement('div');
-  wrap.className = 'msg' + (role === 'me' ? ' me' : '');
-  var who = document.createElement('div');
-  who.className = 'who';
-  who.textContent = role === 'me' ? '我' : 'MV';
-  var b = document.createElement('div');
-  b.className = 'bubble';
-  b.textContent = text;
-  wrap.appendChild(who);
-  wrap.appendChild(b);
-  list.appendChild(wrap);
-  scrollDown();
-  return {wrap: wrap, bubble: b};
-}
-
-function addTags(bubble, x){
-  if (!x) return;
-  var m = document.createElement('div');
-  m.className = 'meta';
-  function t(txt, cls){
-    if (!txt) return;
-    var s = document.createElement('span');
-    s.className = 'tag' + (cls ? ' ' + cls : '');
-    s.textContent = txt;
-    m.appendChild(s);
-  }
-  t('场景 ' + (x.scene || '?'));
-  var jr = String(x.judgment_result || '');
-  t('判定 ' + (jr || '未知'), jr === 'written' ? 'ok' : 'warn');
-  t(x.mastered ? '掌握 ✓' : '未掌握', x.mastered ? 'ok' : '');
-  if (x.tool_line_used) t('工具线 claim', 'warn');
-  t('供给线 ' + (x.scope_line || '?'));
-  t(x.topic_id);
-  bubble.appendChild(m);
-}
-
-async function send(){
-  var q = ta.value.trim();
-  if (!q || busy) return;
-  busy = true;
-  btn.disabled = true;
-  ta.value = '';
-  add('me', q);
-  history.push({role: 'user', content: q});
-  var n = add('bot', '正在跑（复用技能库 + 实查环境，可能要 20~60 秒）…');
-  var t0 = Date.now();
-  var timer = setInterval(function(){
-    stat.textContent = '已等 ' + Math.round((Date.now() - t0) / 1000) + ' 秒';
-  }, 1000);
-  try{
-    var r = await fetch(P + '/v1/chat/completions', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({model: sel.value || 'mve', messages: history})
-    });
-    var d = await r.json();
-    clearInterval(timer);
-    if (!r.ok || d.error){
-      throw new Error((d.error && (d.error.message || d.error)) || ('HTTP ' + r.status));
-    }
-    var c = d.choices && d.choices[0] && d.choices[0].message
-            && d.choices[0].message.content;
-    n.bubble.textContent = c || '(空回答)';
-    addTags(n.bubble, d.x_mve);
-    history.push({role: 'assistant', content: String(c || '')});
-    stat.textContent = '用时 ' + Math.round((Date.now() - t0) / 1000) + ' 秒';
-  }catch(e){
-    clearInterval(timer);
-    n.wrap.className = 'msg err';
-    n.bubble.textContent = '失败：' + e.message;
-    stat.textContent = '失败（详见气泡）';
-  }finally{
-    busy = false;
-    btn.disabled = false;
-    ta.focus();
-    scrollDown();
-  }
-}
-
-btn.addEventListener('click', send);
-ta.addEventListener('keydown', function(e){
-  if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); send(); }
-});
-</script>
-</body>
-</html>
-"""
-
+    """对话页：完全照 DeepSeek R1 客户端的形态（页面本体在 chat_page.py）。"""
+    import chat_page as _cp
+    return _cp.render(PREFIX)
 
 def main() -> None:
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
