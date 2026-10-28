@@ -554,6 +554,11 @@ li{margin:3px 0}
           <button class="btn btn-primary" id="runStart">▶ 启动 Voyager</button>
           <button class="btn btn-danger" id="runStop" disabled>■ 停止</button>
           <button class="btn btn-secondary" id="btnExport" title="把当前学习过程导出成一份 md">⬇ 导出 md</button>
+          <!-- 对话页（2026-10-28）：OpenAI 兼容端点的零安装界面，判定口径与
+               /api/coach 同一条 consume()，不新造第二把尺子。 -->
+          <a class="btn btn-secondary" href="#" id="gotoChat"
+             title="像问 DeepSeek 一样问它：技能库重放 + 环境实查，判定/复用技能都会标出来"
+             onclick="location.href=(window.MVE_PREFIX||'')+'/chat';return false;">💬 对话页</a>
           <button class="btn btn-secondary" id="mcLearn" title="先跑 MC 思路学习（提炼域无关规划思维）并入库，再自动启动标准练习循环（正常 MVE 全流程）">🧠 启动 MC 思路学习 → MVE</button>
           <label class="runctl-ck" id="ckWrap"
                  title="同构原版 Voyager（voyager.py:326 主循环是 while True）：学习循环不带停，只有点停止 / 跑满上限才退。勾上 = 不停；去掉勾 = 只跑一轮看看。">
@@ -3051,6 +3056,10 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/v1/models", "/models"):
             self._openai_models()
             return
+        if path in ("/chat", "/chat.html"):
+            # 对话页：把 OpenAI 兼容端点包成能直接用的界面（零安装消费）。
+            self._send(200, _chat_html().encode("utf-8"), "text/html; charset=utf-8")
+            return
         if path in ("/", "/index.html"):
             body = _html().encode("utf-8")
             ctype = "text/html; charset=utf-8"
@@ -3885,6 +3894,199 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt: str, *args: Any) -> None:  # 静音默认访问日志
         pass
+
+
+def _chat_html() -> str:
+    """对话页：OpenAI 兼容端点的最小客户端（前缀注入同主面板）。"""
+    if not PREFIX:
+        return CHAT_HTML
+    return CHAT_HTML.replace(
+        "<head>", '<head>\n<script>window.MVE_PREFIX="%s";</script>' % PREFIX, 1)
+
+
+# 对话页（2026-10-28）：DeepSeek 客户端式消费的最短路径——不用装任何客户端，
+# 打开 /mve/chat 就能问。它只是 /v1/chat/completions 的一层壳，判定口径与
+# 面板 /api/coach 完全一致（都是 consume()），不新造第二把尺子。
+CHAT_HTML = r"""<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MVE 对话</title>
+<style>
+  :root{
+    color-scheme: light;
+    --bg:#f6f7f9; --panel:#fff; --line:#e3e6ea; --ink:#1b1f24;
+    --dim:#6b7280; --accent:#2563eb; --warn:#b45309; --bad:#b91c1c; --ok:#15803d;
+    font-family:"PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:var(--bg);color:var(--ink);display:flex;flex-direction:column}
+  header{display:flex;align-items:center;gap:12px;padding:12px 18px;background:var(--panel);
+         border-bottom:1px solid var(--line);flex-wrap:wrap}
+  header h1{font-size:15px;margin:0;font-weight:600}
+  header .hint{font-size:12px;color:var(--dim)}
+  select{margin-left:auto;padding:6px 10px;border:1px solid var(--line);border-radius:8px;
+         background:#fff;font-size:13px;max-width:52vw}
+  main{flex:1;min-height:0;overflow-y:auto;padding:20px 18px}
+  .wrap{max-width:780px;margin:0 auto;display:flex;flex-direction:column;gap:14px}
+  .msg{display:flex;gap:10px;align-items:flex-start}
+  .msg.me{flex-direction:row-reverse}
+  .who{width:26px;height:26px;border-radius:8px;flex:0 0 auto;display:grid;
+       place-items:center;font-size:12px;font-weight:600;color:#fff;background:#94a3b8}
+  .msg.me .who{background:var(--accent)}
+  .bubble{padding:10px 13px;border-radius:12px;background:var(--panel);
+          border:1px solid var(--line);font-size:14px;line-height:1.65;
+          white-space:pre-wrap;word-break:break-word;max-width:calc(100% - 56px)}
+  .msg.me .bubble{background:#eef3ff;border-color:#d6e2ff}
+  .msg.err .bubble{color:var(--bad);border-color:#f2c4c4;background:#fdf1f1}
+  .meta{margin-top:9px;display:flex;flex-wrap:wrap;gap:6px}
+  .tag{font-size:11px;padding:2px 7px;border-radius:999px;border:1px solid var(--line);
+       color:var(--dim);background:#fafbfc}
+  .tag.ok{color:var(--ok);border-color:#bfe3c9;background:#f1fbf4}
+  .tag.warn{color:var(--warn);border-color:#f0dcae;background:#fdf9ee}
+  .tag.bad{color:var(--bad);border-color:#f2c4c4;background:#fdf1f1}
+  footer{padding:12px 18px 16px;background:var(--panel);border-top:1px solid var(--line)}
+  .box{max-width:780px;margin:0 auto;display:flex;gap:8px;align-items:flex-end}
+  textarea{flex:1;resize:none;min-height:44px;max-height:140px;padding:11px 12px;
+           border:1px solid var(--line);border-radius:12px;font-size:14px;line-height:1.5;
+           font-family:inherit;outline:none}
+  textarea:focus{border-color:var(--accent)}
+  button{padding:0 18px;height:44px;border:0;border-radius:12px;background:var(--accent);
+         color:#fff;font-size:14px;cursor:pointer}
+  button:disabled{background:#a9bce6;cursor:default}
+  .tip{max-width:780px;margin:8px auto 0;font-size:11px;color:var(--dim);
+       display:flex;gap:14px;flex-wrap:wrap}
+</style>
+</head>
+<body>
+<header>
+  <h1>MVE 对话</h1>
+  <span class="hint">技能库重放 + 环境实查，不是模型自由发挥</span>
+  <select id="model" title="选场景"></select>
+</header>
+<main><div class="wrap" id="list"></div></main>
+<footer>
+  <div class="box">
+    <textarea id="q" rows="1" placeholder="像问 DeepSeek 一样问它，例如：技术部9月的餐补和交通补贴总额是多少？"></textarea>
+    <button id="send">发送</button>
+  </div>
+  <div class="tip">
+    <span>Enter 发送 · Shift+Enter 换行</span>
+    <span id="stat"></span>
+  </div>
+</footer>
+<script>
+var P = window.MVE_PREFIX || '';
+var list = document.getElementById('list');
+var main = document.querySelector('main');
+var ta = document.getElementById('q');
+var btn = document.getElementById('send');
+var sel = document.getElementById('model');
+var stat = document.getElementById('stat');
+var history = [];
+var busy = false;
+
+function scrollDown(){ main.scrollTop = main.scrollHeight; }
+
+fetch(P + '/v1/models').then(function(r){ return r.json(); }).then(function(d){
+  (d.data || []).forEach(function(m){
+    var o = document.createElement('option');
+    o.value = m.id;
+    o.textContent = m.id + (m.description ? ' · ' + m.description : '');
+    sel.appendChild(o);
+  });
+}).catch(function(e){ stat.textContent = '模型列表加载失败：' + e.message; });
+
+function add(role, text){
+  var wrap = document.createElement('div');
+  wrap.className = 'msg' + (role === 'me' ? ' me' : '');
+  var who = document.createElement('div');
+  who.className = 'who';
+  who.textContent = role === 'me' ? '我' : 'MV';
+  var b = document.createElement('div');
+  b.className = 'bubble';
+  b.textContent = text;
+  wrap.appendChild(who);
+  wrap.appendChild(b);
+  list.appendChild(wrap);
+  scrollDown();
+  return {wrap: wrap, bubble: b};
+}
+
+function addTags(bubble, x){
+  if (!x) return;
+  var m = document.createElement('div');
+  m.className = 'meta';
+  function t(txt, cls){
+    if (!txt) return;
+    var s = document.createElement('span');
+    s.className = 'tag' + (cls ? ' ' + cls : '');
+    s.textContent = txt;
+    m.appendChild(s);
+  }
+  t('场景 ' + (x.scene || '?'));
+  var jr = String(x.judgment_result || '');
+  t('判定 ' + (jr || '未知'), jr === 'written' ? 'ok' : 'warn');
+  t(x.mastered ? '掌握 ✓' : '未掌握', x.mastered ? 'ok' : '');
+  if (x.tool_line_used) t('工具线 claim', 'warn');
+  t('供给线 ' + (x.scope_line || '?'));
+  t(x.topic_id);
+  bubble.appendChild(m);
+}
+
+async function send(){
+  var q = ta.value.trim();
+  if (!q || busy) return;
+  busy = true;
+  btn.disabled = true;
+  ta.value = '';
+  add('me', q);
+  history.push({role: 'user', content: q});
+  var n = add('bot', '正在跑（复用技能库 + 实查环境，可能要 20~60 秒）…');
+  var t0 = Date.now();
+  var timer = setInterval(function(){
+    stat.textContent = '已等 ' + Math.round((Date.now() - t0) / 1000) + ' 秒';
+  }, 1000);
+  try{
+    var r = await fetch(P + '/v1/chat/completions', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({model: sel.value || 'mve', messages: history})
+    });
+    var d = await r.json();
+    clearInterval(timer);
+    if (!r.ok || d.error){
+      throw new Error((d.error && (d.error.message || d.error)) || ('HTTP ' + r.status));
+    }
+    var c = d.choices && d.choices[0] && d.choices[0].message
+            && d.choices[0].message.content;
+    n.bubble.textContent = c || '(空回答)';
+    addTags(n.bubble, d.x_mve);
+    history.push({role: 'assistant', content: String(c || '')});
+    stat.textContent = '用时 ' + Math.round((Date.now() - t0) / 1000) + ' 秒';
+  }catch(e){
+    clearInterval(timer);
+    n.wrap.className = 'msg err';
+    n.bubble.textContent = '失败：' + e.message;
+    stat.textContent = '失败（详见气泡）';
+  }finally{
+    busy = false;
+    btn.disabled = false;
+    ta.focus();
+    scrollDown();
+  }
+}
+
+btn.addEventListener('click', send);
+ta.addEventListener('keydown', function(e){
+  if (e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); send(); }
+});
+</script>
+</body>
+</html>
+"""
 
 
 def main() -> None:
