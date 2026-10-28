@@ -66,7 +66,7 @@ def main() -> int:
         db = os.path.join(tmp, "t.duckdb")
         orig = U._scene_db_path
         try:
-            U._scene_db_path = lambda sid: (db, tmp)
+            U._scene_db_path = lambda sid: (db, tmp, "scene")
             csv = ("dept,name,amount\n技术,张伟,600\n技术,李娜,920\n"
                    "财务,王强,300\n").encode("utf-8")
             r = U.ingest("B", "tech 津贴.csv", csv)

@@ -1527,6 +1527,33 @@ async def consume(
                     # 相加或者做什么，也算能力」）。
                     _nar_note += ("；下面各「来源技能」条目是这句话问的总量的"
                                   "组成部分，允许相加汇总，逐个来源编号都标上")
+                    # 合计**算好喂给它**（确定性算术，不依赖 LLM 做加法）：
+                    # 2026-10-28 实测叙事层三次把「合计」写成其中一项
+                    # （133500 而不是 137100）。每个来源取第一条的金额列值。
+                    _parts: list[float] = []
+                    for _e in _executed:
+                        _rows = (_e.get("data") or {}).get("rows") or []
+                        if not _rows:
+                            continue
+                        _r0 = _rows[0]
+                        _pairs = (_r0.items() if isinstance(_r0, dict)
+                                  else [])
+                        for _k, _v in _pairs:
+                            _kl = str(_k).lower()
+                            if any(u in _kl for u in ("hour", "day", "count",
+                                                      "num", "小时", "天数",
+                                                      "次数", "数量")):
+                                continue
+                            try:
+                                _parts.append(float(_v))
+                            except Exception:
+                                continue
+                            break
+                    _parts = [p for p in _parts if p]
+                    if len(_parts) > 1:
+                        _nar_note += (f"；各来源金额相加 = {sum(_parts):.2f} ——"
+                                      f" 题面问的是合计/总额时**必须**用这个数，"
+                                      f"不许只报其中一项")
                 _nar_note += ("；⚠️ 列名是 hours/天数/次数 这类数量/时长的值"
                               "**不是钱**，绝不许写成「××元的加班费/扣款」——"
                               "库里没有费率，这笔钱就不存在")
