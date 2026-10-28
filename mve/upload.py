@@ -172,18 +172,26 @@ def _q(ident: str) -> str:
 
 
 def _scene_db_path(scene_id: str) -> tuple[str, str, str]:
-    """(落库路径, 场景目录, kind)。取场景自己的库；没有就 uploads.duckdb。"""
+    """(落库路径, 场景目录, kind) —— **场景分配到的那个数据源**。
+
+    用户 2026-10-28：「给每个场景分配一个数据源，会存放我们对话传上来的
+    东西，检索逻辑一致」。所以这里不再自己发明 uploads.duckdb：
+      · 普通场景 → `scene_profile.ensure_source()`（每个场景一个固定库，
+        学习/消费/出题/判官读的都是它）；
+      · VLML 域（默认场景）→ 仍是 `uploads.duckdb`，因为 VLML 有自己的数据域，
+        混进去等于破了场景隔离。
+    """
     import scene_profile
     prof = scene_profile.profile(scene_id) or {}
     d = str(prof.get("scene_dir") or "") or scene_profile.scene_dir(scene_id)
-    dbp = str(prof.get("db_path") or "")
     kind = str(prof.get("kind") or "")
-    if dbp and kind in ("scene", "vlml"):
-        # VLML 域（场景 A）不往里写：那是另一个数据域，混进去等于破了场景隔离。
-        if kind == "vlml":
-            return str(Path(d) / "uploads.duckdb"), d, kind
-        return dbp, d, kind
-    return str(Path(d) / "uploads.duckdb"), d, kind
+    if kind == "vlml":
+        return str(Path(d) / "uploads.duckdb"), d, kind
+    try:
+        return str(scene_profile.ensure_source(scene_id)), d, kind
+    except Exception:
+        dbp = str(prof.get("db_path") or "")
+        return (dbp or str(Path(d) / "uploads.duckdb")), d, kind
 
 
 def _read_text(path: str, limit: int = TEXT_LIMIT) -> str:

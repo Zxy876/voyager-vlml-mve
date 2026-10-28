@@ -111,13 +111,84 @@ def profile(scene_id: str = "") -> dict[str, Any]:
     except Exception:
         p = ds
     if not Path(p).exists():
-        out.update(kind=MISSING, db_path=p,
-                   why=f"场景数据源不存在：{p}")
+        # 2026-10-28 改：配了路径但不存在**不再判 missing 空转**（日志实证：
+        # 场景 G 配的 /root/mve/心悦文集 不存在 → 每轮 unreachable，160 轮
+        # 跑满、0 个里程碑）。改成降级到「给这个场景分配的数据源」，并把这件
+        # 事写进 why 让人看得见（不假装配置有效）。
+        alt = ensure_source(sid)
+        out.update(kind=SCENE, db_path=alt, scene_dir=str(scene_dir(sid)),
+                   source_missing=True,
+                   why=(f"你配的数据源 {p} 不存在 —— 已先给本场景分配标准库 "
+                        f"{Path(alt).name}；对话上传的文件会存这里，"
+                        f"要改用别的库请把 data_source 指到存在的文件"))
+        out["tables"] = _tables(alt)
         return out
     out.update(kind=SCENE, db_path=p, scene_dir=str(scene_dir(sid)),
                why=f"本场景自己的数据源：{Path(p).name}（不经 VLML）")
     out["tables"] = _tables(p)
     return out
+
+
+SOURCE_DB_NAME = "scene.duckdb"
+
+
+def ensure_source(scene_id: str) -> str:
+    """给场景**分配**数据源：<场景目录>/scene.duckdb（没有就建空库）。
+
+    用户 2026-10-28：「给每个场景分配一个数据源，会存放我们对话传上来的
+    东西，检索逻辑一致」。
+
+    于是「场景有没有数据源」不再是用户要回答的问题 —— 每个场景**都有**一个，
+    位置固定、名字固定。对话里上传的表格落进它，学习/消费/出题/判官读的也是
+    它，四条路径看同一个库（检索逻辑一致）。
+
+    优先级：
+      ① 场景显式配了 data_source 且文件真存在 → 用户说了算，不另建；
+      ② 场景目录里已经有库（早期 uploads.duckdb / 手工放的 .duckdb）→ 复用，
+         不制造第二个库；
+      ③ 都没有 → 建 scene.duckdb（空库也算「有数据源」，只是还没表）。
+
+    ⚠️ 空库 ≠ 能学习：库里没有表就像空房间，出不了题。调用方要按
+    `profile()["tables"]` 判，并如实提示「上传文件或放数据进来」。
+    """
+    sid = str(scene_id or "").strip()
+    d = Path(scene_dir(sid))
+    sc = _scene(sid)
+    ds = str(sc.get("data_source") or "").strip()
+    if ds:
+        try:
+            import db_switch
+            p = str(db_switch.resolve(ds))
+        except Exception:
+            p = ds
+        if Path(p).exists():
+            return p
+    # 已有库就复用（别制造两个：老场景可能叫 uploads.duckdb / payroll.duckdb）
+    # 选法固定可解释：① 标准名 scene.duckdb 优先；② 否则取**最近改动**的那个
+    # （刚上传/刚放进去的才是当前在用的）；不按字母序瞎挑。
+    dbs = list(d.glob("*.duckdb")) if d else []
+    if dbs:
+        std = d / SOURCE_DB_NAME
+        if std.exists():
+            return str(std)
+        try:
+            dbs.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+        except Exception:
+            dbs.sort()
+        return str(dbs[0])
+    target = d / SOURCE_DB_NAME
+    try:
+        import duckdb
+        con = duckdb.connect(str(target))       # 建空库（只建文件，不建表）
+        con.close()
+    except Exception:
+        pass                                     # 建不出来就让上层如实报
+    return str(target)
+
+
+def source_tables(scene_id: str) -> list[str]:
+    """这个场景数据源里现在有哪些表（空 = 还没有数据）。"""
+    return _tables(ensure_source(scene_id))
 
 
 def scene_dir(scene_id: str) -> str:
