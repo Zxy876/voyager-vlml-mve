@@ -1769,9 +1769,26 @@ async def consume(
     # run_log —— 自动抢跑的轮次人看不见、也不落账，才有截图里「轨迹 0 轮」。
     # 原版铁律不变：任务做成（取到值）才固化；没做成就留在学习账上继续学。
     if not real_calls:
-        learn_kick = {"kicked": False, "manual": True,
-                      "why": "命中但没取到真数（能力还没学会）—— 学习等你在"
-                             "驾驶舱点「▶ 启动 Voyager」触发"}
+        # 自动拉起学习（2026-10-28 用户改设计，与场景分支同款）：答不了数据题
+        # 就**进入学习**（同构 R1「答不了就进入思考」），回复里明说「正在学」。
+        if _is_data_question(question):
+            try:
+                import learn_orchestrate as _lo3
+                _kk = _lo3.kick_learning(
+                    question, _scene_id,
+                    reason="消费没答出来（VLML 侧真空/未学）—— 新对话顺带拉起学习")
+                learn_kick = {
+                    "kicked": bool(_kk.get("kicked")),
+                    "manual": not bool(_kk.get("kicked")),
+                    "why": ("已自动拉起后台学习（学完再问同一句即可复用）"
+                            if _kk.get("kicked") else
+                            f"自动学习没拉起：{_kk.get('why') or '未知'}")}
+            except Exception as _ke2:
+                learn_kick = {"kicked": False, "manual": True,
+                              "why": f"自动学习拉起失败：{type(_ke2).__name__}: {_ke2}"}
+        else:
+            learn_kick = {"kicked": False, "manual": True,
+                          "why": "非数据题（概念/解释类），无需学习流程"}
 
     # ---- ④ 整理事实（**面板披露「取到了哪些数」用，不再是判分的前提**）----
     # ⚠️ 2026-10-13 改判法（用户原话）：「整理事实这个事情本来就是交给 LLM 的，
@@ -1928,23 +1945,38 @@ async def consume(
         answer = (str(answer).rstrip()
                   + "（⚠️ 未验证：本轮未通过 critic 判定，此数字不可信）")
 
-    # ---- 工具线兜底（第 4 步，DeepSeek 消费同构，2026-10-28 落地）----
-    # 库场景答不出（没取到真数 / 裁判硬伤）→ 作用域落 tool 线：联网取公开
-    # 资料、当场作答、用完即弃 —— claim（有真值但未知）。**不入技能库、
-    # 不进能力账、不计入学习曲线**（critic_ok=False → absorbed={} 恒成立，
-    # 工具功劳不会算到学习头上）。学习线照常 kick（on_miss），两条供给线
-    # 并行不互斥：库内可复现的归学习线，库外时变的归工具线。
+    # ---- 句句有回复（R1 客户端同构，与场景分支同一套三层分流）----
     tool_line: dict[str, Any] = {}
-    if (not critic_ok) and _scene_kind == "scene":
-        try:
-            tool_line = await _tool_line_fallback(question)
-        except Exception as e:  # pragma: no cover
-            tool_line = {"used": False, "answer": "", "sources": [],
-                         "note": f"工具线异常：{type(e).__name__}: {str(e)[:140]}"}
-        if tool_line.get("answer"):
-            answer = (str(tool_line["answer"]).rstrip()
-                      + "（⚠️ 工具线 claim：来自联网资料，未经库内验证；"
-                        "不进能力账、不计入学习曲线）")
+    _no_reply_v = not critic_ok and not str(answer or "").strip()
+    if _no_reply_v and _is_data_question(question):
+        # 内部数据题答不出：绝不联网、绝不推断（都是编数）—— 如实交代判官
+        # 结论 + 学习状态（上面已 auto-kick）。
+        _lim_v = str(critic_why or "")
+        answer = ("这题这轮没答出来 —— 不编数。"
+                  + (f"判官结论：{_lim_v[:220]} " if _lim_v.strip() else "")
+                  + ("已自动拉起后台学习，学完再问同一句即可复用。"
+                     if learn_kick.get("kicked") else
+                     f"{learn_kick.get('why') or ''}"))
+    elif _no_reply_v:
+        if not _is_data_question(question):
+            # 非数据题先 inference（同 DeepSeek 客户端：联网默认关，知识题
+            # 模型直接答，标「模型推断」）；模型自评不知 → 工具线 claim。
+            _inf_v = _inference_answer(question)
+            if _inf_v.get("used"):
+                answer = (str(_inf_v["answer"]).rstrip()
+                          + "（⚠️ 模型推断：未从环境取数验证；不入库、"
+                            "不计入学习曲线）")
+                inference_used = True
+        if not str(answer or "").strip():
+            try:
+                tool_line = await _tool_line_fallback(question)
+            except Exception as e:  # pragma: no cover
+                tool_line = {"used": False, "answer": "", "sources": [],
+                             "note": f"工具线异常：{type(e).__name__}: {str(e)[:140]}"}
+            if tool_line.get("answer"):
+                answer = (str(tool_line["answer"]).rstrip()
+                          + "（⚠️ 工具线 claim：来自联网资料，未经库内验证；"
+                            "不进能力账、不计入学习曲线）")
 
     # ---- 答完了 → 这题进能力库 → 掌握（判据是"答没答出来"，不是覆盖率）----
     # 判据是"答没答出来"（取到数 + 给出了回答 + **critic 判过**），**不是**有没有
@@ -2034,6 +2066,8 @@ async def consume(
         "tool_line_used": bool(tool_line.get("used")),
         "tool_sources": (tool_line.get("sources") or [])[:5],
         "tool_line_note": str(tool_line.get("note") or "")[:200],
+        # inference 兜底（句句有回复）：与场景分支同口径的披露。
+        "inference_used": bool(inference_used),
         "cold_start": bool(absorbed.get("cold_start")),
         "node_status": str(absorbed.get("node_status") or ""),
         # —— 路由命中判定（双阈值，非人审）——
