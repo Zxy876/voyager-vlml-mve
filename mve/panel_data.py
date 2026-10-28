@@ -446,6 +446,10 @@ def _consume_curve(limit: int = 40,
             "same_metric": bool(rec.get("same_metric")),
             "voyager_sound": bool(rec.get("voyager_sound")),
             "judged": bool(rec.get("judged")),
+            # 三态披露（2.5）：False = 裁判根本没对照上，上面三个 bool 是
+            # bool(None)=False 占位、无意义 —— 前端据此显示「未对照」而非「有硬伤」。
+            "referee_compared": bool(rec.get("referee_compared")),
+            "scope_line": str(rec.get("scope_line") or ""),
             "referee_rows": int(rec.get("referee_rows") or 0),
             "coverage_referee": (float(rec["coverage_referee"])
                                  if rec.get("coverage_referee") is not None else None),

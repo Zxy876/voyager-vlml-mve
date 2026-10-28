@@ -1155,7 +1155,9 @@ function consumeCurveBody(cc){
             : (c.same_metric?'<span class="chip ok">是</span>':'<span class="chip warn">不是</span>')}</td>
       <td>${c.coverage===null||c.coverage===undefined
             ? '<span class="chip grey">—</span>'
-            : (c.voyager_sound?'<span class="chip ok">站得住</span>':'<span class="chip bad">有硬伤</span>')}</td>
+            : (c.referee_compared
+                ? `<span class="chip ${c.voyager_sound?'ok':'bad'}">${c.voyager_sound?'站得住':'有硬伤'}</span>`
+                : '<span class="chip grey">未对照</span>')}</td>
       <td style="font-size:12px">${ESC(c.method_reason||c.verdict||'')}${c.method_diff?'（'+ESC(c.method_diff)+'）':''}</td>
     </tr>`).join('');
   const delta=(last.mastered_total||0)-(first.mastered_total||0);
@@ -2161,9 +2163,9 @@ function consumeBlock(im){
       ${judged
         ? (im.judged
             ? `<span class="chip ${im.coverage>=0.95?'ok':(im.coverage>0?'warn':'bad')}">一致度 ${pct(im.coverage)}</span>
-               <span class="chip ${im.voyager_sound?'ok':'bad'}">${im.voyager_sound?'做法站得住':'做法有硬伤'}</span>`
+               <span class="chip ${im.referee_compared?(im.voyager_sound?'ok':'bad'):'grey'}">${im.referee_compared?(im.voyager_sound?'做法站得住':'做法有硬伤'):'未对照（裁判没跑成）'}</span>`
             : `<span class="chip grey">口径不同，这一问没真正判到（多数是裁判自己跑偏）</span>
-               <span class="chip ${im.voyager_sound?'ok':'bad'}">${im.voyager_sound?'Voyager 做法站得住':'Voyager 做法有硬伤'}</span>`)
+               <span class="chip ${im.referee_compared?(im.voyager_sound?'ok':'bad'):'grey'}">${im.referee_compared?(im.voyager_sound?'Voyager 做法站得住':'Voyager 做法有硬伤'):'未对照（裁判没跑成）'}</span>`)
         : '<span class="chip grey">未判（VLML 那一路没取到数）</span>'}
       ${(im.coverage_referee!==null&&im.coverage_referee!==undefined)
         ? `<span class="chip grey">硬尺子 ${pct(im.coverage_referee)}</span>`:''}
@@ -2357,7 +2359,7 @@ function renderImportResult(res){
       ${res.method_compare
         ? `<div style="margin-top:4px">
              <span class="chip ${res.same_metric?'ok':'warn'}">${res.same_metric?'同一个量':'两边算的不是同一个量'}</span>
-             <span class="chip ${res.voyager_sound?'ok':'bad'}">${res.voyager_sound?'Voyager 做法站得住':'Voyager 做法有硬伤'}</span>
+             <span class="chip ${res.referee_compared?(res.voyager_sound?'ok':'bad'):'grey'}">${res.referee_compared?(res.voyager_sound?'Voyager 做法站得住':'Voyager 做法有硬伤'):'未对照（裁判没跑成）'}</span>
              <span class="chip grey">一致度 ${pct(res.coverage)}</span>
            </div>
            ${res.method_reason?`<div style="margin-top:4px;font-size:12px"><b>依据：</b>${ESC(res.method_reason)}</div>`:''}

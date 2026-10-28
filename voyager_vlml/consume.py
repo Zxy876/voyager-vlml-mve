@@ -1670,6 +1670,25 @@ async def consume(
     critic_ok = bool(real_calls)
     critic_why = ("" if critic_ok
                   else "取到真空（ok 调用里没有一行真数）——消费侧确定性判据")
+    # ---- 2.5 口径防线（2026-10-28）：裁判对照从「仅供参考的披露」升为「硬伤即拦」----
+    # compare 只在两边都取到真行时才产出；空 compare 的 voyager_sound 旧代码
+    # 写成 bool(None)=False —— 面板「做法有硬伤」其实是「裁判没跑成」，误导
+    # （2026-10-28 消费实测 referee_rows=0 时三条信号全 False）。三态修正：
+    # referee_compared=False = 未对照（旧 bool 字段此时无意义，面板改看三态）。
+    # 裁判判出硬伤（voyager_sound=False）= 有行 ≠ 答出来：答案标「⚠️ 未验证」、
+    # 不进能力库、不标 mastered —— 与「真空判未完成」同一条铁律的口径侧执行。
+    referee_compared = bool(compare)
+    if referee_compared and compare.get("voyager_sound") is False:
+        critic_ok = False
+        critic_why = ("Voyager 做法有硬伤（裁判对照）："
+                      + str(compare.get("reason") or "")[:160]
+                      + " —— 有行不等于答出来（口径侧）")
+    elif referee_compared and compare.get("same_metric") is False:
+        # 两边算的不是同一个量：多数是裁判自己跑偏（2026-10-14 拍板「裁判跑偏
+        # ≠ Voyager 有硬伤」）→ 不拦 mastered，但答案带口径存疑披露。
+        if answer:
+            answer = (str(answer).rstrip()
+                      + "（⚠️ 口径存疑：独立对照两边算的不是同一个量，数值请谨慎）")
     # 判未完成 → 答案标注未验证（与场景分支同款，2026-10-24 用户拍板）。
     if answer and not critic_ok:
         answer = (str(answer).rstrip()
@@ -1729,6 +1748,10 @@ async def consume(
         "method_diff": str(compare.get("diff") or ""),
         "same_metric": bool(compare.get("same_metric")),
         "voyager_sound": bool(compare.get("voyager_sound")),
+        # 三态披露（2.5）：False = 裁判根本没对照上（没跑成/有一路没取到真数），
+        # 此时上面的 same_metric/voyager_sound 是 bool(None)=False 的占位，
+        # **无意义** —— 面板必须看这个字段再决定信不信那两个 bool。
+        "referee_compared": referee_compared,
         # 两边算的不是同一个量 → 这一问**没真正判到**（多数情况是裁判自己跑偏）。
         # 这时覆盖率是"口径一致度 0"，不是"Voyager 答错" —— 面板必须分开展示，
         # 否则一个红彤彤的 0% 会把"没判到"说成"能力不行"。
@@ -1752,6 +1775,9 @@ async def consume(
         "mastery": (round(m_tot / a_tot, 4) if a_tot else None),
         # —— 1→n 泛化：场景归属 + 冷启动标记（补 ⑤ 缺口，使记录可按场景隔离）——
         "root_scene": str(absorbed.get("root_scene") or _scene_id),
+        # 作用域判定（2.5）：这句话归哪条供给线（learn/tool/inference）——
+        # 面板与对账用；工具线接入后（第 4 步）据此分流。
+        "scope_line": _scope_line(_scene_id),
         "cold_start": bool(absorbed.get("cold_start")),
         "node_status": str(absorbed.get("node_status") or ""),
         # —— 路由命中判定（双阈值，非人审）——
@@ -2208,6 +2234,15 @@ def _looks_like_recipe(code: str) -> bool:
 _DATE_LIT_RE = re.compile(r"^\d{4}[-/]\d{1,2}([-/]\d{1,2})?$")
 
 
+def _scope_line(scene_id: str) -> str:
+    """作用域判定（mve/scope.py，2.5）。失败如实降级 inference，不假装判过。"""
+    try:
+        import scope as _scope_mod
+        return str(_scope_mod.scope_line(scene_id))
+    except Exception:
+        return "inference"
+
+
 def _sql_literal_guard(sql: str, db_path: str) -> str:
     """SQL 配方入库前的确定性守卫：字符串字面量必须能在 db_observation 实查
     清单里指认。返回拒绝原因；'' = 通过。
@@ -2266,6 +2301,53 @@ def _sql_literal_guard(sql: str, db_path: str) -> str:
         return (f"SQL 字面量 '{t}' 在数据源实查清单里指认不了"
                 f"（库里没有这个取值）—— 大概率是幻觉取值，拒绝入库")
     return ""
+
+
+def _unit_guard(sql: str, question: str) -> str:
+    """SQL 配方入库前的确定性**单位守卫**（2.5 步落地，2026-10-28 服务器实测）：
+    聚合目标是「数量/时长」列，而题面问的是**钱** —— 小时数/天数当金额用的
+    单位幻觉从此进不了库。
+
+    事故实证（场景 B）：tech_overtime_pay 技能 code = SUM(overtime_hours)
+    （求的是加班**小时数**），却被当成「加班费」配方入库且 r=1.0 —— 内层
+    critic 放行（单表聚合没假设费率，字面量全真），r 只看 real_calls/rows
+    看不出口径错。库里没有加班费率，这种配方组合进总工资答案必错。
+
+    与 `_sql_literal_guard`（字面量真伪）同层互补：字面量是真的、列名也是真
+    的，错的是**单位语义**。确定性判据（不靠 LLM）：
+      ① 题面含钱语义词（工资/费/扣款/金额/…/pay/salary/…）；
+      ② SQL 聚合（SUM/AVG）的目标列名是数量/时长单位（hours/days/count/…）；
+      ③ SQL 里没有乘法（有 列×列 才可能把单位换算成钱 —— 有费率列时不算
+         假设）。SELECT * / COUNT(*) 的星号不算乘法。
+    返回拒绝原因；'' = 通过。任何拿不准的情形都放行（判官仍在兜底）。
+    """
+    _s = str(sql or "").strip()
+    _q = str(question or "").strip()
+    if not _s or not _q:
+        return ""
+    _MONEY = ("工资", "薪", "酬", "费", "扣款", "金额", "总额", "收入",
+              "pay", "salary", "wage", "income", "cost", "fee", "amount")
+    if not any(w in _q.lower() for w in _MONEY):
+        return ""
+    _UNITS = ("hours", "days", "count", "num_", "_num", "hours", "days",
+              "小时", "天数", "次数", "数量")
+    # 聚合目标列：SUM(col) / AVG(col) / sum(col) —— 排除 COUNT（它天生就是数量）。
+    aggs = re.findall(r"\b(?:SUM|AVG)\s*\(\s*([A-Za-z_\u4e00-\u9fff][\w\u4e00-\u9fff.]*)\s*\)",
+                      _s, re.I)
+    bad = [c for c in aggs
+           if any(u in c.lower() for u in ("hours", "days", "count",
+                                           "小时", "天数", "次数", "数量"))]
+    if not bad:
+        return ""
+    # ③ 有乘法 = 可能把单位换算成钱（col * rate）→ 不算单位幻觉，放行。
+    #    先剥掉 SELECT * 与 COUNT(*)，再找 列×列 乘法。
+    _bare = re.sub(r"SELECT\s+\*", " ", _s, flags=re.I)
+    _bare = re.sub(r"COUNT\s*\(\s*\*\s*\)", " ", _bare, flags=re.I)
+    if re.search(r"[\w)\]]\s*\*\s*[\w(]", _bare):
+        return ""
+    return (f"聚合目标列 {','.join(bad)} 的单位是数量/时长（小时/天数），"
+            f"而题面问的是金额 —— 库里没有换算费率，不许假设（单位守卫）。"
+            f"要答金额请改用金额列，或如实判该维度不可答")
 
 
 def _fanout_guard(sql: str, db_path: str) -> str:
@@ -2380,7 +2462,7 @@ def _absorb(question: str, sql: str, topic_id: str,
                            # 这次落到技能库的 key（没有则为空）—— 调用方据此
                            # 指认「是哪一条」，别按 code 字符串匹配（泛化后必败）。
                            "skill_key": ""}
-    # 知识型任务（怎么养育/如何理解…）没有取数 SQL，但有答案 —— 照样算"答出来了"，
+    # 无取数 SQL 但有答案的任务（怎么养育/如何理解…）—— 照样算"答出来了"，
     # 建节点 + 标掌握；只是不写技能库（技能存的是**可执行配方**，答案本身不是配方）。
     if not sql and not str(answer or "").strip():
         return out
@@ -2441,7 +2523,7 @@ def _absorb(question: str, sql: str, topic_id: str,
         return out
 
     if not str(sql or "").strip():
-        out["skill_action"] = "知识型答案（无可执行配方，不写技能库）"
+        out["skill_action"] = "答案无取数配方（不写技能库；技能存的是可执行配方）"
         return out
     if not _looks_like_recipe(sql):
         # 原版技能 = 一次**成功 rollout 的 program_code**，那是真的调了
@@ -2450,8 +2532,8 @@ def _absorb(question: str, sql: str, topic_id: str,
         # 存进去下次就会被当"可复用配方"重放，等于把记忆固化成能力。
         # 2026-10-19 实测：Scene D 问「什么是阿斯伯格」，消费层写的正是这种代码，
         # 被存成 consume_e81eea3e 技能 —— 假配方就这么进了库。
-        out["skill_action"] = ("知识型答案（代码里没有任何取数动作，不是配方，"
-                               "不写技能库）")
+        out["skill_action"] = ("答案无取数动作（代码里没有任何数据源调用，"
+                               "不是配方，不写技能库）")
         return out
     # 入库前确定性守卫（2026-10-24 工资题事故后加）：SQL 字面量取值必须能在
     # 数据源实查清单里指认 —— 'food'/'transportation' 类幻觉从此进不了库。
@@ -2460,6 +2542,10 @@ def _absorb(question: str, sql: str, topic_id: str,
         from scene_profile import profile as _sp
         _dbp = str((_sp(_scene_id) or {}).get("db_path") or "")
         _guard_why = _sql_literal_guard(str(sql), _dbp)
+        if not _guard_why:
+            # 单位守卫（2.5，2026-10-28）：字面量全真也拦不住「小时数当钱」——
+            # SUM(overtime_hours) 当加班费配方入库的实证（tech_overtime_pay）。
+            _guard_why = _unit_guard(str(sql), str(question))
         if _guard_why:
             out["skill_action"] = f"拒绝入库：{_guard_why}"
             print(f"  · {_guard_why}")
