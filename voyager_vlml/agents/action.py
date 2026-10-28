@@ -316,15 +316,15 @@ class VLMLActionAgent:
         # 父表一行对应子表多行时，绝不能直接「父 JOIN 子」再 SUM——那会把父表
         # 数值按子表行数翻倍（乘爆，必错）。这与下方 fan-out 闸门互为表里。
         base += (
-            "\n\n【跨一对多关系聚合的硬规矩】当父表的一行对应子表多行（如一名员工"
-            "有多条考勤/津贴记录），**绝不能直接 `父 JOIN 子表` 后做 SUM/AVG**——"
+            "\n\n【跨一对多关系聚合的硬规矩】当父表的一行对应子表多行（一对多"
+            "关系），**绝不能直接 `父 JOIN 子表` 后做 SUM/AVG**——"
             "那样父表的数值会被子表行数重复乘，答案必错（fan-out 闸门会直接拒用）。"
-            "正确写法二选一：① 先把每个子表按关联键 `GROUP BY` 聚合成单行，再"
+            "正确写法二选一：① 先把子表按关联键 `GROUP BY` 聚合成单行，再"
             " `LEFT JOIN` 到父表；② 改用标量子查询 "
-            "`SUM(e.col + (SELECT COALESCE(SUM(amount),0) FROM 子表 s "
-            "WHERE s.emp_id=e.emp_id AND s.month=:month))`。"
+            "`SUM(父表.数值列 + (SELECT COALESCE(SUM(子表.数值列),0) FROM 子表 "
+            "WHERE 子表.关联键 = 父表.关联键))`。"
             "⚠️ 无论哪种写法，父表自身也要被汇总的列**必须用聚合函数包住**"
-            "（如 `SUM(e.base_salary)`），否则要整句按父表关联键 `GROUP BY emp_id`，"
+            "（如 `SUM(父表.数值列)`），否则要整句按父表关联键 `GROUP BY`，"
             "否则数据库会报 `column must appear in GROUP BY` 错误。"
         )
         blocks: list[str] = []
@@ -342,8 +342,7 @@ class VLMLActionAgent:
             base += (
                 "\n\n【已学会的技能（可复用，按名引用其逻辑）】\n"
                 + "\n\n".join(blocks)
-                + "\n\n复用规则：若题目要求跨多张源表合计（例如「应发 = 基薪 + "
-                  "津贴 + 加班」这类合成题），必须把上面多条技能的逻辑**组合**进"
+                + "\n\n复用规则：若题目要求跨多张源表合计（合成题），必须把上面多条技能的逻辑**组合**进"
                   "同一条查询——分别取各源表的测度再相加/汇总，"
                   "严禁只取其中一条技能就作答（那样会漏维度、给出片面数）。"
             )
@@ -645,13 +644,12 @@ class VLMLActionAgent:
                             f"（{_fan_g.get('rows')} 行 vs 驱动表 "
                             f"{_fan_g.get('distinct')} 行），而你在做聚合 —— "
                             f"父表数值会被按子表行数翻倍，答案必错。请先把右表"
-                            f"按关联键聚合成单行再 JOIN（如 LEFT JOIN "
-                            f"(SELECT emp_id, SUM(amount) AS a FROM allowance "
-                            f"WHERE month=:month GROUP BY emp_id) t "
-                            f"ON t.emp_id=e.emp_id），或改用标量子查询 "
-                            f"SUM(e.col + (SELECT COALESCE(SUM(amount),0) FROM "
-                            f"allowance a WHERE a.emp_id=e.emp_id "
-                            f"AND a.month=:month))")
+                            f"按关联键聚合成单行再 JOIN"
+                            f"（如 LEFT JOIN (SELECT 关联键, SUM(数值列) AS t "
+                            f"FROM 子表 GROUP BY 关联键) s "
+                            f"ON s.关联键=父表.关联键），或改用标量子查询 "
+                            f"SUM(父表.数值列 + (SELECT COALESCE(SUM(子表.数值列),0) FROM "
+                            f"子表 WHERE 子表.关联键=父表.关联键))")
             except Exception:
                 pass
 
@@ -664,11 +662,10 @@ class VLMLActionAgent:
                     _ctx += ("\n\n[环境实查（数据源真实的表/列/取值）：SQL 与答案"
                              "假设的任何表、列、取值都必须能在这里指认，指认不了"
                              " = 编造，判未完成并明说缺什么；答案里的每个具体数"
-                             "字都必须能从取回数据指认或算出。**特别地：两个"
-                             "数值列相乘/相除合成新口径（如 base_salary × "
-                             "overtime_hours 当作「加班费」）同样是假设业务"
-                             "参数** —— 库里没有该口径的列或费率，就是不可"
-                             "计算，判未完成；把月薪当时薪用是语义造假]：\n"
+                             "字都必须能从取回数据指认或算出。**特别地：两个数"
+                             "值列相乘/相除合成新口径，同样是假设业务参数** —— "
+                             "合成出的口径在这份清单里指认不了，就是不可计算，"
+                             "判未完成；]：\n"
                              + _obs)
             except Exception:
                 pass  # 实查清单拿不到时退回原口径（真空闸仍在）
