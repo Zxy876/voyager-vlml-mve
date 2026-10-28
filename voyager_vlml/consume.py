@@ -1271,17 +1271,8 @@ async def consume(
                                     f"{_label} 被 fan-out 闸门拒用（JOIN 乘爆）：{_fwhy[:120]}")
                                 _fails.append({"name": _label, "sql": _sql, "why": _fwhy[:200]})
                                 continue
-                            # 单位守卫（数据一致性，不是业务口径）：小时数当钱用
-                            # 是单位错觉，与「题面问什么」无关 —— 这类确定性
-                            # 检查保留。业务口径（主体/口径/完整性）不在这里判：
-                            # 交给执行后的全貌判官（_fits_judge），它看得到整库
-                            # 全貌，不需要把业务词表写死在代码里（2026-10-28）。
-                            _uwhy = _unit_guard(_sql, question)
-                            if _uwhy:
-                                reuse_errors.append(
-                                    f"{_label} 被单位守卫拒用：{_uwhy[:120]}")
-                                _fails.append({"name": _label, "sql": _sql, "why": _uwhy[:200]})
-                                continue
+                            # 单位守卫已删（2026-10-29）：题面口径/单位语义
+                            # 不在代码里判，交给执行后的全貌判官（_fits_judge）。
                             # 费率守卫（确定性）：乘以库里指认不了的常量 =
                             # 假设费率（SUM(overtime_hours)*100 事故，2026-10-28）。
                             _rwhy = _rate_guard(_sql, _dbp)
@@ -2996,50 +2987,10 @@ def _mentions_value(answer: str, value: float) -> bool:
         return False
 
 
-def _unit_guard(sql: str, question: str) -> str:
-    """SQL 配方入库前的确定性**单位守卫**（2.5 步落地，2026-10-28 服务器实测）：
-    聚合目标是「数量/时长」列，而题面问的是**钱** —— 小时数/天数当金额用的
-    单位幻觉从此进不了库。
-
-    事故实证（场景 B）：tech_overtime_pay 技能 code = SUM(overtime_hours)
-    （求的是加班**小时数**），却被当成「加班费」配方入库且 r=1.0 —— 内层
-    critic 放行（单表聚合没假设费率，字面量全真），r 只看 real_calls/rows
-    看不出口径错。库里没有加班费率，这种配方组合进总工资答案必错。
-
-    与 `_sql_literal_guard`（字面量真伪）同层互补：字面量是真的、列名也是真
-    的，错的是**单位语义**。确定性判据（不靠 LLM）：
-      ① 题面含钱语义词（工资/费/扣款/金额/…/pay/salary/…）；
-      ② SQL 聚合（SUM/AVG）的目标列名是数量/时长单位（hours/days/count/…）；
-      ③ SQL 里没有乘法（有 列×列 才可能把单位换算成钱 —— 有费率列时不算
-         假设）。SELECT * / COUNT(*) 的星号不算乘法。
-    返回拒绝原因；'' = 通过。任何拿不准的情形都放行（判官仍在兜底）。
-    """
-    _s = str(sql or "").strip()
-    _q = str(question or "").strip()
-    if not _s or not _q:
-        return ""
-    _MONEY = ("工资", "薪", "酬", "费", "扣款", "金额", "总额", "收入",
-              "pay", "salary", "wage", "income", "cost", "fee", "amount")
-    if not any(w in _q.lower() for w in _MONEY):
-        return ""
-    # 聚合目标列：SUM(col) / AVG(col) / sum(col) —— 排除 COUNT（它天生就是数量）。
-    aggs = re.findall(r"\b(?:SUM|AVG)\s*\(\s*([A-Za-z_\u4e00-\u9fff][\w\u4e00-\u9fff.]*)\s*\)",
-                      _s, re.I)
-    bad = [c for c in aggs
-           if any(u in c.lower() for u in _QTY_UNITS)]
-    if not bad:
-        return ""
-    # ③ 有乘法 = 可能把单位换算成钱（col * rate）→ 不算单位幻觉，放行。
-    #    先剥掉 SELECT * 与 COUNT(*)，再找 列×列 乘法。
-    _bare = re.sub(r"SELECT\s+\*", " ", _s, flags=re.I)
-    _bare = re.sub(r"COUNT\s*\(\s*\*\s*\)", " ", _bare, flags=re.I)
-    if re.search(r"[\w)\]]\s*\*\s*[\w(]", _bare):
-        return ""
-    return (f"聚合目标列 {','.join(bad)} 的单位是数量/时长（小时/天数），"
-            f"而题面问的是金额 —— 库里没有换算费率，不许假设（单位守卫）。"
-            f"要答金额请改用金额列，或如实判该维度不可答")
-
-
+# 单位守卫 _unit_guard 已删（2026-10-29 用户拍板「删」）：代码里不再写任何
+# 数据口径/语义词表 —— 题面问的是什么口径、结果算不算答对，一律交给看全貌
+# 的对题判官（_fits_judge）。防「SUM(数量列) 当钱」的确定性闸退役；兜底仍是
+# 字面量守卫（取值真伪）+ 费率守卫（乘常量=假设参数）+ 判官三层。
 def _catalog_block(db_path: str, limit: int = 4000) -> str:
     """库的全貌（实查表/列/真实取值）——给 agent 看，而不是给守卫写词表。
 
@@ -3528,10 +3479,7 @@ def _absorb(question: str, sql: str, topic_id: str,
         from scene_profile import profile as _sp
         _dbp = str((_sp(_scene_id) or {}).get("db_path") or "")
         _guard_why = _sql_literal_guard(str(sql), _dbp)
-        if not _guard_why:
-            # 单位守卫（2.5，2026-10-28）：字面量全真也拦不住「小时数当钱」——
-            # SUM(overtime_hours) 当加班费配方入库的实证（tech_overtime_pay）。
-            _guard_why = _unit_guard(str(sql), str(question))
+        # 单位守卫已删（2026-10-29 用户拍板）：口径/单位语义全交判官。
         if _guard_why:
             out["skill_action"] = f"拒绝入库：{_guard_why}"
             print(f"  · {_guard_why}")

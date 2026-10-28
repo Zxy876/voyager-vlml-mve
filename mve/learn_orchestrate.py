@@ -250,18 +250,8 @@ def learn_milestone_skills(scene_id: str, topic_id: str, question: str,
         # 注释写明每个槽位填什么。原版同构：原版技能是带参数的函数，实体值
         # 在调用时传入。泛化失败（LLM 挂/产出不像 SQL）就原样入库 —— 泛化
         # 是增强不是闸门，不阻塞学习闭环。
-        # 单位守卫（2.5，2026-10-28 服务器实证后加）：聚合「数量/时长」列当
-        # 钱用的配方不入库 —— SUM(overtime_hours) 当加班费入库（r=1.0 的
-        # 假掌握，tech_overtime_pay 实证）。守卫在泛化前跑（原文带真实列名）。
-        try:
-            from voyager_vlml.consume import _unit_guard as _ug
-            _ugwhy = _ug(str(code), str(item.get("question") or question))
-        except Exception:
-            _ugwhy = ""
-        if _ugwhy:
-            out["skipped"].append(f"{did}：单位守卫——{_ugwhy[:120]}")
-            print(f"  · 单位守卫拒入库：{did}——{_ugwhy[:90]}", flush=True)
-            continue
+        # 单位守卫已删（2026-10-29 用户拍板「删」）：口径/单位语义不在代码里
+        # 写词表判，入库判定交内层 critic + 字面量守卫 + 费率守卫 + 判官。
         try:
             from voyager_vlml.consume import generalize_sql_recipe as _gen
             # 泛化前的原文留着：模板（code）给检索+回填通道，原文给
@@ -408,16 +398,7 @@ async def learn_milestone_composite(scene_id: str, topic_id: str, question: str,
     if _fwhy:
         out["skipped"] = f"组合 SQL 被 fan-out 闸拒用：{_fwhy[:160]}"
         return out
-    # ②' 单位守卫（2.5，2026-10-28）：组合 SQL 同样不许「数量/时长列当钱」。
-    _ugwhy = ""
-    try:
-        from voyager_vlml.consume import _unit_guard as _ug2
-        _ugwhy = _ug2(body, question)
-    except Exception:
-        _ugwhy = ""
-    if _ugwhy:
-        out["skipped"] = f"组合 SQL 被单位守卫拒用：{_ugwhy[:160]}"
-        return out
+    # ②' 单位守卫已删（2026-10-29 用户拍板）：组合 SQL 的口径判定交判官。
     # ③ 真执行取真数（真空成功防线：整行 NULL 不算）
     try:
         env = SceneDBEnv(str(db_path or ""))

@@ -402,7 +402,8 @@ def narrate_answer(question: str, data: Any, *, note: str = "") -> dict[str, Any
 # 时长/数量列的值不许进金额组合）。对不上 → 重采样一次（R1 的 rejection
 # sampling 同构）→ 仍不过就降级为原始数据平铺（可核、无修辞）。
 
-# 非金额列的键面特征（与 consume._unit_guard 同一张单位表——别复制成两份口径）
+# 非金额列的键面特征（叙述层数字对账内部用；2026-10-29 consume._unit_guard
+# 已删 —— 这是代码里仅存的单位表，属机制层不是业务口径词表）
 _NON_MONEY_KEY_UNITS = ("hours", "days", "count", "num", "rate",
                         "小时", "天数", "次数", "数量", "率")
 
