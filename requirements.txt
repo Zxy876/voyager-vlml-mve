@@ -1,3 +1,6 @@
 # 本仓库跑起来只需要两个第三方包，其余全部是 Python 标准库。
 duckdb>=0.10.0
 httpx>=0.27.0
+# 可选：PDF 上传要抽正文（不装也能跑 —— 只是 PDF 会如实报「读不了」）。
+# 2026-10-28 踩过：服务器 venv 里没装，面板上传 PDF 直接 ModuleNotFoundError。
+pypdf>=4.0.0
