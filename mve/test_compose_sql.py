@@ -79,6 +79,38 @@ def main() -> int:
     check("拒因进入 user 消息", "binder error" in _u2)
     check("并说明是「上一轮没成」", "上一轮" in _u2)
 
+    print("== ⑤ 口径二义披露（2026-10-29 用户拍板「答案披露双口径」）==")
+    C.chat_json = lambda *a, **k: {
+        "sql": "SELECT SUM(month_pay) FROM up_工资明细 WHERE month='2026-09'",
+        "used": ["skill_0"], "note": "按当期明细合计",
+        "alt_sql": "SELECT SUM(base_salary) FROM employees WHERE active",
+        "alt_note": "只在职，不含已离职的"}
+    r5 = _compose_sql("九月份公司一共要支付多少钱", skills, "t(x)")
+    check("alt_sql 透传", r5.get("alt_sql", "").startswith("SELECT SUM(base_salary)"))
+    check("alt_note 透传", "在职" in r5.get("alt_note", ""))
+    check("主 SQL 不受影响（口径披露不改主口径）",
+          "month_pay" in r5.get("sql", ""))
+    _sys5 = str(seen[-1][0].get("content") or "")
+    check("system 要求「口径二义要披露，不许悄悄挑一个」",
+          "二义" in _sys5 and "alt_sql" in _sys5)
+    check("system 同时钉住「无二义别乱给」", "别为保险乱给" in _sys5)
+
+    C.chat_json = lambda *a, **k: {"sql": "SELECT 1", "used": [], "note": "",
+                                   "alt_sql": "", "alt_note": ""}
+    r6 = _compose_sql("q", skills, "t(x)")
+    check("无二义 → alt 为空（不产生废话披露）",
+          r6.get("alt_sql") == "" and r6.get("alt_note") == "")
+
+    print("== ⑥ 备选值取数：bool 不许当金额 ==")
+    from voyager_vlml.consume import _first_number
+    check("状态列（bool）被跳过，取到真金额",
+          _first_number({"columns": ["active", "total"],
+                         "rows": [[True, 137100.0]]}) == 137100.0)
+    check("字符串数字（带千分位）也认",
+          _first_number({"rows": [["1,234.5"]]}) == 1234.5)
+    check("没有数值 → None（不编）",
+          _first_number({"rows": [["技术"]]}) is None)
+
     C.chat_json = _orig
     if _FAILS:
         print(f"✗ 失败 {len(_FAILS)} 项：{_FAILS}")

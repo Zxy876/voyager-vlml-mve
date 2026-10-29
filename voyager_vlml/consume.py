@@ -350,12 +350,22 @@ MVE 的对应物只能是**一条 SQL**（SQL 场景里没有函数作用域）�
   就只用 B。双计不是"多算一点更保险"，是错答案（75120 / 330441 事故）。
 - 题面要的量在库里算不出来（缺费率 / 缺列 / 缺表）→ **不拼凑**，输出
   `{"sql": ""}` 并在 note 里说清缺什么（如实不答优于语义造假）。
+- ⚠️ **口径二义要披露，不许悄悄挑一个**（2026-10-29 用户拍板）：如果数据里存在
+  状态列/标记，让这句话的「合计」有两种都站得住的读法（典型：某个状态列把对象
+  标记成已离职/已停用，但这些对象仍有当期的金额行 → 「按当期明细合计」与
+  「只算状态有效的」两个数），就**按最自然的那一种写 `sql`**，再写 `alt_sql`
+  （另一种读法的同口径 SELECT，只取一个数）和 `alt_note`（一句话说清那个读法
+  是什么口径，如「只在职，不含已离职的」）。
+  没有二义时 `alt_sql` 给空字符串 —— **别为保险乱给**，那会把每道题都变成
+  「可能还有别的口径」的废话。
 - 只准引用 schema 里出现的表名列名；筛选取值必须逐字取自环境观察。
 - 与题面无关的配方不要拿来凑数（张冠李戴 = 更糟）。
 
 只返回一个 JSON：{"sql": "一条完整可执行的 SELECT",
 "used": ["用到的配方名（逐字照抄材料里的名字）"],
-"note": "一句话说明怎么组合的、哪些材料没用上、为什么"}
+"note": "一句话说明怎么组合的、哪些材料没用上、为什么",
+"alt_sql": "口径二义时另一种读法的 SELECT（只取一个数）；无二义给空串",
+"alt_note": "alt_sql 那个读法是什么口径（一句话）；无二义给空串"}
 """)
 
 
@@ -369,8 +379,10 @@ def _compose_sql(question: str, skills: list[dict[str, Any]], schema: str,
     那段程序里；原版**没有**「多个技能结果相加」的合并器。SQL 场景没有函数
     作用域，等价物就是一条能把多个量一次算出来的 SELECT（子查询/CTE/JOIN）。
 
-    返回 {"sql", "used", "note"}；sql 为空 = 组合层判定这题在库里算不出来
-    （缺费率/缺列），调用方如实走"没答出来"，绝不拼凑。
+    返回 {"sql", "used", "note", "alt_sql", "alt_note"}；sql 为空 = 组合层判定
+    这题在库里算不出来（缺费率/缺列），调用方如实走"没答出来"，绝不拼凑。
+    alt_sql 非空 = 这题口径**二义**（两种读法都站得住），调用方另跑一次、把
+    另一种读法的数由代码写进答复（2026-10-29 用户拍板「答案披露双口径」）。
 
     `feedback`（原版 step 迭代同构，voyager.py:236-271）：上一轮的执行报错
     或对题判官的拒因 —— 环境与判官给的才是地面真话，喂回去才修正得了。
@@ -418,7 +430,12 @@ def _compose_sql(question: str, skills: list[dict[str, Any]], schema: str,
     _used = [str(x).strip() for x in ((out or {}).get("used") or [])
              if str(x).strip()]
     return {"sql": _sql, "used": _used[:5],
-            "note": str((out or {}).get("note") or "")}
+            "note": str((out or {}).get("note") or ""),
+            # 口径二义披露（2026-10-29 用户拍板）：主口径照答，另给一种读法的
+            # SELECT 与一句话口径说明 —— 由代码去跑、由代码把数写进答复，
+            # **不经叙事层**（叙事层加数会被 verify_answer_numbers 判成编数）。
+            "alt_sql": str((out or {}).get("alt_sql") or "").strip(),
+            "alt_note": str((out or {}).get("alt_note") or "").strip()[:120]}
 
 
 # （_pick_composite_skill 已删 —— 2026-10-26 多技能编排取代「挑一条复合配方」；
@@ -1207,6 +1224,10 @@ async def consume(
         # 原版 voyager.py:226 同构）。_used_skills 是它的技能元数据（披露用）。
         _executed: list[dict[str, Any]] = []
         _used_skills: list[dict[str, Any]] = []
+        # 口径二义披露（2026-10-29 用户拍板「答案披露双口径」）：组合层发现
+        # 这题两种读法都站得住时，另跑一条 alt SQL，把另一种口径的**数值**
+        # 由代码写进答复尾巴 —— 不经叙事层（叙事层加数会被数字对账判成编数）。
+        _alt_disclosure = ""
         # ⚠️ 这里曾有 _money_kv / _total（把多条结果相加算合计）—— 已删：
         # 那正是 75120 / 330441 双计的产地。合计由组合 SQL 自己算。
         if _scene_kind == "scene":
@@ -1416,9 +1437,47 @@ async def consume(
                                 "rows": _e["rows"], "data": _d,
                                 "data_sources": ["query_sql"]}]
 
+                    async def _alt_line(_c: dict[str, Any]) -> str:
+                        """口径二义的另一种读法：跑 `alt_sql`，把**代码算出的数**
+                        写进披露句（2026-10-29 用户拍板「答案披露双口径」）。
+
+                        为什么不交给叙事层：叙事层多写一个数就会被
+                        `verify_answer_numbers` 判成「编数」（那个数不在本次 data
+                        里）。口径备选的数必须**代码执行得出、原样披露**，才既
+                        可信又不破坏数字对账。
+                        守卫照走：另一种读法也不许带假设参数（费率/字面量/fan-out）。
+                        """
+                        _asql = str(_c.get("alt_sql") or "").strip()
+                        if not _asql or _asql == str(_c.get("sql") or "").strip():
+                            return ""
+                        for _gname, _g in (("字面量", _sql_literal_guard),
+                                           ("fan-out", _fanout_guard),
+                                           ("费率", _rate_guard)):
+                            _why = _g(_asql, _dbp)
+                            if _why:
+                                print(f"  · 口径备选被{_gname}守卫拒用："
+                                      f"{_why[:90]}", flush=True)
+                                return ""
+                        _rr = await _env.run_sql(_asql)
+                        _d = _rr.get("data") or {}
+                        if not (_rr.get("ok") and _d.get("rows")):
+                            print("  · 口径备选没取到数："
+                                  f"{str(_rr.get('error') or '0 行')[:90]}",
+                                  flush=True)
+                            return ""
+                        _v = _first_number(_d)
+                        if _v is None:
+                            return ""
+                        _nm = (str(_c.get("alt_note") or "").strip()
+                               or "另一种口径")
+                        return (f"（口径说明：本答案 = 上面那条 SQL 的口径；"
+                                f"另一种读法「{_nm}」为 {_v:,.2f}。"
+                                f"两种读法都站得住，差在口径 —— 要哪个口径说一声。）")
+
                     _cs = _compose_sql(question, _pool, _schema, db_path=_dbp,
                                        catalog=_cat, file_context=_file_ctx)
                     _last_note: str = str(_cs.get("note") or "")
+                    _cs_win: dict[str, Any] | None = None
                     _why0 = await _try_one(_cs)
                     if not _executed:
                         # 原版 step 迭代同构（voyager.py:236-271）：失败把拒因
@@ -1437,6 +1496,8 @@ async def consume(
                         _fit = _fits_judge(question, code, data, _dbp,
                                            items=_executed, fails=_fails,
                                            catalog=_cat)
+                        if _fit["ok"]:
+                            _cs_win = _cs
                         if not _fit["ok"]:
                             # 判官退回 → **整条重写**，不做「保留对的部分再补
                             # 几条」：那正是回到"相加模型"（判官说缺津贴 →
@@ -1460,6 +1521,8 @@ async def consume(
                                 _settle()
                                 _fit = _fits_judge(question, code, data, _dbp,
                                                    items=_executed, fails=_fails)
+                                if _fit["ok"]:
+                                    _cs_win = _cs3
                             if not _fit["ok"]:
                                 # 重写也没过 → 当没答出来（走学习线）。
                                 # obs/code 一并清空：否则面板会拿上一轮的行数
@@ -1477,6 +1540,11 @@ async def consume(
                                       "why": "已学技能检索到了但组合没取到真数"
                                              " —— 重学该里程碑（或补缺维度）"}
                         obs, code = [], ""
+                    # 口径二义披露（用户 2026-10-29 拍板）：主口径已过判官，
+                    # 再跑一次备选读法 —— 两读法都站得住时，人该看到两个数，
+                    # 而不是被系统悄悄替他挑一个（「指认不了」的口径要点明）。
+                    if _cs_win and data is not None:
+                        _alt_disclosure = await _alt_line(_cs_win)
             else:
                 obs, code = await _la.solve(
                     question, _scene_dir, scene_id=_scene_id, skills=skills,
@@ -1666,6 +1734,11 @@ async def consume(
             # （「合计类问句的确定性终判」已删，2026-10-29：那一步的前提是
             #  「合计由代码从多条结果相加得到」—— 合并器已退役，合计由那一条
             #  组合 SQL 自己算出，代码不再替它做加法，也就没有"代码结论"可兜。）
+        # 口径二义披露（用户 2026-10-29 拍板「答案披露双口径」）：主口径照答，
+        # 另一种读法的数**由代码**附在后面（原样披露，不进叙事层）。
+        # 判读不动：written / 未验证 只看主口径那一条，备选只是口径说明。
+        if answer and data is not None and _alt_disclosure:
+            answer = str(answer).rstrip() + _alt_disclosure
         # 这段代码到底调了哪些抓手（披露用；不含纯计算，见 `_tools_in_code`）
         _mve_traj = _tools_in_code(code, _scene_id)
         # 完成判定（2026-10-25 用户拍板）：消费侧 **LLM critic 判定删除**——
@@ -3040,6 +3113,29 @@ def _qty_outputs(sql: str) -> dict[str, str]:
             alias = ""
         out[alias or col] = col
     return out
+
+
+def _first_number(data: dict[str, Any]) -> float | None:
+    """从一条 SELECT 的结果里取**第一个**数值（口径备选只允许取一个数）。
+
+    ⚠️ bool 是 int 子类：`True` 会被 float() 收成 1.0 —— 状态列排在前面就会
+    把「1.00」当金额披露出去（同 2026-10-24「bool 是 int 子类」那次的坑）。
+    """
+    rows = data.get("rows") or []
+    if not rows:
+        return None
+    r0 = rows[0]
+    vals = list(r0.values()) if isinstance(r0, dict) else list(r0)
+    for v in vals:
+        if isinstance(v, bool) or v is None:
+            continue
+        if isinstance(v, (int, float)):
+            return float(v)
+        try:
+            return float(str(v).replace(",", ""))
+        except Exception:
+            continue
+    return None
 
 
 def _rename_qty_cols(data: dict[str, Any], q: dict[str, str]) -> dict[str, Any]:
