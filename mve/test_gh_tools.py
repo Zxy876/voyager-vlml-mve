@@ -95,14 +95,31 @@ def main() -> int:
     except PermissionError:
         check(".. 段拒绝", True)
 
+    print("== 3b. gh_api：仓库自己的账（commit/contributors/releases/issues）==")
+    # 2026-10-29 用户「重点是我希望它的搜索来源是 github 我的仓库」：
+    # 固定原语只有元数据/树/单文件/搜仓库，调研类维度要的「还在维护吗、
+    # 几个人在写、发过版吗」得走 REST，加一条通用只读入口而不是每指标一个原语。
+    for bad in ("https://api.github.com/repos/a/b", "http://evil.com/x"):
+        try:
+            gh_tools.gh_api(bad)
+            check(f"完整 URL 拒绝：{bad[:30]}", False)
+        except PermissionError:
+            check(f"完整 URL 拒绝：{bad[:30]}", True)
+    for bad in ("user/repos", "../../etc/passwd", "gists/1"):
+        try:
+            gh_tools.gh_api(bad)
+            check(f"端点前缀外拒绝：{bad}", False)
+        except PermissionError:
+            check(f"端点前缀外拒绝：{bad}", True)
+
     print("== 4. 条目化与注册 ==")
     b = gh_tools.bind()
-    check("4 个条目", len(b) == 4 and
+    check("5 个条目（含 gh_api）", len(b) == 5 and
           {x["name"] for x in b} == {"gh_repo_info", "gh_tree", "gh_read",
-                                     "gh_search"})
+                                     "gh_api", "gh_search"})
     import actions
     r = actions.register_gh("TEST_GH")
-    check("注册 4 条", r["added"] == 4, str(r))
+    check("注册 5 条", r["added"] == 5, str(r))
     check("组名 = GitHub", actions._REGISTRY["TEST_GH"]["gh_read"].group
           == gh_tools.GH_GROUP)
     check("origin=net（工具线口径）",
@@ -128,7 +145,7 @@ def main() -> int:
     finally:
         for _n in ("gh_repo_info", "gh_tree", "gh_read", "gh_search"):
             actions.unregister("TEST_GH", _n)
-    check("执行域里有 4 个 gh 原语（不是只登记在注册表）",
+    check("执行域里有 5 个 gh 原语（不是只登记在注册表）",
           {"gh_read", "gh_tree", "gh_repo_info", "gh_search"} <= set(ns),
           str(sorted(k for k in ns if not k.startswith("__")))[:120])
     check("gh_read 是真的可调用函数", callable(ns.get("gh_read")))
@@ -138,6 +155,26 @@ def main() -> int:
                encoding="utf-8").read()
     check("consume 调 register_gh", "register_gh" in src)
     check("规划菜单提到 GitHub", "GitHub 公开仓库可读" in src)
+
+    print("== 6. 题干点名仓库 → 锁定取证来源（不许拿搜索充数）==")
+    la = __import__("local_agent")
+    check("从题干认出仓库",
+          la._focus_repos("联网去仓库地址：<https://github.com/Zxy876/voyager-vlml-mve>开始调研")
+          == ["Zxy876/voyager-vlml-mve"])
+    check(".git 尾巴也认",
+          la._focus_repos("看 https://github.com/a/b.git 的 issue") == ["a/b"])
+    check("没给仓库就不锁定", la._focus_repos("今天天气如何") == [])
+    check("重复只留一个",
+          la._focus_repos("github.com/a/b 和 github.com/a/b") == ["a/b"])
+    blk = la._repo_block(["Zxy876/voyager-vlml-mve"])
+    check("提示块点名仓库 + 给出 gh 三件套",
+          "Zxy876/voyager-vlml-mve" in blk and "gh_repo_info" in blk
+          and "gh_tree" in blk and "gh_read" in blk)
+    check("提示块给出仓库自己的账（gh_api 的几个端点）",
+          "gh_api" in blk and "commits" in blk and "contributors" in blk)
+    check("提示块明确禁止用 web_search 搜本仓库",
+          "不要用 web_search 搜这个仓库" in blk)
+    check("没锁定仓库时提示块为空（不打扰无关题）", la._repo_block([]) == "")
 
     print(f"\n通过 {PASS} / 挂 {FAIL}")
     return 1 if FAIL else 0

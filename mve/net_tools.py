@@ -149,11 +149,30 @@ def web_search(query: str, max_results: int = 5) -> list[dict[str, Any]]:
 def _search_once(query: str, max_results: int = 5) -> list[dict[str, Any]]:
     """单次搜索（不节流、不重试；web_search 负责这两件事）。
 
-    后端链：智谱 web-search-pro → Bing → DuckDuckGo。每个后端的失败
+    后端链：智谱 web-search-pro → DuckDuckGo → Bing。每个后端的失败
     都记进 errors，全灭时报错**列全链**——2026-10-29 实测踩到：智谱对
     天气/实时类 query 返回空 search_result（大多数 query 正常），错误
     被 DDG 的报错覆盖，最后只看到「页面里解析不出结果」，智谱为什么
     空完全没交代，排查半天。
+
+    ⚠️ **每个后端的返回都要过相关性闸**（2026-10-29 生产实测，这是
+    「调研类问题 0/6 闭合」的真根因）：后端没搜到东西时**不报错，而是
+    返回一堆无关页面**，于是链上第一个「能解析出条目」的后端就赢 ——
+    VPS 上实测同一个 query 三个后端给出：
+
+        query = "voyager vlml mve github"
+        智谱 → search_result 空 list
+        Bing(rss, setmkt=zh-CN) → 「扫雷游戏网页版 - Minesweeper」×3
+        DDG  → GitHub Zxy876/voyager-vlml-mve、掘金文章（正确）
+
+    Bing 那一组被原样交给模型，模型拿着「扫雷」去答「这个项目的社区活跃度」，
+    判官只能说「材料里没有该项目信息」。所以这里按**零交集**判垃圾（只是
+    「query 里的词一条都没出现」，不做精确相关度，避免误杀）：不合格就把
+    这一组丢掉、记原因、继续试下一个后端。全链都不合格 = 如实报「没搜到
+    相关内容」，别拿无关页面充数。
+
+    顺序也换了（DDG 提到 Bing 前）：本 VPS 实测 DDG 对技术类 query 准，
+    Bing 的中文市场对 "mve" 这类短词会解析成完全无关的热门站。
     """
     q = str(query or "").strip()
     if not q:
@@ -162,31 +181,16 @@ def _search_once(query: str, max_results: int = 5) -> list[dict[str, Any]]:
     errors: list[str] = []
     # 1) 智谱：有 key 就走（快、稳、摘要带正文）
     try:
-        return _zhipu_search(q, n)
+        rs = _zhipu_search(q, n)
+        kept, dropped = _split_relevant(q, rs)
+        if kept:
+            return kept[:n]
+        errors.append(f"智谱: {dropped} 条全与问题无关（query 里的词一条都没出现）")
     except _NoBackend:
         errors.append("智谱: 未配置 ZHIPU_API_KEY")
     except Exception as e:
         errors.append(f"智谱: {type(e).__name__}: {str(e)[:120]}")
-    # 2) Bing（2026-10-29 新增兜底：VPS 实测 200 稳定；先 RSS 后 HTML ——
-    #    RSS（format=rss）是官方输出：明文链接、带摘要、无自家导航噪声，
-    #    天气类 query 的 HTML 版只会给 images/dict 这类自家导航页）
-    try:
-        _status, raw = _http_get(
-            f"https://www.bing.com/search?q={urllib.request.quote(q)}&setmkt=zh-CN&format=rss",
-            timeout=_SEARCH_TIMEOUT)
-        results = _parse_bing_rss(raw.decode("utf-8", errors="replace"))
-        if not results:
-            errors.append("Bing(rss): 没有条目")
-            _status, raw = _http_get(
-                f"https://www.bing.com/search?q={urllib.request.quote(q)}&setmkt=zh-CN",
-                timeout=_SEARCH_TIMEOUT)
-            results = _parse_bing(raw.decode("utf-8", errors="replace"))
-        if results:
-            return results[:n]
-        errors.append("Bing: 页面里解析不出结果")
-    except Exception as e:
-        errors.append(f"Bing: {type(e).__name__}: {str(e)[:120]}")
-    # 3) DuckDuckGo（免 key 再兜底；多数被限流的机器上会是 403/超时）
+    # 2) DuckDuckGo（免 key，实测本 VPS 上准确率最高）
     for endpoint in (f"https://html.duckduckgo.com/html/?q={urllib.request.quote(q)}",
                      f"https://lite.duckduckgo.com/lite/?q={urllib.request.quote(q)}"):
         try:
@@ -194,8 +198,12 @@ def _search_once(query: str, max_results: int = 5) -> list[dict[str, Any]]:
             html = raw.decode("utf-8", errors="replace")
             results = _parse_ddg(html)
             if results:
-                return results[:n]
-            errors.append("DDG: 页面里解析不出结果（可能被限流）")
+                kept, dropped = _split_relevant(q, results)
+                if kept:
+                    return kept[:n]
+                errors.append(f"DDG: {dropped} 条全与问题无关")
+            else:
+                errors.append("DDG: 页面里解析不出结果（可能被限流）")
         except Exception as e:
             err = f"DDG: {type(e).__name__}: {e}"
             # 2026-10-22 场景 B：VPS 出口 IP 被 DDG 限流（403），24 次撞墙没一次
@@ -204,8 +212,72 @@ def _search_once(query: str, max_results: int = 5) -> list[dict[str, Any]]:
                 err += ("（可能被搜索服务限流：换个更具体的关键词重试，"
                         "或稍后再试；不要用同一个关键词反复撞）")
             errors.append(err)
+    # 3) Bing（2026-10-29 新增兜底：VPS 实测 200 稳定；先 RSS 后 HTML ——
+    #    RSS（format=rss）是官方输出：明文链接、带摘要、无自家导航噪声，
+    #    天气类 query 的 HTML 版只会给 images/dict 这类自家导航页）
+    #    市场按 query 语言选：中文 query 用 zh-CN，纯英文用 en-US ——
+    #    原来一律 zh-CN，对英文技术词是负优化（实测给出「扫雷游戏」）。
+    _mkt = "zh-CN" if re.search(r"[\u4e00-\u9fff]", q) else "en-US"
+    for url in (f"https://www.bing.com/search?q={urllib.request.quote(q)}"
+                f"&setmkt={_mkt}&format=rss",
+                f"https://www.bing.com/search?q={urllib.request.quote(q)}"
+                f"&setmkt={_mkt}"):
+        try:
+            _status, raw = _http_get(url, timeout=_SEARCH_TIMEOUT)
+            text = raw.decode("utf-8", errors="replace")
+            results = (_parse_bing_rss(text) if "format=rss" in url
+                       else _parse_bing(text))
+            if not results:
+                errors.append("Bing: 没有条目" if "format=rss" in url
+                              else "Bing: 页面里解析不出结果")
+                continue
+            kept, dropped = _split_relevant(q, results)
+            if kept:
+                return kept[:n]
+            errors.append(f"Bing: {dropped} 条全与问题无关")
+        except Exception as e:
+            errors.append(f"Bing: {type(e).__name__}: {str(e)[:120]}")
     raise RuntimeError(
         "联网搜索失败（后端全灭：" + "；".join(errors) + "）—— 取不到就如实说，不编造")
+
+
+# URL/域名里的通用碎片，不能当作「query 命中」的证据
+# （否则任何 .com 站点都会通过 "com" 这一条，垃圾页永远挡不住）。
+_TLD_NOISE = {"com", "www", "http", "https", "html", "org", "net", "cn", "io",
+              "the", "and", "for", "with", "from", "that", "this", "are", "was",
+              "you", "can", "not", "but", "如何", "什么", "哪些", "怎么"}
+
+
+def _query_terms(q: str) -> list[str]:
+    """query 里的判别词：优先 ASCII 词（≥3 字符），纯中文时退回汉字 2-gram。"""
+    ascii_toks = [t.lower() for t in re.findall(r"[A-Za-z0-9][A-Za-z0-9_.\-]{2,}", q)
+                  if t.lower() not in _TLD_NOISE]
+    if ascii_toks:
+        return ascii_toks
+    zh = re.sub(r"[^\u4e00-\u9fff]", "", q)
+    if len(zh) < 2:
+        return []
+    return [zh[i:i + 2] for i in range(len(zh) - 1)]
+
+
+def _split_relevant(q: str, results: list[dict[str, Any]]
+                    ) -> tuple[list[dict[str, Any]], int]:
+    """把「query 里的判别词一条都没出现」的结果挑出去，返回 (留下的, 丢掉几条)。
+
+    只做**零交集**判定，不做精确相关度：宁可放进一条弱相关的，也不误杀一条
+    真结果（后面还有判官和材料账把关；这里只负责挡住「扫雷游戏」这种整组
+    跑偏的）。
+    """
+    terms = _query_terms(q)
+    if not terms or not results:
+        return results, 0
+    kept: list[dict[str, Any]] = []
+    for r in results:
+        blob = " ".join(str(r.get(k) or "") for k in
+                        ("title", "url", "snippet")).lower()
+        if any(t in blob for t in terms):
+            kept.append(r)
+    return kept, len(results) - len(kept)
 
 
 class _NoBackend(Exception):

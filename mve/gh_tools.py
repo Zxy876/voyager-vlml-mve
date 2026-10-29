@@ -86,17 +86,77 @@ def _raise_gh(status: int, url: str) -> None:
 
 
 def gh_repo_info(repo: str) -> dict[str, Any]:
-    """仓库元数据：描述/star/语言/默认分支。"""
+    """仓库元数据：描述 / star / fork / 开放 issue / 最近推送 / 创建时间 等。
+
+    ⚠️ 2026-10-29 补字段：原先只给 `description/stars/language/default_branch`，
+    于是「这个项目社区活跃度如何」这种维度**只有 stars 一个指标**可用 ——
+    判官的原话是「请根据材料中仅有的 stars 数据给出初步判断，并指出材料缺失了
+    哪些衡量社区活跃度的关键指标」。活跃度本来就该看 forks / 开放 issue /
+    最近推送时间 / 创建时间，这些同一个 API 响应里全有，没理由不给模型。
+    """
     r = _norm_repo(repo)
     j = _get_json(f"{_API}/repos/{r}")
     if isinstance(j, dict) and j.get("message"):
         _raise_gh(403 if "rate limit" in str(j.get("message")) else 404, r)
+    lic = j.get("license") or {}
     return {"repo": r,
             "description": str(j.get("description") or "")[:300],
             "stars": int(j.get("stargazers_count") or 0),
+            "forks": int(j.get("forks_count") or 0),
+            # ⚠️ `watchers_count` 在 GitHub API 里其实是 star 数（历史包袱），
+            # 真正的 watcher 是 subscribers_count —— 别混用。
+            "watchers": int(j.get("subscribers_count") or 0),
+            "open_issues": int(j.get("open_issues_count") or 0),
             "language": str(j.get("language") or ""),
             "default_branch": str(j.get("default_branch") or "main"),
+            "created_at": str(j.get("created_at") or ""),
+            "pushed_at": str(j.get("pushed_at") or ""),
+            "updated_at": str(j.get("updated_at") or ""),
+            "size_kb": int(j.get("size") or 0),
+            "topics": [str(t) for t in (j.get("topics") or [])][:20],
+            "license": str(lic.get("spdx_id") or ""),
+            "homepage": str(j.get("homepage") or ""),
             "url": str(j.get("html_url") or f"https://github.com/{r}")}
+
+
+# gh_api 允许的端点前缀：只放**公开只读**的几族，别让它变成任意 URL 代理
+# （那等于给模型一个绕过 net_tools SSRF 守卫的出口）。
+_API_PREFIXES = ("repos/", "users/", "orgs/", "search/", "repositories/")
+
+
+def gh_api(path: str, max_items: int = 30) -> Any:
+    """读任意 GitHub REST 只读端点（公开数据），返回原始 JSON（列表长则截断）。
+
+    为什么需要（2026-10-29 用户：「重点是我希望它的搜索来源是 github 我的仓库」）：
+    固定原语只能覆盖「元数据 / 树 / 单文件 / 搜仓库」四件事，而调研类问题要的是
+    **仓库自己的账**：最近的 commit（= 还在维护吗）、contributors（= 几个人在写）、
+    releases（= 发过版吗）、issues（= 有人用吗）。这些都在 REST 里，一条通用
+    入口就够，不用为每个指标加一个原语（也避免把指标写死）。
+
+    用法示例：
+        gh_api("repos/Zxy876/voyager-vlml-mve/commits?per_page=5")
+        gh_api("repos/Zxy876/voyager-vlml-mve/contributors")
+        gh_api("repos/Zxy876/voyager-vlml-mve/releases?per_page=3")
+        gh_api("repos/Zxy876/voyager-vlml-mve/issues?state=all&per_page=10")
+
+    ⚠️ 只接受**端点路径**（如 `repos/...`），不接受完整 URL —— 传 URL 一律拒，
+    否则这个原语就成了任意站点代理。
+    """
+    p = str(path or "").strip().lstrip("/")
+    if not p:
+        raise ValueError("path 是空的（要读哪个端点？如 repos/owner/repo/commits）")
+    if p.startswith("http") or "://" in p:
+        raise PermissionError(
+            f"gh_api 只接受端点路径（如 repos/owner/repo/commits），不接受完整 URL：{p[:80]}")
+    if not p.startswith(_API_PREFIXES):
+        raise PermissionError(
+            f"gh_api 只许这几族端点：{'、'.join(_API_PREFIXES)}（收到 {p[:60]}）")
+    j = _get_json(f"{_API}/{p}", max_bytes=2_000_000)
+    if isinstance(j, dict) and j.get("message") and "rate limit" in str(j.get("message")):
+        _raise_gh(403, p)
+    if isinstance(j, list):
+        return j[:max(1, int(max_items or 30))]
+    return j
 
 
 def gh_read(repo: str, path: str, ref: str = "") -> dict[str, Any]:
@@ -175,6 +235,15 @@ PRIMITIVES: list[dict[str, Any]] = [
          "repo": {"type": "string"}, "path": {"type": "string"},
          "ref": {"type": "string"}},
          "required": ["repo", "path"]}},
+    {"name": "gh_api",
+     "fn": gh_api,
+     "desc": ("读 GitHub REST 只读端点，返回原始 JSON —— 仓库自己的账都在这儿："
+              "repos/o/r/commits?per_page=5（还在维护吗）、repos/o/r/contributors"
+              "（几个人在写）、repos/o/r/releases（发过版吗）、"
+              "repos/o/r/issues?state=all（有人用吗）"),
+     "schema": {"type": "object", "properties": {
+         "path": {"type": "string"}, "max_items": {"type": "integer"}},
+         "required": ["path"]}},
     {"name": "gh_search",
      "fn": gh_search,
      "desc": "搜 GitHub 仓库（top 结果：名字/描述/star）",

@@ -89,39 +89,51 @@ def main() -> int:
         out = net_tools._search_once("q")
         check("智谱成功直接返回", len(out) == 1 and calls == ["zhipu"])
 
-        # 3b. 智谱空 → Bing 接住
+        # 3b. 智谱空 → **DDG 接住**（2026-10-29 顺序调整：DDG 提到 Bing 之前，
+        #     因为实测 Bing 的中文市场会把 "mve" 类 query 解析成「扫雷游戏」）
         calls.clear()
 
         def _empty_zhipu(q, n):
             calls.append("zhipu")
             raise RuntimeError("智谱 web-search-pro 没返回 search_result 条目")
 
-        def _bing_hit(url, timeout=10):
+        _DDG_HIT = ('<a class="result__a" href="https://www.weather.com.cn/bj.shtml">'
+                    '北京天气</a>')
+
+        def _ddg_hit(url, timeout=10):
             calls.append(url.split("/")[2] if "://" in url else url)
+            if "duckduckgo.com" in url:
+                if "html" in url:
+                    return 200, _DDG_HIT.encode()
+                raise AssertionError("html 版已接住，不该再请求 lite：" + url[:60])
+            raise AssertionError("不该走到 " + url[:60])
+
+        net_tools._zhipu_search = _empty_zhipu
+        net_tools._http_get = _ddg_hit
+        out = net_tools._search_once("北京今天天气")
+        check("智谱空 → DDG 接住（顺序：智谱→DDG→Bing）",
+              len(out) == 1 and calls[:1] == ["zhipu"]
+              and "duckduckgo" in calls[1], str(calls))
+
+        # 3b'. DDG 也没结果 → 落到 Bing（RSS 优先）
+        calls.clear()
+
+        def _ddg_empty_bing_hit(url, timeout=10):
+            calls.append(url.split("/")[2] if "://" in url else url)
+            if "duckduckgo.com" in url:
+                return 200, b"<html><body>No results.</body></html>"
             if "bing.com" in url:
-                # Bing 步骤先 RSS 后 HTML：让 RSS 接住（验证首选通道）
                 if "format=rss" in url:
                     return 200, _BING_RSS.encode()
                 raise AssertionError("RSS 已接住，不该再请求 HTML：" + url[:60])
             raise AssertionError("不该走到 " + url[:60])
 
-        net_tools._zhipu_search = _empty_zhipu
-        net_tools._http_get = _bing_hit
+        net_tools._http_get = _ddg_empty_bing_hit
         out = net_tools._search_once("北京今天天气")
-        check("智谱空 → Bing(rss) 接住", len(out) == 2 and calls[:1] == ["zhipu"]
-              and "bing.com" in calls[1], str(calls))
-
-        # 3b'. RSS 空但 HTML 有 → 落到 HTML 解析
-        calls.clear()
-
-        def _rss_empty_html_hit(url, timeout=10):
-            if "format=rss" in url:
-                return 200, b"<?xml version='1.0'?><rss version='2.0'><channel></channel></rss>"
-            return 200, _BING_HTML_ZH.encode()
-
-        net_tools._http_get = _rss_empty_html_hit
-        out = net_tools._search_once("q")
-        check("RSS 空 → 落 Bing HTML", len(out) == 2)
+        # 注意只剩 1 条：_BING_RSS 第 2 条（「第二条」/「另一条摘要」）与 query
+        # 零交集，被相关性闸筛掉 —— 这正是闸该有的样子。
+        check("DDG 空 → 落 Bing(rss)（无关条目被闸筛掉）", len(out) == 1
+              and any("bing.com" in c for c in calls), str(calls))
 
         # 3c. 全灭 → 报错列全链（智谱错误不被覆盖）
         def _all_fail(url, timeout=10):
@@ -142,9 +154,9 @@ def main() -> int:
             raise net_tools._NoBackend()
 
         net_tools._zhipu_search = _no_backend
-        net_tools._http_get = _bing_hit
-        out = net_tools._search_once("q")
-        check("无 key 仍走 Bing 兜底", len(out) == 2)
+        net_tools._http_get = _ddg_empty_bing_hit
+        out = net_tools._search_once("北京今天天气")
+        check("无 key 仍走兜底（DDG→Bing）", len(out) == 1)
     finally:
         net_tools._zhipu_search, net_tools._http_get = _orig_zhipu, _orig_get
 
@@ -157,6 +169,50 @@ def main() -> int:
     src = open(net_tools.__file__, encoding="utf-8").read()
     check("保留退避重试（别撞限流原地重打）", "_RETRY_WAITS" in src)
     check("保留节流", "_throttle" in src)
+
+    print("== 5. 相关性闸：整组跑偏的搜索结果不许充数 ==")
+    # 2026-10-29 生产实测原样（query → 三个后端）：
+    #   智谱 → 空；Bing(rss, zh-CN) → 「扫雷游戏网页版 - Minesweeper」×3；
+    #   DDG → GitHub Zxy876/voyager-vlml-mve（正确）
+    # 原来是「谁先解析出条目谁赢」，扫雷被原样交给模型 → 判官只能说材料里没这项目。
+    _q = "voyager vlml mve github"
+    _junk = [{"title": "扫雷游戏网页版 - Minesweeper", "url": "http://www.minesweeper.cn/",
+              "snippet": "扫雷"},
+             {"title": "扫雷网页版 - 扫雷网", "url": "https://www.saoleiwang.com/",
+              "snippet": ""}]
+    _good = [{"title": "GitHub - Zxy876/voyager-vlml-mve",
+              "url": "https://github.com/Zxy876/voyager-vlml-mve", "snippet": ""}]
+    kept, dropped = net_tools._split_relevant(_q, _junk)
+    check("扫雷那一组被整组挡掉（零交集）", kept == [] and dropped == 2, str(kept))
+    kept, dropped = net_tools._split_relevant(_q, _good)
+    check("真结果放行", len(kept) == 1 and dropped == 0)
+    kept, _ = net_tools._split_relevant("今天天气如何",
+                                        [{"title": "北京天气", "url": "https://weather.com.cn/",
+                                          "snippet": "今天天气晴"}])
+    check("纯中文 query 用 2-gram 判（别把天气题误杀）", len(kept) == 1)
+    check("URL 碎片不算命中（com/www 之类）",
+          "com" not in net_tools._query_terms("https://github.com/a/b")
+          and "github.com" in net_tools._query_terms("https://github.com/a/b"))
+    # 全链都跑偏 → 如实报「没搜到相关内容」，不拿无关页面充数
+    _oz, _og = net_tools._zhipu_search, net_tools._http_get
+    try:
+        net_tools._zhipu_search = lambda q, n: [
+            {"title": "扫雷", "url": "http://www.minesweeper.cn/", "snippet": ""}]
+
+        def _junk_all(url, timeout=10):
+            if "duckduckgo.com" in url:
+                return 200, ('<a class="result__a" href="https://www.saoleiwang.com/">'
+                             '扫雷网页版</a>').encode()
+            return 200, _BING_RSS.encode()   # 天气 RSS，与 voyager 无关
+        net_tools._http_get = _junk_all
+        try:
+            net_tools._search_once(_q)
+            check("全链跑偏时要抛错（不拿无关页面充数）", False)
+        except RuntimeError as e:
+            check("全链跑偏时要抛错（不拿无关页面充数）",
+                  "全与问题无关" in str(e), str(e)[:120])
+    finally:
+        net_tools._zhipu_search, net_tools._http_get = _oz, _og
 
     print(f"\n通过 {PASS} / 挂 {FAIL}")
     return 1 if FAIL else 0

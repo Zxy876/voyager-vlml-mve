@@ -38,6 +38,7 @@ import asyncio
 import fnmatch
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -729,6 +730,7 @@ async def solve(question: str, scene_dir: str, *, llm=None,
                 # 文件内容就在这里，别去猜、也别假装查过库。
                 + (f"{context}\n\n" if str(context or "").strip() else "")
                 + fetch_txt
+                + _repo_block(_focus_repos(question) or _focus_repos(context))
                 + dim_txt + avoid_txt
                 + (f"\n上一轮没通过 critic 检查，它的评语（务必针对它改）：{critique}\n"
                    if critique else "")
@@ -837,6 +839,51 @@ def _mcp_dead(tool_id: str) -> str:
     """已判死的工具返回「失败次数+原因」，否则空串。"""
     n, why = _MCP_FAILS.get(str(tool_id), (0, ""))
     return f"本轮已连续失败 {n} 次（{why}）" if n >= _MCP_FAIL_LIMIT else ""
+
+
+def _focus_repos(text: str) -> list[str]:
+    """从题干/上下文里抽出被点名的 GitHub 仓库（owner/repo，去重保序）。
+
+    用户 2026-10-29：「重点是我希望它的搜索来源是 github 我的仓库」——
+    题干给了仓库地址，取证就该直接读那个仓库，而不是拿搜索引擎的二手结果
+    充数（实测搜 "voyager vlml mve github" 回来的是「扫雷游戏」和知乎帖）。
+    这里只做「认出被点名的仓库」，不猜、不补——题干没给就不锁定。
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in re.finditer(r"github\.com/([A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+)",
+                         str(text or "")):
+        r = m.group(1).rstrip(".,;)）】").removesuffix(".git")
+        if r.count("/") != 1 or r in seen:
+            continue
+        seen.add(r)
+        out.append(r)
+    return out
+
+
+def _repo_block(repos: list[str]) -> str:
+    """锁定了仓库时给模型的硬规则（比菜单里那句「先用哪个由题目定」硬）。"""
+    if not repos:
+        return ""
+    first = repos[0]
+    return (
+        "\n【本题锁定了仓库：" + "、".join(repos) + "】\n"
+        "这是**你的仓库**，取证只能从仓库本身来 —— 按这个顺序：\n"
+        f"  1. 仓库元数据（star/fork/开放 issue/最近推送/创建时间/语言）→ "
+        f"`gh_repo_info(\"{first}\")`（一次就给全，别只拿 star 说事）；\n"
+        f"  2. 目录结构 → `gh_tree(\"{first}\")`；具体文件（README/源码/配置）→ "
+        f"`gh_read(\"{first}\", \"path\")`；\n"
+        f"  3. 仓库自己的账（回答「活跃度/贡献/最近更新/有没有人用」必须用这些）→ "
+        f"`gh_api(\"repos/{first}/commits?per_page=5\")`、"
+        f"`gh_api(\"repos/{first}/contributors\")`、"
+        f"`gh_api(\"repos/{first}/releases?per_page=3\")`、"
+        f"`gh_api(\"repos/{first}/issues?state=all&per_page=10\")`。\n"
+        "**不要用 web_search 搜这个仓库**：搜回来的是二手转载、同名项目、甚至完全"
+        "无关的页面（生产实测：搜 \"voyager vlml mve github\" 拿到「扫雷游戏」和知乎"
+        "「阿里国际站」，整轮 0 闭合）——那不是这个仓库的证据，拿它作答等于编造。\n"
+        "仓库里确实没有的（外部评价、第三方讨论）才允许搜索，并且必须标注"
+        "「这是外部说法，不是仓库数据」；仓库里有的就用仓库数据，别绕远路。\n"
+    )
 
 
 def _mcp_listify(obj: Any) -> Any:
