@@ -431,6 +431,36 @@ def register_net(scene_id: str) -> dict[str, Any]:
     return {"added": n, "names": [str(p["name"]) for p in prims], "reason": ""}
 
 
+def register_gh(scene_id: str) -> dict[str, Any]:
+    """把 **GitHub 原语**注册成场景里的一组条目（origin=net / group=GitHub）。
+
+    用户 2026-10-29 的需求：「给 MVE 接 GitHub 让它帮我学习解释项目」。
+    只读公开仓库（gh_repo_info/gh_tree/gh_read/gh_search），同 net_tools
+    同构（impl 是模块级函数 → 快照可直接恢复）；**不下载、不执行**仓库里的
+    代码 —— 动态拉连接器涉及供应链安全，另行设计。
+    """
+    try:
+        import gh_tools
+        prims = gh_tools.bind()
+    except Exception as e:
+        return {"added": 0, "names": [],
+                "reason": f"GitHub 原语不可用：{type(e).__name__}: {e}"}
+    n = 0
+    for p in prims:
+        spec = ActionSpec(
+            name=str(p["name"]), description=str(p.get("description") or ""),
+            fn=p["fn"], scene_id=str(scene_id),
+            input_schema=dict(p.get("schema") or {}),
+            origin="net", group=gh_tools.GH_GROUP,
+            impl=str(p.get("impl") or ""),
+        )
+        _REGISTRY.setdefault(str(scene_id), {})[spec.name] = spec
+        n += 1
+    if n:
+        _save_snapshot()
+    return {"added": n, "names": [str(p["name"]) for p in prims], "reason": ""}
+
+
 def unregister(scene_id: str, name: str) -> bool:
     bucket = _REGISTRY.get(str(scene_id))
     if not bucket or name not in bucket:

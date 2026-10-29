@@ -1380,6 +1380,15 @@ async def consume(
             _act_net.register_net(_scene_id)
         except Exception:
             pass
+        # ---- GitHub 原语（2026-10-29 用户需求「接 GitHub 学习解释项目」）：
+        # 只读公开仓库（gh_repo_info/gh_tree/gh_read/gh_search），local/scene
+        # 两种形态同 net_tools 一样都要注册（不注册 = 「读这个仓库的 README」
+        # 这类题永远不可达）。
+        try:
+            import actions as _act_gh
+            _act_gh.register_gh(_scene_id)
+        except Exception:
+            pass
         # ③a 复用优先（同构 Voyager：retrieve → 重放 → 取不到才写新代码）。
         # 只认「本机形态」的配方（代码里有 RESULT、能 run_saved 重放）；
         # VLML 的 SQL 配方在本机场景重放不了 —— 那是另一个数据源的东西，
@@ -3753,7 +3762,8 @@ def _plan_routes(question: str, *, scene_id: str, has_file: bool,
                  f"信息路菜单：\n"
                  f"- db：场景数据源/已学技能（"
                  f"{'有表：' + '、'.join((scene_tables or [])[:6]) if (scene_tables or []) else '当前没有表'}）\n"
-                 f"- web：场景**外**的信息（外部对比基准/时变行情/公开数据）"
+                 f"- web：场景**外**的信息（外部对比基准/时变行情/公开数据，"
+                 f"GitHub 公开仓库可读：owner/repo）"
                  f"—— 规划里允许有这一步，可达性执行时另核\n"
                  f"- file：用户上传的文件"
                  f"{'（本次检测到上传）' if has_file else '（本次没有上传）'}\n"

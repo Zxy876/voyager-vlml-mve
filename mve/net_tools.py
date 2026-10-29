@@ -107,12 +107,15 @@ def _guard_url(url: str) -> str:
     return u
 
 
-def _http_get(url: str, timeout: int = _TIMEOUT) -> tuple[int, bytes]:
+def _http_get(url: str, timeout: int = _TIMEOUT,
+              max_bytes: int = _MAX_BYTES) -> tuple[int, bytes]:
     u = _guard_url(url)
     req = urllib.request.Request(u, headers={"User-Agent": _UA,
                                              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return int(resp.status or 0), resp.read(_MAX_BYTES)
+        # 上限钳到 5MB：默认 200KB 够网页；GitHub git/trees?recursive 这类
+        # JSON 响应大仓库轻松过 200KB（2026-10-29 gh_tree 实测踩到）
+        return int(resp.status or 0), resp.read(max(1000, min(int(max_bytes), 5_000_000)))
 
 
 # ---------------------------------------------------------------------------
