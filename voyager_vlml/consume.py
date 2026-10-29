@@ -1944,7 +1944,9 @@ async def consume(
             "root_scene": _scene_id, "scene_kind": _scene_kind,
             # 作用域 + 工具线披露（2.5/第 4 步）：场景分支不跑 VLML 裁判对照，
             # referee_compared 恒 False（面板显示「未对照」而非「有硬伤」）。
-            "scope_line": _scope_line(_scene_id),
+            "scope_line": ("tool" if (_plan.get("planned") and _plan.get("web")
+                               and not _plan.get("db"))
+                              else _scope_line(_scene_id)),
             "referee_compared": False,
             "tool_line_used": bool(tool_line.get("used")),
             "tool_sources": (tool_line.get("sources") or [])[:5],
@@ -2536,7 +2538,9 @@ async def consume(
         "root_scene": str(absorbed.get("root_scene") or _scene_id),
         # 作用域判定（2.5）：这句话归哪条供给线（learn/tool/inference）——
         # 面板与对账用；工具线接入后（第 4 步）据此分流。
-        "scope_line": _scope_line(_scene_id),
+        "scope_line": ("tool" if (_plan.get("planned") and _plan.get("web")
+                               and not _plan.get("db"))
+                              else _scope_line(_scene_id)),
         # 工具线（第 4 步）：这轮有没有走联网兜底、取回了哪些来源、为什么没走成。
         "tool_line_used": bool(tool_line.get("used")),
         "tool_sources": (tool_line.get("sources") or [])[:5],
