@@ -79,6 +79,9 @@ _SYSTEM = """你是 Voyager 的 critic：评估一个助手有没有完成给定
   "Mine 3 wood logs"）：答案里的每个具体数字都必须能从「观察」里的**真实
   行值**指认或算出来；对不上、指认不了 → success=false，并在 critique 里
   指出差在哪。
+- **有材料账时**（「材料账」那段 = 数据源**实际返回**的内容）：答案里每一条
+  具体说法（数字、名字、某文件里提了什么）都必须能在材料账里找到出处。
+  材料账里没有、只在答案里出现的细节 = 编的 → success=false。
 - 有「必须回答的维度清单」时（Maieutic spec gate），判定由 `maieutic_gate`
   单独做（只核清单 + 带追问），本模块不重复判一遍 —— 别让 critic 又判质量
   又判清单。
@@ -133,6 +136,19 @@ def _evidence_text(result: dict[str, Any], limit: int = 2600) -> str:
                 lines.append("报错: " + str(o.get("error") or "调用失败")[:150])
     else:
         lines.append("各轮观察: （无）")
+    # 材料账：数据源**实际返回**的内容（local_agent._recorder 逐次记的）。
+    # 判官原先只看模型自述的 RESULT（就是 observations.data），于是「RESULT 里
+    # 写了 README 提到 X」这种毫无依据的细节根本判不出来 —— 2026-10-29 端到端
+    # 实测：gh_repo_info 只回了仓库 description，答案却多编了一句「README 中
+    # 提到的关键模块是…」，判官照样放行。同构原版：判官看的是环境真实末态，
+    # 不是执行者的转述。
+    mat = result.get("evidence")
+    if isinstance(mat, list) and mat:
+        lines.append("材料账（数据源实际返回；答案里说的每一点都得在这里找得到）:")
+        for it in [m for m in mat if isinstance(m, dict)][-6:]:
+            tail = str(it.get("text") or it.get("error") or "")[:400]
+            tag = "" if it.get("ok") else "（失败，不算材料）"
+            lines.append(f"- {it.get('tool') or '?'}{tag}: {tail}")
     ab = result.get("absorbed") or {}
     if ab:
         lines.append(f"入库: topic={ab.get('topic_id')} mastered={ab.get('mastered')}")

@@ -328,6 +328,33 @@ def test_critique_feeds_next_iteration_and_answer() -> None:
     print("PASS  口径 critique 进下一轮；成功后 answer = 结论句（不是 SQL）")
 
 
+def test_material_ledger_reaches_judge() -> None:
+    """材料账（数据源实际返回）必须进判官视野。
+
+    2026-10-29 端到端实测：gh_repo_info 只返回了仓库 description，答案却多编
+    了一句「README 中提到的关键模块是…」，判官照样放行 —— 因为判官只看模型
+    自述的 RESULT（observations.data），看不到工具实际返回什么，无从对账。
+    """
+    import task_critic
+    res = {
+        "execution_backend": "local", "status": "written",
+        "answer": "这个仓库是 XXX，README 提到的关键模块是 MVE",
+        "execution": {"data_sources": ["gh_repo_info"], "calls": 1,
+                      "real_calls": 1, "rows": 1, "ok": True},
+        "observations": [{"ok": True, "rows": 1, "data": {"answer": "…"}}],
+        "evidence": [{"tool": "gh_repo_info", "ok": True,
+                      "text": "description: LLM Agent 的在线强化学习系统"}],
+    }
+    txt = task_critic._evidence_text(res)
+    assert "材料账" in txt, txt
+    assert "gh_repo_info" in txt and "在线强化学习" in txt, txt
+    res2 = dict(res, evidence=[{"tool": "web_fetch", "ok": False,
+                                "error": "HTTPError: 403 Forbidden"}])
+    txt2 = task_critic._evidence_text(res2)
+    assert "不算材料" in txt2, txt2
+    print("PASS  材料账进判官观察面（实际返回 + 失败条目标注不算材料）")
+
+
 def main() -> int:
     test_vacuous_short_circuits_without_llm()
     test_all_failed_short_circuits()
@@ -342,6 +369,7 @@ def main() -> int:
     test_grain_evidence_reaches_critic_and_action()
     test_observe_grain_only_on_join()
     test_critique_feeds_next_iteration_and_answer()
+    test_material_ledger_reaches_judge()
     print("\n全部通过：critic = 真空闸门 + 原版口径检验（LLM）+ 行放大实测证据")
     return 0
 
