@@ -114,8 +114,14 @@ def reasoning_text(res: dict[str, Any] | None, *, scene_id: str = "",
 
     jr = str(res.get("judgment_result") or "")
     if jr:
-        m = "掌握 ✓" if res.get("mastered") else "未掌握"
-        L.append(f"判定：{jr}；{m}。")
+        if jr == "claim":
+            # 工具线答出来的：有答案但**不是**学到的能力（联网资料，未验证）。
+            # 不能沿用「未掌握」那行 —— 那读起来像没答出来（2026-10-29 实测）。
+            L.append("判定：claim（联网取回、未经库内验证）；"
+                     "不进能力账、不计学习曲线。")
+        else:
+            m = "掌握 ✓" if res.get("mastered") else "未掌握"
+            L.append(f"判定：{jr}；{m}。")
     if res.get("learn_kicked"):
         L.append("这道题我还没学会 —— 已自动拉起后台学习（同构 R1「答不了"
                  "就进入思考」：MVE 答不了数据题就进入学习），学完再问同一句"
@@ -571,8 +577,15 @@ function tagRow(x){
     row.appendChild(s);
   }
   var jr = String(x.judgment_result || '');
-  t('判定 ' + (jr || '未知'), jr === 'written' ? 'ok' : 'warn');
-  t(x.mastered ? '掌握 ✓' : '未掌握', x.mastered ? 'ok' : '');
+  if (jr === 'claim') {
+    // 工具线答出来的：有答案但不是学到的能力 —— 不显示「未掌握」（那读起来
+    // 像没答出来，2026-10-29 实测），如实标 claim + 不入账。
+    t('判定 claim（联网取回、未验证）', 'warn');
+    t('不进能力账', '');
+  } else {
+    t('判定 ' + (jr || '未知'), jr === 'written' ? 'ok' : 'warn');
+    t(x.mastered ? '掌握 ✓' : '未掌握', x.mastered ? 'ok' : '');
+  }
   if (x.tool_line_used) t('工具线 claim', 'warn');
   if (x.inference_used) t('模型推断', 'warn');
   if (x.learn_kicked) t('已派学习', 'warn');

@@ -1132,6 +1132,7 @@ function consumeCurveBody(cc){
     :c.route_decision?'<span class="chip grey">未命中</span>':'';
   const judTag=c=>c.judgment_result==='written'?'<span class="chip ok">写入图谱</span>'
     :c.judgment_result==='insufficient_evidence'?'<span class="chip warn">冷启动单证据</span>'
+    :c.judgment_result==='claim'?'<span class="chip warn">联网 claim</span>'
     :c.judgment_result==='fetched_empty'?'<span class="chip grey">取到真空</span>'
     :c.judgment_result==='failed'?'<span class="chip bad">失败</span>':'';
   const masPts=cc.map((c,i)=>({
@@ -2186,7 +2187,7 @@ function consumeBlock(im){
       ${im.route_decision==='HIGH_CONFIDENCE'?'<span class="chip ok">高置信命中</span>'
         :im.route_decision==='MEDIUM_CONFIDENCE'?'<span class="chip warn">中置信命中</span>'
         :im.route_decision==='REJECTED'?'<span class="chip grey">未命中 → 新建节点</span>':''}
-      ${im.judgment_result?`<span class="chip ${im.judgment_result==='written'?'ok':(im.judgment_result==='failed'?'bad':'grey')}">${{written:'✅ 写入图谱',insufficient_evidence:'🌱 冷启动单证据',fetched_empty:'取到真空',failed:'失败'}[im.judgment_result]||ESC(im.judgment_result)}</span>`:''}
+      ${im.judgment_result?`<span class="chip ${im.judgment_result==='written'?'ok':(im.judgment_result==='claim'?'warn':(im.judgment_result==='failed'?'bad':'grey'))}">${{written:'✅ 写入图谱',insufficient_evidence:'🌱 冷启动单证据',claim:'🌐 联网 claim',fetched_empty:'取到真空',failed:'失败'}[im.judgment_result]||ESC(im.judgment_result)}</span>`:''}
     </div>
     ${im.reuse_explain?`<div style="margin-top:5px;font-size:12px"><b>为什么算复用：</b>${ESC(im.reuse_explain)}</div>`:''}
     ${(im.reuse_errors&&im.reuse_errors.length)?`<div style="margin-top:5px;font-size:12px"><b>配方为什么没复用上：</b>${ESC(im.reuse_errors.join('；'))}</div>`:''}

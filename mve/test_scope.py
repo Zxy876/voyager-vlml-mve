@@ -206,6 +206,17 @@ def main() -> int:
           'str(critic_why or "") if _use_env else ""' in src_plan)
     check("没执行过查询时 rows=None（不是 0）",
           'if obs else None)' in src_plan)
+    # 工具线答出来的题：判定 = claim（有答案、未验证、不入账），
+    # 既不是 written 也不是 fetched_empty（那是「查了库取到真空」）。
+    check("工具线答出 → 判定 claim（不是取到真空）",
+          '"claim" if (data is None and tool_line.get("used"))' in src_plan)
+    check("工具线答出后不写「跳过原因」",
+          '"" if (data is not None or tool_line.get("used"))' in src_plan)
+    _cp_src = open(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "chat_page.py"),
+        encoding="utf-8").read()
+    check("对话页对 claim 换口径（不显示未掌握）",
+          "判定：claim（联网取回、未经库内验证）" in _cp_src)
     # 2026-10-29 撤销自创的「web 题学方法不学数值」（qa_cache 方法沉淀 + 消费侧复用）。
     # 事实口径：DeepSeek 的联网经验在训练期进权重，运行时不留检索记忆；MVE 侧仿造属发明。
     # 这条是回归守卫：机制不许复活，否则又是一份自创。

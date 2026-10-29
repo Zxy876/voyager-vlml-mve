@@ -2018,11 +2018,17 @@ async def consume(
             "judgment_result": (
                 "written" if (data is not None and critic_ok
                               and nar.get("answered", True))
-                else "fetched_empty"),
+                # 工具线答出来的（联网 claim）：既不是 written（没进库、没进
+                # 学习账），也不是 fetched_empty（那是「查了库取到真空」）。
+                # 服务器实测（腾讯校招起薪）：答出来了却标 fetched_empty +
+                # 「未掌握」，读起来就是「没答出来」，与内容矛盾。
+                else ("claim" if (data is None and tool_line.get("used"))
+                      else "fetched_empty")),
             # 没答出来的原因：查过库的题才说「数据源里没有」；没查库的题
             # （规划没排 db 路）如实说走的是工具线、联网这半场什么结果。
-            # 同一把尺子：_use_env（规划门控）。
-            "skipped": ("" if data is not None else
+            # 同一把尺子：_use_env（规划门控）。工具线已经答出来了 → 不写
+            # 「跳过原因」（写了会和下面「取回 3 个来源」自相矛盾，实测）。
+            "skipped": ("" if (data is not None or tool_line.get("used")) else
                         (("规划里没有 db 路 —— 这一问走工具线（联网），不查场景库："
                           + (str(tool_line.get("note") or "")[:160]
                              or "联网没取到可用资料"))
