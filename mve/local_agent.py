@@ -109,12 +109,23 @@ def read_file(scene_dir: str, path: str, max_bytes: int = _MAX_BYTES) -> dict[st
     return {"path": str(p), "bytes": len(raw), "text": text}
 
 
-def query_sql(scene_dir: str, sql: str) -> dict[str, Any]:
-    """本机场景目录里的 .duckdb（有就用，没有就如实说没有）。"""
-    dbs = sorted(Path(scene_dir).glob("*.duckdb")) if scene_dir else []
+def query_sql(scene_dir: str, sql: str, db_path: str = "") -> dict[str, Any]:
+    """查 .duckdb（只读）：优先用场景契约里的 db_path，否则找场景目录里的库。
+
+    `db_path` 是「抄 DeepSeek 原理」的那一半（2026-10-29 用户拍板）：DeepSeek
+    只有一个执行工具（code interpreter），SQL 只是代码里的一行 —— 所以场景库
+    形态也该能在代码里 query_sql(...) 查自己的库，而不是只有旁边一条 SQL 专用
+    通道。场景库的 duckdb 常在 scene_data/<别的目录>/（B 在 P、C 在 C），
+    只 glob scene_dir 会认不到。
+    """
+    _want = str(db_path or "").strip()
+    dbs = [Path(_want)] if _want and Path(_want).suffix == ".duckdb" else []
+    if not dbs:
+        dbs = sorted(Path(scene_dir).glob("*.duckdb")) if scene_dir else []
     if not dbs:
         raise FileNotFoundError(
-            f"本机场景目录里没有 .duckdb：{scene_dir}（放一个进去就能查）")
+            f"没有可查的 .duckdb：{scene_dir or '（无场景目录）'}"
+            f"（场景里放一个库、或给 query_sql 传 db_path 即可）")
     import duckdb
     con = duckdb.connect(str(dbs[0]), read_only=True)
     try:
@@ -382,6 +393,7 @@ async def solve(question: str, scene_dir: str, *, llm=None,
                 timeout: float = 30.0,
                 evidence: list[dict[str, Any]] | None = None,
                 context: str = "",
+                db_path: str = "",
                 ) -> tuple[list[dict[str, Any]], str]:
     """写代码 → 跑 → 看结果；失败带反馈重写。返回 (观察列表, 最后一段代码)。
 
@@ -425,7 +437,7 @@ async def solve(question: str, scene_dir: str, *, llm=None,
         except RuntimeError:      # 测试等非协程环境：退回旧行为（如实降级）
             _loop = None
         ns = _ns_base(scene_dir, scene_id, tracer=tracer, loop=_loop,
-                      evidence=evidence)
+                      evidence=evidence, db_path=db_path)
         # 已学技能进**执行域**（不是只进 prompt）—— 同构原版
         # index.js:256 的 `programs + code` 同作用域 eval：模型写的
         # `skill_def()` 才真的调得到。
@@ -1005,12 +1017,26 @@ PRIMITIVES: list[dict[str, Any]] = [
 LOCAL_GROUP = "本机能力"
 
 
-def bind(scene_dir: str) -> list[dict[str, Any]]:
-    """把原语绑到某个场景目录上（给 actions.register_local 用）。"""
+def bind(scene_dir: str, db_path: str = "") -> list[dict[str, Any]]:
+    """把原语绑到某个场景目录上（给 actions.register_local 用）。
+
+    `db_path`：场景契约里的库（场景库形态 kind=scene 的 duckdb 常不在
+    scene_dir 里，B 在 scene_data/P）。传了就优先查它 —— 这是「一个执行
+    工具」的一半：模型在代码里 query_sql 就能查场景库，不必只走 SQL 专用
+    通道（2026-10-29 用户拍板「抄 DeepSeek 原理」）。
+    """
     from functools import partial
-    return [{"name": p["name"], "fn": partial(p["fn"], scene_dir),
-             "description": p["desc"], "schema": dict(p["schema"]),
-             "impl": f"local_agent:{p['name']}"} for p in PRIMITIVES]
+    out = []
+    for p in PRIMITIVES:
+        if p["name"] == "query_sql":
+            fn = (lambda sql, _d=scene_dir, _db=db_path:
+                  query_sql(_d, sql, _db))
+        else:
+            fn = partial(p["fn"], scene_dir)
+        out.append({"name": p["name"], "fn": fn,
+                    "description": p["desc"], "schema": dict(p["schema"]),
+                    "impl": f"local_agent:{p['name']}"})
+    return out
 
 
 def primitive_names() -> list[str]:
@@ -1023,7 +1049,8 @@ def primitive_names() -> list[str]:
 def _ns_base(scene_dir: str, scene_id: str = "",
              tracer: list[str] | None = None,
              loop: Any = None,
-             evidence: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+             evidence: list[dict[str, Any]] | None = None,
+             db_path: str = "") -> dict[str, Any]:
     """执行命名空间。
 
     给了 scene_id 就**按注册表里的启用条目**建（猫爪总开关关掉的组不注入 ——
@@ -1045,7 +1072,7 @@ def _ns_base(scene_dir: str, scene_id: str = "",
         "read_file": lambda path, max_bytes=_MAX_BYTES: read_file(
             scene_dir, path, max_bytes),
         "read_json": lambda path: read_json(scene_dir, path),
-        "query_sql": lambda sql: query_sql(scene_dir, sql),
+        "query_sql": lambda sql: query_sql(scene_dir, sql, db_path),
     }
     try:
         import net_tools
@@ -1073,7 +1100,7 @@ def _ns_base(scene_dir: str, scene_id: str = "",
             # 学到的联网配方，报 `NameError: name 'web_search' is not defined`，
             # 只因为那个进程没走过 consume 的注册那一步。技能是跨入口复用的资产，
             # 重放不能依赖「调用方刚好注册过」。
-            actions.register_local(scene_id, str(scene_dir))
+            actions.register_local(scene_id, str(scene_dir), db_path=db_path)
             actions.register_net(scene_id)
             actions.register_gh(scene_id)
             names = {str(e.get("name")) for e in actions.enabled_entries(scene_id)
@@ -1083,13 +1110,16 @@ def _ns_base(scene_dir: str, scene_id: str = "",
             # 定义的数据源），不是「外来能力」—— 猫爪同构 neko，管的是插件/外来
             # 工具（web_search、mcp_* 这些抓手）；把它关掉不该连场景自己绑定的
             # 库一起关（那等于整个场景没数据，学习必败）。原语表里 query_sql
-            # 只在场景目录真有 .duckdb 时才有意义，照实判。
+            # 只在真有库时才有意义：db_path（场景契约）给了算有，
+            # 否则看场景目录里有没有 .duckdb。
             try:
-                if any(f.endswith(".duckdb")
-                       for f in os.listdir(str(scene_dir) or ".")):
+                if (db_path and Path(str(db_path)).suffix == ".duckdb") or \
+                        any(f.endswith(".duckdb")
+                            for f in os.listdir(str(scene_dir) or ".")):
                     names.add("query_sql")
             except Exception:
-                pass
+                if db_path:
+                    names.add("query_sql")
         except Exception:
             names = set(full)
     ns: dict[str, Any] = {k: v for k, v in full.items() if k in names}

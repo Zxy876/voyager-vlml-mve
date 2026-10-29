@@ -374,15 +374,20 @@ def register_builtin_actions(scene_id: str) -> dict[str, Any]:
     return {"added": n, "tools": tools, "reason": ""}
 
 
-def register_local(scene_id: str, scene_dir: str) -> dict[str, Any]:
+def register_local(scene_id: str, scene_dir: str,
+                   db_path: str = "") -> dict[str, Any]:
     """把**本机原语**注册成场景里的一组条目（origin=local / group=本机能力）。
 
     同构 neko：插件（能力来源）+ 猫爪总开关（这一组的开关）+ 开关下面的条目。
     幂等：重复调用只是按当前场景目录重绑一次（场景目录变了也不会指错地方）。
+
+    `db_path`：场景契约里的库（kind=scene 的 duckdb 常在 scene_data/<别的
+    目录>/，不在 scene_dir 里）—— 传了就绑到 query_sql 上，「一个执行工具」
+    才认得场景自己的库（2026-10-29）。
     """
     try:
         import local_agent
-        prims = local_agent.bind(scene_dir)
+        prims = local_agent.bind(scene_dir, db_path=db_path)
     except Exception as e:
         return {"added": 0, "names": [],
                 "reason": f"本机原语不可用：{type(e).__name__}: {e}"}

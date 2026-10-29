@@ -247,6 +247,19 @@ def main() -> int:
     check("场景库形态也注册联网原语（时变题走工具线的前提）",
           _i_mcp != -1 and _i_net > _i_mcp,
           f"mcp_skip@{_i_mcp} register_net@{_i_net}")
+    # 2026-10-29 用户拍板「抄 DeepSeek 原理：只有一个执行工具，SQL 只是代码
+    # 里的一行」—— 场景库形态 SQL 通道全败要能换说法再试（写代码 query_sql），
+    # query_sql 必须认场景契约 db_path（B 的库在 scene_data/P，不在 scene_dir）。
+    _la_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "local_agent.py"), encoding="utf-8").read()
+    check("一个执行工具：query_sql 认场景契约 db_path",
+          'def query_sql(scene_dir: str, sql: str, db_path: str = "")'
+          in _la_src
+          and "query_sql(scene_dir, sql, db_path)" in _la_src
+          and "register_local(scene_id, str(scene_dir), db_path=db_path)"
+          in _la_src)
+    check("SQL 通道全败 → 换执行工具再试（不硬分类）",
+          "换执行工具再试" in _all_src)
     print(f"== 结果：{PASS} 过 / {FAIL} 挂 ==")
     return 1 if FAIL else 0
 

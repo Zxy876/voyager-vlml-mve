@@ -1791,6 +1791,32 @@ async def consume(
                 real = [o for o in obs
                         if o.get("ok") and o.get("data") is not None]
                 data = (real[-1].get("data") if real else None)
+            # ---- 一个执行工具（2026-10-29 用户拍板「抄 DeepSeek 原理」）----
+            # DeepSeek 只有一个执行工具（code interpreter），SQL 只是代码里的
+            # 一行 —— 语言由上下文与报错决定，不靠标签分派。场景库形态的 SQL
+            # 通道全败时，让 agent 换个说法再试一次：写 Python 调 query_sql
+            # 查同一个库（query_sql 绑的就是场景契约 db_path，见 local_agent）。
+            # 不预设谁对谁错，谁说得通谁算；取到的 data 照旧过真空/fan-out 闸。
+            if (_scene_kind == "scene" and data is None and reuse_errors
+                    and _use_env):
+                try:
+                    _dbp2 = str((_prof or {}).get("db_path") or "")
+                    print("  · SQL 通道没取到数 → 换执行工具再试"
+                          "（写代码调 query_sql）", flush=True)
+                    _obs2, _code2 = await _la.solve(
+                        question, _scene_dir, scene_id=_scene_id, skills=skills,
+                        timeout=_consume_timeout(len(skills or [])),
+                        context=_file_ctx, db_path=_dbp2)
+                    _real2 = [o for o in _obs2
+                              if o.get("ok") and o.get("data") is not None]
+                    if _real2:
+                        data, code, obs = (_real2[-1].get("data"),
+                                           _code2, _obs2)
+                        reuse_errors.append(
+                            "SQL 通道没成 → 改由 agent 写代码（query_sql）取到数")
+                except Exception as _e2:
+                    reuse_errors.append(
+                        f"换执行工具失败：{type(_e2).__name__}: {_e2}")
             if _scene_kind == "scene" and data is not None:
                 # fan-out 闸门（消费侧确定性拒乘爆兜底）：复用回填出的 SQL 即便
                 # 过了上面的字面量守卫，这里用实查行数再兜一道——跨一对多 JOIN
