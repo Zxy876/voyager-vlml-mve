@@ -799,6 +799,32 @@ def _tools_in_code(code: str, scene_id: str = "") -> list[str]:
     return out
 
 
+def _compose_halves(question: str, db_part: str, web_part: str) -> str:
+    """按规划把两半合成一个回答（2026-10-29 用户：「所有问题都应由外部规划
+    去完成」——规划不止路由，还要负责合成）。
+
+    铁律：库内数字原样引用、不改不凑；外部信息如实标注来自联网资料；材料
+    里没有的绝不补。合成失败 → 返回空串，调用方退回机械拼接（不假装合成过）。
+    """
+    try:
+        cj = chat_json(
+            [{"role": "system",
+              "content": ("把两半材料合成一个回答。铁律：库内数字原样引用、"
+                          "不改不凑；外部信息如实标注来自联网资料；材料里"
+                          "没有的绝不补、不算。只返回 JSON：{\"answer\": \"...\"}")},
+             {"role": "user",
+              "content": (f"问题：{question}\n\n"
+                          f"【库内半场（可复现，已验证取到真数）】\n"
+                          f"{str(db_part)[:3000]}\n\n"
+                          f"【外部半场（联网 claim，未验证）】\n"
+                          f"{str(web_part)[:3000]}\n\n"
+                          "请对照两边给出结论；看不出结论就如实说数据不足。")}],
+            temperature=0.0)
+        return str((cj or {}).get("answer") or "").strip()
+    except Exception:
+        return ""
+
+
 async def _tool_line_fallback(question: str, context: str = "") -> dict[str, Any]:
     """工具线兜底（第 4 步，DeepSeek 消费同构）：库场景答不出 → 联网取公开
     资料、当场作答、用完即弃。
@@ -978,6 +1004,14 @@ async def consume(
                              scene_tables=_scene_tables)
     except Exception:
         _plan = {}
+
+    # ---- 规划门控（2026-10-29 用户拍板「所有问题都应有外部规划去完成」）----
+    # 走不走环境由**规划**决定，不由词表决定。旧门控 `_is_data_question`
+    # 把「待遇好不好」这类评价题判成非知识题 → db 半场直接跳过、0 行进
+    # 收场（实测）。规划员不可用（planned=False）时才退回词表 —— 行为
+    # 不会比现状更差。词表本身保留：它是兜底，也是规划失败时的安全方向。
+    _use_env = (bool(_plan.get("db")) if _plan.get("planned")
+                else _is_data_question(question))
 
     # ---- ① 归题（找评分点）----
     topic_id, hit, task = _infer(question)
@@ -1598,7 +1632,7 @@ async def consume(
         # 没取到 → 还是没学会。同样**不自动后台学**（2026-10-19 用户改设计）：
         # 这条问题已在场景学习账上（coach_log 判读 = 没答出来），人点驾驶舱
         # 「▶ 启动 Voyager」时 scene_learn.py 会排到它 —— 每轮落 run_log 可见。
-        if data is None and _is_data_question(question):
+        if data is None and _use_env:
             # 自动拉起学习（2026-10-28 用户改设计，原 2026-10-19「只人工触发」
             # 作废）：「发送新的对话内容，就顺带拉取一个新的学习流程」—— 同构
             # R1「答不了就进入思考」：MVE 答不了数据题就**进入学习**，回复里
@@ -1749,8 +1783,10 @@ async def consume(
         # ⚠️ 有上传文件当上下文时**不写"未学"**：文件就在手里，DeepSeek
         # 客户端拿到文件也照样读（2026-10-28 用户：「上下文是上传文件」）。
         # 让它落到下面的 inference 分支按文件作答，并如实标注来源。
-        if (data is None and not skills and _is_data_question(question)
-                and not _file_ctx):
+        # ⚠️ 规划里有 web 这一步时**不写"未学"**：这题的一半答案本来就在
+        # 场景外（2026-10-29）—— 写"未学"会把「未学」当成库内半场去合成。
+        if (data is None and not skills and _use_env
+                and not _file_ctx and not _plan.get("web")):
             answer = ("⚠️ 未学：这道题还没学过，检索不到已学配方 —— 不编数。"
                       + ("已自动拉起后台学习，学完再问同一句即可复用。"
                          if learn_kick.get("kicked") else
@@ -1778,13 +1814,13 @@ async def consume(
         # → 宁可 fetched_empty 也不读文件 —— 那不是谨慎，是没同构。
         # （残留上传顶替正确答案的问题已在源头解决：过期上传连表清掉。）
         _file_as_source = bool(_file_ctx)
-        if (_no_reply and _is_data_question(question) and _internal_hit
-                and not _file_as_source):
+        if (_no_reply and _use_env and not _plan.get("web")
+                and _internal_hit and not _file_as_source):
             pass                       # 上面已有「未学/不会」交代 + 已派学习
         elif _no_reply:
             # 有上传文件 → 数据题也先读文件（文件就是上下文）；没文件才只答
             # 知识题。标注分两种：按文件作答 vs 模型推断，别混成一句。
-            if _file_as_source or not _is_data_question(question):
+            if _file_as_source or not _use_env:
                 _inf = _inference_answer(question, context=_file_ctx)
                 if _inf.get("used"):
                     answer = (str(_inf["answer"]).rstrip()
@@ -1845,11 +1881,22 @@ async def consume(
                                  "note": (f"工具线异常：{type(e).__name__}: "
                                           f"{str(e)[:140]}")}
                 if tool_line.get("answer"):
-                    answer = (str(answer).rstrip()
-                              + "\n\n—— 外部信息（联网检索） ——\n"
-                              + str(tool_line["answer"]).rstrip()
-                              + "（⚠️ 工具线 claim：来自联网资料，未经库内验证；"
-                                "不进能力账、不计入学习曲线）")
+                    _db_part = str(answer).rstrip()
+                    _wpart = str(tool_line["answer"]).rstrip()
+                    # 规划负责合成（2026-10-29）：两半都有材料 → 让 LLM 对照
+                    # 给出结论；合成失败退回机械拼接（如实分段，不假装合成）。
+                    _syn = _compose_halves(question, _db_part, _wpart)
+                    if _syn:
+                        answer = (_syn + "\n\n—— 口径 ——\n"
+                                  "库内半场：已验证取数（可复现）；"
+                                  "外部半场：联网 claim（未验证、不入库、"
+                                  "不计入学习曲线）")
+                    else:
+                        answer = (_db_part
+                                  + "\n\n—— 外部信息（联网检索） ——\n"
+                                  + _wpart
+                                  + "（⚠️ 工具线 claim：来自联网资料，未经库内"
+                                    "验证；不进能力账、不计入学习曲线）")
             else:
                 tool_line = {"used": False, "answer": "", "sources": [],
                              "note": ("规划里有联网步骤，但本场景的联网工具当前"
@@ -2085,8 +2132,8 @@ async def consume(
         if sql:
             print(f"  （配方回填后没取到真数，降级为现场写 SQL：{note[:60]}）")
         reused, sql = False, ""
-        if not _is_data_question(question):
-            # 知识题不走环境（R1 同构：知识题不调工具，直接凭模型答）——
+        if not _use_env:
+            # 规划没排 db 路（或规划员不可用+词表判知识题）→ 不走环境。
             # act.solve 的 3 轮迭代实测要 80s+，对「什么是强化学习」纯属
             # 浪费；落到下面统一的 inference/工具线兜底，句子必有回复。
             observations, sql = [], ""
@@ -2135,7 +2182,7 @@ async def consume(
     if not real_calls:
         # 自动拉起学习（2026-10-28 用户改设计，与场景分支同款）：答不了数据题
         # 就**进入学习**（同构 R1「答不了就进入思考」），回复里明说「正在学」。
-        if _is_data_question(question):
+        if _use_env:
             try:
                 import learn_orchestrate as _lo3
                 _kk = _lo3.kick_learning(
@@ -2312,7 +2359,7 @@ async def consume(
     # ---- 句句有回复（R1 客户端同构，与场景分支同一套三层分流）----
     tool_line: dict[str, Any] = {}
     _no_reply_v = not critic_ok and not str(answer or "").strip()
-    if _no_reply_v and _is_data_question(question):
+    if _no_reply_v and _use_env and not _plan.get("web"):
         # 内部数据题答不出：绝不联网、绝不推断（都是编数）—— 如实交代判官
         # 结论 + 学习状态（上面已 auto-kick）。
         _lim_v = str(critic_why or "")
@@ -2322,8 +2369,8 @@ async def consume(
                      if learn_kick.get("kicked") else
                      f"{learn_kick.get('why') or ''}"))
     elif _no_reply_v:
-        if not _is_data_question(question):
-            # 非数据题先 inference（同 DeepSeek 客户端：联网默认关，知识题
+        if not _use_env:
+            # 规划没排 db 路 → 先 inference（同 DeepSeek 客户端：联网默认关，知识题
             # 模型直接答，标「模型推断」）；模型自评不知 → 工具线 claim。
             _inf_v = _inference_answer(question, context=_file_ctx)
             if _inf_v.get("used"):

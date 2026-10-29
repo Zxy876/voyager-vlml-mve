@@ -150,6 +150,14 @@ def main() -> int:
     check("consume 主流程调用 _plan_routes", "_plan_routes(" in src_plan)
     check("对比题 db 半场目标被规划裁剪（「本轮只做 db 半场」）",
           "本轮只做 db 半场" in src_plan and "_solve_task" in src_plan)
+    # 「所有问题都应由外部规划去完成」（2026-10-29 用户拍板）：
+    # 走不走环境由规划决定，不由词表决定；词表只做规划员挂掉时的兜底。
+    check("环境门控 = 规划门控（_use_env）",
+          "_use_env = (bool(_plan.get(\"db\"))" in src_plan)
+    check("规划裁剪之外的词表门控已清零",
+          src_plan.count("_is_data_question(question)") <= 1)
+    check("混合题两半由规划合成（_compose_halves）",
+          "_compose_halves(" in src_plan and "库内半场" in src_plan)
     check("计划外动作不执行（规划 web=False → 不联网）",
           '_plan.get("planned") and not _plan.get("web")' in src_plan)
     check("web 步骤执行前核可达性（_web_reachable）",
