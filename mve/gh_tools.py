@@ -79,9 +79,19 @@ def _raise_gh(status: int, url: str) -> None:
     if status == 404:
         raise RuntimeError(f"GitHub 上没有这个资源（404，检查 owner/repo/path"
                            f" 与分支）：{url[:120]}")
-    if status == 403:
-        raise RuntimeError("GitHub API 限速（匿名 60 次/小时；设 GITHUB_TOKEN "
-                           "可提到 5000 次/小时）—— 稍后再试")
+    if status in (403, 429):
+        # 2026-10-29 Scene H 实测：服务器出口 IP 的匿名配额被打到 `limit: 0`
+        # （api.github.com 直接 403），四个调研维度各自只跑 12~17s 就死 ——
+        # 模型唯一一步用来调 gh_repo_info，撞 403 后**不知道该换哪条路**。
+        # 报错文案必须点名那条**不受 API 配额限制**的通路（raw / git 都不限），
+        # 否则「工具报错就换工具」只是句空话。raw 实测 200、api 403 同时成立。
+        raise RuntimeError(
+            "GitHub API 限速/封禁（HTTP 403；匿名 60 次/小时，或出口 IP 已被"
+            "限到 0，设 GITHUB_TOKEN 可提到 5000 次/小时）。"
+            "**立刻换通路，别重试这个函数**：读文件正文用 gh_read"
+            "（走 raw.githubusercontent.com，不受 API 配额限制）；"
+            "看目录结构可用 gh_read 读 README / 已知路径试探。"
+            f"本轮 gh_repo_info/gh_tree/gh_api 都不可用：{url[:100]}")
     raise RuntimeError(f"GitHub 请求失败（HTTP {status}）：{url[:120]}")
 
 

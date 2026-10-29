@@ -176,6 +176,22 @@ def main() -> int:
           "不要用 web_search 搜这个仓库" in blk)
     check("没锁定仓库时提示块为空（不打扰无关题）", la._repo_block([]) == "")
 
+    # 403 文案必须点名「换哪条路」（2026-10-29 Scene H：服务器出口 IP 的 API
+    # 配额被限到 0，模型只调 gh_repo_info，撞 403 后不知道 raw 不受限 → 四个
+    # 维度各 12~17s 就死。报错文案本身就是那一步唯一能看到的提示。）
+    try:
+        gh_tools._raise_gh(403, "repos/a/b")
+        check("403 抛错", False)
+    except RuntimeError as e:
+        _m = str(e)
+        check("403 点名改走 gh_read（raw 不受 API 配额限制）",
+              "gh_read" in _m and "raw.githubusercontent.com" in _m, _m[:80])
+        check("403 明确说别重试这个函数", "别重试" in _m)
+    try:
+        gh_tools._raise_gh(404, "repos/a/b")
+    except RuntimeError as e:
+        check("404 文案不提换通路（那是真没有）", "gh_read" not in str(e))
+
     print(f"\n通过 {PASS} / 挂 {FAIL}")
     return 1 if FAIL else 0
 

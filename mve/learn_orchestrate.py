@@ -173,6 +173,17 @@ def _has_real(obs: list[dict[str, Any]]) -> bool:
 # 外部工具的量级给，可用环境变量覆盖（跑本地/纯 SQL 场景时可以调小）。
 EXEC_TIMEOUT = float(os.environ.get("MVE_EXEC_TIMEOUT") or 90.0)
 
+# 内层步数 = 原版 `action_agent_task_max_retries`（voyager 配置 4，
+# `agents/action.py:713 solve(max_iters=4)` 就是它的默认值）：一个任务内
+# 「写代码 → 跑 → 看执行反馈 → 改」最多 4 步。
+#
+# ⚠️ 2026-10-29 实测偏离（Scene H）：本文件 4 个 local_agent.solve 调用点
+# 都没传 max_iters → 吃 `local_agent.solve` 的默认 2，等于只允许「改一次」。
+# H 的四个维度各跑 12~17s 就死（两次代码都撞 GitHub 403，第二次本来该换
+# gh_read/raw 却没步数了），与实际「4 步迭代」的注释对不上。调度层要和原版
+# 同构，这里就必须显式传 4，不能靠默认值。
+INNER_MAX_ITERS = int(os.environ.get("MVE_INNER_ITERS") or 4)
+
 
 def available_grabs(scene_id: str, scene_dir: str = "") -> list[str]:
     """这个场景**现在真的能调**哪些取证手段（本机原语 + 联网 + 经 MCP 接入的）。
@@ -1005,7 +1016,7 @@ async def _start_learning_impl(
                             # 就在 _hint_ctx 里，别丢。
                             observations, sql = await local_agent.solve(
                                 question, local_dir or exec_dir, llm=llm,
-                                scene_id=scene,
+                                scene_id=scene, max_iters=INNER_MAX_ITERS,
                                 critique=str(critique or ""), dimensions=[],
                                 avoid=_avoid, skills=_py_skills,
                                 require_tools=True, evidence=_ev0,
@@ -1200,7 +1211,7 @@ async def _start_learning_impl(
                         if _code_exec:
                             obs1, code1 = await local_agent.solve(
                                 _q1, local_dir or exec_dir, llm=llm,
-                                scene_id=scene,
+                                scene_id=scene, max_iters=INNER_MAX_ITERS,
                                 avoid=_avoid, critique=str(crit1 or ""),
                                 evidence=_ev1,
                                 skills=_py_skills, require_tools=True,
@@ -1554,7 +1565,7 @@ async def _start_learning_impl(
                     if _code_exec:
                         observations, sql = await local_agent.solve(
                             question, local_dir or exec_dir, llm=llm,
-                            scene_id=scene,
+                            scene_id=scene, max_iters=INNER_MAX_ITERS,
                             critique=str(critique or ""),
                             dimensions=_dims, avoid=_avoid,
                             skills=_py_skills, require_tools=True,
@@ -1586,7 +1597,8 @@ async def _start_learning_impl(
                     # 不这么写，MVE_CODE_EXEC=all 时 agent 是 None → 这里 AttributeError。
                     observations, sql = await local_agent.solve(
                         question, local_dir or exec_dir, llm=llm,
-                        scene_id=scene, critique=str(critique or ""),
+                        scene_id=scene, max_iters=INNER_MAX_ITERS,
+                        critique=str(critique or ""),
                         dimensions=[], avoid=_avoid, skills=_py_skills,
                         require_tools=True, timeout=EXEC_TIMEOUT,
                         db_path=exec_db,

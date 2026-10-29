@@ -12,6 +12,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from pathlib import Path  # noqa: E402
+
 PASS = FAIL = 0
 
 
@@ -334,6 +336,20 @@ def main() -> int:
     finally:
         os.environ.pop("MVE_READ_ROOTS", None)
     check("MVE_READ_ROOTS 点名授权后可读（不点名就不给）", _ok_extra)
+    # 内层步数 = 原版 action_agent_task_max_retries（voyager 配置 4，
+    # agents/action.py:713 的 solve(max_iters=4) 默认值）。2026-10-29 实测：
+    # learn_orchestrate 的 local_agent.solve 调用点全都没传 max_iters →
+    # 吃 local_agent.solve 的默认 2 → "只允许改一次"，与注释「4 步迭代」不符。
+    # 这条盯住"每个调用点都显式传"，别让下一次新增路径又漏掉。
+    _lo = (Path(__file__).resolve().parent
+           / "learn_orchestrate.py").read_text(encoding="utf-8")
+    _n_calls = _lo.count("await local_agent.solve(")
+    _n_iters = _lo.count("max_iters=INNER_MAX_ITERS")
+    check(f"内层 4 步：{_n_calls} 个 local_agent.solve 调用点都传 max_iters"
+          f"（实传 {_n_iters} 处）", _n_calls > 0 and _n_calls == _n_iters,
+          f"calls={_n_calls} iters={_n_iters}")
+    check("内层步数默认 = 原版 4（MVE_INNER_ITERS 可覆盖）",
+          "INNER_MAX_ITERS = int(os.environ.get(\"MVE_INNER_ITERS\") or 4)" in _lo)
     print(f"== 结果：{PASS} 过 / {FAIL} 挂 ==")
     return 1 if FAIL else 0
 
