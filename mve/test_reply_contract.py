@@ -359,8 +359,6 @@ def main() -> int:
                        encoding="utf-8").read()
     check("coach 白名单透传 plan_routes/plan_why",
           '"plan_routes"' in _coach_src2 and '"plan_why"' in _coach_src2)
-    check("coach 白名单透传 method_learned（惯犯第 9 次预防）",
-          '"method_learned"' in _coach_src2)
 
     print(f"== 结果：{PASS} 过 / {FAIL} 挂 ==")
     return 1 if FAIL else 0

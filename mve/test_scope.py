@@ -190,41 +190,14 @@ def main() -> int:
           and '"db": False, "web": False' in _all_src)
     check("混合题两半由规划合成（_compose_halves）",
           "_compose_halves(" in src_plan and "库内半场" in src_plan)
-    # web 题「学方法不学数值」（2026-10-29 拍板，DeepSeek 同构）
-    check("web 题调 record_web_method（学方法）",
-          "record_web_method(" in src_plan)
-    check("base 披露 method_learned", '"method_learned"' in src_plan)
-    import learn_orchestrate as _LO
-    check("learn_orchestrate 有 record_web_method", hasattr(_LO, "record_web_method"))
-    check("计划外动作不执行（规划 web=False → 不联网）",
-          '_plan.get("planned") and not _plan.get("web")' in src_plan)
-    check("web 步骤执行前核可达性（_web_reachable）",
-          "_web_reachable(" in src_plan)
-    check("不可达 → 如实缺失不编数", "外部信息如实缺失" in src_plan)
-    check("对比题 web 半场追加（claim 只挂答案尾部）",
-          "外部信息（联网检索）" in src_plan)
-    # 行为断言：_web_reachable 对空注册表 → 不可达（False + 说明）
-    ok, names = C._web_reachable("__no_such_scene__")
-    check("_web_reachable 空注册表 → False", ok is False, f"names={names[:40]}")
-    # 行为断言：规划员挂掉 → 兜底 planned=False（执行层退回旧行为，不比现状差）
-    _orig_cj2 = C.chat_json
-    try:
-        C.chat_json = lambda msgs, **kw: (_ for _ in ()).throw(
-            RuntimeError("规划员不可用"))
-        pf = C._plan_routes("汇率现在多少", scene_id="__t__", has_file=False)
-        check("规划员挂掉 → 兜底 planned=False", pf.get("planned") is False)
-        check("兜底不含 web（可达性与旧行为接管）", pf.get("web") is False)
-        # 行为断言：规划成功 → planned=True + 按模型输出取路
-        C.chat_json = lambda msgs, **kw: {"db": True, "web": True,
-                                          "file": False, "infer": False,
-                                          "why": "内部+外部对比题"}
-        pg = C._plan_routes("待遇好不好", scene_id="__t__", has_file=False)
-        check("规划成功 → planned=True + web=True（对比题双路）",
-              pg.get("planned") is True and pg.get("web") is True
-              and pg.get("db") is True)
-    finally:
-        C.chat_json = _orig_cj2
-
+    # 2026-10-29 撤销自创的「web 题学方法不学数值」（qa_cache 方法沉淀 + 消费侧复用）。
+    # 事实口径：DeepSeek 的联网经验在训练期进权重，运行时不留检索记忆；MVE 侧仿造属发明。
+    # 这条是回归守卫：机制不许复活，否则又是一份自创。
+    check("自创「学方法」机制已撤且不许复活",
+          "record_web_method(" not in _all_src
+          and "_web_tips(" not in _all_src
+          and '"method_learned"' not in _all_src
+          and '"method_reused"' not in _all_src)
     print(f"== 结果：{PASS} 过 / {FAIL} 挂 ==")
     return 1 if FAIL else 0
 
