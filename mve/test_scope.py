@@ -279,6 +279,30 @@ def main() -> int:
              "int", "float", "sorted", "range", "enumerate", "Exception"}
     check("受限执行域给语言级内建（isinstance 等）", _need <= _bi,
           "缺：" + "、".join(sorted(_need - _bi)))
+    # 2026-10-29 用户问「它这么学习下去能读到我代码吗」时查出的两个真实漏洞：
+    # ① 可读根含应用工作区（/root/mve）→ 一句 read_file("mve/.env") 就能把
+    #    API key 读进上下文，再经材料账/判官/技能库/日志散出去；
+    # ② DuckDB 的 read_text() 能读任意路径 → 绕过 read_file 的守卫。
+    import tempfile as _tf
+    from pathlib import Path as _P
+    _d = _tf.mkdtemp()
+    _P(_d, ".env").write_text("ZHIPU_API_KEY=sk-secret", encoding="utf-8")
+    _P(_d, "a.md").write_text("# 正常的业务文件", encoding="utf-8")
+    _P(_d, ".git").mkdir()
+    try:
+        _la.read_file(_d, ".env")
+        _leak = True
+    except PermissionError:
+        _leak = False
+    check("密钥文件不可读（.env 被拒）", not _leak)
+    check("普通文件照读（不是一刀切禁读）",
+          "正常的业务文件" in str(_la.read_file(_d, "a.md").get("text")))
+    _names = [r["name"] for r in _la.list_files(_d, "", "*")]
+    check("列目录不暴露密钥文件、不进 .git",
+          ".env" not in _names and ".git" not in _names and "a.md" in _names,
+          str(_names))
+    check("query_sql 关外部文件访问（read_text 不能绕过读密钥）",
+          "enable_external_access=false" in _la_src)
     print(f"== 结果：{PASS} 过 / {FAIL} 挂 ==")
     return 1 if FAIL else 0
 

@@ -46,6 +46,39 @@ _MAX_BYTES = 200_000
 # ---------------------------------------------------------------------------
 # 原语（只读、路径受限）
 # ---------------------------------------------------------------------------
+def _is_sensitive(p: Path) -> bool:
+    """密钥类文件 → 一律不读、不列（2026-10-29 用户问「它能读到我代码吗」时查出来）。
+
+    实测漏洞：可读根包含应用工作区（/root/mve），于是模型写一句
+    `read_file("/root/mve/mve/.env")` 就能把 ZHIPU_API_KEY 读进上下文，
+    再经材料账/判官/技能库/面板日志散出去 —— 而它做这件事**不需要任何恶意**，
+    只要「想看看配置是怎么写的」就够了。
+
+    挡的是密钥形态，不是业务数据：.env / 私钥 / 证书 / 凭据文件。
+    `.env.example` 这种模板也一起挡（拿它判不出真实值，挡了省得解释）。
+    """
+    n = p.name.lower()
+    if n == ".env" or n.startswith(".env."):
+        return True
+    if n in (".netrc", ".pgpass", ".npmrc", ".pypirc", "id_rsa", "id_dsa",
+             "id_ecdsa", "id_ed25519", ".git-credentials"):
+        return True
+    if p.suffix.lower() in (".key", ".pem", ".p12", ".pfx", ".keystore",
+                            ".jks", ".kdbx"):
+        return True
+    if p.suffix.lower() in (".json", ".yaml", ".yml", ".ini", ".cfg", ".conf",
+                           ".toml", ".txt"):
+        if any(k in n for k in ("credential", "secret", "apikey", "api_key",
+                                "access_key", "token")):
+            return True
+    return False
+
+
+# 遍历时直接跳过的目录：不是数据，进去只会把模型带进二进制/依赖树
+_SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules",
+              ".mypy_cache", ".pytest_cache", ".idea"}
+
+
 def _roots(scene_dir: str) -> list[Path]:
     """允许的根 = **应用自己的工作区** + 场景目录。
 
@@ -71,10 +104,16 @@ def _resolve_under(path: str, scene_dir: str) -> Path:
     for r in _roots(scene_dir):
         try:
             p.relative_to(r)
-            return p
+            break
         except ValueError:
             continue
-    raise PermissionError(f"路径不在应用工作区/场景目录内：{p}")
+    else:
+        raise PermissionError(f"路径不在应用工作区/场景目录内：{p}")
+    if _is_sensitive(p):
+        raise PermissionError(
+            f"不读密钥类文件：{p.name}（.env/私钥/凭据不在可读范围 —— "
+            "这不是数据源，读了也只会在上下文和日志里散出去）")
+    return p
 
 
 def list_files(scene_dir: str, path: str = "", pattern: str = "*",
@@ -86,6 +125,12 @@ def list_files(scene_dir: str, path: str = "", pattern: str = "*",
     targets = [base] if base.is_file() else sorted(base.iterdir())
     for f in targets:
         if not fnmatch.fnmatch(f.name, str(pattern or "*")):
+            continue
+        # 密钥类不列（连"存在"都不用告诉它）；.git/.venv 这类不是数据，
+        # 列出来只会把模型带进依赖树和二进制对象
+        if _is_sensitive(f):
+            continue
+        if f.is_dir() and f.name in _SKIP_DIRS:
             continue
         try:
             st = f.stat()
@@ -129,6 +174,14 @@ def query_sql(scene_dir: str, sql: str, db_path: str = "") -> dict[str, Any]:
     import duckdb
     con = duckdb.connect(str(dbs[0]), read_only=True)
     try:
+        # 关掉外部文件访问（2026-10-29 实测：DuckDB 的 read_text/read_csv 能读
+        # 任意路径 —— 一句 `SELECT * FROM read_text('/root/mve/mve/.env')` 就绕过
+        # 了 read_file 的密钥守卫。read_only 不防这个，必须关 external access；
+        # 库内表照常查（SET 后 COUNT(*) 实测正常）。
+        try:
+            con.execute("SET enable_external_access=false")
+        except Exception:
+            pass
         cur = con.execute(sql)
         cols = [d[0] for d in (cur.description or [])]
         return {"columns": cols, "rows": cur.fetchall(),
