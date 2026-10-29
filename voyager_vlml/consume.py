@@ -507,6 +507,63 @@ def _scope_check(question: str, sql: str, schema: str,
 
 
 # ---------------------------------------------------------------------------
+# 对话记忆 → 指代消解（2026-10-29 用户实测指出的怪：
+#   上一轮答完「九月份一共支付 137,100」，下一轮问「相比于网上其他公司，
+#   这家公司的待遇好不好」—— 「这家公司」没人认识，规划员没认出库内有锚点，
+#   工具线联网搜回来一家不相干的公司还答「无法比较」。
+#   根因：对话页把完整历史发上来了，但 `_openai_chat` 只取**最后一条 user**
+#   就把历史扔了 —— consume 每次都是失忆的。修法不是把历史塞给每个环节，
+#   而是在入口做一次**指代消解**：把最新一句改写成不依赖历史也看得懂的
+#   独立问句，下游（路由/规划/回填/工具线）照旧只吃一句 —— 改动面最小，
+#   且任何客户端（带不带历史）行为一致。
+# ---------------------------------------------------------------------------
+
+_HISTORY_SYSTEM = """你是对话指代消解器。给你一段对话历史和用户的最新一句话。
+任务：把最新一句话改写成**不依赖历史也能看懂**的独立问句 —— 把「这家公司 /
+它 / 上面那个数 / 刚才那道题 / 这份文件」这类指代，替换成历史里它指的**具体
+对象**（公司/题面里的主体、数值、部门、月份、文件名）。
+
+硬规则：
+1. 历史里找不到的指代**不许编** —— 那就原样返回最新一句（改写不出来好过编错）；
+2. 只做指代替换与必要的补全，**不改这句话在问什么**，不许捎带回答、
+   不许新增问题；
+3. 最新一句本来就独立成立 → **逐字原样返回**；
+4. 只返回一个 JSON：{"question": "改写后的问句"}
+"""
+
+
+def _resolve_history(question: str,
+                     history: list[dict[str, str]] | None) -> str:
+    """把「这家公司/它/上面那个数」消解成历史里的具体对象，返回可用问句。
+
+    失败（LLM 挂 / 返回空 / 返回原句）→ 一律返回原问句：消解是增强，
+    不许因为这一步挂掉而让问题变得不可答。
+    """
+    _q = str(question or "").strip()
+    _hist = [h for h in (history or []) if isinstance(h, dict)
+             and str(h.get("content") or "").strip()
+             and str(h.get("role") or "") in ("user", "assistant")]
+    if not _q or not _hist:
+        return _q
+    _hist = _hist[-8:]                       # 只看最近 8 轮，防窗口爆
+    _lines = "\n".join(
+        f"{'用户' if str(h.get('role')) == 'user' else '助手'}："
+        f"{str(h.get('content'))[:500]}"
+        for h in _hist)
+    user = (f"[对话历史]\n{_lines}\n\n"
+            f"[最新一句]\n{_q}\n\n"
+            "把最新一句改写成不依赖历史的独立问句；本来就独立就逐字原样返回。"
+            "只返回 JSON。")
+    try:
+        out = chat_json([{"role": "system", "content": _HISTORY_SYSTEM},
+                         {"role": "user", "content": user}], temperature=0.0)
+    except Exception:
+        return _q
+    _r = str((out or {}).get("question") or "").strip()
+    return _r or _q
+
+
+# ---------------------------------------------------------------------------
 # ③' 配方泛化：入库前把「上一题的取数 SQL」改写成**槽位模板**
 #     （用户 2026-10-23 定：「不要把数值写死，而是把算法积累成技能」）
 # ---------------------------------------------------------------------------
@@ -1024,6 +1081,7 @@ async def consume(
     auto_task: bool = True,
     env: VLMLMCPEnv | None = None,
     web_allowed: bool | None = None,
+    history: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     # ⚠️ 环境**延迟创建**：下面按场景后果判断要不要 VLML。非 VLML 场景
     # （用户 2026-10-19：「别的场景下，voyager 的学习和 VLML 没有关系」）
@@ -1045,6 +1103,17 @@ async def consume(
         _scene_id = _env_sid or str(_sc.current_scene_id() or "A")
     except Exception:
         pass
+
+    # ---- ⓪⁻ 对话记忆：指代消解（2026-10-29，见 _resolve_history 注释）----
+    # 带历史的客户端（对话页发的就是完整 messages）→ 先把「这家公司/它/上面
+    # 那个数」消解成具体对象，之后所有环节（文件上下文/规划/回填/工具线）
+    # 照旧只吃一句独立问句。不带历史 → 原样返回，零开销、行为不变。
+    # ⚠️ 用消解后的问句记账：导入批次/检索键都以它为准 —— 它是自包含的，
+    # 跨轮重问同一句才能对上批次（原句里带「这家公司」这种词，永远对不上）。
+    try:
+        question = _resolve_history(question, history)
+    except Exception:
+        pass                       # 消解挂了就当没有历史，原句照答
 
     # ---- ⓪ 上传文件当上下文（R1 客户端式）----
     # 用户 2026-10-28：「上传文件的时候要像 R1 客户端一样当作上下文输入」。

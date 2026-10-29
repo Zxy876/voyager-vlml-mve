@@ -3000,6 +3000,27 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": {"message": "messages 里没有 user 内容",
                                        "type": "invalid_request_error"}})
             return
+        # 对话记忆（2026-10-29 用户实测指出失忆的怪）：历史不再扔掉 ——
+        # 传给消费侧做指代消解（「这家公司」→ 历史里指的对象）。
+        # 只取最后一条 user **之前**的消息：那条 user 就是本次的 q。
+        _hist: list[dict[str, str]] = []
+        _last_u = -1
+        for _i, _m in enumerate(msgs if isinstance(msgs, list) else []):
+            if isinstance(_m, dict) and str(_m.get("role")) == "user":
+                _last_u = _i
+        for _m in (msgs if isinstance(msgs, list) else [])[:max(_last_u, 0)]:
+            if not isinstance(_m, dict):
+                continue
+            _role = str(_m.get("role") or "")
+            if _role not in ("user", "assistant"):
+                continue
+            _c = _m.get("content")
+            if isinstance(_c, list):
+                _c = " ".join(str(x.get("text") or "") for x in _c
+                              if isinstance(x, dict))
+            _c = str(_c or "").strip()
+            if _c:
+                _hist.append({"role": _role, "content": _c})
         model = str(payload.get("model") or "mve").strip()
         sid = model.split(":", 1)[1].strip().upper() if ":" in model else (
             model.upper() if model.upper() in ("A", "B", "C", "D", "E", "F") else "")
@@ -3014,9 +3035,10 @@ class Handler(BaseHTTPRequestHandler):
         _web = payload.get("web")
         _web = bool(_web) if isinstance(_web, bool) else None
         if payload.get("stream"):
-            self._openai_stream(q, model, sid, prev, web_allowed=_web)
+            self._openai_stream(q, model, sid, prev, web_allowed=_web,
+                                history=_hist)
             return
-        res = self._mve_ask(q, sid, prev, web_allowed=_web)
+        res = self._mve_ask(q, sid, prev, web_allowed=_web, history=_hist)
         content, reasoning, x = _openai_answer(res, sid, prev)
         now = int(time.time())
         self._json(200, {
@@ -3078,13 +3100,15 @@ class Handler(BaseHTTPRequestHandler):
                     .encode("utf-8"))
 
     def _openai_stream(self, q: str, model: str, sid: str, prev: str,
-                       web_allowed: bool | None = None) -> None:
+                       web_allowed: bool | None = None,
+                       history: list[dict[str, str]] | None = None) -> None:
         """先心跳、后逐字：消费要 20~60 秒，干等会让客户端超时判死。"""
         import threading
         box: dict[str, Any] = {}
 
         def _work() -> None:
-            box["res"] = self._mve_ask(q, sid, prev, web_allowed=web_allowed)
+            box["res"] = self._mve_ask(q, sid, prev, web_allowed=web_allowed,
+                                       history=history)
 
         th = threading.Thread(target=_work, daemon=True)
         th.start()
@@ -3111,7 +3135,8 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def _mve_ask(self, q: str, sid: str, prev: str,
-                 web_allowed: bool | None = None) -> dict:
+                 web_allowed: bool | None = None,
+                 history: list[dict[str, str]] | None = None) -> dict:
         """跑一次消费并还原场景。返回 consume() 的结果（异常也包成结果）。"""
         try:
             import scenes as _sc
@@ -3129,7 +3154,8 @@ class Handler(BaseHTTPRequestHandler):
             if _root2 not in sys.path:
                 sys.path.insert(0, _root2)
             import voyager_vlml.consume as _consume2
-            return _aio.run(_consume2.consume(q, web_allowed=web_allowed))
+            return _aio.run(_consume2.consume(q, web_allowed=web_allowed,
+                                              history=history))
         except Exception as e:
             return {"ok": False, "answer": "",
                     "errors": [f"{type(e).__name__}: {e}"]}
