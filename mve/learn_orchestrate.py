@@ -1484,9 +1484,21 @@ async def _start_learning_impl(
                     out["dimension_nodes"] = closed_nodes
                     # ---- 里程碑判定（骨架一次生成，这里只判闭合）----
                     try:
+                        # ⚠️ 第三个参数要传**累计账**（_prog 存量 ∪ 本轮新闭合），
+                        # 不能只传 `learned_dims`：预设维度路径下 `_dims` 只有
+                        # 「本轮那一条」（:931 `_dims = [dict(preset_dimension)]`），
+                        # 于是 `learned_dims = _dims ∩ _prog` 最多一条 → milestone_state
+                        # 每次都只看得到本轮那一条，上一轮闭合的从 closed 里掉出去。
+                        # 生产实测（Scene H，2026-10-29）：project_overview 那轮报
+                        # 「1/6 闭合」，紧接着 technical_architecture 失败那轮就回落
+                        # 成「0/6 闭合，还差 project_overview」—— 数字来回跳、achieved
+                        # 永远翻不了，人看到的就是「学了也不涨」。
+                        _learned_now = (set(str(x) for x in _prog)
+                                        | set(str(x) for x in closed_ids)
+                                        | {str(d.get("id") or "") for d in learned_dims})
                         _mst = _ms.milestone_state(
                             scene, question,
-                            [str(d.get("id") or "") for d in learned_dims],
+                            sorted(x for x in _learned_now if x),
                             # 用**完整**维度集算总进度：预设维度单发闭合时，
                             # 其它维度仍是未闭合，achieved 才不会误翻。
                             # 里程碑重试轮传 None → milestone_state 读**骨架

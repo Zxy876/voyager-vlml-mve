@@ -272,6 +272,14 @@ def main() -> int:
     check("学习侧走代码路径（全场景，判据=环境形态）",
           "_code_exec" in _learn_src and "MVE_CODE_EXEC" in _learn_src
           and 'prof["kind"]' in _learn_src)
+    # 里程碑闭合数必须按**累计账**算（2026-10-29 Scene H 实测：project_overview
+    # 那轮报「1/6 闭合」，下一轮别的维度失败就回落成「0/6，还差 project_overview」
+    # —— 因为 milestone_state 只喂了本轮 learned_dims，而预设维度路径下
+    # `_dims` 只有那一条）。闭合数会回退 = 人看到「学了也不涨」。
+    check("里程碑判定传累计账（_prog ∪ 本轮），不是只传本轮",
+          "_learned_now" in _learn_src
+          and "| set(str(x) for x in _prog)" in _learn_src
+          and "| set(str(x) for x in closed_ids)" in _learn_src)
     import local_agent as _la
     _ns0 = _la._ns_base("/tmp", "", tracer=None)
     _bi = set(_ns0.get("__builtins__") or {})
