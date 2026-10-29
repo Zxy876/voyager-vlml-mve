@@ -656,6 +656,34 @@ async def _start_learning_impl(
     db_path = db_path or scene_db          # 调用方显式给的优先
     out["backend"]["vlml"] = use_vlml
 
+    # ---- 走哪条执行路径：代码为主，SQL 只是代码里的一行（2026-10-29）----
+    # 生产实证：Scene H（kind=scene，库里有 web_docs 快照）一直走 VLML SQL
+    # agent —— 那条路径的执行域里**只有 SQL**，gh/联网原语一个都拿不到，于是
+    # 「读某个 GitHub 仓库」被硬拗成 3~4 轮
+    # `SELECT * FROM web_docs WHERE query LIKE ...` 的过滤条件打磨（第 4 步
+    # 甚至开始让判词教它加 AND title LIKE），永远不可能答出来。用户原话
+    # 「感觉它还在试错 sql」就是这个形状 —— 不是它笨，是我们只给了它 SQL。
+    # 消费侧 4c25a6a 已经同构地改过（「一个执行工具：SQL 只是代码里的一行」），
+    # 学习侧不跟上 = 两侧不同构。代码路径里 query_sql / gh_read /
+    # web_search / list_files 在**同一个命名空间**（local_agent._ns_base），
+    # 用哪个由环境和题目决定，不由我们分类。
+    #
+    # ⚠️ 判据是**环境形态**（kind），不是场景 id —— 新增任何场景都自动适用：
+    #   local（本机文件）、scene（自带库，B/C/H/P/G…）→ 代码路径
+    #   vlml（场景 A，数据面是 VLML 库）→ 默认仍走它专用的 SQL 执行器
+    # 开关（env，不给就 auto）：
+    #   MVE_CODE_EXEC=0    → 全部退回旧路径（vlml→VLML agent，scene→SceneDBEnv）
+    #   MVE_CODE_EXEC=all  → 连 VLML 场景也走代码路径（query_sql 只读它自己的库）
+    exec_dir = str(prof.get("scene_dir") or "")
+    # 代码路径要能查库：scene 用契约库，VLML 用它的数据面库（只读）
+    exec_db = str(db_path or prof.get("db_path") or "")
+    _mode = str(os.environ.get("MVE_CODE_EXEC", "auto")).strip().lower()
+    _off = _mode in ("0", "off", "false", "no")
+    _code_exec = (not _off) and (not use_vlml or _mode == "all")
+    # 代码路径可重放的技能（下方取到 skills 后填）：只有 Python 形态
+    # （code 里有 RESULT）能 exec；SQL 配方 exec 只会 SyntaxError。
+    _py_skills: list[dict[str, Any]] = []
+
     # ---- ① 图谱任务拆分（同构 decompose_task；LLM 失败降级会如实标 origin）----
     # 本机/知识型场景走 Maieutic 追问骨架（maieutic_scaffold，移植自
     # ~/ maieutic_fork 的 scaffolding.ts）：出的不是"Get X"动宾空壳，而是
@@ -808,20 +836,28 @@ async def _start_learning_impl(
                 print(f"  · 已学配方回注执行层：{len(skills)} 条"
                       f"（{'、'.join(x for x in _snm if x)}）", flush=True)
             agent = None
-            if use_vlml:
+            # 代码路径只能重放 **Python 形态**的技能（code 里有 RESULT）；scene
+            # 场景的旧技能是 SQL 配方，exec 一段 SQL 只会 SyntaxError —— 传进去
+            # 等于给模型喂 NameError。判据与 consume「只认本机形态的配方」同一条。
+            _py_skills = [s for s in (skills or [])
+                          if "RESULT" in str((s or {}).get("code") or "")]
+            if _code_exec:
+                # 全场景统一代码路径（本机/scene；MVE_CODE_EXEC=all 时含 vlml）：
+                # 不构造 VLML 环境，模型写代码调真实原语（原版 Voyager 就是写代码
+                # 调 control_primitives，SQL 只是其中一行）。
+                out["execution_backend"] = (f"code:{exec_dir or exec_db}"
+                                            + ("（vlml 库只读）"
+                                               if use_vlml else ""))
+            elif use_vlml:
                 from voyager_vlml.agents.action import VLMLActionAgent
                 agent = VLMLActionAgent()
-            elif not is_local:
+            else:
                 # 场景配了自己的库：写 SQL 的 prompt/critic 照旧复用，但**数据面**
                 # 只连这个库（SceneDBEnv），不引导 VLML、不读 rib。
                 from voyager_vlml.agents.action import VLMLActionAgent
                 from scene_db import SceneDBEnv
                 agent = VLMLActionAgent(env=SceneDBEnv(prof["db_path"]))
                 out["execution_backend"] = f"scene_db:{prof['db_path']}"
-            else:
-                # 本机场景：**写代码**调本机只读原语（原版 Voyager 就是写代码调
-                # control_primitives）。全程不构造 VLML 环境。
-                out["execution_backend"] = f"local:{local_dir}"
             # 抓手条目 = 注册表里本场景的**全部**条目（builtin + forged），
             # 同构 MCP tools/list 交给模型。forge 出来的条目描述里带着实查到的
             # 真实列名 —— 不交给它，它就凭 schema 瞎猜 join 键（实测踩过）。
@@ -959,13 +995,17 @@ async def _start_learning_impl(
                         # achieved 分支（learn() 第二步同构，用存量配方）。
                         print("  · 里程碑重试：对题目本体执行（已闭合维度不重学，"
                               "上轮评语进 context 槽）", flush=True)
-                        if is_local:
+                        if _code_exec:
                             _ev0: list[dict[str, Any]] = []
                             observations, sql = await local_agent.solve(
-                                question, local_dir, llm=llm, scene_id=scene,
+                                question, local_dir or exec_dir, llm=llm,
+                                scene_id=scene,
                                 critique=str(critique or ""), dimensions=[],
-                                avoid=_avoid, skills=skills,
-                                require_tools=True, evidence=_ev0)
+                                avoid=_avoid, skills=_py_skills,
+                                require_tools=True, evidence=_ev0,
+                                timeout=EXEC_TIMEOUT, db_path=exec_db,
+                                context=(_env_obs_block(exec_db)
+                                         if exec_db else ""))
                         else:
                             observations, sql = await agent.solve(
                                 question, skills=skills, grabs=grabs,
@@ -1150,13 +1190,20 @@ async def _start_learning_impl(
                                         "origin": "failed",
                                         "reason": f"{type(_ge).__name__}: {_ge}"}
 
-                        if is_local:
+                        if _code_exec:
                             obs1, code1 = await local_agent.solve(
-                                _q1, local_dir, llm=llm, scene_id=scene,
+                                _q1, local_dir or exec_dir, llm=llm,
+                                scene_id=scene,
                                 avoid=_avoid, critique=str(crit1 or ""),
                                 evidence=_ev1,
-                                skills=skills, require_tools=True,
-                                timeout=EXEC_TIMEOUT)
+                                skills=_py_skills, require_tools=True,
+                                timeout=EXEC_TIMEOUT, db_path=exec_db,
+                                # 库的表/列/真实取值 = 环境观察面（三方共用）。
+                                # 不给它，模型只能猜表名（"库里有没有 web_docs、
+                                # 里面是正文还是两行摘要"全靠猜）；给了它才判得出
+                                # 「这张表里没有答案」→ 换 gh_read 去读仓库。
+                                # 这就是"见人说人话"，不是我们替它分类。
+                                context=(_env1 if exec_db else ""))
                         else:
                             obs1, code1 = await agent.solve(
                                 _q1, skills=skills, grabs=grabs,
@@ -1221,10 +1268,13 @@ async def _start_learning_impl(
                         # （不阻塞，退化成内层单独判）。轮级 check_task_success
                         # 对数据路径**退役**——它的活儿步级已经干了，再跑一遍
                         # 是双倍 LLM 调用 + 轮级/步级两个判官口径漂移的风险。
-                        # local 路径没有内层 critic，轮级闸门仍是唯一判官，
-                        # 维持原口径（is_local 分支）。
+                        # 代码路径（_code_exec：本机 + 所有 scene，见 ⑤ 执行层
+                        # 开头）没有内层 critic，轮级闸门仍是唯一判官 —— 它的
+                        # 观察面里现在带**材料账**（task_critic._evidence_text
+                        # 渲染 result["evidence"]），判的是"答案里的说法能不能
+                        # 在工具实际返回里对上"，不再只看模型自述。
                         _inner_ok = True
-                        if is_local:
+                        if _code_exec:
                             try:
                                 import task_critic as _tc1
                                 # dimensions=[一个维度] → 走 maieutic_gate 闭合
@@ -1235,7 +1285,7 @@ async def _start_learning_impl(
                                 import reward as _rw
                                 ok1, crit1 = _tc1.check_task_success(
                                     _q1, str(crit1 or ""), r1, dimensions=[_d],
-                                    env_obs=_env_obs_block(db_path),
+                                    env_obs=_env_obs_block(exec_db or db_path),
                                     prior_questions=list(
                                         (_iters.get(_did) or {}).get("asked_q")
                                         or []),
@@ -1400,7 +1450,7 @@ async def _start_learning_impl(
                             "asked_q": ([] if _crit_missing else
                                         [str(q)[:200] for q in
                                          (getattr(agent, "_gate_asked", None)
-                                          or [])][:6]) if not is_local else [],
+                                          or [])][:6]) if not _code_exec else [],
                             "gap": ("" if (ok1 and _inner_ok) else str(_q1)[:300]),
                             "passed": bool(ok1 and _inner_ok),
                             "tools": list(tools_map.get(_did) or []),
@@ -1482,12 +1532,17 @@ async def _start_learning_impl(
                     # 材料账（同构 gathered）：整题一次执行也可能直接交 answer，
                     # 同样把「实际取回的内容」按账收着，供 critic/闸门判定。
                     _ev3: list[dict[str, Any]] = []
-                    if is_local:
+                    if _code_exec:
                         observations, sql = await local_agent.solve(
-                            question, local_dir, llm=llm, scene_id=scene,
+                            question, local_dir or exec_dir, llm=llm,
+                            scene_id=scene,
                             critique=str(critique or ""),
                             dimensions=_dims, avoid=_avoid,
-                            skills=skills, require_tools=True, evidence=_ev3)
+                            skills=_py_skills, require_tools=True,
+                            evidence=_ev3, timeout=EXEC_TIMEOUT,
+                            db_path=exec_db,
+                            context=(_env_obs_block(exec_db)
+                                     if exec_db else ""))
                     else:
                         observations, sql = await agent.solve(
                             question, skills=skills, grabs=grabs,
@@ -1504,15 +1559,27 @@ async def _start_learning_impl(
                 # context 槽（见 action.py:507），所以把 context 拼在最前。
                 _hint_ctx = [str(x).strip() for x in (str(context or ""), str(critique or ""))
                              if str(x or "").strip()]
-                observations, sql = await agent.solve(
-                    question, skills=skills, grabs=grabs, focus_tables=focus,
-                    hints=_hint_ctx
-                    + [str(s.get("need") or "") for s in plan["subtasks"]])
+                if _code_exec:
+                    # 出题器自由出题也走代码路径（同一套原语：库/本机/联网/GitHub）。
+                    # 不这么写，MVE_CODE_EXEC=all 时 agent 是 None → 这里 AttributeError。
+                    observations, sql = await local_agent.solve(
+                        question, local_dir or exec_dir, llm=llm,
+                        scene_id=scene, critique=str(critique or ""),
+                        dimensions=[], avoid=_avoid, skills=_py_skills,
+                        require_tools=True, timeout=EXEC_TIMEOUT,
+                        db_path=exec_db,
+                        context=((_env_obs_block(exec_db) if exec_db else "")
+                                 + "\n" + "\n".join(_hint_ctx)).strip())
+                else:
+                    observations, sql = await agent.solve(
+                        question, skills=skills, grabs=grabs, focus_tables=focus,
+                        hints=_hint_ctx
+                        + [str(s.get("need") or "") for s in plan["subtasks"]])
                 # 唯一 critic（2026-10-24 同构化）：solve 内层每步的判定（口径=
                 # 原版 critic.txt + 环境实查，见 VLMLActionAgent.critic_check）
                 # 就是原版 rollout 的 critic —— 这里把最后一步的判定/判词带出，
                 # ⑤' 直接采用，外层不再让 task_critic 重判一遍（双 critic 偏离）。
-                if getattr(agent, "last_success", None) is not None:
+                if agent is not None and getattr(agent, "last_success", None) is not None:
                     _ic = getattr(agent, "critic", None)
                     out["inner_critic"] = {
                         "success": bool(agent.last_success),
@@ -1676,7 +1743,7 @@ async def _start_learning_impl(
         # （2026-10-26 生产实测 2/4 闭合）闭合维度的技能永远停在技能库
         # 文本层，消费侧 invoke 不到（crystallize_all 零调用方，面板重启
         # 自检也不重结晶）。0 闭合时 added 为空，helper 自然空转。
-        _crystallize_round_skills(out, scene, local_dir, is_local, sql)
+        _crystallize_round_skills(out, scene, local_dir or exec_dir, _code_exec, sql)
         out.update(status=(("partial" if (_dres or {}).get("learned")
                             else "failed") if _dres is not None
                            else ("no_data" if not real else "failed")),
@@ -1735,7 +1802,7 @@ async def _start_learning_impl(
         out["milestone"]["why"] = f"{type(e).__name__}: {e}"
 
     # ---- ⑦ 写入技能库 → 结晶成条目（闭环最后一环：下次抓得到）----
-    _crystallize_round_skills(out, scene, local_dir, is_local, sql)
+    _crystallize_round_skills(out, scene, local_dir or exec_dir, _code_exec, sql)
 
     out["status"] = "learned" if out["absorbed"].get("mastered") else "partial"
     if out["status"] == "partial":
@@ -1795,7 +1862,7 @@ def kick_learning(question: str, scene_id: str = "", *,
 
 
 def _crystallize_round_skills(out: dict[str, Any], scene: str,
-                              local_dir: str, is_local: bool,
+                              code_dir: str, code_exec: bool,
                               sql: str) -> None:
     """把这一轮**真实落库**的技能结晶成可 invoke 条目（闭环最后一环）。
 
@@ -1845,7 +1912,7 @@ def _crystallize_round_skills(out: dict[str, Any], scene: str,
         for _s in fresh:
             _cries.append(plugin_forge.crystallize_skill(
                 _s, into_scene=scene,
-                local_scene_dir=(local_dir if is_local else "")))
+                local_scene_dir=(code_dir if code_exec else "")))
         if _cries:
             # 主结果保持 dict 形状（面板 / scene_learn 按 .ok/.entry 读）；
             # 多条时全量进 crystallized_all —— 别把后几条 silently 丢掉。
