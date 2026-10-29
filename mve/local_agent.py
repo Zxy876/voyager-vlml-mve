@@ -608,11 +608,20 @@ async def solve(question: str, scene_dir: str, *, llm=None,
                 _code_ex = (
                     f"r = {_ex}(query=\"<本题关键词>\")\n"
                     f"RESULT = {{\"answer\": r, \"source\": \"{_ex}\"}}")
+            _desc = tool_descriptions()
+            _menu = "\n".join(
+                f"- {n} — {_desc.get(n) or '（没有说明，按名字判断）'}"
+                for n in _names[:16])
             fetch_txt = (
                 "【取证要求（先做这个，再写答案）】这是**学习环节**：你的答案必须"
                 "来自你**真正调用**下列函数取回的内容，凭记忆直接写的答案判不通"
-                "过、也不会被记成能力。\n可用函数："
-                + "、".join(_names[:16]) + "\n"
+                "过、也不会被记成能力。\n可用函数（名字 — 它能给你什么）：\n"
+                + _menu + "\n"
+                + "**先用哪个由题目定，别只看下面的示例**（示例只演示「先取证、"
+                "再据实组织」的形状）：要读某个公开仓库/项目就读 gh_repo_info/"
+                "gh_tree/gh_read（原文，不是搜索摘要）；要公开网页上的事实就 "
+                "web_search 找种子再抓正文；本机/上传的文件用 list_files/"
+                "read_file；场景库里的数用 query_sql。\n"
                 + ("搜索结果只是摘要：够用就直接据实组织（标来源）；摘要不够就"
                    "对最相关的 1~2 个结果抓**正文**再提炼。\n"
                    "**抓回来的东西是不是正文，一律用 `ok_text(page)` 判**（我们提供的"
@@ -621,7 +630,7 @@ async def solve(question: str, scene_dir: str, *, llm=None,
                    "再试（最多 3 个）。不许把错误信息或内存里的记忆当答案交上来；"
                    "3 个都失败就如实写 `RESULT = {\"error\": ...}`。\n"
                    if _fx else "")
-                + "代码必须长这样（先取证，再据实组织；参数照上面签名的名字传）：\n"
+                + "代码长这样（先取证，再据实组织；参数照上面签名的名字传）：\n"
                 "```python\n" + _code_ex + "\n```\n")
         user = (f"问题：{question}\n\n{inv_txt}\n"
                 # 用户上传的文件 = 这次请求的上下文（DeepSeek 客户端同构）：
@@ -1047,6 +1056,28 @@ def bind(scene_dir: str, db_path: str = "") -> list[dict[str, Any]]:
 
 def primitive_names() -> list[str]:
     return [p["name"] for p in PRIMITIVES]
+
+
+def tool_descriptions() -> dict[str, str]:
+    """名字 → 一句话说明（给学习侧的工具菜单用，不写死名单）。
+
+    2026-10-29 生产实测的坑：菜单里原来只有**光秃秃的函数名**（gh_read、
+    query_sql…），模型根本不知道 gh_read 是"读 GitHub 仓库文件"——于是
+    「读一下某仓库」的题它去 web_search 搜摘要、再照抄示例里的 web_fetch，
+    抓回来的正文是 youtube 首页，答案却是编的。工具说明书就是能力边界，
+    得如实告诉它（同 DeepSeek 工具调用的 function description）。
+    """
+    out: dict[str, str] = {}
+    for p in PRIMITIVES:
+        out[str(p["name"])] = str(p.get("desc") or "")
+    for mod in ("net_tools", "gh_tools"):
+        try:
+            m = __import__(mod)
+            for p in (getattr(m, "PRIMITIVES", []) or []):
+                out[str(p["name"])] = str(p.get("desc") or "")
+        except Exception:
+            continue
+    return out
 
 
 # ---------------------------------------------------------------------------
