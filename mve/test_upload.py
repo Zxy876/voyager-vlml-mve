@@ -90,6 +90,31 @@ def main() -> int:
             r2 = U.ingest("B", "tech 津贴.csv", csv)
             check("同名重复上传 → 覆盖同名表（不产垃圾表）",
                   r2["ok"] and r2["table"] == r["table"], str(r2.get("table")))
+            # ---- 内容指纹去重（2026-10-29 用户拍板「同构 DeepSeek 归一去重」）
+            # ① 同内容、换文件名+换列序+换行序 → 不建第二张表，映射已有表
+            csv_re = ("amount,dept,name\n300,财务,王强\n600,技术,张伟\n"
+                      "920,技术,李娜\n").encode("utf-8")
+            rd = U.ingest("B", "另一份津贴表.csv", csv_re)
+            check("同内容换列序/行序/文件名 → 去重",
+                  rd["ok"] and rd.get("dedup") is True
+                  and rd["table"] == r["table"], str(rd)[:160])
+            check("去重后库里没有第二张表", rd["table"] in
+                  [x[0] for x in duckdb.connect(db, read_only=True).execute(
+                      "SELECT table_name FROM information_schema.tables "
+                      "WHERE table_schema='main'").fetchall()]
+                  and str(rd.get("duplicated_of")) == r["table"], "")
+            check("去重结果如实告知", "完全相同" in str(rd.get("why") or ""),
+                  str(rd.get("why"))[:60])
+            # ② 不同内容 → 照常导入，不去重
+            csv3 = ("dept,name,amount\n技术,张伟,700\n").encode("utf-8")
+            r5 = U.ingest("B", "别的数据.csv", csv3)
+            check("不同内容 → 照常建表", r5["ok"] and not r5.get("dedup"),
+                  str(r5.get("table")))
+            # ③ 上下文块里如实标注去重
+            _meta = U._load_meta("B")
+            _hit = [x for x in _meta if x.get("note")]
+            check("meta 记录去重来源", bool(_hit), str(_hit)[:80])
+
             d = U.describe("B")
             check("describe 列出上传表", r["table"] in (d.get("tables") or []),
                   str(d.get("tables")))

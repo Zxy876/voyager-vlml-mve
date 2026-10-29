@@ -34,6 +34,7 @@ DeepSeek 客户端的真相是：**文件先被转成文本，拼进这次请求
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -179,6 +180,9 @@ def context_block(scene_id: str, max_rows: int = 12,
             vis = "已接入本场景库，可直接查询" if it.get("visible") \
                 else "仅作上下文（未接入本场景库，查不到）"
             lines.append(f"- {_name} → 表 {tb}（{it.get('rows')} 行；{vis}）")
+            _tn = str(it.get("note") or "")
+            if _tn:
+                lines.append(f"  （{_tn}）")
             cols = it.get("columns") or []
             if cols:
                 lines.append(f"  列：{', '.join(str(c) for c in cols)}")
@@ -427,6 +431,28 @@ def _connect_write(db_path: str, tries: int = 6) -> Any:
     raise RuntimeError(f"库被占用，写不进去（{type(last).__name__}: {last}）")
 
 
+def _table_fingerprint(con: Any, table: str) -> str:
+    """表内容指纹：列名集合 + 全行取值（str 归一、排序）→ sha256。
+
+    归一去重用（2026-10-29 用户实测归因：同一批 CSV 反复导入，库里同一事实
+    两份名字——employees / up_employees 指纹完全相同——组合层把同一笔钱当
+    两个组成部分各加一次，总额被叠成 303600）。DeepSeek 同构：文件内容只进
+    一次，从不复制第二份。判定纯机制（无业务词）：列名排序 + 行值排序哈希；
+    顺序差异、行序差异不影响指纹。类型推断差异会导致指纹不同 → 照常导入
+    （安全方向：宁可贵一点，不可错杀）。
+    """
+    _t = str(table).replace("'", "''")
+    cols_phys = [str(r[0]) for r in con.execute(
+        "SELECT column_name FROM information_schema.columns "
+        f"WHERE table_name = '{_t}' ORDER BY ordinal_position").fetchall()]
+    rows = con.execute(f"SELECT * FROM {_q(table)}").fetchall()
+    # 列序归一：按列名排序后的顺序取值（同一份数据换列序指纹不变）
+    idx = sorted(range(len(cols_phys)), key=lambda i: cols_phys[i])
+    norm = sorted("|".join(str(r[i]) for i in idx) for r in rows)
+    payload = json.dumps([sorted(cols_phys), norm], ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def ingest(scene_id: str, filename: str, blob: bytes) -> dict[str, Any]:
     """把一个上传文件落成场景库里的表。返回 {ok, table, rows, columns, ...}。
 
@@ -511,6 +537,49 @@ def ingest(scene_id: str, filename: str, blob: bytes) -> dict[str, Any]:
         cols = [str(r[0]) for r in desc]
         sample = con.execute(f"SELECT * FROM {_q(table)} LIMIT 3").fetchall()
         _cols = cols
+
+        # ---- 内容指纹去重（2026-10-29 用户拍板「同构 DeepSeek 归一去重」）：
+        # 同一批数据反复导入 → 库里同一事实两份名字 → 学习侧学出两条同值
+        # 技能、组合层把同一笔钱当两个组成部分各加一次（实测 303600 事故，
+        # 其中 3600+3600 = allowance 与 up_allowance 同一笔钱）。机制判据：
+        # 指纹相同 = 同一份数据 → 不建第二张表，映射到已有表。
+        try:
+            _fp_new = _table_fingerprint(con, table)
+            _dup = ""
+            _tables = [str(r[0]) for r in con.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_schema = 'main'").fetchall()]
+            for _t in _tables:
+                if _t == table:
+                    continue
+                try:
+                    if _table_fingerprint(con, _t) == _fp_new:
+                        _dup = _t
+                        break
+                except Exception:
+                    continue          # 指纹算不了的表（视图等）跳过
+            if _dup:
+                con.execute(f"DROP TABLE {_q(table)}")
+                out.update(ok=True, table=_dup, rows=int(n), columns=_cols,
+                           dedup=True, duplicated_of=_dup,
+                           why=f"内容与已有表 {_dup} 完全相同，未重复建表")
+                try:
+                    _items = [x for x in _load_meta(scene_id)
+                              if str(x.get("table") or "") != table]
+                    _items.append({
+                        "name": name, "kind": "table", "table": _dup,
+                        "rows": int(n), "columns": _cols,
+                        "visible": bool(out.get("visible")),
+                        "note": f"与已有表 {_dup} 内容完全相同（未重复建表）",
+                        "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    })
+                    _save_meta(scene_id, _items)
+                except Exception:
+                    pass
+                return out
+        except Exception:
+            pass                      # 指纹失败 = 不去重，照常导入（安全方向）
+
         out.update(ok=True, table=table, rows=int(n), columns=_cols,
                    sample=[dict(zip(_cols, map(str, r))) for r in sample],
                    db_path=db_path, file=str(src))
