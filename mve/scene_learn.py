@@ -78,6 +78,7 @@ def scene_questions(scene_id: str) -> list[dict[str, Any]]:
     当前答不出来 = 要学；历史上答出来过不能抵消这一点。
     """
     latest: dict[str, str] = {}
+    latest_scope: dict[str, str] = {}
     todo: list[str] = []
     try:
         if COACH_LOG.exists():
@@ -97,6 +98,12 @@ def scene_questions(scene_id: str) -> list[dict[str, Any]]:
         if not q:
             continue
         latest[q] = str(r.get("judgment_result") or "")   # 后写的覆盖先写的
+        # 这条题归属哪条供给线（learn / tool / inference）。工具线（联网）
+        # 的题**不进待学队列**：学习侧的学习单元是「环境里的一次 rollout」，
+        # 联网结果既没有可复现的环境、也没有能验真的判官 —— 排进去只会
+        # 让驾驶舱反复拆维度、烧轮次，最后 given_up（用户 2026-10-28
+        # 拍板「工具线的答案不计入学习曲线」，不进学习账 = 也不该进待学队）。
+        latest_scope[q] = str(r.get("scope_line") or "")
     # ⚠️ **不能**拿 coach_log 的 judgment_result=="written" 当"课程已完成"。
     # 那是**消费侧**的判读（人问一句、当场答出来），原版里对应的是"这次答复成功"，
     # 不是 curriculum 的两本账。原版课程账只由 curriculum 自己记
@@ -125,6 +132,8 @@ def scene_questions(scene_id: str) -> list[dict[str, Any]]:
         if str(r.get("mode") or "") != "voyager_consume":
             continue
         q = str(r.get("question") or "").strip()
+        if latest_scope.get(q) == "tool":
+            continue                                 # 工具线题：不排学习（见上）
         if q and q not in learned_done and q not in todo:
             todo.append(q)
     # 待审区（人导入了、还没解出来的另一本账）
