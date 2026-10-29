@@ -124,6 +124,23 @@ def main() -> int:
     partial_f, why_f = _answer_is_partial(ans_f, skills_f, n_dims=3)
     check("F 不拦（dim_tabs 空）", partial_f is False, why_f)
 
+    print("== ⑧' 中文表名不许被截断（2026-10-29 服务器误杀回归）==")
+    # 实测：`up_工资明细` 被旧正则截成 `up_`，于是"一条 SQL 已答全"也被判
+    # 1/2 片面 —— 场景库的中文表名是常态。
+    _tabs = _sql_tables("SELECT SUM(month_pay) FROM up_工资明细 WHERE month='2026-09'")
+    check("中文表名完整解析", _tabs == {"up_工资明细"}, f"{_tabs}")
+    skills_cn = [
+        _skill("cn_base", "SELECT SUM(base_salary) FROM up_工资明细"),
+        _skill("cn_allow", "SELECT SUM(amount) FROM allowance"),
+    ]
+    ans_cn = "SELECT SUM(month_pay) FROM up_工资明细 WHERE month = '2026-09'"
+    partial_cn, why_cn = _answer_is_partial(ans_cn, skills_cn, n_dims=2)
+    check("中文表名题：只触及 1/2 仍如实拦（判据不松）",
+          partial_cn is True and "up_工资明细" in why_cn, why_cn)
+    # 同源单表（复用技能只涉及中文表）→ 不拦（len(dim_tabs)<2）
+    partial_cn2, why_cn2 = _answer_is_partial(ans_cn, [skills_cn[0]], n_dims=2)
+    check("复用技能同源 → 不拦", partial_cn2 is False, why_cn2)
+
     print()
     print("== ⑨ milestone_dimensions（导入式里程碑权威维度）==")
     try:

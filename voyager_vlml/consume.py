@@ -1536,12 +1536,13 @@ async def consume(
             # 被它误判成「组成部分不齐」，明明一条 SQL 就答全了。真正的判据
             # 是「本题各维度技能所涉源表」覆盖没覆盖（_answer_is_partial 的第
             # 二段：同一个源 = 谈不上组合漏维），加上 _fits_judge 的全貌判官。
-            # ⚠️ 2026-10-29：维度源表要按**全部可用材料**取（`skills`），不能按
-            # `_ans_skills` —— 组合题只复用"一条组合 SQL"，_ans_skills 里就只有
-            # 一条 → dim_tabs 只剩一张表 → 守卫形同虚设（它要查的正是"这条
-            # 组合 SQL 触及了几张维度源表"）。
-            _partial, _cwhy = _answer_is_partial(code, (skills or _ans_skills),
-                                                 _nd)
+            # ⚠️ 源表取 `_ans_skills`（**本条答案实际复用的技能**，2026-10-25 语义），
+            # 不能取检索到的全部 `skills`：那会把没用到的方法的表也算进维度源表，
+            # 于是"一条组合 SQL 已答全"也被判成 1/N 片面（2026-10-29 服务器实测：
+            # month_pay 合成列一表答全，却被 allowanc 表拉成 1/2 误杀）。
+            # 组合模型下这道闸天然变弱（一条 SQL 就覆盖多维度），最终判据是
+            # 看全貌的 _fits_judge；这里只保留它抓「明显只答了一部分」的能力。
+            _partial, _cwhy = _answer_is_partial(code, _ans_skills, _nd)
             if _partial:
                 _coverage_why = _cwhy
                 data = None
@@ -3529,8 +3530,13 @@ def _sql_tables(sql: str) -> set[str]:
     s = re.sub(r"--[^\n]*", " ", str(sql))
     s = re.sub(r"'[^']*'", " ", s)
     tabs: set[str] = set()
-    for m in re.finditer(r"\b(FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)",
-                         s, re.IGNORECASE):
+    # ⚠️ 表名必须允许中文（2026-10-29 实测）：旧正则 `[A-Za-z_]` 把
+    # `up_工资明细` 截成 `up_` —— 于是覆盖守卫拿 `['up_'] / ['allowance','up_']`
+    # 判"只触及 1/2 张"，把已经答全的合成题（month_pay 是含津贴的合成列）
+    # 误杀成 fetched_empty。中文表名在场景库里是常态，不能当英文标识符处理。
+    for m in re.finditer(
+            r"\b(FROM|JOIN)\s+([A-Za-z_\u4e00-\u9fff][\w\u4e00-\u9fff]*)",
+            s, re.IGNORECASE):
         tabs.add(m.group(2).lower())
     return tabs
 
