@@ -195,6 +195,11 @@ def main() -> int:
     check("技能检索受规划门控（无 db 路不检索库内配方）",
           "_retrieve_skills(question, topic_id or topic_hint, _scene_id)"
           in src_plan and "if _use_env else [])" in src_plan)
+    # 同一实测的另一半：没查库的题不许报「真空」判词、不许叫人「往场景目录里放数据」。
+    check("没查库的题不套真空判词 / 不叫人放数据",
+          "规划里没有 db 路 —— 这一问走工具线（联网），不查场景库：" in src_plan
+          and '("" if critic_ok else str(critic_why or "")[:300])\n'
+              '                            if _use_env else "")' in src_plan)
     # 2026-10-29 撤销自创的「web 题学方法不学数值」（qa_cache 方法沉淀 + 消费侧复用）。
     # 事实口径：DeepSeek 的联网经验在训练期进权重，运行时不留检索记忆；MVE 侧仿造属发明。
     # 这条是回归守卫：机制不许复活，否则又是一份自创。

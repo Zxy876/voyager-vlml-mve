@@ -2000,19 +2000,31 @@ async def consume(
             "mcp_tools": mcp_ready,
             # 有行 ≠ 答出来：critic 判没答出来（含叙事层 answered=false 的情形）
             # 一律 fetched_empty —— 错语义数据不能假解锁（2026-10-23 Scene P）。
-            "critic_note": "" if critic_ok else str(critic_why or "")[:300],
+            # ⚠️ 2026-10-29：规划里没有 db 路的题（纯工具线）根本不查库，不能
+            # 套「真空/无结果」的判词 —— 服务器实测（腾讯校招起薪）回复里出现
+            # 「核对没过：没取到真数（真空/无结果）」，人看到会以为查了库没数据。
+            # 真空判据只对「查了库」的题成立。
+            "critic_note": (("" if critic_ok else str(critic_why or "")[:300])
+                            if _use_env else ""),
             "judgment_result": (
                 "written" if (data is not None and critic_ok
                               and nar.get("answered", True))
                 else "fetched_empty"),
+            # 没答出来的原因：查过库的题才说「数据源里没有」；没查库的题
+            # （规划没排 db 路）如实说走的是工具线、联网这半场什么结果。
+            # 同一把尺子：_use_env（规划门控）。
             "skipped": ("" if data is not None else
-                        (("场景数据源里没有能回答它的数据（" + _scene_why + "）"
-                          "—— 往场景目录里放数据 / 调整库内容后重试")
-                         if _scene_kind == "scene" else
-                         "本机工作区里没有能回答它的数据（" + _scene_why + "）"
-                         "——「本机」= 应用跑在用户自己电脑上的那一档：只读应用"
-                         "工作区/场景目录，不联网、也不翻操作者的私人文件；"
-                         "这类问题需要外部数据源")),
+                        (("规划里没有 db 路 —— 这一问走工具线（联网），不查场景库："
+                          + (str(tool_line.get("note") or "")[:160]
+                             or "联网没取到可用资料"))
+                         if not _use_env else
+                         (("场景数据源里没有能回答它的数据（" + _scene_why + "）"
+                           "—— 往场景目录里放数据 / 调整库内容后重试")
+                          if _scene_kind == "scene" else
+                          "本机工作区里没有能回答它的数据（" + _scene_why + "）"
+                          "——「本机」= 应用跑在用户自己电脑上的那一档：只读应用"
+                          "工作区/场景目录，不联网、也不翻操作者的私人文件；"
+                          "这类问题需要外部数据源"))),
         }
         # ⑤ 记进能力库的闸门：**只有真取到数才记账**。
         # 没取到数（data is None）时绝不能把这段代码写进技能库 —— 否则下一问
