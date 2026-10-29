@@ -821,61 +821,91 @@ async def _tool_line_fallback(question: str, context: str = "") -> dict[str, Any
         out["note"] = f"联网原语不可用：{type(e).__name__}: {e}"
         return out
     import asyncio as _aio
-    # ① 搜索（同步函数 → 线程池，不堵事件循环）
-    try:
-        results = await _aio.to_thread(net_tools.web_search, question, 5)
-    except Exception as e:
-        out["note"] = (f"搜索失败（联网失败不是答一个像样的）："
-                       f"{type(e).__name__}: {str(e)[:140]}")
-        return out
-    results = [r for r in (results or [])
-               if str(r.get("url") or "").strip()][:3]
-    if not results:
-        out["note"] = "搜索没返回任何结果 —— 如实不答"
-        return out
-    out["sources"] = [{"title": str(r.get("title") or "")[:120],
-                       "url": str(r.get("url") or "")} for r in results]
-    # ② 取页正文（top 2）
-    pages: list[dict[str, str]] = []
-    for r in results[:2]:
+
+    async def _one_shot(qry: str) -> dict[str, Any]:
+        """一轮完整的 搜索 → 取正文 → claim 综合。供首答与改写重试共用。"""
+        o: dict[str, Any] = {"used": False, "answer": "", "sources": [],
+                             "note": ""}
+        # ① 搜索（同步函数 → 线程池，不堵事件循环）
         try:
-            pg = await _aio.to_thread(net_tools.web_fetch, str(r["url"]))
-            if str(pg.get("text") or "").strip():
-                pages.append({"title": str(r.get("title") or "")[:120],
-                              "url": str(r.get("url") or ""),
-                              "text": str(pg["text"])[:5000]})
+            results = await _aio.to_thread(net_tools.web_search, qry, 5)
+        except Exception as e:
+            o["note"] = (f"搜索失败（联网失败不是答一个像样的）："
+                         f"{type(e).__name__}: {str(e)[:140]}")
+            return o
+        results = [r for r in (results or [])
+                   if str(r.get("url") or "").strip()][:3]
+        if not results:
+            o["note"] = "搜索没返回任何结果 —— 如实不答"
+            return o
+        o["sources"] = [{"title": str(r.get("title") or "")[:120],
+                         "url": str(r.get("url") or "")} for r in results]
+        # ② 取页正文（top 2）
+        pages: list[dict[str, str]] = []
+        for r in results[:2]:
+            try:
+                pg = await _aio.to_thread(net_tools.web_fetch, str(r["url"]))
+                if str(pg.get("text") or "").strip():
+                    pages.append({"title": str(r.get("title") or "")[:120],
+                                  "url": str(r.get("url") or ""),
+                                  "text": str(pg["text"])[:5000]})
+            except Exception:
+                continue
+        if not pages:
+            o["note"] = "搜索有结果但页面正文都没取到 —— 如实不答"
+            return o
+        # ③ claim 综合：只准用取回的资料，缺了就说缺
+        material = "\n\n".join(
+            f"【资料{i+1}】{p['title']}\n{p['url']}\n{p['text']}"
+            for i, p in enumerate(pages))
+        try:
+            cj = chat_json(
+                [{"role": "system",
+                  "content": ("你根据给出的联网资料回答问题。铁律：**只依据资料**；"
+                              "资料里没有的写「资料未提及」；绝不编造数字与事实。"
+                              "只返回 JSON："
+                              '{"answer": "基于资料的回答", "grounded": true/false}'
+                              "（grounded = 资料是否足以回答该问题）")},
+                 {"role": "user",
+                  # 上传的文件是这次的上下文：先按文件答，联网资料是补充。
+                  "content": ((str(context).strip() + "\n\n")
+                              if str(context or "").strip() else "")
+                             + f"问题：{qry}\n\n联网资料：\n{material[:9000]}"}],
+                temperature=0.0)
+            ans = str((cj or {}).get("answer") or "").strip()
+            if ans and bool((cj or {}).get("grounded", True)):
+                o["used"] = True
+                o["answer"] = ans
+            elif ans:
+                o["note"] = "资料不足以回答（grounded=false，如实不答）"
+            else:
+                o["note"] = "claim 综合没产出回答"
+        except Exception as e:
+            o["note"] = f"claim 综合失败：{type(e).__name__}: {str(e)[:140]}"
+        return o
+
+    out = await _one_shot(question)
+    if not out.get("used"):
+        # 改写重试（DeepSeek 同构：搜索词也是工具调用的参数，模型自己写）：
+        # 题面常带指代与口语（「这家公司…啊」），直接拿去搜命中率低 —— 实测
+        # 同一题换通用措辞就能取回正文。改写一轮再来一次；还不行就如实报。
+        _q2 = ""
+        try:
+            _cj2 = chat_json(
+                [{"role": "system",
+                  "content": ("把这句话改写成适合搜索引擎的通用查询：去掉指代"
+                              "（如「这家公司」）与口语语气词，保留要查的主题；"
+                              "不是翻译也不是扩写。只返回 JSON："
+                              '{"query": "搜索词"}')},
+                 {"role": "user", "content": question}],
+                temperature=0.0)
+            _q2 = str((_cj2 or {}).get("query") or "").strip()
         except Exception:
-            continue
-    if not pages:
-        out["note"] = "搜索有结果但页面正文都没取到 —— 如实不答"
-        return out
-    # ③ claim 综合：只准用取回的资料，缺了就说缺
-    material = "\n\n".join(
-        f"【资料{i+1}】{p['title']}\n{p['url']}\n{p['text']}"
-        for i, p in enumerate(pages))
-    try:
-        cj = chat_json(
-            [{"role": "system",
-              "content": ("你根据给出的联网资料回答问题。铁律：**只依据资料**；"
-                          "资料里没有的写「资料未提及」；绝不编造数字与事实。"
-                          "只返回 JSON："
-                          '{"answer": "基于资料的回答", "grounded": true/false}'
-                          "（grounded = 资料是否足以回答该问题）")},
-             {"role": "user",
-              # 上传的文件是这次的上下文：先按文件答，联网资料是补充。
-              "content": ((str(context).strip() + "\n\n") if str(context or "").strip() else "")
-                         + f"问题：{question}\n\n联网资料：\n{material[:9000]}"}],
-            temperature=0.0)
-        ans = str((cj or {}).get("answer") or "").strip()
-        if ans and bool((cj or {}).get("grounded", True)):
-            out["used"] = True
-            out["answer"] = ans
-        elif ans:
-            out["note"] = "资料不足以回答（grounded=false，如实不答）"
-        else:
-            out["note"] = "claim 综合没产出回答"
-    except Exception as e:
-        out["note"] = f"claim 综合失败：{type(e).__name__}: {str(e)[:140]}"
+            _q2 = ""
+        if _q2 and _q2 != question:
+            _out2 = await _one_shot(_q2)
+            if _out2.get("used"):
+                out = _out2
     return out
 
 
@@ -2074,7 +2104,20 @@ async def consume(
                          for e in _act2.entries(_scene_id)]
             except Exception:
                 grabs = []
-            observations, sql = await act.solve(question, max_iters=3, grabs=grabs)
+            _solve_task = question
+            if (_plan.get("planned") and _plan.get("db")
+                    and _plan.get("web")):
+                # 规划裁剪（2026-10-29 拍板「先规划、再按规划逐路执行」的落实）：
+                # 对比题的 db 半场只要求算出**库内**能指认的量，与外部对象的
+                # 对比留给联网半场。原题直接进内层 = 判官拿「好不好」对库判
+                # 闭合，永远闭不上（实测 3 轮全拒、0 行收场）。
+                _solve_task = (question + "\n（规划：这是内部+外部的对比题，"
+                               "本轮只做 db 半场 —— 用场景数据源把**库内**能"
+                               "指认的量算出来（口径必须能落到真实表/列）；"
+                               "与外部对象的对比由联网半场负责，不要求本轮在"
+                               "库里找到，不构成拒判理由。）")
+            observations, sql = await act.solve(_solve_task, max_iters=3,
+                                                grabs=grabs)
 
     ok_calls = [o for o in observations if o.get("ok")]
     # 真的取到了数（ok 且非真空）—— 判分 / 回答 / 沉淀都只认这个，

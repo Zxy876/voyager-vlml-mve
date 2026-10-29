@@ -105,6 +105,29 @@ def main() -> int:
     r4 = asyncio.run(C._tool_line_fallback("第三个问题"))
     check("grounded=false → used=False（不编造）",
           r4.get("used") is False and not r4.get("answer"))
+
+    # 改写重试（2026-10-29）：首答失败 → LLM 改写搜索词 → 再来一轮。
+    # 题面带指代（「这家公司」）直接搜命中率低，实测同题换通用措辞就能取回。
+    _fetch_calls = {"n": 0}
+    def _fetch_stateful(url, max_bytes=200000):
+        _fetch_calls["n"] += 1
+        if _fetch_calls["n"] == 1:
+            return {"url": url, "status": 200, "bytes": 10, "text": "  "}
+        return {"url": url, "status": 200, "bytes": 100,
+                "text": "2026 年互联网行业平均年薪 30 万元。"}
+    stub_net.web_fetch = _fetch_stateful
+    stub_net.web_search = lambda q, n=5: [
+        {"title": "行业薪资", "url": "https://example.com/sal", "snippet": "s"}]
+    def _cj_dispatch(msgs, **kw):
+        _sysc = str((msgs or [{}])[0].get("content") or "")
+        if "改写成适合搜索引擎" in _sysc:
+            return {"query": "互联网行业 平均薪资 水平"}
+        return {"answer": "行业平均年薪约 30 万元（资料1）", "grounded": True}
+    C.chat_json = _cj_dispatch
+    r5 = asyncio.run(C._tool_line_fallback("这家公司的待遇好不好啊"))
+    check("首答失败 → 改写重试成功 used=True",
+          r5.get("used") is True and "30 万" in str(r5.get("answer")))
+    check("改写后的查询真被拿去取过正文", _fetch_calls["n"] >= 2)
     C.chat_json = _orig_cj
     sys.modules.pop("net_tools", None)
 
@@ -125,6 +148,8 @@ def main() -> int:
     print("== 6. 信息路规划接线（2026-10-29 拍板：先规划、再可达性检查）==")
     src_plan = inspect.getsource(C.consume)
     check("consume 主流程调用 _plan_routes", "_plan_routes(" in src_plan)
+    check("对比题 db 半场目标被规划裁剪（「本轮只做 db 半场」）",
+          "本轮只做 db 半场" in src_plan and "_solve_task" in src_plan)
     check("计划外动作不执行（规划 web=False → 不联网）",
           '_plan.get("planned") and not _plan.get("web")' in src_plan)
     check("web 步骤执行前核可达性（_web_reachable）",
