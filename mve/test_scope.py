@@ -217,6 +217,20 @@ def main() -> int:
         encoding="utf-8").read()
     check("对话页对 claim 换口径（不显示未掌握）",
           "判定：claim（联网取回、未经库内验证）" in _cp_src)
+    # 2026-10-29 用户拍板「按原版改」：合成 = **一条程序里组合调用**
+    # （voyager.py:226 env.step(code, programs)），原版**没有**「多条技能结果
+    # 相加」的合并器。MVE 那套 _refill_sql_multi 逐条 + _do_merge 相加是移植时
+    # 自造的，正是 75120 / 330441 双计的产地 —— 回归守卫：不许复活。
+    check("消费侧合成走一条组合 SQL（_compose_sql）",
+          "_compose_sql(" in src_plan and "_COMPOSE_SYSTEM" in _all_src)
+    check("合成器（逐条回填 + 相加）已删且不许复活",
+          "_refill_sql_multi(" not in _all_src
+          and "_do_merge(" not in _all_src
+          and "def _money_parts" not in _all_src
+          and "def _total_answer" not in _all_src)
+    check("叙事层不再被授权相加",
+          "允许相加汇总" not in _all_src
+          and "各来源金额相加" not in _all_src)
     # 2026-10-29 撤销自创的「web 题学方法不学数值」（qa_cache 方法沉淀 + 消费侧复用）。
     # 事实口径：DeepSeek 的联网经验在训练期进权重，运行时不留检索记忆；MVE 侧仿造属发明。
     # 这条是回归守卫：机制不许复活，否则又是一份自创。

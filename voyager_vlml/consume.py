@@ -336,49 +336,50 @@ def _refill_sql(question: str, skills: list[dict[str, Any]], schema: str,
 # 多技能输出契约 = 共享 _REFILL_SYSTEM 的规则 0-5（量纲判断 / 回填不是抄数值 /
 # 字面量地面真话 / 防乘爆 / 槽位），只换输出段 —— 单文件单一事实源，规则改动
 # 两边同步生效。
-_REFILL_MULTI_SYSTEM = (_REFILL_SYSTEM.split("只返回一个 JSON：")[0] + """多条输出契约（原版同构 2026-10-26：消费检索到的**全部**已学技能整批交给
-执行层按需组合调用 —— voyager.py:195 retrieve → :199 render_system_message →
-action.py:94 programs 注入；此前只挑一条写一条 SQL，合成题（base+津贴+加班）
-被单维度配方答掉，实测 3600/264000/133500 三连）：
+_COMPOSE_SYSTEM = (_REFILL_SYSTEM.split("只返回一个 JSON：")[0] + """组合输出契约（**原版同构 2026-10-29 用户拍板「按原版改」**）：
 
-- **逐条**判断检索到的每条配方：它算的量，要么本身就是这句话问的量，
-  要么是这句话问的量的**组成部分** —— 问「总支出」时，基本工资/津贴/加班费
-  各条配方都是组成部分，**都要实例化出来**，各自取真数后由叙事层相加组织
-  （用户 2026-10-25：「检索到的技能取到数字，给叙事 LLM 相加或者做什么，
-  也算能力」）。
-- 跟问的量无关的配方不要输出（硬凑 = 张冠李戴，规则 0 同款）。
-- 如果某条**复合配方**（一条 SQL 已覆盖整题全部组成部分）命中，就只输出它，
-  不必再输出它的组成部分。
-- 每条 SQL 必须独立可执行（单条 SELECT）；守卫与执行逐条进行，一条被拒不
-  连坐其它条。
+原版的合成不在「多个技能的结果相加」里 —— `voyager.py:226`
+`env.step(code, programs=self.skill_manager.programs)`：agent 写的**一段程序**
+在技能定义同一作用域里执行，组合就写在这段程序里（`skill_a() + skill_b()`）。
+MVE 的对应物只能是**一条 SQL**（SQL 场景里没有函数作用域），所以：
 
-只返回一个 JSON：{"items": [{"name": "配方名", "sql": "该配方实例化后的 SELECT"}],
-"note": "一句话说明复用了哪些配方、各填了什么值；哪些没用上、为什么"}
-其中 name **必须逐字写配方标签「｜」之后的原配方名**（如 total_base_salary），
-不要把整个【配方 N｜topic=…｜…】标签抄进来 —— 下游要靠它精确对回配方。""")
+- 你只输出**一条** SELECT，把这句话要的量一次算出来（子查询 / CTE / JOIN 都行）。
+- 上面每条配方是**方法材料**（它算哪个量、源列是什么），不是"待相加的项"。
+- 同一笔钱不许在一条 SQL 里被算两次：若材料 A 算的量**已经被**材料 B 包含
+  （例：`total_pay` 已含 `base_salary` 与津贴，再有 `SUM(base_salary)`），
+  就只用 B。双计不是"多算一点更保险"，是错答案（75120 / 330441 事故）。
+- 题面要的量在库里算不出来（缺费率 / 缺列 / 缺表）→ **不拼凑**，输出
+  `{"sql": ""}` 并在 note 里说清缺什么（如实不答优于语义造假）。
+- 只准引用 schema 里出现的表名列名；筛选取值必须逐字取自环境观察。
+- 与题面无关的配方不要拿来凑数（张冠李戴 = 更糟）。
+
+只返回一个 JSON：{"sql": "一条完整可执行的 SELECT",
+"used": ["用到的配方名（逐字照抄材料里的名字）"],
+"note": "一句话说明怎么组合的、哪些材料没用上、为什么"}
+""")
 
 
-def _refill_sql_multi(question: str, skills: list[dict[str, Any]], schema: str,
-                      db_path: str = "", feedback: str = "",
-                      catalog: str = "", file_context: str = "") -> dict[str, Any]:
-    """原版同构的多技能实例化：检索到的每条相关配方都回填成 SQL（不是只挑一条）。
+def _compose_sql(question: str, skills: list[dict[str, Any]], schema: str,
+                 db_path: str = "", feedback: str = "",
+                 catalog: str = "", file_context: str = "") -> dict[str, Any]:
+    """把检索到的配方当**材料**，让执行层写**一条**组合 SQL（原版同构）。
 
-    与 `_refill_sql` 同一地面真话（db_observation 实查取值清单 + schema），
-    输出从「一条 SQL」改为「SQL 列表」—— 合成题由多条原子技能各取真数、
-    叙事层组织；复合配方命中时只出它。
+    原版证据（voyager.py:195 retrieve → :199 render_system_message(skills) →
+    :226 env.step(code, programs=...））：技能是**可调用材料**，组合写在 agent
+    那段程序里；原版**没有**「多个技能结果相加」的合并器。SQL 场景没有函数
+    作用域，等价物就是一条能把多个量一次算出来的 SELECT（子查询/CTE/JOIN）。
 
-    `feedback`（2026-10-26）：上一轮回填/执行的报错清单（原版 step 的
-    critique——环境报错是地面真话，喂回去 LLM 才修正得了，voyager.py:236-271）。
+    返回 {"sql", "used", "note"}；sql 为空 = 组合层判定这题在库里算不出来
+    （缺费率/缺列），调用方如实走"没答出来"，绝不拼凑。
 
-    `catalog`（2026-10-28 用户拍板「让 agent 看到全貌」）：技能库**全库**目录。
-    检索只给命中的 top_k，模型就看不出「问总额 = 基薪配方 + 津贴配方」这种
-    组合关系（实测：命中 base_salary 一条 → 只算出 55000，漏 2120 津贴）。
-    给了全库目录，组合关系由模型自己看出来，不需要在代码里写死业务词表。
+    `feedback`（原版 step 迭代同构，voyager.py:236-271）：上一轮的执行报错
+    或对题判官的拒因 —— 环境与判官给的才是地面真话，喂回去才修正得了。
+    `catalog`：技能库全库目录（判官/组合都按技能库现状看"库里能算什么"）。
     """
     recipes = "\n\n".join(
-        f"【配方 {i+1}｜topic={s.get('topic')}｜{s.get('name') or ''}】\n"
+        f"【材料 {i+1}｜topic={s.get('topic')}｜{s.get('name') or ''}】\n"
         f"说明：{str(s.get('text') or '')[:200]}\n"
-        f"SQL：\n{str(s.get('code') or '')[:900]}"
+        f"它算的量（SQL）：\n{str(s.get('code') or '')[:900]}"
         for i, s in enumerate(skills[:5])
     )
     ground = ""
@@ -391,47 +392,38 @@ def _refill_sql_multi(question: str, skills: list[dict[str, Any]], schema: str,
     user = (
         f"当前这句话：\n{question}\n\n"
         # R1 客户端式：用户上传的文件**原文进上下文**（列名/行数/真实前几行）。
-        # 用户 2026-10-28：「上传文件的时候要像 R1 客户端一样当作上下文输入
-        # （这个可以防一堆暴雷；比写死一堆 prompt 强）」——模型看到真实内容，
-        # 就不用猜列名/取值，也不用在代码里列业务词。
         + (f"{file_context}\n\n" if file_context else "")
-        + f"已学会的配方：\n{recipes}\n\n"
-        + (f"[技能库全库目录 —— 库里已经学会的**全部**方法，上面只列了本题命中"
-           f"的几条。判断题面要的量需不需要**组合多条**（题面问合计/总额而"
-           f"单一配方只覆盖其中一部分时）：需要就把对应方法也各实例化一条 "
-           f"SELECT，交给上层相加]\n"
+        + f"可用的已学方法材料：\n{recipes}\n\n"
+        + (f"[技能库全库目录 —— 库里已经学会的全部方法，上面只列了本题命中的"
+           f"几条。判断这条 SQL 用哪条方法能算出题面要的量]\n"
            f"{catalog[:3000]}\n\n" if catalog else "")
         + f"当前库真实存在的表与列（只能引用这里出现的名字）：\n{schema[:6000]}\n\n"
         + (f"[环境观察（数据源真实的取值）——筛选字面量必须逐字取自这里，"
            f"清单里没有的写法不许出现在 SQL 里]：\n{ground[:5000]}\n\n"
            if ground else "")
-        + "按规则把**每条**要用的配方都实例化成独立的 SELECT。"
-        + (f"\n\n⚠️ 上一轮这些配方的回填/执行失败了（报错是环境给的地面真话，"
-           f"照着修——列名/表名以 schema 为准，不许发明列）：\n{feedback}"
-           f"\n\n⚠️ 硬约束：被拒原因是「费率/系数不存在」的配方，说明该量在"
-           f"库里**不可计算** —— 直接不输出那条，绝不许去掉系数、换口径、"
-           f"换列来凑一个数（那是语义造假，比答不出更糟）。"
+        + "写**一条** SELECT 把这句话要的量算出来。"
+        + (f"\n\n⚠️ 上一轮没成（报错/拒因是环境与判官给的地面真话，照着修 ——"
+           f"列名表名以 schema 为准，不许发明列；缺费率就如实说算不出来，"
+           f"绝不许去掉系数换口径凑数）：\n{feedback}"
            if feedback else "")
     )
     out = chat_json(
         [
-            {"role": "system", "content": _REFILL_MULTI_SYSTEM},
+            {"role": "system", "content": _COMPOSE_SYSTEM},
             {"role": "user", "content": user},
         ],
         temperature=0.2,
     )
-    items: list[dict[str, str]] = []
-    for it in (out.get("items") or [])[:5]:
-        if not isinstance(it, dict):
-            continue
-        _sql = str(it.get("sql") or "").strip()
-        if _sql:
-            items.append({"name": str(it.get("name") or ""), "sql": _sql})
-    return {"items": items, "note": str(out.get("note") or "")}
+    _sql = str((out or {}).get("sql") or "").strip()
+    _used = [str(x).strip() for x in ((out or {}).get("used") or [])
+             if str(x).strip()]
+    return {"sql": _sql, "used": _used[:5],
+            "note": str((out or {}).get("note") or "")}
 
 
-# （_pick_composite_skill 已删 —— 2026-10-26 多技能编排取代「挑一条复合配方」：
-#  回填层自己判断是出复合配方还是多条原子配方，见 _refill_sql_multi 的输出契约。）
+# （_pick_composite_skill 已删 —— 2026-10-26 多技能编排取代「挑一条复合配方」；
+#  2026-10-29 再改一层：多技能不再「逐条实例化 + 相加」，而是 agent 写**一条**
+#  组合 SQL（原版 voyager.py:226 同构），见 _compose_sql。）
 
 
 # ---------------------------------------------------------------------------
@@ -1211,13 +1203,12 @@ async def consume(
         obs: list[dict[str, Any]] = []
         reused_skill: dict[str, Any] | None = None
         reuse_errors: list[str] = []
-        # 多技能编排的执行账（_refill_sql_multi 逐条实例化 + 执行成功的技能）；
-        # _used_skills 是它们的技能元数据（面板 used_skills 披露用）。
+        # 组合执行账：**至多一条**（2026-10-29 起 ③b 是「一条组合 SQL」，
+        # 原版 voyager.py:226 同构）。_used_skills 是它的技能元数据（披露用）。
         _executed: list[dict[str, Any]] = []
         _used_skills: list[dict[str, Any]] = []
-        # 合并时算出的「各来源金额」与「合计」（确定性算术；_do_merge 里填）。
-        _money_kv: list[tuple[str, float]] = []
-        _total: float | None = None
+        # ⚠️ 这里曾有 _money_kv / _total（把多条结果相加算合计）—— 已删：
+        # 那正是 75120 / 330441 双计的产地。合计由组合 SQL 自己算。
         if _scene_kind == "scene":
             # ---- 场景库形态的配方复用：**回填**，不原样重放（2026-10-23 用户
             # 定「不要把数值写死，把算法积累成技能」）----
@@ -1266,16 +1257,15 @@ async def consume(
                 obs = [{"ok": True, "tool": "local_python", "rows": 1,
                         "data": data_try}]
                 break
-        # ③b 场景库形态：**多技能编排复用**（原版同构 2026-10-26 用户拍板
-        # 「检索/组织复用没对齐就改」）。原版消费 = inference → rollout → step：
-        # 检索技能**整批**注入执行层（voyager.py:195-199 → action.py:94 programs），
-        # agent 按需组合调用，critic 收口 —— 没有单配方捷径。此前只挑一条配方写
-        # 一条 SQL，合成题被单维度答掉（实测 3600/264000/133500 三连）。现在：
-        # 检索到的全部已学技能整批回填成 SQL 列表（_refill_sql_multi）→ 逐条过
-        # 确定性守卫（字面量 + fan-out）→ 逐条执行取真数 → 合并交叙事层相加组织
-        # （用户 2026-10-25：「取到数字给叙事 LLM 相加也算能力」）。
-        # 边界不变：消费不现做合成 —— 回填全是已学配方的实例化；实例化不出/
-        # 守卫拒/执行空 → 如实标记去学，绝不现场写 SQL。
+        # ③b 场景库形态：**原版同构的组合**（2026-10-29 用户拍板「按原版改」）。
+        # 原版消费 = inference → rollout → step：检索到的技能**整批**注入执行层
+        # （voyager.py:195-199 → action.py:94 programs），agent 写的那段程序里
+        # 直接组合调用（skill_a() + skill_b()），critic 收口；原版**没有**
+        # 「多条技能结果相加」的合并器。
+        # 中途那版（2026-10-26「整批回填成 SQL 列表 → 逐条执行 → 交叙事层相加」）
+        # 把组合从"程序里"挪到了"结果相加"，于是同一笔钱被算两次
+        # （75120 / 330441 事故）。现在：一条组合 SQL + 守卫 + 执行 + 对题判官。
+        # 边界不变：消费不现做新方法 —— 组合只能用已学材料（配方里的写法）。
         if reused_skill is None:
             if _scene_kind == "scene":
                 _dbp = str((_prof or {}).get("db_path") or "")
@@ -1318,265 +1308,161 @@ async def consume(
                                          "被学习跑过，需驾驶舱 ▶ 启动 Voyager 学完"}
                     obs, code = [], ""
                 else:
-                    _mr = _refill_sql_multi(question, skills, _schema,
-                                            db_path=_dbp,
-                                            file_context=_file_ctx)
-                    if not _mr["items"]:
-                        reuse_errors.append(
-                            f"检索到 {len(skills)} 条已学技能但回填层没实例化出任何"
-                            f" SQL：{str(_mr['note'])[:140]}")
+                    # ③b 原版同构（2026-10-29 用户拍板「按原版改」）：合成 =
+                    # **一条程序里组合调用**，不是「多条查询逐条取数再相加」。
+                    # 原版证据：voyager.py:226 `env.step(code, programs=...)`
+                    # —— agent 写的程序在技能定义**同一作用域**执行，组合就写在
+                    # 程序里（skill_library/trial1 有 7 处技能调技能）；原版全文
+                    # 没有「把多条技能结果相加」的合并器。SQL 场景没有函数作用域，
+                    # 等价物 = 一条能把多个量一次算出来的 SELECT（子查询/CTE/JOIN）。
+                    _cat, _all_sk = _scene_skill_catalog(_scene_id)
+                    _pool = skills or _all_sk
                     _fails: list[dict[str, str]] = []
 
-                    async def _try_items(_items: list[dict[str, str]],
-                                         _round: str) -> None:
-                        """逐条守卫 → 执行（原版 step 同构：每条配方 = 一个
-                        子目标 rollout，环境报错如实记账）。"""
-                        for _it in _items:
-                            _sql = _it["sql"]
-                            # name 对回：先精确，再宽松（LLM 偶尔把整个
-                            # 【配方 N｜topic=…｜原名】标签抄进 name —— 标签里
-                            # 含原配方名就算命中，否则 _sk=None 会让 _used_skills
-                            # 披露丢条目、used_skills 少报（实测「用到 1 条技能」）。
-                            _sk = next((s for s in skills
-                                        if str(s.get("name") or "") == _it["name"]),
-                                       None)
-                            if _sk is None and _it["name"]:
-                                _sk = next((s for s in skills
-                                            if str(s.get("name") or "")
-                                            and str(s.get("name")) in _it["name"]),
-                                           None)
-                            _label = (str((_sk or {}).get("name") or "")
-                                      or _it["name"]
-                                      or str((skills[0] if skills else {})
-                                             .get("name") or "配方"))
-                            # 防重复按**结果签名**判，不按配方名判。
-                            # 2026-10-28 那版按配方名挡（防同一配方两个变体
-                            # 重复相加），但 2026-10-29 实测它把**合法的另一个
-                            # 槽位**也挡了：重填层想补「全公司」口径的
-                            # tech_base_salary 实例化，被「该配方已有一条成功
-                            # 账」跳过 —— 判官只能拒，整题空手。同一份 SQL =
-                            # 同一份结果，才叫重复；不同槽位（技术部 vs 全公司）
-                            # 是不同的账，该放行。
-                            _sig = " ".join(str(_sql or "").split()).lower()
-                            if any(" ".join(str(e.get("sql") or "").split()).lower()
-                                   == _sig for e in _executed):
-                                reuse_errors.append(
-                                    f"{_label} 的这份 SQL 与已有账逐字相同"
-                                    f" —— 同一结果不重复计")
-                                continue
-                            _gwhy = _sql_literal_guard(_sql, _dbp)
-                            if _gwhy:
-                                reuse_errors.append(
-                                    f"{_label} 被字面量守卫拒用（幻觉取值）：{_gwhy[:120]}")
-                                _fails.append({"name": _label, "sql": _sql,
-                                               "why": _gwhy[:200], "guard": "literal"})
-                                continue
-                            _fwhy = _fanout_guard(_sql, _dbp)
-                            if _fwhy:
-                                reuse_errors.append(
-                                    f"{_label} 被 fan-out 闸门拒用（JOIN 乘爆）：{_fwhy[:120]}")
-                                _fails.append({"name": _label, "sql": _sql,
-                                               "why": _fwhy[:200], "guard": "fanout"})
-                                continue
-                            # 单位守卫已删（2026-10-29）：题面口径/单位语义
-                            # 不在代码里判，交给执行后的全貌判官（_fits_judge）。
-                            # 费率守卫（确定性）：乘以库里指认不了的常量 =
-                            # 假设费率（SUM(overtime_hours)*100 事故，2026-10-28）。
-                            _rwhy = _rate_guard(_sql, _dbp)
-                            if _rwhy:
-                                reuse_errors.append(
-                                    f"{_label} 被费率守卫拒用：{_rwhy[:120]}")
-                                _fails.append({"name": _label, "sql": _sql,
-                                               "why": _rwhy[:200], "guard": "rate"})
-                                continue
-                            _rr = await _env.run_sql(_sql)
-                            _d = _rr.get("data") or {}
-                            if _rr.get("ok") and _d.get("rows"):
-                                _executed.append({"skill": _sk or {},
-                                                  "name": _label,
-                                                  "sql": _sql, "data": _d,
-                                                  "rows": _rr.get("rows")})
-                            else:
-                                _why = str(_rr.get("error") or "0 行")[:200]
-                                reuse_errors.append(
-                                    f"{_label} 回填后没取到真数：{_why[:120]}")
-                                _fails.append({"name": _label, "sql": _sql, "why": _why})
+                    def _label_of(_cs: dict[str, Any]) -> str:
+                        _nm = [str(x) for x in (_cs.get("used") or [])]
+                        return ("、".join(_nm[:3])
+                                or str((skills[0] if skills else {})
+                                       .get("name") or "组合配方"))
 
-                    await _try_items(_mr["items"], "首轮")
-                    if not _executed and _fails:
-                        # 原版 step 同构（voyager.py:236-271）：执行报错作为
-                        # critique 重新 render 进下一轮 human message —— 环境报错
-                        # 是地面真话，喂回去 LLM 才修正得了。冷启动单发实测会犯
-                        # BinderException（total_salary 配方本身干净，回填 LLM
-                        # 画蛇添足给 employees 加了不存在的 month 列）。重试一次
-                        # （= 原版 4 步迭代里的一次修正轮，不是新发明）。
-                        _fb = "\n".join(f"- {_f['name']}：{_f['why']}"
-                                        for _f in _fails[:5])
-                        print(f"  · 复用首轮全败（{len(_fails)} 条）→ 报错当 critique "
-                              f"重试一轮（原版 step 迭代同构）", flush=True)
-                        # 重试必须带上**全貌**（表/列/真实取值）：只给报错
-                        # 不给取值，模型会把「津贴」当成 allowance.kind 的取值
-                        # 再写一遍（2026-10-28 实测：kind='津贴' 被字面量守卫
-                        # 连拒两轮 → 整题真空；库里真实取值是 餐补/交通）。
-                        _mr2 = _refill_sql_multi(question, skills, _schema,
-                                                 db_path=_dbp, feedback=_fb,
-                                                 catalog=_catalog_block(_dbp),
-                                                 file_context=_file_ctx)
-                        if _mr2["items"]:
-                            await _try_items(_mr2["items"], "重试")
-                    _last_note: str = str(_mr.get("note") or "")
+                    async def _try_one(_cs: dict[str, Any]) -> str:
+                        """守卫 → 执行 → 记进 `_executed`（**至多一条**）。返回拒因。
 
-                    def _do_merge() -> None:
-                        """把 _executed 合并成 data/code/obs（判官退回后要重来一遍）。"""
+                        与旧版逐条执行的区别：组合已经在那一条 SQL 里做完了，
+                        这里不做「多取几条再来合并」——原版也没有那一步。
+                        """
+                        _sql = str(_cs.get("sql") or "").strip()
+                        if not _sql:
+                            return (f"组合层没产出 SQL："
+                                    f"{str(_cs.get('note') or '')[:120]}")
+                        _lb = _label_of(_cs)
+                        for _gname, _g in (("字面量", _sql_literal_guard),
+                                           ("fan-out", _fanout_guard),
+                                           ("费率", _rate_guard)):
+                            _why = _g(_sql, _dbp)
+                            if _why:
+                                _msg = (f"{_lb} 被{_gname}守卫拒用："
+                                        f"{_why[:120]}")
+                                reuse_errors.append(_msg)
+                                _fails.append({"name": _lb, "sql": _sql,
+                                               "why": _why[:200],
+                                               "guard": _gname})
+                                return _msg
+                        _rr = await _env.run_sql(_sql)
+                        _d = _rr.get("data") or {}
+                        if _rr.get("ok") and _d.get("rows"):
+                            _sk = next((s for s in _pool
+                                        if str(s.get("name") or "")
+                                        in (_cs.get("used") or [])), None)
+                            _executed.append({"skill": _sk or {},
+                                              "name": _lb, "sql": _sql,
+                                              "data": _d,
+                                              "rows": _rr.get("rows")})
+                            return ""
+                        _err = str(_rr.get("error") or "0 行")
+                        _msg = f"{_lb} 执行没取到真数：{_err[:160]}"
+                        reuse_errors.append(_msg)
+                        _fails.append({"name": _lb, "sql": _sql,
+                                       "why": _err[:200]})
+                        return _msg
+
+                    def _settle() -> None:
+                        """把那**一条**组合结果装进 data/code/obs —— **不相加**。
+
+                        原版没有合并器：组合已经在程序里做完了。这里再"把各条
+                        金额列相加"就是把同一笔钱算两次（75120 / 330441 事故）。
+                        """
                         nonlocal data, code, obs, reused_skill
                         nonlocal _used_skills, _ans_skills
-                        nonlocal _money_kv, _total
-                        # 多技能结果合并（原版：agent 组合多条技能的产出交呈现层）：
-                        # 每行标注来源技能，叙事层据此相加/组织；`rows` 键保住
-                        # 下方真空防线的口径不变。
-                        _merged: list[Any] = []
-                        for _e in _executed:
-                            # list 行还原列名（执行层 run_sql 带 columns）——
-                            # 叙述守卫的单位语义靠**列名**活着，丢列名的
-                            # 「值」行会让 20.5 小时混进金额相加（2026-10-28）。
-                            _cols = [str(c) for c in
-                                     ((_e.get("data") or {}).get("columns")
-                                      or [])]
-                            # 别名不撒谎（2026-10-28 用户截图事故）：配方写
-                            # `SUM(overtime_hours) AS overtime_pay` 时，输出列
-                            # 名看着是钱、来源列其实是小时 —— 合并时把这种列
-                            # 改成「<来源列>（数量/时长，不是钱）」，下游
-                            # （叙事对账 _collect_evidence、合计、人眼）就都
-                            # 不会再把它当金额。
-                            _q = _qty_outputs(str(_e.get("sql") or ""))
-                            for _row in (_e["data"].get("rows") or []):
-                                if isinstance(_row, dict):
-                                    _pair = dict(_row)
-                                elif (isinstance(_row, (list, tuple)) and _cols
-                                      and len(_row) == len(_cols)):
-                                    _pair = dict(zip(_cols, _row))
-                                else:
-                                    _merged.append({"来源技能": _e["name"],
-                                                    "值": _row})
-                                    continue
-                                _fixed = {_k: _v for _k, _v in _pair.items()
-                                          if _k not in _q}
-                                for _k, _v in _pair.items():
-                                    if _k in _q:
-                                        _fixed[f"{_q[_k]}（数量/时长，不是钱）"] = _v
-                                _merged.append({"来源技能": _e["name"], **_fixed})
-                        # 合计**在这里算好**（确定性算术，不交给叙事 LLM 做加法，
-                        # 也不交给它挑「哪几个是钱」）：数据里带一个「合计」，
-                        # 叙事照着说就行，对账也认得出这个数。
-                        _money_kv = _money_parts(_executed)
-                        _total = (round(sum(v for _, v in _money_kv), 2)
-                                  if len(_money_kv) > 1 else None)
-                        data = {"rows": _merged,
-                                "sources": [_e["name"] for _e in _executed]}
-                        if _total is not None:
-                            data = {"合计（各金额来源相加）": _total, **data}
-                        code = "\n;\n".join(_e["sql"] for _e in _executed)
-                        _first = next((e["skill"] for e in _executed
-                                       if e.get("skill")), None) or skills[0]
-                        reused_skill = {**dict(_first), "refill_note": _last_note,
-                                        "composed_of": [_e["name"]
-                                                        for _e in _executed]}
-                        _used_skills = [dict(e["skill"]) for e in _executed
-                                        if e.get("skill")]
+                        _e = _executed[0]
+                        _d = _e["data"]
+                        # 别名不撒谎（2026-10-28 事故的确定性防线，原样保留）：
+                        # 配方写 `SUM(overtime_hours) AS overtime_pay` 时，输出列
+                        # 名看着是钱、聚合的来源列其实是小时 —— 把这种列改名成
+                        # 「<来源列>（数量/时长，不是钱）」，叙事/对账/人眼就都
+                        # 不会再把它当金额（43.5 小时 → 43.5 元那次）。
+                        _q = _qty_outputs(str(_e.get("sql") or ""))
+                        if _q:
+                            _d = _rename_qty_cols(_d, _q)
+                        data = _d
+                        code = _e["sql"]
+                        # 对回本次「真正被复用的那条技能」：模型在 used 里写的
+                        # 名字必须逐字对上材料名；对不上（模型改了写法）就退回
+                        # 命中的第一条 —— 与旧合并器同一兜底，不然 reused_skill
+                        # 没 key → ⑤ 的 _absorb 会按 topic 新建 consume_ 脏账
+                        # （违反「消费不写新技能」，2026-10-25 边界）。
+                        _first = (dict(_e.get("skill") or {})
+                                  or (dict(skills[0]) if skills else {}))
+                        reused_skill = {**_first,
+                                        "refill_note": _last_note,
+                                        "composed_of": [_e["name"]]}
+                        _used_skills = ([dict(_first)] if _first else [])
                         _ans_skills = (_used_skills or skills)
                         obs = [{"ok": True, "tool": "query_sql",
-                                "rows": _e["rows"], "data": _e["data"],
-                                "data_sources": ["query_sql"]}
-                               for _e in _executed]
+                                "rows": _e["rows"], "data": _d,
+                                "data_sources": ["query_sql"]}]
 
+                    _cs = _compose_sql(question, _pool, _schema, db_path=_dbp,
+                                       catalog=_cat, file_context=_file_ctx)
+                    _last_note: str = str(_cs.get("note") or "")
+                    _why0 = await _try_one(_cs)
+                    if not _executed:
+                        # 原版 step 迭代同构（voyager.py:236-271）：失败把拒因
+                        # 当 critique 喂回去重写一轮 —— 环境报错是地面真话。
+                        print(f"  · 组合首轮没成（{_why0[:90]}）→ 带拒因重写一轮",
+                              flush=True)
+                        _cs2 = _compose_sql(question, _pool, _schema,
+                                            db_path=_dbp,
+                                            feedback=f"- 上一轮：{_why0}",
+                                            catalog=_cat,
+                                            file_context=_file_ctx)
+                        _last_note = str(_cs2.get("note") or _last_note)
+                        await _try_one(_cs2)
                     if _executed:
-                        _do_merge()
-                    else:
-                        reuse_errors.append(
-                            "已检索到已学技能但复用未取到真数（回填/守卫/执行全败）")
-                        learn_kick = {"kicked": False, "manual": True,
-                                      "why": "已学技能检索到了但复用未取到真数 —— "
-                                             "消费不做合成，需驾驶舱 ▶ 启动 Voyager "
-                                             "重学该里程碑（或补缺维度）"}
-                        obs, code = [], ""
-                    # ---- 作答对题判官（**看全貌**判，不靠写死词表）----
-                    # 2026-10-28 用户拍板：「不能这样写死守卫解决，而是…让 agent
-                    # 看到全貌」。判官拿到「题面 + 实际 SQL + 取回结果 + 整库全貌
-                    # （表/列/真实取值）+ 技能库全库目录」，自己看出「工资 = 基本
-                    # 工资 + 津贴」这类合成关系 —— 业务口径不再写进代码。
-                    # 判不过 → 带着全貌与拒因重填一轮（原版 step 迭代同构）；仍
-                    # 不过就当没答出来（data=None 走学习线），绝不交片面数。
-                    # 技能目录在判官**之前**取（2026-10-29 用户拍板「守卫根据
-                    # 技能更新」）：判官眼中的「库里可算口径」锚在技能库现状上，
-                    # 每学一条技能，可算集合自动扩一圈 —— 守卫不再依赖写死的
-                    # 假设，跟原版 Voyager 以技能库/环境现状为判定锚同构。
-                    _cat, _all_sk = _scene_skill_catalog(_scene_id)
-                    if _executed:
+                        _settle()
                         _fit = _fits_judge(question, code, data, _dbp,
                                            items=_executed, fails=_fails,
                                            catalog=_cat)
                         if not _fit["ok"]:
+                            # 判官退回 → **整条重写**，不做「保留对的部分再补
+                            # 几条」：那正是回到"相加模型"（判官说缺津贴 →
+                            # 补一条津贴 → 两条结果相加 → 双计）。
                             reuse_errors.append(
-                                f"作答被对题判官退回：{_fit['why'][:160]}")
+                                f"组合被对题判官退回：{_fit['why'][:160]}")
                             print(f"  · 对题判官退回：{_fit['why'][:110]}"
-                                  f" → 带全库目录重填一轮", flush=True)
-                            _fb_lines = [f"- 上一轮结果被判官退回：{_fit['why']}"]
-                            if _fails:
-                                # 执行报错也是地面真话，必须一起喂回去：
-                                # 只说「缺了津贴」而没说「你写的 month 列不存在」，
-                                # 重填会照着同一个错再写一遍（2026-10-28 实测）。
-                                _fb_lines.append("- 上一轮这些配方取数失败"
-                                                 "（照着改，列名以 schema 为准）：")
-                                _fb_lines += [f"  · {f['name']}：{f['why'][:160]}"
-                                              for f in _fails[:5]]
-                            _fb_lines.append("- 技能库全库目录（可组合多条，"
-                                             "别只看命中的）：")
-                            _fb_lines.append(f"{_cat or '（空）'}")
-                            _fb2 = "\n".join(_fb_lines)
-                            try:
-                                _mr3 = _refill_sql_multi(
-                                    question, (_all_sk or skills), _schema,
-                                    db_path=_dbp, feedback=_fb2, catalog=_cat,
-                                    file_context=_file_ctx)
-                            except Exception as _e3:
-                                _mr3 = {"items": [], "note": str(_e3)}
-                            if _mr3["items"]:
-                                # ⚠️ 判官说的是「缺一部分」，不是「全错」：
-                                # 上一轮已取到真数的条目必须留着（清掉=把对的也
-                                # 扔了 → 第二轮三条全被字面量守卫拒 → 空手。
-                                # 2026-10-28 实测：首轮 基薪+津贴 已执行成功、判官
-                                # 只指出缺加班费，清表后整题退回 fetched_empty）。
-                                _prev = list(_executed)
-                                _prev_sql = {" ".join(str(e["sql"]).split()).lower()
-                                             for e in _prev}
-                                # 结果内容一样 = 同一条账（换了个写法），不许
-                                # 重复计进合并（实测重填出了第二份 allowance →
-                                # 判官看到「SQL 3 和 SQL 4 重复计算了餐补」）。
-                                _prev_sig = {
-                                    json.dumps((e.get("data") or {}).get("rows"),
-                                               ensure_ascii=False, sort_keys=True)
-                                    for e in _prev}
-                                _executed.clear()
-                                _fails.clear()
-                                _last_note = str(_mr3.get("note") or _last_note)
-                                await _try_items(_mr3["items"], "判官退回重填")
-                                _executed[:] = _prev + [
-                                    e for e in _executed
-                                    if " ".join(str(e["sql"]).split()).lower()
-                                    not in _prev_sql
-                                    and json.dumps(
-                                        (e.get("data") or {}).get("rows"),
-                                        ensure_ascii=False, sort_keys=True)
-                                    not in _prev_sig]
+                                  f" → 带全库目录重写一条", flush=True)
+                            _executed.clear()
+                            _fails.clear()
+                            _cs3 = _compose_sql(
+                                question, (_all_sk or _pool), _schema,
+                                db_path=_dbp,
+                                feedback=(f"- 上一轮被对题判官退回："
+                                          f"{_fit['why']}\n"
+                                          f"- 技能库全库目录：\n{_cat or '（空）'}"),
+                                catalog=_cat, file_context=_file_ctx)
+                            _last_note = str(_cs3.get("note") or _last_note)
+                            await _try_one(_cs3)
                             if _executed:
-                                _do_merge()
+                                _settle()
                                 _fit = _fits_judge(question, code, data, _dbp,
                                                    items=_executed, fails=_fails)
                             if not _fit["ok"]:
+                                # 重写也没过 → 当没答出来（走学习线）。
+                                # obs/code 一并清空：否则面板会拿上一轮的行数
+                                # 当"取到了数"（假证据同 2026-10-29 那三处）。
                                 data = None
                                 reused_skill = None
+                                obs, code = [], ""
                                 reuse_errors.append(
-                                    f"重填后仍不对题：{_fit['why'][:160]}")
+                                    f"重写后仍不对题：{_fit['why'][:160]}")
+                    else:
+                        reuse_errors.append(
+                            "已检索到已学技能但组合没取到真数"
+                            "（组合/守卫/执行全败）")
+                        learn_kick = {"kicked": False, "manual": True,
+                                      "why": "已学技能检索到了但组合没取到真数"
+                                             " —— 重学该里程碑（或补缺维度）"}
+                        obs, code = [], ""
             else:
                 obs, code = await _la.solve(
                     question, _scene_dir, scene_id=_scene_id, skills=skills,
@@ -1650,7 +1536,12 @@ async def consume(
             # 被它误判成「组成部分不齐」，明明一条 SQL 就答全了。真正的判据
             # 是「本题各维度技能所涉源表」覆盖没覆盖（_answer_is_partial 的第
             # 二段：同一个源 = 谈不上组合漏维），加上 _fits_judge 的全貌判官。
-            _partial, _cwhy = _answer_is_partial(code, _ans_skills, _nd)
+            # ⚠️ 2026-10-29：维度源表要按**全部可用材料**取（`skills`），不能按
+            # `_ans_skills` —— 组合题只复用"一条组合 SQL"，_ans_skills 里就只有
+            # 一条 → dim_tabs 只剩一张表 → 守卫形同虚设（它要查的正是"这条
+            # 组合 SQL 触及了几张维度源表"）。
+            _partial, _cwhy = _answer_is_partial(code, (skills or _ans_skills),
+                                                 _nd)
             if _partial:
                 _coverage_why = _cwhy
                 data = None
@@ -1698,25 +1589,12 @@ async def consume(
             try:
                 import narrator as _nar
                 _nar_note = f"数据源：{_scene_why}"
-                if len((reused_skill or {}).get("composed_of") or []) > 1:
-                    # 多技能编排：各条目是同一总量的组成部分，授权叙事层相加
-                    # （用户 2026-10-25：「检索到的技能取到数字，给叙事 LLM
-                    # 相加或者做什么，也算能力」）。
-                    _nar_note += ("；下面各「来源技能」条目是这句话问的总量的"
-                                  "组成部分，允许相加汇总，逐个来源编号都标上")
-                    # 合计**已经算好**（在 _do_merge 里，确定性算术）：这里只
-                    # 把结果和「哪些是钱」告诉叙事层，不让它自己挑、自己加。
-                    # 2026-10-28 实测：让它自己加 → 三次把合计写成其中一项
-                    # （133500 而不是 137100），还把小时数当钱加成 134903.5。
-                    if _total is not None:
-                        _kv_txt = " + ".join(f"{_v:,.2f}" for _n, _v in _money_kv)
-                        _nar_note += (f"；各来源金额相加 = {_total:,.2f}"
-                                      f"（{_kv_txt}）—— 题面问的是合计/总额时"
-                                      f"**必须**用这个数，不许只报其中一项，"
-                                      f"也不许自己另算一个合计")
-                    else:
-                        _nar_note += ("；数据里没有可相加的金额（各来源不是钱，"
-                                      "或只有一项）—— 题面问合计时如实说算不出来")
+                # 合成已经在那**一条** SQL 里做完（原版 voyager.py:226 同构），
+                # 数据里就只有一条结果 —— 不再授权叙事层相加：授权相加等于把
+                # 合并器从代码挪进提示词，双计照样发生（330441 事故的另一半）。
+                _nar_note += ("；这一答是**一条查询**算出来的完整结果，"
+                              "只准原样引用其中的数，不许自己再相加/合并"
+                              "（各数字之间是同一口径内的关系，不是待相加的分项）")
                 _nar_note += ("；⚠️ 值的单位是数量/时长（不是货币）时，绝不许"
                               "把它叙述成某个货币金额 —— 数据源里没有换算"
                               "比率，这笔钱就不存在")
@@ -1770,22 +1648,9 @@ async def consume(
                                 + _why_n[:120] + "），已退回原始数据平铺")
                         except Exception:
                             pass
-            # ---- 合计类问句的确定性终判（R1 同构：rule-based 判最终结论）----
-            # 叙事层的活儿只剩「把话说顺」：合计对不对，不再由它决定。
-            # 2026-10-28 三轮实测它把合计写成其中一项（133500 vs 137100），
-            # 还有一轮自己加了小时数（134903.5）—— 代码算好的数它不引用，
-            # 那就换成代码拼的那句。数字逐项可指认，谁也没得编。
-            if (_total is not None
-                    and not _mentions_value(answer, _total)):
-                _by_code = _total_answer(_total, _money_kv)
-                try:
-                    nar["caveats"] = list(nar.get("caveats") or []) + [
-                        "合计由代码相加得到（叙事层没引用这个数，已改用代码结论）"]
-                    nar["answer"] = _by_code
-                except Exception:
-                    nar = {"ok": True, "answer": _by_code,
-                           "caveats": ["合计由代码相加得到（叙事层没引用它）"]}
-                answer = _by_code
+            # （「合计类问句的确定性终判」已删，2026-10-29：那一步的前提是
+            #  「合计由代码从多条结果相加得到」—— 合并器已退役，合计由那一条
+            #  组合 SQL 自己算出，代码不再替它做加法，也就没有"代码结论"可兜。）
         # 这段代码到底调了哪些抓手（披露用；不含纯计算，见 `_tools_in_code`）
         _mve_traj = _tools_in_code(code, _scene_id)
         # 完成判定（2026-10-25 用户拍板）：消费侧 **LLM critic 判定删除**——
@@ -3162,74 +3027,30 @@ def _qty_outputs(sql: str) -> dict[str, str]:
     return out
 
 
-def _entry_pairs(entry: dict[str, Any]) -> list[tuple[str, Any]]:
-    """一条执行结果的首行 (列名, 值) —— dict 行与 list 行两种返回形态都要认。
+def _rename_qty_cols(data: dict[str, Any], q: dict[str, str]) -> dict[str, Any]:
+    """把「别名是钱、来源列是数量/时长」的输出列**改名**（不改值）。
 
-    ⚠️ 2026-10-28 实测坑：`run_sql` 的 rows 多数是 **list**（列名在 columns
-    里），只按 dict 取 key 会让「合计」整段算不出来（合计注进 note 里，但
-    data 里没有那个数 → 叙述对账判它指认不了 → 整题退化成原始 JSON）。
+    `_qty_outputs` 找出的就是这种列（`SUM(overtime_hours) AS overtime_pay`
+    → {"overtime_pay": "overtime_hours"}）。合并器退役后这道确定性防线
+    仍在用：单条组合结果同样可能带这种列，叙事/对账看到「43.50 元加班费」
+    就会把人小时数说成钱（2026-10-28 事故）。
     """
-    _d = entry.get("data") or {}
-    _rows = _d.get("rows") or []
-    if not _rows:
-        return []
-    _r0 = _rows[0]
-    if isinstance(_r0, dict):
-        return [(str(k), v) for k, v in _r0.items()]
-    _cols = [str(c) for c in (_d.get("columns") or [])]
-    if _cols and isinstance(_r0, (list, tuple)) and len(_r0) == len(_cols):
-        return list(zip(_cols, _r0))
-    return []
+    def _fix(k: str) -> str:
+        return f"{q[k]}（数量/时长，不是钱）" if k in q else k
 
-
-def _money_parts(executed: list[dict[str, Any]]) -> list[tuple[str, float]]:
-    """各条目里「这笔钱」的值：跳过数量/时长列（按来源列判，不按别名）。
-
-    返回 [(来源技能名, 金额)]。同一来源只取第一个金额列（一条配方 = 一笔账）。
-    """
-    out: list[tuple[str, float]] = []
-    for _e in (executed or []):
-        _q = _qty_outputs(str(_e.get("sql") or ""))
-        for _k, _v in _entry_pairs(_e):
-            _kl = str(_k)
-            if any(u in _kl.lower() for u in _QTY_UNITS):
-                continue
-            if _kl in _q:                       # 别名是钱、来源列是小时 → 跳过
-                continue
-            if isinstance(_v, bool):
-                continue
-            try:
-                _fv = float(_v)
-            except (TypeError, ValueError):
-                continue
-            out.append((str(_e.get("name") or ""), _fv))
-            break
-    return out
-
-
-# 「合计」不再靠问句关键词触发：多技能编排（composed_of>1）本身就是「这组
-# 条目是同一个总量的组成部分」（既有设计语义，2026-10-25 用户拍板），数据里
-# 有 ≥2 个金额来源就该有合计。代码只算数，不猜题意。
-
-
-def _total_answer(total: float, parts: list[tuple[str, float]]) -> str:
-    """合计的确定性答法（代码拼，不经 LLM）：数字可逐项指认，不会被改口径。"""
-    _items = "、".join(f"{_n} {_v:,.2f} 元" for _n, _v in parts if _v)
-    return f"合计 {total:,.2f} 元（{_items}）"
-
-
-def _mentions_value(answer: str, value: float) -> bool:
-    """答案里说到这个数没有（与叙述对账用同一把剥时间的尺子）。"""
-    try:
-        import narrator as _n
-        return bool(_n.mentions_value(answer, value))
-    except Exception:
-        # 叙事模块不可用（缺依赖等）不该让整题挂掉：退回朴素包含判断
-        _s = re.sub(r"[,，\s]", "", str(answer or ""))
-        for cand in (f"{value:.2f}", f"{value:.1f}", str(int(value))):
-            if cand.lstrip("0") and cand in _s:
-                return True
-        return False
+    _rows = list(data.get("rows") or [])
+    _cols = [str(c) for c in (data.get("columns") or [])]
+    _out: list[Any] = []
+    for _r in _rows:
+        if isinstance(_r, dict):
+            _out.append({_fix(str(k)): v for k, v in _r.items()})
+        else:
+            _out.append(_r)          # list 行：列名在 columns 里，值不动
+    _d = dict(data)
+    _d["rows"] = _out
+    if _cols:
+        _d["columns"] = [_fix(c) for c in _cols]
+    return _d
 
 
 # 单位守卫 _unit_guard 已删（2026-10-29 用户拍板「删」）：代码里不再写任何

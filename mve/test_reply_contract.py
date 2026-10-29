@@ -260,17 +260,20 @@ def main() -> int:
           and "items=_executed" in src)
     check("solve 兜底路径也过判官",
           "整段 SQL 被对题判官退回" in src)
-    check("判不过 → 带全库目录重填一轮", "catalog=_cat" in src and "_fb2" in src)
-    check("重填用技能库全库（不只命中的几条）",
-          "_scene_skill_catalog(_scene_id)" in src and "_all_sk or skills" in src)
-    check("重填后仍不过 → 当没答出来（走学习线）",
-          "重填后仍不对题" in src and "reused_skill = None" in src)
-    check("回填层收得到全库目录",
+    # 2026-10-29「按原版改」：合成 = 一条组合 SQL + 判官，判不过**整条重写**
+    # （不再"保留对的部分再补几条"——那正是回到相加模型）。
+    check("判不过 → 带全库目录重写一条",
+          "catalog=_cat" in src and "组合被对题判官退回" in src)
+    check("重写用技能库全库（不只命中的几条）",
+          "_scene_skill_catalog(_scene_id)" in src and "_all_sk or _pool" in src)
+    check("重写后仍不过 → 当没答出来（走学习线）",
+          "重写后仍不对题" in src and "reused_skill = None" in src)
+    check("组合层收得到全库目录",
           "catalog: str = \"\"" in src and "技能库全库目录" in src)
-    check("复用逐条不再过单位守卫（口径判定交判官，2026-10-29 拍板）",
+    check("复用不再过单位守卫（口径判定交判官，2026-10-29 拍板）",
           "_unit_guard(" not in src)
-    check("复用逐条仍过费率守卫（SUM(小时)*100 事故）",
-          "_rate_guard(_sql, _dbp)" in src)
+    check("复用仍过费率守卫（SUM(小时)*100 事故）",
+          '("费率", _rate_guard)' in src)
     g = C._rate_guard("SELECT SUM(overtime_hours) * 100 AS t FROM attendance", "")
     check("乘以库里指认不了的常量 → 拒（假设费率）",
           bool(g) and "不许假设" in g, g[:50])
