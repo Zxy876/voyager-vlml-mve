@@ -186,7 +186,8 @@ def context_block(scene_id: str, max_rows: int = 12,
             if rows:
                 try:
                     lines.append("  真实前几行："
-                                 + json.dumps(rows, ensure_ascii=False)[:1200])
+                                 + json.dumps(rows, ensure_ascii=False,
+                                              default=str)[:1200])
                 except Exception:
                     pass
             continue

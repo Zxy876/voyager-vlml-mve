@@ -1564,7 +1564,8 @@ async def _start_learning_impl(
                  "data_sources": list(o.get("data_sources") or []),
                  "evidence": str(o.get("evidence") or ""),
                  "error": str(o.get("error") or "")[:200],
-                 "data": (json.dumps(o.get("data"), ensure_ascii=False)[:600]
+                 "data": (json.dumps(o.get("data"), ensure_ascii=False,
+                                     default=str)[:600]
                           if not isinstance(o.get("data"), str)
                           else str(o.get("data"))[:600])}
                 for o in (observations or [])][-4:]

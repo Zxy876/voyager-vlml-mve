@@ -3105,8 +3105,11 @@ def _fits_judge(question: str, sql: str, data: Any,
     if isinstance(data, dict):
         rows = data.get("rows")
     try:
-        preview = json.dumps(rows[:8], ensure_ascii=False)[:1200] if rows else \
-            str(data)[:800]
+        # default=str：DuckDB 的 DATE/TIMESTAMP/DECIMAL 列返回的是
+        # date/datetime/Decimal 对象，json.dumps 原生不认（2026-10-29 实测
+        # 学习整轮被误判「执行层失败」）—— 序列化层兜底，不动运行时类型。
+        preview = json.dumps(rows[:8], ensure_ascii=False, default=str)[:1200] \
+            if rows else str(data)[:800]
     except Exception:
         preview = str(data)[:800]
     obs = _catalog_block(db_path, 3200)
