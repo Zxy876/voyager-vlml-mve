@@ -221,6 +221,9 @@ def _log_import(result: dict[str, Any]) -> None:
         "plan_routes": (result.get("plan_routes")
                         if isinstance(result.get("plan_routes"), dict) else {}),
         "plan_why": str(result.get("plan_why") or "")[:200],
+        # 方法学过没有（web 题「学方法不学数值」，2026-10-29）。
+        # ⚠️ 白名单惯犯第 9 次预防。
+        "method_learned": bool(result.get("method_learned")),
         # inference 兜底（句句有回复，2026-10-28）：模型推断层用没用。
         # ⚠️ 白名单惯犯第 7 次预防：consume 里写了不透传 = coach_log 永远空。
         "inference_used": bool(result.get("inference_used")),

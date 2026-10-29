@@ -128,6 +128,31 @@ def main() -> int:
     check("首答失败 → 改写重试成功 used=True",
           r5.get("used") is True and "30 万" in str(r5.get("answer")))
     check("改写后的查询真被拿去取过正文", _fetch_calls["n"] >= 2)
+
+    # 多源重试（2026-10-29 用户拍板「一定做」）：单个源抓不到不该拖垮整轮
+    _urls = []
+    def _fetch_multi(url, max_bytes=200000):
+        _urls.append(url)
+        if "bad" in url:
+            raise RuntimeError("403 反爬")
+        return {"url": url, "status": 200, "bytes": 100,
+                "text": "2026 年互联网行业平均年薪 30 万元。"}
+    stub_net.web_fetch = _fetch_multi
+    stub_net.web_search = lambda q, n=5: [
+        {"title": "坏源", "url": "https://example.com/bad1", "snippet": "s"},
+        {"title": "坏源2", "url": "https://example.com/bad2", "snippet": "s"},
+        {"title": "好源", "url": "https://example.com/good", "snippet": "s"}]
+    C.chat_json = lambda msgs, **kw: (
+        {"query": "互联网行业 平均薪资 水平"}
+        if "改写成适合搜索引擎" in str((msgs or [{}])[0].get("content") or "")
+        else {"answer": "行业平均年薪约 30 万元（资料1）", "grounded": True})
+    r6 = asyncio.run(C._tool_line_fallback("其他公司待遇怎么样"))
+    check("单个源反爬 → 换源后仍然取到（used=True）",
+          r6.get("used") is True)
+    check("坏源被重试过（同一 url 至少两次）",
+          _urls.count("https://example.com/bad1") >= 2, f"urls={_urls[:6]}")
+    check("好源被取到且在 sources 里",
+          any("good" in str(x.get("url")) for x in (r6.get("sources") or [])))
     C.chat_json = _orig_cj
     sys.modules.pop("net_tools", None)
 
@@ -165,6 +190,12 @@ def main() -> int:
           and '"db": False, "web": False' in _all_src)
     check("混合题两半由规划合成（_compose_halves）",
           "_compose_halves(" in src_plan and "库内半场" in src_plan)
+    # web 题「学方法不学数值」（2026-10-29 拍板，DeepSeek 同构）
+    check("web 题调 record_web_method（学方法）",
+          "record_web_method(" in src_plan)
+    check("base 披露 method_learned", '"method_learned"' in src_plan)
+    import learn_orchestrate as _LO
+    check("learn_orchestrate 有 record_web_method", hasattr(_LO, "record_web_method"))
     check("计划外动作不执行（规划 web=False → 不联网）",
           '_plan.get("planned") and not _plan.get("web")' in src_plan)
     check("web 步骤执行前核可达性（_web_reachable）",

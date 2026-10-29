@@ -866,19 +866,29 @@ async def _tool_line_fallback(question: str, context: str = "") -> dict[str, Any
             return o
         o["sources"] = [{"title": str(r.get("title") or "")[:120],
                          "url": str(r.get("url") or "")} for r in results]
-        # ② 取页正文（top 2）
+        # ② 取页正文（多源重试，2026-10-29 用户拍板「一定做」）：
+        # 反爬/超时是常态，只抓 top2 且各试一次命中率太低（实测同一题
+        # 「搜索有结果但正文都没取到」）。现在：最多试 top4，每个失败再
+        # 重试一次，凑够 3 页就停 —— 全失败才如实报，绝不编。
         pages: list[dict[str, str]] = []
-        for r in results[:2]:
-            try:
-                pg = await _aio.to_thread(net_tools.web_fetch, str(r["url"]))
-                if str(pg.get("text") or "").strip():
-                    pages.append({"title": str(r.get("title") or "")[:120],
-                                  "url": str(r.get("url") or ""),
-                                  "text": str(pg["text"])[:5000]})
-            except Exception:
-                continue
+        tries = 0
+        for r in results[:4]:
+            if len(pages) >= 3:
+                break
+            for _attempt in (1, 2):
+                tries += 1
+                try:
+                    pg = await _aio.to_thread(net_tools.web_fetch, str(r["url"]))
+                    if str(pg.get("text") or "").strip():
+                        pages.append({"title": str(r.get("title") or "")[:120],
+                                      "url": str(r.get("url") or ""),
+                                      "text": str(pg["text"])[:5000]})
+                        break
+                except Exception:
+                    continue
         if not pages:
-            o["note"] = "搜索有结果但页面正文都没取到 —— 如实不答"
+            o["note"] = (f"搜索有结果但页面正文都没取到（试了 {tries} 次）"
+                         " —— 如实不答")
             return o
         # ③ claim 综合：只准用取回的资料，缺了就说缺
         material = "\n\n".join(
@@ -1639,6 +1649,18 @@ async def consume(
         # 没取到 → 还是没学会。同样**不自动后台学**（2026-10-19 用户改设计）：
         # 这条问题已在场景学习账上（coach_log 判读 = 没答出来），人点驾驶舱
         # 「▶ 启动 Voyager」时 scene_learn.py 会排到它 —— 每轮落 run_log 可见。
+        # web 半场的方法也学（2026-10-29 用户拍板，DeepSeek 同构）：
+        # 学习侧学的是**工具策略**（怎么搜、怎么核），不是外部数值本身。
+        # 数值仍是 claim（不入库、不进曲线）；方法进攻略缓存，下次同类题
+        # 执行前由 get_task_context 复用。与 db 学习并行，互不连坐。
+        web_method: dict[str, Any] = {}
+        if _plan.get("web"):
+            try:
+                import learn_orchestrate as _lo_wm
+                web_method = _lo_wm.record_web_method(question, _scene_id)
+            except Exception as _wme:
+                web_method = {"ok": False,
+                              "why": f"{type(_wme).__name__}: {_wme}"[:120]}
         if data is None and _use_env:
             # 自动拉起学习（2026-10-28 用户改设计，原 2026-10-19「只人工触发」
             # 作废）：「发送新的对话内容，就顺带拉取一个新的学习流程」—— 同构
@@ -1938,6 +1960,7 @@ async def consume(
             "learn_kicked": bool(learn_kick.get("kicked")),
             "learn_kick_note": str(learn_kick.get("why")
                                    or learn_kick.get("reason") or ""),
+            "method_learned": bool(web_method.get("ok")),
             "miss_node": str(miss_info.get("node_id") or ""),
             "miss_node_created": bool(miss_info.get("node_created")),
             "milestone_target_set": bool(miss_info.get("milestone_target_set")),
@@ -2204,9 +2227,15 @@ async def consume(
             except Exception as _ke2:
                 learn_kick = {"kicked": False, "manual": True,
                               "why": f"自动学习拉起失败：{type(_ke2).__name__}: {_ke2}"}
+        elif _plan.get("web"):
+            learn_kick = {"kicked": False, "manual": True,
+                          "why": ("工具线题：检索方法已记进攻略缓存"
+                                  "（数值不入库、不计学习曲线）"
+                                  if web_method.get("ok") else
+                                  f"工具线题：方法没记成（{web_method.get('why') or '未知'}）")}
         else:
             learn_kick = {"kicked": False, "manual": True,
-                          "why": "非数据题（概念/解释类），无需学习流程"}
+                          "why": "规划里没有 db 路（概念/解释类），无需学习流程"}
 
     # ---- ④ 整理事实（**面板披露「取到了哪些数」用，不再是判分的前提**）----
     # ⚠️ 2026-10-13 改判法（用户原话）：「整理事实这个事情本来就是交给 LLM 的，

@@ -1785,6 +1785,32 @@ def kick_learning(question: str, scene_id: str = "", *,
             "reason": str(reason or "")}
 
 
+def record_web_method(question: str, scene_id: str = "") -> dict[str, Any]:
+    """web 题「学方法不学数值」（2026-10-29 用户拍板，DeepSeek 同构）。
+
+    依据：DeepSeek 的工具用法是**训练期**学的（V3.2 用 1800+ 环境、85k+
+    指令做 agent 数据合成 + RL），学的是**策略**——何时调工具、搜索词怎么
+    构造、结果怎么核；不是把检索到的那条内容背下来。MVE 的运行时同构：
+    方法进攻略缓存（qa_cache，下次同类题执行前由 get_task_context 复用），
+    数值仍是 claim —— 不入技能库、不进能力账、不计学习曲线（时变数据入库
+    即污染，同 75120 教训）。
+
+    无 db_path → get_task_context 自动只谈方法不谈数据（既有分支）。
+    失败不抛：学习侧挂掉不能影响回答。
+    """
+    q = str(question or "").strip()
+    if not q:
+        return {"ok": False, "why": "空问题"}
+    try:
+        import curriculum_auto as _ca
+        ca = _ca.CurriculumAgent(str(scene_id or ""), db_path="")
+        ctx = ca.get_task_context(q)
+        return {"ok": bool(ctx), "where": "qa_cache",
+                "why": "" if ctx else "攻略层没产出（LLM 失败或空输出）"}
+    except Exception as e:
+        return {"ok": False, "why": f"{type(e).__name__}: {e}"[:160]}
+
+
 def _crystallize_round_skills(out: dict[str, Any], scene: str,
                               local_dir: str, is_local: bool,
                               sql: str) -> None:
