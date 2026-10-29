@@ -997,6 +997,12 @@ async def _start_learning_impl(
                               "上轮评语进 context 槽）", flush=True)
                         if _code_exec:
                             _ev0: list[dict[str, Any]] = []
+                            # ⚠️ context 槽必须带上 _hint_ctx（里程碑名/导入原话/
+                            # 追问历史）—— 2026-10-29 踩到：里程碑维度题只传了
+                            # 库表观察块，题干里没有仓库地址 → `_focus_repos`
+                            # 抓不到「调研哪个仓库」→ 模型拿搜索引擎的二手结果
+                            # 充数。里程碑名（「联网去仓库地址：<https://…>」）
+                            # 就在 _hint_ctx 里，别丢。
                             observations, sql = await local_agent.solve(
                                 question, local_dir or exec_dir, llm=llm,
                                 scene_id=scene,
@@ -1004,8 +1010,9 @@ async def _start_learning_impl(
                                 avoid=_avoid, skills=_py_skills,
                                 require_tools=True, evidence=_ev0,
                                 timeout=EXEC_TIMEOUT, db_path=exec_db,
-                                context=(_env_obs_block(exec_db)
-                                         if exec_db else ""))
+                                context=((_env_obs_block(exec_db)
+                                          if exec_db else "")
+                                         + "\n" + "\n".join(_hint_ctx)).strip())
                         else:
                             observations, sql = await agent.solve(
                                 question, skills=skills, grabs=grabs,
@@ -1541,8 +1548,11 @@ async def _start_learning_impl(
                             skills=_py_skills, require_tools=True,
                             evidence=_ev3, timeout=EXEC_TIMEOUT,
                             db_path=exec_db,
-                            context=(_env_obs_block(exec_db)
-                                     if exec_db else ""))
+                            # 同 1007 行：_hint_ctx（含里程碑名里的仓库地址）
+                            # 必须进 context，否则题干没 URL 时模型不知道调研谁。
+                            context=((_env_obs_block(exec_db)
+                                      if exec_db else "")
+                                     + "\n" + "\n".join(_hint_ctx)).strip())
                     else:
                         observations, sql = await agent.solve(
                             question, skills=skills, grabs=grabs,
