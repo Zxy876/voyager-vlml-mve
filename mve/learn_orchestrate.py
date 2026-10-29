@@ -144,7 +144,9 @@ def _answer_text(obs: list[dict[str, Any]], *, ok_only: bool = False) -> str:
         try:
             if isinstance(d, str):
                 return d[:1200]
-            return json.dumps(d, ensure_ascii=False)[:1200]
+            # default=str：DuckDB DATE 列是 date 对象（同 1d6ffa0 的坑），
+            # 不兜底会静默跌进 str(d) 的 Python repr，判官看到的是垃圾格式。
+            return json.dumps(d, ensure_ascii=False, default=str)[:1200]
         except Exception:
             return str(d)[:1200]
     return ""

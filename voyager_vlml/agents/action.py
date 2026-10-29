@@ -559,8 +559,17 @@ class VLMLActionAgent:
                      events=events, code=sql, task=self.task,
                      context=self.context, critique=critique)},
             ]
+            # 展示口径（2026-10-29 用户指出「失败 · 取到 1 行」语序误导）：
+            # 先报**做了什么**（取到几行 + 实际 SQL 片段），再报**判成什么**
+            # （内层判官/闸门的判词）。取到数 ≠ 判成功 —— 拒的是口径不是取数。
+            _verdict = "判闭合" if success else "判未闭合"
             print(f"  [第 {self.rollout_num_iter + 1}/{self.task_max_retries} 次] "
-                  f"{'成功' if success else '失败'} · {self.summarize_chatlog(events)}")
+                  f"{self.summarize_chatlog(events)}"
+                  + (f" · SQL: {str(self.last_sql or '')[:120]}"
+                     if self.last_sql else "")
+                  + f" → {_verdict}")
+            if not success and critique:
+                print(f"    判词：{critique[:200]}")
             if self.gate_check is not None and self.last_gate_result:
                 _gs = ("闸门不可用，内层单独判"
                        if self.last_gate_passed is None
