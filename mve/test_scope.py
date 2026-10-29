@@ -260,6 +260,25 @@ def main() -> int:
           in _la_src)
     check("SQL 通道全败 → 换执行工具再试（不硬分类）",
           "换执行工具再试" in _all_src)
+    # 2026-10-29 生产实测两连坑，都必须钉住：
+    # ① 学习侧也得走代码路径，且判据是**环境形态**不是场景 id（新增场景自动
+    #    适用）—— Scene H 走 VLML SQL agent 时 gh/联网原语一个都拿不到，调研题
+    #    只能在 web_docs 上磨 WHERE。
+    # ② 示例代码里写了 isinstance(r, list)，而受限执行域白名单里没有 →
+    #    `NameError: name 'isinstance' is not defined` 把整条维度打死。
+    #    语言级内建（判型/容器/异常）必须有，这不是能力，是写 Python 的语法。
+    _learn_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "learn_orchestrate.py"), encoding="utf-8").read()
+    check("学习侧走代码路径（全场景，判据=环境形态）",
+          "_code_exec" in _learn_src and "MVE_CODE_EXEC" in _learn_src
+          and 'prof["kind"]' in _learn_src)
+    import local_agent as _la
+    _ns0 = _la._ns_base("/tmp", "", tracer=None)
+    _bi = set(_ns0.get("__builtins__") or {})
+    _need = {"isinstance", "bool", "tuple", "set", "len", "str", "list", "dict",
+             "int", "float", "sorted", "range", "enumerate", "Exception"}
+    check("受限执行域给语言级内建（isinstance 等）", _need <= _bi,
+          "缺：" + "、".join(sorted(_need - _bi)))
     print(f"== 结果：{PASS} 过 / {FAIL} 挂 ==")
     return 1 if FAIL else 0
 

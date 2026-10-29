@@ -1232,7 +1232,17 @@ def _ns_base(scene_dir: str, scene_id: str = "",
                           "int": int, "float": float, "sorted": sorted,
                           "sum": sum, "min": min, "max": max, "any": any,
                           "all": all, "range": range, "enumerate": enumerate,
-                          "Exception": Exception}
+                          # 语言级判型/容器（2026-10-29 生产实测缺这一个就把
+                          # 整条维度打死：示例里 `isinstance(r, list)` 直接
+                          # `NameError: name 'isinstance' is not defined`）。
+                          # 这些不是能力，是写 Python 的基本语法；不给等于逼
+                          # 模型写 try/except 猜形状。禁的是 import/exec/open。
+                          "isinstance": isinstance, "bool": bool, "tuple": tuple,
+                          "set": set, "type": type, "abs": abs, "round": round,
+                          "zip": zip, "reversed": reversed, "repr": repr,
+                          "ValueError": ValueError, "TypeError": TypeError,
+                          "KeyError": KeyError, "AttributeError": AttributeError,
+                          "IndexError": IndexError, "Exception": Exception}
     return ns
 
 
