@@ -164,13 +164,20 @@ def _search_once(query: str, max_results: int = 5) -> list[dict[str, Any]]:
         errors.append("智谱: 未配置 ZHIPU_API_KEY")
     except Exception as e:
         errors.append(f"智谱: {type(e).__name__}: {str(e)[:120]}")
-    # 2) Bing（2026-10-29 新增兜底：VPS 实测 200 稳定、b_algo 结构可解析；
-    #    带 setmkt=zh-CN 时直接给明文链接，不带时给 ck/a 加密跳转）
+    # 2) Bing（2026-10-29 新增兜底：VPS 实测 200 稳定；先 RSS 后 HTML ——
+    #    RSS（format=rss）是官方输出：明文链接、带摘要、无自家导航噪声，
+    #    天气类 query 的 HTML 版只会给 images/dict 这类自家导航页）
     try:
         _status, raw = _http_get(
-            f"https://www.bing.com/search?q={urllib.request.quote(q)}&setmkt=zh-CN",
+            f"https://www.bing.com/search?q={urllib.request.quote(q)}&setmkt=zh-CN&format=rss",
             timeout=_SEARCH_TIMEOUT)
-        results = _parse_bing(raw.decode("utf-8", errors="replace"))
+        results = _parse_bing_rss(raw.decode("utf-8", errors="replace"))
+        if not results:
+            errors.append("Bing(rss): 没有条目")
+            _status, raw = _http_get(
+                f"https://www.bing.com/search?q={urllib.request.quote(q)}&setmkt=zh-CN",
+                timeout=_SEARCH_TIMEOUT)
+            results = _parse_bing(raw.decode("utf-8", errors="replace"))
         if results:
             return results[:n]
         errors.append("Bing: 页面里解析不出结果")
@@ -269,6 +276,24 @@ def _parse_ddg(html: str) -> list[dict[str, Any]]:
             r'class="result-snippet"[^>]*>(.*?)</td>', html, re.S)):
         if i < len(out) and not out[i]["snippet"]:
             out[i]["snippet"] = re.sub(r"<[^>]+>", "", m.group(1)).strip()[:300]
+    return out
+
+
+def _parse_bing_rss(xml_text: str) -> list[dict[str, Any]]:
+    """Bing RSS 输出解析（format=rss；比 HTML 版稳：明文链接+摘要，无导航噪声）。"""
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(xml_text)
+    out: list[dict[str, Any]] = []
+    for item in root.iter("item"):
+        t = item.findtext("title") or ""
+        l = (item.findtext("link") or "").strip()
+        d = item.findtext("description") or ""
+        if t.strip() and l.startswith("http"):
+            out.append({"title": re.sub(r"\s+", " ", t).strip()[:120],
+                        "url": l,
+                        "snippet": re.sub(
+                            r"\s+", " ",
+                            re.sub(r"<[^>]+>", " ", d)).strip()[:300]})
     return out
 
 

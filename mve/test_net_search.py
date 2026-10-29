@@ -29,6 +29,13 @@ def check(name: str, cond: bool, detail: str = "") -> None:
         print(f"  ❌ {name}" + (f" —— {detail}" if detail else ""))
 
 
+_BING_RSS = """<?xml version="1.0"?><rss version="2.0"><channel>
+<item><title>北京天气预报</title><link>https://www.weather.com.cn/bj.shtml</link>
+<description>今天北京晴转多云，气温 8~16 ℃。</description></item>
+<item><title>第二条</title><link>http://www.nmc.cn/bj</link>
+<description>另一条摘要</description></item>
+</channel></rss>"""
+
 _BING_HTML_ZH = """<html><body><ol>
 <li class="b_algo"><h2><a href="https://weather.example.cn/bj">北京天气预报</a></h2>
 <div class="b_caption"><p>今天北京晴转多云，气温 8~16 ℃。</p></div></li>
@@ -53,6 +60,13 @@ def main() -> int:
     check("链接 &amp; 还原", r and r[1]["url"] == "https://www.example.com/x?a=1&b=2",
           r[1]["url"] if len(r) > 1 else "")
     check("snippet 取到", r and "8~16" in r[0]["snippet"], r[0]["snippet"][:40] if r else "")
+
+    print("== 1b. _parse_bing_rss：RSS 形态（首选，明文链接+摘要）==")
+    r0 = net_tools._parse_bing_rss(_BING_RSS)
+    check("解析出 2 条", len(r0) == 2, str(len(r0)))
+    check("明文链接", r0 and r0[0]["url"] == "https://www.weather.com.cn/bj.shtml",
+          r0[0]["url"] if r0 else "")
+    check("snippet 取到", r0 and "8~16" in r0[0]["snippet"], r0[0]["snippet"][:40] if r0 else "")
 
     print("== 2. _parse_bing：ck/a 跳转形态 ==")
     want = base64.urlsafe_b64decode("aHR0cHM6Ly9yZWFsLmV4YW1wbGUuY24vcGFnZQ==").decode()
@@ -85,14 +99,29 @@ def main() -> int:
         def _bing_hit(url, timeout=10):
             calls.append(url.split("/")[2] if "://" in url else url)
             if "bing.com" in url:
-                return 200, _BING_HTML_ZH.encode()
+                # Bing 步骤先 RSS 后 HTML：让 RSS 接住（验证首选通道）
+                if "format=rss" in url:
+                    return 200, _BING_RSS.encode()
+                raise AssertionError("RSS 已接住，不该再请求 HTML：" + url[:60])
             raise AssertionError("不该走到 " + url[:60])
 
         net_tools._zhipu_search = _empty_zhipu
         net_tools._http_get = _bing_hit
         out = net_tools._search_once("北京今天天气")
-        check("智谱空 → Bing 接住", len(out) == 2 and calls[:1] == ["zhipu"]
+        check("智谱空 → Bing(rss) 接住", len(out) == 2 and calls[:1] == ["zhipu"]
               and "bing.com" in calls[1], str(calls))
+
+        # 3b'. RSS 空但 HTML 有 → 落到 HTML 解析
+        calls.clear()
+
+        def _rss_empty_html_hit(url, timeout=10):
+            if "format=rss" in url:
+                return 200, b"<?xml version='1.0'?><rss version='2.0'><channel></channel></rss>"
+            return 200, _BING_HTML_ZH.encode()
+
+        net_tools._http_get = _rss_empty_html_hit
+        out = net_tools._search_once("q")
+        check("RSS 空 → 落 Bing HTML", len(out) == 2)
 
         # 3c. 全灭 → 报错列全链（智谱错误不被覆盖）
         def _all_fail(url, timeout=10):
