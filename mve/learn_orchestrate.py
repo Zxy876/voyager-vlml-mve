@@ -842,6 +842,16 @@ async def _start_learning_impl(
             # action.py:94 `+ skills`），所以这条数就是"能力边界"的可视化 ——
             # 不打印的话，人只能从"学得快没快"猜它有没有生效。
             if skills:
+                # ⚠️ 2026-10-29 实测缺口：这里只打印、**从不记账** —— H 场景 17 条
+                # 技能 hits 全 0，面板一律显示「⚪ 未验证」，而检索打分里的质量项
+                # （0.25*min(hits,6) + 0.6*ok/hits）因此恒为 0：学到的配方永远爬
+                # 不上来，人看到的就是「学了半天没用」。注入就是一次 hit
+                # （consume.py:232 一直这么记，学习侧漏了）。
+                try:
+                    skill_store.mark_used(
+                        [str((s or {}).get("key") or "") for s in skills])
+                except Exception:
+                    pass
                 _snm = [str((s or {}).get("name") or (s or {}).get("topic") or "")
                         for s in skills[:6]]
                 print(f"  · 已学配方回注执行层：{len(skills)} 条"

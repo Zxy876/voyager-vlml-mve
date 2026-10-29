@@ -350,6 +350,10 @@ def main() -> int:
           f"calls={_n_calls} iters={_n_iters}")
     check("内层步数默认 = 原版 4（MVE_INNER_ITERS 可覆盖）",
           "INNER_MAX_ITERS = int(os.environ.get(\"MVE_INNER_ITERS\") or 4)" in _lo)
+    # 注入必须记账（hits+1）。2026-10-29 实测：学习侧 retrieve 后只打印、
+    # 不调 mark_used → H 场景 17 条技能 hits 全 0 → 面板全「未验证」、
+    # 检索质量项恒 0 → 学到的配方永远爬不上来（人看到「学了没用」）。
+    check("学习侧注入记账：retrieve 后必须 mark_used", "mark_used(" in _lo)
     print(f"== 结果：{PASS} 过 / {FAIL} 挂 ==")
     return 1 if FAIL else 0
 
