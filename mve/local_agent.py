@@ -35,6 +35,8 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
+import decimal
 import fnmatch
 import json
 import os
@@ -359,6 +361,28 @@ def _run_restricted(code: str, ns: dict[str, Any], timeout: float = 30.0
     return box
 
 
+def _jsonable(v: Any) -> Any:
+    """把执行层取回的对象转成 JSON 可序列化的形状。
+
+    2026-10-29 生产实测：`query_sql("select fetched_at from web_docs")` 取回的是
+    `datetime`，模型把它塞进 RESULT → `TypeError: Object of type datetime is not
+    JSON serializable` → 整个维度判「执行层没有产出答案」。SQL 结果里
+    datetime/Decimal/bytes 都是常态（时间列、金额列、二进制列），执行层必须在
+    交付前统一成字符串，而不是让模型自己记得转（它不会记得）。
+    """
+    if isinstance(v, dict):
+        return {str(k): _jsonable(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_jsonable(x) for x in v]
+    if isinstance(v, (datetime.datetime, datetime.date, datetime.time)):
+        return str(v)
+    if isinstance(v, decimal.Decimal):
+        return float(v)
+    if isinstance(v, (bytes, bytearray)):
+        return bytes(v).decode("utf-8", errors="replace")
+    return v
+
+
 def _payload(value: Any) -> tuple[Any, str]:
     """RESULT → (data, error)。
 
@@ -374,10 +398,10 @@ def _payload(value: Any) -> tuple[Any, str]:
     if isinstance(value, (list, dict, str)) and len(value) == 0:
         return None, "RESULT 是空的（没取到任何内容）"
     if isinstance(value, list):
-        return (value, "")
+        return (_jsonable(value), "")
     if isinstance(value, dict):
-        return (value, "")
-    return ({"value": value}, "")
+        return (_jsonable(value), "")
+    return ({"value": _jsonable(value)}, "")
 
 
 def _skill_call_name(raw: str) -> str:
@@ -1008,9 +1032,9 @@ def _flat_text(ret: Any) -> str:
             body = (ret.get("text") or ret.get("content") or ret.get("answer")
                     or ret.get("rows") or ret)
             return body if isinstance(body, str) else json.dumps(
-                body, ensure_ascii=False)
+                _jsonable(body), ensure_ascii=False)
     if isinstance(ret, (list, tuple)):
-        return json.dumps(list(ret), ensure_ascii=False)
+        return json.dumps(_jsonable(list(ret)), ensure_ascii=False)
     return str(ret or "")
 
 
