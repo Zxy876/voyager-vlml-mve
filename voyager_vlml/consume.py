@@ -1351,9 +1351,23 @@ async def consume(
                         _rr = await _env.run_sql(_sql)
                         _d = _rr.get("data") or {}
                         if _rr.get("ok") and _d.get("rows"):
-                            _sk = next((s for s in _pool
-                                        if str(s.get("name") or "")
-                                        in (_cs.get("used") or [])), None)
+                            # 对回「这条组合 SQL 用了哪些已学方法」：模型可能在
+                            # used 里写全库目录里的配方名（而不只是本题命中的
+                            # 那几条），所以两张清单都要找；精确优先、再宽松
+                            # （模型偶尔把【材料 N｜…】整段抄进去）。
+                            _used = [str(x) for x in (_cs.get("used") or [])]
+                            _sk = None
+                            for _u in _used:
+                                _cands = list(_pool or []) + list(_all_sk or [])
+                                _sk = next(
+                                    (s for s in _cands
+                                     if str(s.get("name") or "")
+                                     and (str(s.get("name")) == _u
+                                          or str(s.get("name")) in _u
+                                          or _u in str(s.get("name")))),
+                                    None)
+                                if _sk:
+                                    break
                             _executed.append({"skill": _sk or {},
                                               "name": _lb, "sql": _sql,
                                               "data": _d,
