@@ -442,6 +442,69 @@ def _compose_sql(question: str, skills: list[dict[str, Any]], schema: str,
 #  2026-10-29 再改一层：多技能不再「逐条实例化 + 相加」，而是 agent 写**一条**
 #  组合 SQL（原版 voyager.py:226 同构），见 _compose_sql。）
 
+# ---------------------------------------------------------------------------
+# 口径体检（2026-10-29 用户拍板「答案披露双口径」）
+#   实测教训：把「二义就出 alt_sql」写进 _COMPOSE_SYSTEM 里**不生效** ——
+#   主查询一停（glm 连出 3 次同一个 SUM(base_salary+allowance_amount)，
+#   alt 全空），因为组合层的注意力全在「怎么算出这个量」上，没空自查口径。
+#   所以拆成一次**独立的小问**：只看「这条跑通的 SQL + 环境实查」，
+#   问一句「还有没有另一种也站得住的口径」。代价是一次便宜的 LLM 调用。
+# ---------------------------------------------------------------------------
+_SCOPE_SYSTEM = """你是口径体检员：只判断「这句话的合计要不要点明口径」，不负责算数。
+
+给你三样东西：当前这句话、已经跑通的那条 SQL、库里真实的表/列/取值（环境实查）。
+问自己一件事：这条 SQL 的口径，有没有**另一种也站得住**的读法？
+典型是某列是个状态标记（active / 是否在职 / 是否停用 / 是否有效），算与不算
+它会得到两个都说得通的数。
+
+只返回一个 JSON：
+{"ambiguous": true 或 false,
+ "alt_sql": "ambiguous 为 true 时给另一种读法的**完整 SELECT**（只取一个数）；否则空串",
+ "alt_note": "一句话说清那种读法是什么口径（例：只在职，不含已离职的）；否则空串"}
+
+硬规则：
+1. 只有**能从环境实查里指认**的状态/范围列才算 —— 不许凭空假设业务规则或参数；
+2. 只是换个时间段、换个部门、换个筛选值 → **不算**二义（那是另一个问题）；
+3. 拿不准就 false：每道题都挂一句「可能还有别的口径」是废话，不是严谨。
+"""
+
+
+def _scope_check(question: str, sql: str, schema: str,
+                 db_path: str = "") -> dict[str, str]:
+    """口径二义体检：返回 {"alt_sql", "alt_note"}（无二义两个都空）。
+
+    与 `_compose_sql` 分开的理由见上面那段注释：写在一起的提示词里，模型
+    只顾算数、不自查口径（服务器实测 3/3 次 alt 全空）。
+    """
+    _sql = str(sql or "").strip()
+    if not _sql:
+        return {"alt_sql": "", "alt_note": ""}
+    ground = ""
+    if str(db_path or "").strip():
+        try:
+            from curriculum_auto import db_observation as _dbobs
+            ground = str(_dbobs(db_path) or "")
+        except Exception:
+            ground = ""
+    user = (f"当前这句话：\n{question}\n\n"
+            f"已经跑通的那条 SQL：\n{_sql}\n\n"
+            f"库里真实的表与列：\n{schema[:5000]}\n\n"
+            + (f"[环境实查（真实取值）——状态列要看这里]\n{ground[:4000]}\n\n"
+               if ground else "")
+            + "这条 SQL 的口径有没有另一种也站得住、且能从上面的实查里指认的"
+              "读法？只返回 JSON。")
+    try:
+        out = chat_json([{"role": "system", "content": _SCOPE_SYSTEM},
+                         {"role": "user", "content": user}], temperature=0.0)
+    except Exception:
+        return {"alt_sql": "", "alt_note": ""}
+    out = out or {}
+    if not out.get("ambiguous"):
+        return {"alt_sql": "", "alt_note": ""}
+    _alt = str(out.get("alt_sql") or "").strip()
+    return {"alt_sql": _alt,
+            "alt_note": str(out.get("alt_note") or "").strip()[:120]}
+
 
 # ---------------------------------------------------------------------------
 # ③' 配方泛化：入库前把「上一题的取数 SQL」改写成**槽位模板**
@@ -1448,7 +1511,15 @@ async def consume(
                         守卫照走：另一种读法也不许带假设参数（费率/字面量/fan-out）。
                         """
                         _asql = str(_c.get("alt_sql") or "").strip()
-                        if not _asql or _asql == str(_c.get("sql") or "").strip():
+                        _anote = str(_c.get("alt_note") or "").strip()
+                        _main = str(_c.get("sql") or "").strip()
+                        if not _asql:
+                            # 组合层没给（实测常态：它只顾算数）→ 单独体检一次。
+                            _sc = _scope_check(question, _main, _schema,
+                                               db_path=_dbp)
+                            _asql = _sc["alt_sql"]
+                            _anote = _anote or _sc["alt_note"]
+                        if not _asql or _asql == _main:
                             return ""
                         for _gname, _g in (("字面量", _sql_literal_guard),
                                            ("fan-out", _fanout_guard),
@@ -1468,10 +1539,16 @@ async def consume(
                         _v = _first_number(_d)
                         if _v is None:
                             return ""
-                        _nm = (str(_c.get("alt_note") or "").strip()
-                               or "另一种口径")
-                        return (f"（口径说明：本答案 = 上面那条 SQL 的口径；"
-                                f"另一种读法「{_nm}」为 {_v:,.2f}。"
+                        # 另一种读法算出**同一个数** → 这题其实没有二义（实测：
+                        # 津贴题里那位离职员工的津贴是 0，排除他与不排除他同值）。
+                        # 同值还挂一句「也可能按另一种口径」就是废话 —— 不披露。
+                        _pv = _first_number(data or {})
+                        if _pv is not None and abs(_v - _pv) < 1e-9:
+                            return ""
+                        _nm = (_anote or "另一种口径")
+                        # 措辞只陈述**能确证**的事：另一种读法是什么、它的数是多少。
+                        # 不去替主口径起名字（那要靠语义猜），也不假装二选一已定。
+                        return (f"（口径提示：另一种读法「{_nm}」为 {_v:,.2f}。"
                                 f"两种读法都站得住，差在口径 —— 要哪个口径说一声。）")
 
                     _cs = _compose_sql(question, _pool, _schema, db_path=_dbp,
