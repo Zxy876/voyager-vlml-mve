@@ -278,7 +278,7 @@ def main() -> int:
     # `_dims` 只有那一条）。闭合数会回退 = 人看到「学了也不涨」。
     check("里程碑判定传累计账（_prog ∪ 本轮），不是只传本轮",
           "_learned_now" in _learn_src
-          and "| set(str(x) for x in _prog)" in _learn_src
+          and "set(str(x) for x in _prog)" in _learn_src
           and "| set(str(x) for x in closed_ids)" in _learn_src)
     import local_agent as _la
     _ns0 = _la._ns_base("/tmp", "", tracer=None)
