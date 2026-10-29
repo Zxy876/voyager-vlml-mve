@@ -197,16 +197,26 @@ def _read_cache(path: Path) -> tuple[dict, str]:
 #   被当成新维度重跑还连挂 3 轮，里程碑从 0/4 退到 0/5。**骨架必须固定**，否则
 #   `progress` 这个计数没有意义。
 #
-#   正确的落点：试满 N 轮仍不闭合的维度 → 按原版「跳过这条子目标」处理
-#   （`_exhausted_dims`），驾驶舱不再选它；全部维度要么闭合要么跳过仍不达成 →
-#   里程碑如实报 failed，不假装、也不无限重试同一张骨节。
+#   正确的落点：试满 N 轮仍不闭合的维度 → ~~按原版「跳过这条子目标」处理~~
+#   ⚠️ 2026-10-29 更正：原版**没有"跳过子目标"**（见下方注），这里只把轮数当
+#   「这条很顽固」的观测信号（`_exhausted_dims`），**不参与选题**；里程碑
+#   只认「全部维度闭合」这一条达成口径，不假装、也不靠放弃来点亮。
 # ─────────────────────────────────────────────────────────────────────────────
+# 2026-10-29（用户「调度层和原 voyager 同构就好啦」）：这个阈值**不再用来
+# 跳过维度**，只用来标记「这条很顽固」（面板/日志看得见）。原版
+# `voyager.py:394` 的子目标循环是 `while progress < len(sub_goals)`，失败不
+# 推进 progress → 下一轮还是同一条，**没有"试满 N 次就放弃"这回事**；
+# 止损只有外层 `learn()` 的 `if iteration > max_iterations`。按同构，
+# `milestone_unclosed` 不再排除这里算出来的维度。
 GIVE_UP_AFTER_ROUNDS = 3
 
 
 def _exhausted_dims(scene_id: str, question: str,
                     db_path: str = "") -> list[tuple[str, int, str]]:
-    """试过 ≥ GIVE_UP_AFTER_ROUNDS 轮**仍未闭合**的维度 = 按原版语义跳过的那些。
+    """试过 ≥ GIVE_UP_AFTER_ROUNDS 轮**仍未闭合**的维度 = 「这条很顽固」的观测信号。
+
+    ⚠️ 2026-10-29 起**不再用于跳过**（原版没有"跳过子目标"这回事）：只是让面板/
+    日志能说清"哪几条已经试了很多轮"，选题仍由 `milestone_unclosed` 全量给出。
 
     只读信号，不做任何词面判断：闭合与否看 progress 账，轮数看 _iters 账，
     判词取判官最后一次的原话。返回 [(维度 id, 已试轮数, 判词)]。
@@ -451,9 +461,10 @@ def milestone_state(scene_id: str, question: str,
     total = len(dims)
     got = {str(x) for x in (learned_ids or [])}
     missing = [str(d.get("id")) for d in dims if str(d.get("id")) not in got]
-    # 试满 GIVE_UP_AFTER_ROUNDS 轮仍不闭合的维度 = 原版「跳过这条子目标」。
-    # 它们仍算 missing（**不假装达成**），只是不再被驾驶舱选来重试；
-    # 当 missing 全部落在这一批里 → exhausted=True（这题已经没什么可再攻的了）。
+    # 试过多轮仍不闭合的维度 = 「很顽固」的观测信号（2026-10-29 起**不用于跳过**：
+    # 原版 `while progress < len(sub_goals)` 里失败不推进 progress，下一轮还攻它）。
+    # 它们仍算 missing（**不假装达成**）；missing 全落在这批里 → exhausted=True，
+    # 只表示"这题眼下很硬"，调用方据此**多打备注**、不据此判死。
     _ex = {d for d, _n, _c in _exhausted_dims(str(scene_id or "A"),
                                               str(question or ""))}
     given_up = [d for d in missing if d in _ex]
@@ -468,9 +479,9 @@ def milestone_state(scene_id: str, question: str,
         "total": total,
         "closed": total - len(missing),
         "missing": missing,
-        # 已按原版语义跳过（试满轮数仍不闭合）的维度 —— 仍是 missing，不算闭合
+        # 「很顽固」的维度（试过多轮仍不闭合）—— 仍是 missing，不算闭合、不跳过
         "given_up": given_up,
-        # 没有可再攻的维度了（剩下的全是跳过的那批）：该如实报 failed，别再空转
+        # 剩下的**全是**顽固维度：只作观测（面板/日志多打一句），不据此判死
         "exhausted": bool(total) and bool(missing) and len(given_up) == len(missing),
         # 0 个维度的骨架不构成里程碑（没有可闭合的东西就别报"达成"）
         "achieved": (bool(total) and not missing) or achieved_flag,
@@ -926,16 +937,29 @@ def current_target(scene_id: str) -> str:
 
 def milestone_unclosed(scene_id: str, question: str, *,
                        db_path: str = "") -> list[dict[str, Any]]:
-    """该目标里程碑**还没闭合、且还没被跳过**的维度（驾驶舱优先学这些）。
+    """该目标里程碑**还没闭合**的维度（驾驶舱优先学这些）。
 
     靠 load_progress（已闭合维度 id 集）与 scaffold（全部维度）对账得出 ——
     不复用 start_learning 内部状态，纯只读，驾驶舱每轮都能安全调用。
 
-    ⚠️ 必须排除 `_exhausted_dims`（试满 GIVE_UP_AFTER_ROUNDS 轮仍不闭合的）：
-    否则驾驶舱每轮都把同一条不可达维度再选一遍，永远「有未闭合维度」→ 无限烧
-    同一张骨架（2026-10-26 生产实测：场景 B 卡在「哪些员工在九月是活跃的」这
-    条 —— 库里只有 active 布尔、没有月份字段，这条维度永远闭合不了）。原版
-    遇到这种情况是「Skipping to next task」，不是原地重试到 160 轮用尽。
+    ⚠️ 2026-10-29 改：**不再排除**「试满若干轮仍不闭合」的维度。
+    原版 `voyager.py:394` 的子目标循环是
+
+        while self.curriculum_agent.progress < len(sub_goals):
+            next_task = sub_goals[self.curriculum_agent.progress]   # 失败不推进
+            rollout(...)                                            # → 下一轮还是它
+            update_exploration_progress(info)                       # 只记 failed
+
+    而 `progress = len(completed_tasks)`（curriculum.py:131-132）—— **子目标失败
+    不跳过、无重试上限**，止损只有外层 `learn()` 的 `if iteration > max_iterations`。
+    原来这里按 `GIVE_UP_AFTER_ROUNDS=3` 把维度排除出选题，是我们自己发明的取舍
+    （当时的理由是「场景 B 卡在库里没有月份的维度上」），但它把两件事混成一件：
+    「这条维度不可达」和「前置能力还没长出来」（用户 2026-10-29：「查 webdoc
+    可能是我们让它做的里程碑的前置能力」）。前置会在一次次重试里被技能库补上
+    （`已学配方回注执行层`），跳过就等于把这条学习曲线掐断。
+
+    `_exhausted_dims` 仍保留，但只作**观测**（面板/日志显示"这条很顽固"），
+    不参与选题。
     """
     q = str(question or "").strip()
     if not q:
@@ -946,10 +970,7 @@ def milestone_unclosed(scene_id: str, question: str, *,
         if not dims:
             return []
         done = load_progress(str(scene_id or "A"), q)
-        _ex = {d for d, _n, _c in _exhausted_dims(str(scene_id or "A"), q)}
-        return [d for d in dims
-                if str(d.get("id") or "") not in done
-                and str(d.get("id") or "") not in _ex]
+        return [d for d in dims if str(d.get("id") or "") not in done]
     except Exception:
         return []
 
@@ -984,10 +1005,11 @@ def milestone_lit(scene_id: str, question: str) -> dict[str, Any]:
             "achieved": bool(data.get("milestone_achieved")),
             "verified_real": bool(data.get("milestone_verified_real")),
             "total_dims": len(dims),
-            # 试满轮数仍不闭合、按原版语义跳过的维度（如实报，不假装达成）
+            # 试过多轮仍不闭合的维度：**只作观测**（2026-10-29 起不用于跳过，
+            # 原版 inference 里子目标失败不推进 progress、下一轮还攻它）
             "given_up": _gu,
-            # 剩下的未闭合维度全是跳过的 → 这题没什么可再攻的了，
-            # 驾驶舱该如实判 failed，而不是继续走「重试里程碑直至成功」的循环
+            # 剩下的未闭合维度全是顽固维度 → 只表示"这题眼下很硬"，
+            # 驾驶舱**多打一句备注**、继续走「重试里程碑直至成功」的循环
             "exhausted": bool(dims) and bool(_missing) and len(_gu) == len(_missing),
         }
     except Exception:

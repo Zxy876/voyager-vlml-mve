@@ -732,15 +732,20 @@ def test_save_progress_keeps_codes_and_iterations() -> None:
     print("PASS  test_save_progress_keeps_codes_and_iterations")
 
 
-def test_given_up_dims_are_skipped_not_repeated() -> None:
-    """试满轮数仍不闭合的维度：驾驶舱不再选它，里程碑则如实报 exhausted。
+def test_given_up_dims_still_retried() -> None:
+    """试满轮数仍不闭合的维度：**照样被选、照样重试**，只额外打「顽固」标记。
 
-    这是「维度层跳过」的落地：原版 task 内的子目标拆一次固定、失败原地重试；
-    反复够不着的（MVE 场景 B 的「哪些员工在九月是活跃的」—— 库里只有 active
-    布尔、没有月份字段）按 `Skipping to next task` 处理，**不假装达成**、也不
-    无限烧同一张骨架。关键两条：
-      · milestone_unclosed 必须排除它们（否则驾驶舱每轮都选它，永远有未闭合）；
-      · 剩下的未闭合维度全是它们时 exhausted=True（驾驶舱据此判 failed、停止重试）。
+    2026-10-29 用户「调度层和原 voyager 同构就好啦」之后的口径：原版
+    `voyager.py:394` 的子目标循环是 `while progress < len(sub_goals)`，
+    子目标失败只 `failed_tasks.append(task)`、**不推进 progress** → 下一轮
+    还是同一条；`curriculum.py:131` 的 `progress = len(completed_tasks)` 也是
+    这个意思。原版**没有"试满 N 次就跳过"这回事**，止损只在外层
+    `learn()` 的 `if iteration > max_iterations`。
+
+    所以这里只要求：
+      · milestone_unclosed 不排除顽固维度（否则驾驶舱永远翻不到它闭合）；
+      · given_up / exhausted 仍如实报（观测用，且必须 != achieved，
+        不许靠"放弃"来点亮里程碑）。
     """
     import maieutic_scaffold as M
 
@@ -761,20 +766,26 @@ def test_given_up_dims_are_skipped_not_repeated() -> None:
             "d2": {"rounds": M.GIVE_UP_AFTER_ROUNDS, "asked": "这条落不了地"},
             "d3": {"rounds": 1, "asked": "再试"},
         })
-        # 驾驶舱选题：只该选 d3（d1 闭合、d2 已跳过）
-        assert [d["id"] for d in M.milestone_unclosed("B", q)] == ["d3"], \
+        # 驾驶舱选题：d1 闭合，d2/d3 都还没闭合 → **都该被选**
+        # （2026-10-29 用户「调度层和原 voyager 同构就好啦」：原版
+        #  `while progress < len(sub_goals)` 里子目标失败不推进 progress，
+        #  下一轮还是同一条，**没有"试满 N 次就跳过"这回事**）
+        assert [d["id"] for d in M.milestone_unclosed("B", q)] == ["d2", "d3"], \
             M.milestone_unclosed("B", q)
         st = M.milestone_state("B", q, ["d1"])
+        # given_up 只作观测（这条很顽固），不再影响选题
         assert st["given_up"] == ["d2"], st
         assert st["missing"] == ["d2", "d3"], st
         assert not st["exhausted"], f"还有 d3 可攻，不算 exhausted：{st}"
         assert not st["achieved"], f"不许假装达成：{st}"
         _lit = M.milestone_lit("B", q)
         assert _lit["given_up"] == ["d2"] and not _lit["exhausted"], _lit
-        # d3 也试满 → 没有可攻的维度了，exhausted 翻真，仍未达成
+        # d3 也试满 → exhausted 翻真（观测），但**仍然不跳过**：
+        # 原版没有"放弃子目标"，止损只有外层 max_iterations
         M.save_progress_iterations("B", q, {
             "d3": {"rounds": M.GIVE_UP_AFTER_ROUNDS - 1, "asked": "还是不行"}})
-        assert M.milestone_unclosed("B", q) == [], M.milestone_unclosed("B", q)
+        assert [d["id"] for d in M.milestone_unclosed("B", q)] == ["d2", "d3"], \
+            M.milestone_unclosed("B", q)
         st2 = M.milestone_state("B", q, ["d1"])
         assert st2["exhausted"] and not st2["achieved"], st2
         assert st2["closed"] == 1 and st2["total"] == 3, st2
@@ -782,7 +793,7 @@ def test_given_up_dims_are_skipped_not_repeated() -> None:
     finally:
         M.CKPT = old
         shutil.rmtree(tmp, ignore_errors=True)
-    print("PASS  test_given_up_dims_are_skipped_not_repeated")
+    print("PASS  test_given_up_dims_still_retried")
 
 
 def test_scaffold_llm_empty_is_failed_no_keyword_fallback() -> None:
@@ -921,7 +932,7 @@ def main() -> None:
     test_skeleton_never_rebuilt_once_made()
     test_rebuild_keeps_progress_account()
     test_save_progress_keeps_codes_and_iterations()
-    test_given_up_dims_are_skipped_not_repeated()
+    test_given_up_dims_still_retried()
     test_scaffold_llm_empty_is_failed_no_keyword_fallback()
     test_milestone_achieved_persist_and_readback()
     test_milestone_lit_retry_criterion()

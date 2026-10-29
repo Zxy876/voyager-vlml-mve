@@ -102,8 +102,9 @@ def scene_questions(scene_id: str) -> list[dict[str, Any]]:
         # 这条题**规划里有没有 db 路**（None = 老记录，没有 plan_routes 字段）。
         # 学习侧的学习单元 = 环境里的一次 rollout；规划没排 db 路 = 这题不需要
         # 环境（联网题 / 概念题 / 聊天），排进待学只会让驾驶舱反复拆库内维度、
-        # 烧轮次到 given_up（实测 b2a70f4：外部对比题硬拆 5 个库内维度、
-        # learned 空）。同一把尺子：规划决定走不走环境（_use_env），
+        # 白烧轮次（实测 b2a70f4：外部对比题硬拆 5 个库内维度、learned 空；
+        # 那时还会轮次攒到 given_up —— 2026-10-29 起 given_up 只作观测、不跳过）。
+        # 同一把尺子：规划决定走不走环境（_use_env），
         # 也就决定学不学。老记录保持旧行为（宁可学，不静默丢）。
         _pr = r.get("plan_routes")
         latest_db[q] = (bool((_pr or {}).get("db"))
@@ -216,13 +217,18 @@ def _log_learning_detail(r: dict[str, Any]) -> None:
         _log(f"  · 里程碑：{_name}（{ms.get('closed')}/{ms.get('total')} 闭合）"
              + ("✅ 达成" if ms.get("achieved")
                 else f"未达成（还差：{'，'.join(ms.get('missing') or []) or '？'}）"))
-        # 试满轮数仍不闭合的维度（原版「跳过这条子目标」）：如实报，别装没发生
+        # 重试多轮仍不闭合的维度：**只作观测**（2026-10-29 按原版 inference 改：
+        # 子目标失败不跳过，下一轮还是它，止损只有外层 max_iterations）。
         _gu = ms.get("given_up") or []
         if _gu:
-            _log(f"  · 已跳过 {len(_gu)} 条（试满轮数仍不闭合）："
-                 + "，".join(str(x) for x in _gu)
-                 + ("　→ 这题已没有可再攻的维度，按 failed 收（不假装达成）"
-                    if ms.get("exhausted") else ""))
+            try:
+                import maieutic_scaffold as _msc
+                _n_gu = int(getattr(_msc, "GIVE_UP_AFTER_ROUNDS", 3))
+            except Exception:
+                _n_gu = 3
+            _log(f"  · 顽固维度 {len(_gu)} 条（已重试 ≥{_n_gu}"
+                 f" 轮仍未闭合，按原版语义继续重试、不跳过）："
+                 + "，".join(str(x) for x in _gu))
     sk = r.get("skills") or {}
     if sk:
         _add = sk.get("added") or []
@@ -474,19 +480,24 @@ def main() -> int:
                          f"非数据题），释放锚点降级自由出题。")
                     _ms.clear_current_target(scene)
                 elif _lit.get("exhausted") and not _lit.get("achieved"):
-                    # 剩下的未闭合维度**全部**是「试满轮数仍不闭合」那批 → 原版
-                    # 「Skipping to next task」在这一层的同构：这题已经没有可再攻
-                    # 的子目标了。如实判 failed，**不走**「重试里程碑直至成功」的
-                    # 循环（那只会无限烧同一个取数动作，永远闭不上），也不点亮
-                    # （不假装达成）。锚点**保留不清** —— 人设的题属 manual 语义，
-                    # 等人换题 / 换库 / 补数据后再说。
-                    # 不写 continue：直接落到下方选题队列，本轮去学自由出题的题。
+                    # ⚠️ 2026-10-29 按原版 inference 改：子目标失败**不跳过**。
+                    # 这里原来判 failed + 「降级自由出题」，那是替原版发明的取舍
+                    # （原版 `while progress < len(sub_goals)` 里失败不推进 progress，
+                    # 下一轮照样拿同一条，止损只有外层 max_iterations）。而且它把
+                    # 两件事混成一件：「这条维度不可达」和「前置能力还没长出来」
+                    # （用户原话：「查 webdoc 可能是我们让它做的里程碑的前置能力」）。
+                    # 前置会在反复重试里被技能库补上，判死等于掐断这条学习曲线。
+                    # 现在只如实报「这条很顽固」（人看得见），**落在下方自由出题**，
+                    # 下一轮 while 再回来看它 —— 不判死、也不原地空转。
+                    # 正常走不到这里：`milestone_unclosed` 已不再排除顽固维度，
+                    # 只要还 missing 就一定在 `_unclosed` 里被上面的维度循环接走；
+                    # 真走到说明骨架与进度账对不上（读缓存失败之类），如实报 + 降级。
                     _gu = _lit.get("given_up") or []
                     _n_gu = getattr(_ms, "GIVE_UP_AFTER_ROUNDS", 3)
-                    _log(f"[场景学习] 里程碑「{_tgt[:42]}」的未闭合维度已全部试满"
-                         f" {_n_gu} 轮仍不闭合"
-                         f"（{'，'.join(str(x) for x in _gu) or '？'}）→ 如实判"
-                         f" failed，不再重试这张骨架，本轮降级自由出题（锚点保留）。")
+                    _log(f"[场景学习] 里程碑「{_tgt[:42]}」这些维度已重试 ≥{_n_gu}"
+                         f" 轮仍未闭合（{'，'.join(str(x) for x in _gu) or '？'}）"
+                         f" → 按原版 inference 语义继续重试（不跳过、不判死）；"
+                         f"本轮先降到自由出题，下一轮回来再攻。")
                 elif not _lit.get("achieved"):
                     iteration += 1
                     if _light_up_milestone(scene, _tgt, _dbp, max_retries):
