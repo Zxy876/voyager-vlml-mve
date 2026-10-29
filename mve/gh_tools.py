@@ -34,8 +34,39 @@ _REPO_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
 
 
 def _token() -> str:
-    """GITHUB_TOKEN（可选）：环境变量优先。没有就匿名（60 次/小时）。"""
-    return os.getenv("GITHUB_TOKEN", "").strip()
+    """GITHUB_TOKEN（可选）：环境变量优先，其次 mve/.env；没有就匿名。
+
+    2026-10-29：服务器出口 IP 的匿名配额被打到 `limit: 0`（api.github.com 403，
+    但 raw 200 / git ls-remote 通）→ `gh_repo_info/gh_tree/gh_api` 全废。
+    配了 token 是 5000 次/小时，按 token 计数，不受出口 IP 封禁影响。
+
+    ⚠️ 不能指望别处已经加载过 .env：`voyager_vlml.llm._load_env_once` 只在
+    解析 LLM 端点时被调（`setdefault` 副作用），靠调用顺序传过来的环境变量太脆。
+    这里照 `net_tools._zhipu_key` 的做法自己读一遍 .env。
+    """
+    k = os.getenv("GITHUB_TOKEN", "").strip()
+    if k:
+        return k
+    for line in _env_lines():
+        if line.startswith("GITHUB_TOKEN="):
+            v = line.split("=", 1)[1].strip().strip('"').strip("'")
+            if v:
+                return v
+    return ""
+
+
+def _env_lines() -> list[str]:
+    """mve/.env 的非空非注释行（读不到就空表，不抛）。"""
+    from pathlib import Path
+    try:
+        p = Path(__file__).with_name(".env")
+        if not p.is_file():
+            return []
+        return [ln.strip() for ln in
+                p.read_text(encoding="utf-8", errors="replace").splitlines()
+                if ln.strip() and not ln.strip().startswith("#")]
+    except Exception:
+        return []
 
 
 def _norm_repo(repo: str) -> str:

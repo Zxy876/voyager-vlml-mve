@@ -221,6 +221,21 @@ def main() -> int:
     except RuntimeError as e:
         check("404 文案不提换通路（那是真没有）", "gh_read" not in str(e))
 
+    # token 兜底：环境变量优先，其次 mve/.env（2026-10-29 出口 IP 配额被限到 0，
+    # 配 token 是唯一解法；不能指望 llm._load_env_once 的 setdefault 顺序副作用）。
+    _orig_lines = gh_tools._env_lines
+    _old_tok = os.environ.pop("GITHUB_TOKEN", None)
+    try:
+        gh_tools._env_lines = lambda: ["# 注释", "GITHUB_TOKEN=ghp_from_envfile"]
+        check("token 从 mve/.env 兜底", gh_tools._token() == "ghp_from_envfile")
+        os.environ["GITHUB_TOKEN"] = "env_wins"
+        check("环境变量优先于 .env", gh_tools._token() == "env_wins")
+    finally:
+        gh_tools._env_lines = _orig_lines
+        os.environ.pop("GITHUB_TOKEN", None)
+        if _old_tok is not None:
+            os.environ["GITHUB_TOKEN"] = _old_tok
+
     print(f"\n通过 {PASS} / 挂 {FAIL}")
     return 1 if FAIL else 0
 
