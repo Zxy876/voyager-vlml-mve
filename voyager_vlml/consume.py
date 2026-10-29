@@ -1151,12 +1151,37 @@ async def consume(
     _plan: dict[str, Any] = {}
     tool_line: dict[str, Any] = {"used": False, "answer": "", "sources": [],
                                  "note": ""}
+    # 失败经验回灌（failures.recall_block）：本场景类似问题上次犯的错先取出来
+    try:
+        import failures as _failures
+        _fail_block = _failures.recall_block(_scene_id, question)
+    except Exception:
+        _fail_block = ""
     try:
         _plan = _plan_routes(question, scene_id=_scene_id,
                              has_file=bool(_file_ctx),
-                             scene_tables=_scene_tables)
+                             scene_tables=_scene_tables,
+                             fail_block=_fail_block)
     except Exception:
         _plan = {}
+    # ---- 理解层自检（2026-10-29 用户拍板「搬」②）：规划错了就地换路一次，
+    # 别把「路线分错」留给用户用眼睛发现。判错了也进失败账（下次规划直接看到）。
+    if _plan.get("planned"):
+        try:
+            _sc = _plan_selfcheck(question, _plan, scene_tables=_scene_tables)
+            if not _sc["ok"] and _sc["fix"]:
+                _old_why = str(_plan.get("why") or "")
+                _plan = {**_plan, **_sc["fix"],
+                         "why": (f"自检改路：{_sc['why']}"
+                                 f"（原规划：{_old_why}）")[:200]}
+                try:
+                    _failures.record(_scene_id, question,
+                                     f"路线规划错了（自检改路）：{_sc['why']}",
+                                     "plan")
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     # ---- 规划门控（2026-10-29 用户拍板「所有问题都应由外部规划去完成」）----
     # 走不走环境**只**由规划决定。词表已删（它是硬编码路由：把「待遇好不好」
@@ -1662,6 +1687,13 @@ async def consume(
                             # 补一条津贴 → 两条结果相加 → 双计）。
                             reuse_errors.append(
                                 f"组合被对题判官退回：{_fit['why'][:160]}")
+                            # 失败经验沉淀（R1 判词回灌）：判词跨轮不再丢
+                            try:
+                                import failures as _failures
+                                _failures.record(_scene_id, question,
+                                                 _fit["why"], "fit")
+                            except Exception:
+                                pass
                             print(f"  · 对题判官退回：{_fit['why'][:110]}"
                                   f" → 带全库目录重写一条", flush=True)
                             _executed.clear()
@@ -1690,10 +1722,26 @@ async def consume(
                                 obs, code = [], ""
                                 reuse_errors.append(
                                     f"重写后仍不对题：{_fit['why'][:160]}")
+                                try:
+                                    import failures as _failures
+                                    _failures.record(
+                                        _scene_id, question,
+                                        f"重写后仍不对题：{_fit['why']}",
+                                        "rewrite")
+                                except Exception:
+                                    pass
                     else:
                         reuse_errors.append(
                             "已检索到已学技能但组合没取到真数"
                             "（组合/守卫/执行全败）")
+                        try:
+                            import failures as _failures
+                            _failures.record(
+                                _scene_id, question,
+                                "已检索到已学技能但组合没取到真数"
+                                "（组合/守卫/执行全败）", "compose")
+                        except Exception:
+                            pass
                         learn_kick = {"kicked": False, "manual": True,
                                       "why": "已学技能检索到了但组合没取到真数"
                                              " —— 重学该里程碑（或补缺维度）"}
@@ -3673,7 +3721,8 @@ def _web_reachable(scene_id: str) -> tuple[bool, str]:
 
 
 def _plan_routes(question: str, *, scene_id: str, has_file: bool,
-                 scene_tables: list[str] | None = None) -> dict[str, Any]:
+                 scene_tables: list[str] | None = None,
+                 fail_block: str = "") -> dict[str, Any]:
     """信息路规划：先让模型对着**能力菜单**规划这道题要哪几路，再逐路执行。
 
     斯坦福 Generative Agents 同构（用户 2026-10-29 拍板）：规划先行，执行
@@ -3682,6 +3731,8 @@ def _plan_routes(question: str, *, scene_id: str, has_file: bool,
     规划 ≠ 可达：web 路执行时还要过 `_web_reachable`（工具开关核不核得上）
     —— 两步分开，不可达就如实修订计划。
     LLM 不可用 → 按旧词表兜底（安全方向：行为退回现状，不会更差）。
+    `fail_block`：失败经验账（failures.recall_block）—— 本场景类似问题
+    上次犯过的错，注入让规划员别再踩同一个坑（R1 判词回灌的落点）。
     """
     try:
         _cat = _scene_skill_catalog(scene_id)[0][:1200]
@@ -3709,6 +3760,7 @@ def _plan_routes(question: str, *, scene_id: str, has_file: bool,
                  f"- infer：概念/方法解释，不需要任何取数\n\n"
                  + (f"已学技能目录（库内已被验证可算的方法）：\n{_cat}\n\n"
                     if _cat else "")
+                 + (fail_block + "\n\n" if fail_block else "")
                  + "这道题需要哪几路？只输出 JSON。")}],
             temperature=0.0)
     except Exception:
@@ -3725,6 +3777,63 @@ def _plan_routes(question: str, *, scene_id: str, has_file: bool,
     out["why"] = str(cj.get("why") or "")[:160]
     out["planned"] = True
     return out
+
+
+def _plan_selfcheck(question: str, plan: dict[str, Any],
+                    scene_tables: list[str] | None = None) -> dict[str, Any]:
+    """理解层自检（2026-10-29 用户拍板「搬」②：补 a 层失败不可见的缺口）。
+
+    规划员把题路分错（该走 db 的走了 claim、评价题只给了 infer）在旧链路
+    上**没有任何判定** —— 只能靠用户用眼睛发现。这里在规划产出后加一次
+    **独立小问**（同 _scope_check 模式：独立小问才不会被主规划的脚步带走）：
+    只问「题面要的是什么、选的路对不对」，错了给出修正后的路。
+
+    返回 {"ok": bool, "fix": {db,web,file,infer}, "why": str}。
+    自检挂了/格式不对 → ok=True 照旧（自检是增强不是依赖，绝不挡路）。
+    """
+    try:
+        cj = chat_json(
+            [{"role": "system", "content": (
+                "你是复核员。给你一个用户问题和对它的执行路线规划"
+                "（db=查场景数据库/已学技能；web=联网取场景外的信息；"
+                "file=读用户上传的文件；infer=纯概念解释不取数）。"
+                "判断规划是否匹配问题的真实意图：\n"
+                "· 问数/算账/统计（「多少钱」「平均」「哪家高」）→ 至少要 db"
+                "（库里有表）或 file（有上传）或 web（库确实没有这类数据）；\n"
+                "· 主观评价（「好不好」「怎么样」）→ 常常要 db+web 两路"
+                "（库内事实 + 外部基准），**只给 infer 是错的**；\n"
+                "· 时变信息（天气/汇率/行情）→ web；\n"
+                "· 纯概念解释（「什么是 X」）→ infer 就够。\n"
+                '只返回 JSON：{"ok": true/false, '
+                '"fix": {"db": bool, "web": bool, "file": bool, "infer": bool}, '
+                '"why": "一句话理由"}。规划本来就对就 ok=true（fix 可空）。'
+                "不要因为问题措辞口语就降低标准。")},
+             {"role": "user", "content": (
+                 f"问题：{question}\n"
+                 f"场景数据源："
+                 f"{'有表：' + '、'.join((scene_tables or [])[:6]) if (scene_tables or []) else '当前没有表'}\n"
+                 f"规划：db={bool(plan.get('db'))}, web={bool(plan.get('web'))}, "
+                 f"file={bool(plan.get('file'))}, infer={bool(plan.get('infer'))}"
+                 f"（规划理由：{str(plan.get('why') or '')[:120]}）\n"
+                 "这份规划对吗？")}],
+            temperature=0.0)
+    except Exception as e:
+        return {"ok": True, "fix": {}, "why": f"自检不可用（{type(e).__name__}）—— 照旧"}
+    if not isinstance(cj, dict):
+        return {"ok": True, "fix": {}, "why": "自检返回异常 —— 照旧"}
+    ok = cj.get("ok")
+    ok = bool(ok) if isinstance(ok, bool) else str(ok).strip().lower() in ("true", "1", "yes")
+    fix: dict[str, Any] = {}
+    f = cj.get("fix")
+    if isinstance(f, dict):
+        for k in ("db", "web", "file", "infer"):
+            v = f.get(k)
+            fix[k] = (bool(v) if isinstance(v, bool)
+                      else str(v).strip().lower() in ("true", "1", "yes"))
+        if not any(fix.values()):
+            fix = {}          # 修出全 False 的路 = 修坏了，不采信
+    return {"ok": ok, "fix": fix,
+            "why": str(cj.get("why") or "")[:160]}
 
 
 def _inference_answer(question: str, context: str = "") -> dict[str, Any]:
