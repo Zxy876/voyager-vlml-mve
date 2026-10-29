@@ -61,6 +61,16 @@ def reasoning_text(res: dict[str, Any] | None, *, scene_id: str = "",
         L.append(f"没有可指认的环境（{at}），"
                  "这条只能算 inference：模型推的，不写图。")
 
+    # 规划披露（2026-10-29）：先规划、再逐路执行。规划≠可达，web 实际
+    # 执行结果看下面工具线那段 —— 这里只转述 consume 返回的字段。
+    _pr = res.get("plan_routes")
+    if isinstance(_pr, dict) and any(bool(v) for v in _pr.values()):
+        _names = " + ".join(k for k in ("db", "web", "file", "infer")
+                            if _pr.get(k))
+        _pwhy = str(res.get("plan_why") or "").strip()
+        L.append(f"这一问的规划：走 {_names} 路"
+                 + (f"（{_pwhy[:120]}）" if _pwhy else "") + "。")
+
     used = res.get("used_skills") or []
     if used:
         names = []
@@ -120,6 +130,12 @@ def reasoning_text(res: dict[str, Any] | None, *, scene_id: str = "",
     if res.get("tool_line_used"):
         srcs = res.get("tool_sources") or []
         L.append(f"工具线取回 {len(srcs)} 个来源（claim，不入库、不计曲线）。")
+    else:
+        # 联网这半场走了但没答成（如 grounded=false）也要如实转述 ——
+        # 不披露就会被读成「没触发联网」（2026-10-29 用户实测误解）。
+        _tln = str(res.get("tool_line_note") or "").strip()
+        if _tln:
+            L.append(f"联网这半场的执行结果：{_tln[:160]}")
     note = str(res.get("answer_note") or "").strip()
     if note:
         L.append("叙述说明：" + note[:200])

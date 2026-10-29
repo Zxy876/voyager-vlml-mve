@@ -216,6 +216,11 @@ def _log_import(result: dict[str, Any]) -> None:
         "tool_line_used": bool(result.get("tool_line_used")),
         "tool_sources": (result.get("tool_sources") or [])[:5],
         "tool_line_note": str(result.get("tool_line_note") or "")[:200],
+        # 规划披露（2026-10-29）：规划了哪几路 + 规划员理由。
+        # ⚠️ 白名单惯犯第 8 次预防：consume 里写了不透传 = coach_log 永远空。
+        "plan_routes": (result.get("plan_routes")
+                        if isinstance(result.get("plan_routes"), dict) else {}),
+        "plan_why": str(result.get("plan_why") or "")[:200],
         # inference 兜底（句句有回复，2026-10-28）：模型推断层用没用。
         # ⚠️ 白名单惯犯第 7 次预防：consume 里写了不透传 = coach_log 永远空。
         "inference_used": bool(result.get("inference_used")),

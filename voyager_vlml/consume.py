@@ -1837,6 +1837,13 @@ async def consume(
             "tool_line_used": bool(tool_line.get("used")),
             "tool_sources": (tool_line.get("sources") or [])[:5],
             "tool_line_note": str(tool_line.get("note") or "")[:200],
+            # 规划披露（2026-10-29）：这一问规划了哪几路 + 规划员的一句话
+            # 理由。规划≠可达，web 实际执行结果看 tool_line_note。
+            "plan_routes": {k: bool((_plan or {}).get(k))
+                            for k in ("db", "web", "file", "infer")},
+            "plan_why": (str((_plan or {}).get("why") or "")[:160]
+                         + ("" if _plan.get("planned") is not False
+                            else "（规划员不可用，按词表兜底）"))[:200],
             # inference 兜底（句句有回复）：模型推断层用没用 —— 与工具线
             # claim 同级的披露，面板/对话页据此挂「模型推断」标注。
             "inference_used": bool(inference_used),
@@ -2392,6 +2399,12 @@ async def consume(
         "tool_line_used": bool(tool_line.get("used")),
         "tool_sources": (tool_line.get("sources") or [])[:5],
         "tool_line_note": str(tool_line.get("note") or "")[:200],
+        # 规划披露（2026-10-29）：与场景分支同口径。
+        "plan_routes": {k: bool((_plan or {}).get(k))
+                        for k in ("db", "web", "file", "infer")},
+        "plan_why": (str((_plan or {}).get("why") or "")[:160]
+                     + ("" if _plan.get("planned") is not False
+                        else "（规划员不可用，按词表兜底）"))[:200],
         # inference 兜底（句句有回复）：与场景分支同口径的披露。
         "inference_used": bool(inference_used),
         "cold_start": bool(absorbed.get("cold_start")),

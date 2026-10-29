@@ -327,6 +327,37 @@ def main() -> int:
     check("判官局限写进思考轨迹", "核对没过" in r and "口径不符" in r)
     check("已派学习写进思考轨迹", "已自动拉起后台学习" in r)
 
+    print("== 7. 规划/联网半场的披露（2026-10-29 实测误解：走了联网但没答成 ==")
+    print("   被读成「没触发」，规划与执行结果必须进思考轨迹和正文）")
+    r2 = CP.reasoning_text(dict(plan_routes={"db": True, "web": True,
+                                             "file": False, "infer": False},
+                                plan_why="内部+外部对比题",
+                                tool_line_used=False,
+                                tool_line_note="资料不足以回答（grounded=false，如实不答）"),
+                                scene_id="B", scene_label="工资")
+    check("规划写进思考轨迹（db + web 路）",
+          "这一问的规划" in r2 and "db + web" in r2)
+    check("规划理由写进思考轨迹", "内部+外部对比题" in r2)
+    check("联网没答成也如实转述（不读成没触发）",
+          "联网这半场的执行结果" in r2 and "grounded=false" in r2)
+    r3 = CP.reasoning_text(dict(plan_routes={"db": True, "web": False,
+                                             "file": False, "infer": True},
+                                tool_line_used=False,
+                                tool_line_note="规划里没有联网这一步（计划外的动作不执行）"),
+                                scene_id="B", scene_label="工资")
+    check("计划外不执行也如实转述", "计划外的动作不执行" in r3)
+    check("规划员兜底如实标注", "规划员不可用" not in r3 or "兜底" in r3)
+    # consume base 带规划字段 + coach 白名单透传（惯犯第 8 次预防）
+    _csrc = open(os.path.join(os.path.dirname(_HERE),
+                              "voyager_vlml", "consume.py"),
+                 encoding="utf-8").read()
+    check("consume base 带 plan_routes/plan_why",
+          '"plan_routes"' in _csrc and '"plan_why"' in _csrc)
+    _coach_src2 = open(os.path.join(os.path.dirname(_HERE), "mve", "coach.py"),
+                       encoding="utf-8").read()
+    check("coach 白名单透传 plan_routes/plan_why",
+          '"plan_routes"' in _coach_src2 and '"plan_why"' in _coach_src2)
+
     print(f"== 结果：{PASS} 过 / {FAIL} 挂 ==")
     return 1 if FAIL else 0
 

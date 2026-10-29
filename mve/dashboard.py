@@ -4063,6 +4063,12 @@ def _openai_answer(res: dict, sid: str, prev: str) -> tuple[str, str, dict]:
             str(x.get("name") or "") for x in res["used_skills"][:4]))
     if res.get("tool_line_used"):
         tail.append("工具线（联网 claim）")
+    else:
+        # 走了联网但没答成（如 grounded=false）也要在正文披露，否则会被
+        # 读成「没触发联网」（2026-10-29 用户实测误解）。
+        _tln = str(res.get("tool_line_note") or "").strip()
+        if _tln:
+            tail.append("联网已查：" + _tln[:60])
     content = ans + "\n\n—— MVE｜" + "｜".join(tail)
 
     scene_id = sid or prev or "A"
