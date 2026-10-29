@@ -1146,7 +1146,15 @@ async def consume(
     # （consume_2461737d），本题自己那批（consume_ca2125be）一条都没进 prompt。
     # 表现就是：图谱已经高置信命中、技能库里明明有 6 条，消费却报"用到 0 条"。
     # 同原版 `retrieve_skills(query=self.context)` —— context 里就是当前这道题。
-    _raw_skills = _retrieve_skills(question, topic_id or topic_hint, _scene_id)
+    # ⚠️ 2026-10-29 服务器实测（「腾讯校招算法岗起薪」）：规划明明只排了 web 路
+    # （外部市场数据，库里没有），却仍去技能库检索，命中一条库内配方
+    # `base_salary_comparison` 并**真去实查**（`SELECT ... FROM up_工资明细`），
+    # 判官随后按「主体范围错误：题面问腾讯校招，SQL 只查了技术部」退回，
+    # 白烧一轮 + 判词写成 fetched_empty。根因：检索不看规划。
+    # 规划里没有 db 路 = 这题不该用库内配方 → 不检索、不 mark_used。
+    # 有 db 路（含 db+web 混合题）照旧检索。
+    _raw_skills = (_retrieve_skills(question, topic_id or topic_hint, _scene_id)
+                   if _use_env else [])
     # ⚠️ 消费会话级技能（`consume_<md5>` topic）不是「学习跑过的里程碑」技能，
     # 只是上次消费兜底现做经 `_absorb` 落库的产物。按用户边界（2026-10-25：
     # 消费只编排、不复用消费会话产物、未学不答只标记）—— 必须排除出「已学

@@ -190,6 +190,11 @@ def main() -> int:
           and '"db": False, "web": False' in _all_src)
     check("混合题两半由规划合成（_compose_halves）",
           "_compose_halves(" in src_plan and "库内半场" in src_plan)
+    # 2026-10-29 服务器实测（腾讯校招起薪）：规划只排 web 路，却仍去技能库
+    # 检索并实查库内配方 → 判官按「主体范围错误」退回，白烧一轮。检索也得看规划。
+    check("技能检索受规划门控（无 db 路不检索库内配方）",
+          "_retrieve_skills(question, topic_id or topic_hint, _scene_id)"
+          in src_plan and "if _use_env else [])" in src_plan)
     # 2026-10-29 撤销自创的「web 题学方法不学数值」（qa_cache 方法沉淀 + 消费侧复用）。
     # 事实口径：DeepSeek 的联网经验在训练期进权重，运行时不留检索记忆；MVE 侧仿造属发明。
     # 这条是回归守卫：机制不许复活，否则又是一份自创。
