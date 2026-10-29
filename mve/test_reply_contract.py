@@ -224,12 +224,14 @@ def main() -> int:
     check("_scene_skill_catalog 返回 (目录文本, 全库技能表)",
           isinstance(_cat, str) and isinstance(_all, list))
 
-    print("== 2. 数据题判定（决定答不出时走哪条路） ==")
-    check("「工资发多少」是数据题", C._is_data_question("技术部九月份工资发多少钱"))
-    check("「什么是强化学习」不是数据题", not C._is_data_question("什么是强化学习"))
-    check("「平均/排名/哪些」是数据题",
-          C._is_data_question("各部门平均工资排名") and
-          C._is_data_question("哪些员工有津贴"))
+    print("== 2. 题型词表已删（2026-10-29 用户拍板：那是硬编码） ==")
+    check("_is_data_question 已彻底删除（不许复活）",
+          not hasattr(C, "_is_data_question"))
+    _csrc2 = open(os.path.join(os.path.dirname(_HERE),
+                               "voyager_vlml", "consume.py"),
+                  encoding="utf-8").read()
+    check("源码里不再出现词表调用", "_is_data_question(" not in _csrc2)
+    check("走不走环境只由规划决定（_use_env）", "_use_env = bool(_plan.get(\"db\"))" in _csrc2)
 
     print("== 3. inference 兜底（句句有回复的最后一层） ==")
     orig = C.chat_json
@@ -289,8 +291,8 @@ def main() -> int:
     check("业务词表守卫已彻底删除（不许回归）",
           not any((f"def {g}(" in src or f"{g}(question" in src
                    or f"{g}(_sql" in src) for g in _biz_guards))
-    check("答不出数据题 → 自动 kick_learning",
-          "kick_learning(" in src and "_is_data_question(question)" in src)
+    check("答不出 → 自动 kick_learning（规划门控 _use_env）",
+          "kick_learning(" in src and "_use_env" in src)
     check("kick 注明同构语义（答不了就进入学习）", "进入学习" in src)
     # 两处调用现在都带上下文（context=_file_ctx）—— 只认函数名，别认实参写法
     # 认**调用点**（带 = 号），别认定义（定义在文件末尾，index 会先撞上它）

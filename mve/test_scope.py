@@ -153,9 +153,16 @@ def main() -> int:
     # 「所有问题都应由外部规划去完成」（2026-10-29 用户拍板）：
     # 走不走环境由规划决定，不由词表决定；词表只做规划员挂掉时的兜底。
     check("环境门控 = 规划门控（_use_env）",
-          "_use_env = (bool(_plan.get(\"db\"))" in src_plan)
-    check("规划裁剪之外的词表门控已清零",
-          src_plan.count("_is_data_question(question)") <= 1)
+          '_use_env = bool(_plan.get("db"))' in src_plan)
+    check("词表已彻底删除（源码零调用 + 函数不存在）",
+          "_is_data_question" not in src_plan
+          and not hasattr(C, "_is_data_question"))
+    _all_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "..", "voyager_vlml", "consume.py"),
+                    encoding="utf-8").read()
+    check("规划员不可用时不碰环境（兜底 planned=False + db=False）",
+          "规划员不可用 → 不碰环境" in _all_src
+          and '"db": False, "web": False' in _all_src)
     check("混合题两半由规划合成（_compose_halves）",
           "_compose_halves(" in src_plan and "库内半场" in src_plan)
     check("计划外动作不执行（规划 web=False → 不联网）",

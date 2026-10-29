@@ -350,6 +350,10 @@ button{font-family:inherit}
       <span>深度思考</span>
       <div class="sw on" id="thinkSw"><i></i></div>
     </div>
+    <div class="thinktoggle" title="规划里排了 web 这一步时，是否真的去联网取回资料">
+      <span>联网</span>
+      <div class="sw on" id="webSw"><i></i></div>
+    </div>
   </div>
 
   <div class="scroll" id="scroll">
@@ -480,6 +484,14 @@ function applyTheme(){
 }
 applyTheme();
 $('themeBtn').onclick = function(){ theme = theme === 'dark' ? 'light' : 'dark'; applyTheme(); };
+
+var webOn = localStorage.getItem('mve_chat_web') !== '0';
+if (!webOn) $('webSw').classList.remove('on');
+$('webSw').onclick = function(){
+  webOn = !webOn;
+  $('webSw').classList.toggle('on', webOn);
+  localStorage.setItem('mve_chat_web', webOn ? '1' : '0');
+};
 
 var deepThink = localStorage.getItem('mve_chat_think') !== '0';
 if (!deepThink) $('thinkSw').classList.remove('on');
@@ -719,6 +731,7 @@ async function run(s, q){
   var payload = {
     model: s.model || model,
     stream: true,
+    web: webOn,
     messages: s.messages.filter(function(m){ return m.role === 'user' || m.role === 'assistant'; })
                        .map(function(m){ return {role: m.role, content: m.content}; })
   };

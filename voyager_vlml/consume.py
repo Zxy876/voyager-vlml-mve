@@ -941,6 +941,7 @@ async def consume(
     topic_hint: str = "",
     auto_task: bool = True,
     env: VLMLMCPEnv | None = None,
+    web_allowed: bool | None = None,
 ) -> dict[str, Any]:
     # ⚠️ 环境**延迟创建**：下面按场景后果判断要不要 VLML。非 VLML 场景
     # （用户 2026-10-19：「别的场景下，voyager 的学习和 VLML 没有关系」）
@@ -1005,13 +1006,19 @@ async def consume(
     except Exception:
         _plan = {}
 
-    # ---- 规划门控（2026-10-29 用户拍板「所有问题都应有外部规划去完成」）----
-    # 走不走环境由**规划**决定，不由词表决定。旧门控 `_is_data_question`
-    # 把「待遇好不好」这类评价题判成非知识题 → db 半场直接跳过、0 行进
-    # 收场（实测）。规划员不可用（planned=False）时才退回词表 —— 行为
-    # 不会比现状更差。词表本身保留：它是兜底，也是规划失败时的安全方向。
-    _use_env = (bool(_plan.get("db")) if _plan.get("planned")
-                else _is_data_question(question))
+    # ---- 规划门控（2026-10-29 用户拍板「所有问题都应由外部规划去完成」）----
+    # 走不走环境**只**由规划决定。词表已删（它是硬编码路由：把「待遇好不好」
+    # 判成非数据题 → db 半场直接跳过、0 行收场，实测）。规划员不可用
+    # （planned=False）→ 兜底也不碰环境（不猜题型），只做模型推断并如实标注。
+    _use_env = bool(_plan.get("db")) if _plan.get("planned") else False
+    # 对话页联网开关（DeepSeek 同构，2026-10-29）：开关关 = 规划里的 web 步
+    # 不执行（计划照旧显示，执行层如实交代）；开关开 = 仍要过可达性检查。
+    # None = 没带开关（旧客户端/CLI）→ 按规划执行。
+    if web_allowed is False and _plan.get("web"):
+        _plan = dict(_plan)
+        _plan["web"] = False
+        _plan["why"] = (str(_plan.get("why") or "")
+                        + "（对话页联网开关关：web 步不执行）")[:200]
 
     # ---- ① 归题（找评分点）----
     topic_id, hit, task = _infer(question)
@@ -1920,7 +1927,7 @@ async def consume(
                             for k in ("db", "web", "file", "infer")},
             "plan_why": (str((_plan or {}).get("why") or "")[:160]
                          + ("" if _plan.get("planned") is not False
-                            else "（规划员不可用，按词表兜底）"))[:200],
+                            else "（规划员不可用：不碰环境、不联网，仅模型推断）"))[:200],
             # inference 兜底（句句有回复）：模型推断层用没用 —— 与工具线
             # claim 同级的披露，面板/对话页据此挂「模型推断」标注。
             "inference_used": bool(inference_used),
@@ -2494,7 +2501,7 @@ async def consume(
                         for k in ("db", "web", "file", "infer")},
         "plan_why": (str((_plan or {}).get("why") or "")[:160]
                      + ("" if _plan.get("planned") is not False
-                        else "（规划员不可用，按词表兜底）"))[:200],
+                        else "（规划员不可用：不碰环境、不联网，仅模型推断）"))[:200],
         # inference 兜底（句句有回复）：与场景分支同口径的披露。
         "inference_used": bool(inference_used),
         "cold_start": bool(absorbed.get("cold_start")),
@@ -3509,10 +3516,13 @@ def _plan_routes(question: str, *, scene_id: str, has_file: bool,
         _cat = _scene_skill_catalog(scene_id)[0][:1200]
     except Exception:
         _cat = ""
-    _old_data = _is_data_question(question)
-    _fallback = {"db": _old_data, "web": False, "file": bool(has_file),
-                 "infer": not _old_data,
-                 "why": "规划员不可用，按词表兜底", "planned": False}
+    # 规划员不可用时的兜底（2026-10-29 用户拍板「不应该有词表」）：
+    # 不猜题型 —— 不碰环境、不联网，只走模型推断并如实标注。这是「没有
+    # 规划就不执行计划外动作」的安全方向；词表这条路由已删，不再复活。
+    _fallback = {"db": False, "web": False, "file": bool(has_file),
+                 "infer": True,
+                 "why": "规划员不可用 → 不碰环境、不联网，只做模型推断",
+                 "planned": False}
     try:
         cj = chat_json(
             [{"role": "system", "content": _PLAN_SYSTEM},
@@ -3544,22 +3554,6 @@ def _plan_routes(question: str, *, scene_id: str, has_file: bool,
     out["why"] = str(cj.get("why") or "")[:160]
     out["planned"] = True
     return out
-
-
-def _is_data_question(question: str) -> bool:
-    """题面在不在**找数据**（rule-based，R1「会不会答」的对称面）。
-
-    找数据的题：环境答不出 = 不会 —— 绝不联网编、绝不推断编，如实交代 +
-    拉学习。不找数据的题（是什么/为什么/怎么）：模型知识可答（标 inference），
-    联网资料可证（标 claim）—— 同 DeepSeek 客户端：联网默认关，知识题直接答。
-    """
-    _q = str(question or "").lower()
-    _DATA_WORDS = ("多少", "几", "总额", "总共", "一共", "总和", "合计",
-                   "平均", "均值", "最大", "最小", "最高", "最低", "排名",
-                   "哪些", "列表", "数量", "占比", "比例", "增长率",
-                   "how many", "how much", "sum", "count", "average",
-                   "total", "list")
-    return any(w in _q for w in _DATA_WORDS)
 
 
 def _inference_answer(question: str, context: str = "") -> dict[str, Any]:

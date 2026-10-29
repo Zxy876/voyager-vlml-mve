@@ -3008,10 +3008,14 @@ class Handler(BaseHTTPRequestHandler):
             prev = str(_sc4.current_scene_id() or "A")
         except Exception:
             sid = ""
+        # 对话页联网开关（DeepSeek 同构，2026-10-29）：payload.web=false →
+        # 规划里的 web 步不执行；缺省 None = 按规划执行（CLI/旧客户端）。
+        _web = payload.get("web")
+        _web = bool(_web) if isinstance(_web, bool) else None
         if payload.get("stream"):
-            self._openai_stream(q, model, sid, prev)
+            self._openai_stream(q, model, sid, prev, web_allowed=_web)
             return
-        res = self._mve_ask(q, sid, prev)
+        res = self._mve_ask(q, sid, prev, web_allowed=_web)
         content, reasoning, x = _openai_answer(res, sid, prev)
         now = int(time.time())
         self._json(200, {
@@ -3072,13 +3076,14 @@ class Handler(BaseHTTPRequestHandler):
         self._chunk(("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n")
                     .encode("utf-8"))
 
-    def _openai_stream(self, q: str, model: str, sid: str, prev: str) -> None:
+    def _openai_stream(self, q: str, model: str, sid: str, prev: str,
+                       web_allowed: bool | None = None) -> None:
         """先心跳、后逐字：消费要 20~60 秒，干等会让客户端超时判死。"""
         import threading
         box: dict[str, Any] = {}
 
         def _work() -> None:
-            box["res"] = self._mve_ask(q, sid, prev)
+            box["res"] = self._mve_ask(q, sid, prev, web_allowed=web_allowed)
 
         th = threading.Thread(target=_work, daemon=True)
         th.start()
@@ -3104,7 +3109,8 @@ class Handler(BaseHTTPRequestHandler):
             # 人点了「停止生成」——消费线程自己跑完落账，这里只是不再写。
             pass
 
-    def _mve_ask(self, q: str, sid: str, prev: str) -> dict:
+    def _mve_ask(self, q: str, sid: str, prev: str,
+                 web_allowed: bool | None = None) -> dict:
         """跑一次消费并还原场景。返回 consume() 的结果（异常也包成结果）。"""
         try:
             import scenes as _sc
@@ -3122,7 +3128,7 @@ class Handler(BaseHTTPRequestHandler):
             if _root2 not in sys.path:
                 sys.path.insert(0, _root2)
             import voyager_vlml.consume as _consume2
-            return _aio.run(_consume2.consume(q))
+            return _aio.run(_consume2.consume(q, web_allowed=web_allowed))
         except Exception as e:
             return {"ok": False, "answer": "",
                     "errors": [f"{type(e).__name__}: {e}"]}
