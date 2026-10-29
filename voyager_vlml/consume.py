@@ -1415,10 +1415,11 @@ async def consume(
             _act_gh.register_gh(_scene_id)
         except Exception:
             pass
-        # ③a 复用优先（同构 Voyager：retrieve → 重放 → 取不到才写新代码）。
-        # 只认「本机形态」的配方（代码里有 RESULT、能 run_saved 重放）；
-        # VLML 的 SQL 配方在本机场景重放不了 —— 那是另一个数据源的东西，
-        # 跨后端复用就等于场景隔离破功。
+        # ③a 复用优先（同构 Voyager：retrieve 到的技能当**示例**注入执行层，
+        # 模型现写程序；**不原样重放**——重放旧代码 = 答旧题，见下面 else 段）。
+        # SQL/场景库形态走模板回填（_refill_sql，方法不变、实体值按本题填），
+        # 代码形态交给 solve 现写。跨后端（SQL 配方 ↔ 本机代码）不复用：
+        # 那是另一个数据源的东西，跨后端复用就等于场景隔离破功。
         data = None
         code = ""
         obs: list[dict[str, Any]] = []
@@ -1453,35 +1454,19 @@ async def consume(
             # 技能整批实例化、逐条执行，见下方 `if reused_skill is None:` 块；
             # 原子题/合成题同一条编排路径，不再分流。）
         else:
-            for s in skills:
-                sc = str(s.get("code") or "")
-                if "RESULT" not in sc:
-                    continue
-                try:
-                    # 必须走 async 版：同步 run_saved 会在事件循环线程里阻塞等
-                    # 自己提交给同一 loop 的 MCP 调用 → 60s 超时 → 配方被误判失效
-                    # （2026-10-20 实测：明明命中 3 条配方，却"用到 0 条技能"）。
-                    # 墙钟同样要给足：单条技能 = 一次真实联网取数（2026-10-21）。
-                    val = await _la.run_saved_async(
-                        sc, _scene_dir, scene_id=_scene_id,
-                        timeout=_consume_timeout(1))
-                except Exception as e:
-                    reuse_errors.append(f"重放 {s.get('name')} 抛错：{e}")
-                    continue
-                # ⚠️ 重放结果必须过真空判据：`{"error": ...}` / 空值**不算答出来**。
-                # 实测（2026-10-19 截图「命中 1 · 有效率 0%」）：命中后复用一条
-                # 历史错误配方，它把 RESULT=error 当答案交了上去 —— 命中了、
-                # 掌握度也有了、就是没回答问题。所以这里与 critic 同一口径：
-                # error/空 → 这条配方当失败，换下一条；全失败就现场重写。
-                data_try, err_try = _la._payload(val)
-                if data_try is None:
-                    reuse_errors.append(
-                        f"重放 {s.get('name')} 没取到数：{err_try}")
-                    continue
-                data, code, reused_skill = data_try, sc, dict(s)
-                obs = [{"ok": True, "tool": "local_python", "rows": 1,
-                        "data": data_try}]
-                break
+            # ---- 2026-10-29 用户拍板：「不要硬分类，让 agent 根据判官的提示
+            # 规划产出 —— 见人说人话，见鬼说鬼话」（参考 DeepSeek：按需拉工具、
+            # 工具结果回灌上下文、模型自己规划；原版 Voyager 同构：检索到的
+            # 技能是**示例**塞进 prompt，模型每次现写程序，**从不原样重放**）。
+            #
+            # 这里曾逐条 run_saved 重放旧代码、凭「取到数」就当答案用 —— 旧
+            # 代码里带着上一题的实体值（仓库名/路径/部门名），重放出来的就是
+            # 旧题的答案，还被算成命中（SQL 侧同类问题 2026-10-23 已用模板泛化
+            # 解掉，代码侧没有等价物）。已删：技能只当参考，交给下面 solve
+            # 让 agent 按当前问题自己写，执行结果由 solve 的迭代收口。
+            # 不新增旁路判官（用户同日拍板「参考 DeepSeek」——判定在环境反馈
+            # 与最终收口，不在每步外加一层裁决）。
+            pass
         # ③b 场景库形态：**原版同构的组合**（2026-10-29 用户拍板「按原版改」）。
         # 原版消费 = inference → rollout → step：检索到的技能**整批**注入执行层
         # （voyager.py:195-199 → action.py:94 programs），agent 写的那段程序里
