@@ -51,9 +51,15 @@ def _norm_repo(repo: str) -> str:
 
 def _get_json(url: str, max_bytes: int = 0) -> dict[str, Any]:
     import net_tools
+    import urllib.error
     _mb = int(max_bytes) if max_bytes else net_tools._MAX_BYTES
     headers_token = _token()
-    # _http_get 只带 UA；带 token 要自己补头 —— 复用 _guard_url 逻辑换实现
+    # ⚠️ 2026-10-29 Scene H 实测：`net_tools._http_get` 内部是裸 urlopen，
+    # 403/404 会**直接抛 urllib HTTPError**（str 就是 "HTTP Error 403: rate
+    # limit exceeded"），根本走不到下面 `status != 200` 那一行 —— 于是
+    # `_raise_gh` 里那段"换 gh_read / raw 不受配额限制"的指路文案**永远发不出去**，
+    # 模型只看到一句干巴巴的 403，4 步内一直重打同一个 API。
+    # 所以两条路径都必须把 HTTPError 翻译成 `_raise_gh` 的话。
     if headers_token:
         import urllib.request
         u = net_tools._guard_url(url)
@@ -61,10 +67,17 @@ def _get_json(url: str, max_bytes: int = 0) -> dict[str, Any]:
             u, headers={"User-Agent": net_tools._UA,
                         "Authorization": f"Bearer {headers_token}",
                         "Accept": "application/vnd.github+json"})
-        with urllib.request.urlopen(req, timeout=net_tools._TIMEOUT) as resp:
-            return json.loads(resp.read(_mb).decode("utf-8",
-                                                   errors="replace"))
-    status, raw = net_tools._http_get(url, max_bytes=_mb)
+        try:
+            with urllib.request.urlopen(req, timeout=net_tools._TIMEOUT) as resp:
+                return json.loads(resp.read(_mb).decode("utf-8",
+                                                        errors="replace"))
+        except urllib.error.HTTPError as e:
+            _raise_gh(int(e.code or 0), url)
+    try:
+        status, raw = net_tools._http_get(url, max_bytes=_mb)
+    except urllib.error.HTTPError as e:
+        _raise_gh(int(e.code or 0), url)
+        raise                                   # 不可达，只为类型收窄
     if status != 200:
         _raise_gh(status, url)
     try:
@@ -85,12 +98,13 @@ def _raise_gh(status: int, url: str) -> None:
         # 模型唯一一步用来调 gh_repo_info，撞 403 后**不知道该换哪条路**。
         # 报错文案必须点名那条**不受 API 配额限制**的通路（raw / git 都不限），
         # 否则「工具报错就换工具」只是句空话。raw 实测 200、api 403 同时成立。
+        # ⚠️ 行动指令放**最前面**：证据层/追问历史会把错误信息截到 200 字符，
+        # 解释性的话放后面会被截掉，模型就只看到「403 限速」四个字。
         raise RuntimeError(
+            "别重试本函数，改走 gh_read（raw.githubusercontent.com，"
+            "不受 API 配额限制）读文件正文。"
             "GitHub API 限速/封禁（HTTP 403；匿名 60 次/小时，或出口 IP 已被"
-            "限到 0，设 GITHUB_TOKEN 可提到 5000 次/小时）。"
-            "**立刻换通路，别重试这个函数**：读文件正文用 gh_read"
-            "（走 raw.githubusercontent.com，不受 API 配额限制）；"
-            "看目录结构可用 gh_read 读 README / 已知路径试探。"
+            "限到 0，设 GITHUB_TOKEN 可提到 5000 次/小时）；"
             f"本轮 gh_repo_info/gh_tree/gh_api 都不可用：{url[:100]}")
     raise RuntimeError(f"GitHub 请求失败（HTTP {status}）：{url[:120]}")
 
@@ -181,9 +195,28 @@ def gh_read(repo: str, path: str, ref: str = "") -> dict[str, Any]:
     if any(seg == ".." for seg in p.split("/")):
         raise PermissionError(f"path 不许包含 .. 段：{p[:80]}")
     url = f"{_RAW}/{r}/{_rf}/{p}"
-    status, raw = net_tools._http_get(url)
+    import urllib.error
+
+    def _raise_read(status: int) -> None:
+        """读文件的失败文案：404 必须给出"下一步试什么"。
+
+        模型常在猜文件名（H 实测就死在猜路径上），4 步里全靠这条提示换路。
+        """
+        if int(status or 0) == 404:
+            raise RuntimeError(
+                f"仓库里没有这个路径（404）：{p[:80]} —— 常用入口是 README.md、"
+                "docs/、requirements.txt；不知道结构就先 gh_read 读 README.md，"
+                "它通常写着目录说明")
+        _raise_gh(int(status or 0), url)
+
+    try:
+        status, raw = net_tools._http_get(url)
+    except urllib.error.HTTPError as e:
+        # 同 `_get_json`：裸 urlopen 的 403/404 是 HTTPError，不走 status 分支。
+        _raise_read(int(e.code or 0))
+        raise
     if status != 200:
-        _raise_gh(status, url)
+        _raise_read(status)
     text = raw.decode("utf-8", errors="replace")
     return {"repo": r, "path": p, "ref": _rf, "bytes": len(raw),
             "text": text[:_TEXT_LIMIT],

@@ -84,7 +84,36 @@ def main() -> int:
             gh_tools.gh_read("owner/repo", "不存在.md")
             check("404 如实抛错", False)
         except RuntimeError as e:
-            check("404 如实抛错", "404" in str(e) or "没有这个资源" in str(e))
+            check("404 如实抛错", "404" in str(e))
+            check("gh_read 404 给出下一步（试 README.md）",
+                  "README.md" in str(e), str(e)[:60])
+
+        # ⚠️ 真根因回归（2026-10-29 Scene H）：`net_tools._http_get` 内部是裸
+        # urlopen，403/404 会**直接抛 urllib HTTPError**，不返回 status ——
+        # 于是 `_raise_gh` 的指路文案从未发出过，模型只看到
+        # "HTTP Error 403: rate limit exceeded"。这里把"抛 HTTPError"这条路
+        # 打桩，断言最终抛的是**带指路的话**，不是裸 HTTPError。
+        import urllib.error
+
+        def boom_get(url, timeout=10, max_bytes=0):
+            raise urllib.error.HTTPError(url, 403, "rate limit exceeded",
+                                         {}, None)
+
+        net_tools._http_get = boom_get
+        for _fn, _lbl in ((lambda: gh_tools.gh_repo_info("owner/repo"),
+                           "gh_repo_info"),
+                          (lambda: gh_tools.gh_tree("owner/repo"), "gh_tree"),
+                          (lambda: gh_tools.gh_read("owner/repo", "README.md"),
+                           "gh_read")):
+            try:
+                _fn()
+                check(f"{_lbl} 抛 HTTPError 时改抛带指路的错", False)
+            except urllib.error.HTTPError:
+                check(f"{_lbl} 抛 HTTPError 时改抛带指路的错", False,
+                      "原样漏出 HTTPError —— _raise_gh 又被绕过了")
+            except RuntimeError as e:
+                check(f"{_lbl} 抛 HTTPError 时改抛带指路的错",
+                      "gh_read" in str(e) or "404" in str(e), str(e)[:60])
     finally:
         net_tools._http_get = _orig_get
 
