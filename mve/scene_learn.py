@@ -79,6 +79,7 @@ def scene_questions(scene_id: str) -> list[dict[str, Any]]:
     """
     latest: dict[str, str] = {}
     latest_scope: dict[str, str] = {}
+    latest_db: dict[str, bool | None] = {}
     todo: list[str] = []
     try:
         if COACH_LOG.exists():
@@ -98,11 +99,15 @@ def scene_questions(scene_id: str) -> list[dict[str, Any]]:
         if not q:
             continue
         latest[q] = str(r.get("judgment_result") or "")   # 后写的覆盖先写的
-        # 这条题归属哪条供给线（learn / tool / inference）。工具线（联网）
-        # 的题**不进待学队列**：学习侧的学习单元是「环境里的一次 rollout」，
-        # 联网结果既没有可复现的环境、也没有能验真的判官 —— 排进去只会
-        # 让驾驶舱反复拆维度、烧轮次，最后 given_up（用户 2026-10-28
-        # 拍板「工具线的答案不计入学习曲线」，不进学习账 = 也不该进待学队）。
+        # 这条题**规划里有没有 db 路**（None = 老记录，没有 plan_routes 字段）。
+        # 学习侧的学习单元 = 环境里的一次 rollout；规划没排 db 路 = 这题不需要
+        # 环境（联网题 / 概念题 / 聊天），排进待学只会让驾驶舱反复拆库内维度、
+        # 烧轮次到 given_up（实测 b2a70f4：外部对比题硬拆 5 个库内维度、
+        # learned 空）。同一把尺子：规划决定走不走环境（_use_env），
+        # 也就决定学不学。老记录保持旧行为（宁可学，不静默丢）。
+        _pr = r.get("plan_routes")
+        latest_db[q] = (bool((_pr or {}).get("db"))
+                        if isinstance(_pr, dict) and _pr else None)
         latest_scope[q] = str(r.get("scope_line") or "")
     # ⚠️ **不能**拿 coach_log 的 judgment_result=="written" 当"课程已完成"。
     # 那是**消费侧**的判读（人问一句、当场答出来），原版里对应的是"这次答复成功"，
@@ -132,15 +137,20 @@ def scene_questions(scene_id: str) -> list[dict[str, Any]]:
         if str(r.get("mode") or "") != "voyager_consume":
             continue
         q = str(r.get("question") or "").strip()
-        if latest_scope.get(q) == "tool":
-            continue                                 # 工具线题：不排学习（见上）
+        if latest_db.get(q) is False:
+            continue             # 规划里没 db 路：不排学习（见上，含待审区）
         if q and q not in learned_done and q not in todo:
             todo.append(q)
     # 待审区（人导入了、还没解出来的另一本账）
+    # ⚠️ 同一把尺子也管这里：待审区的题若已判过「规划里没有 db 路」，同样
+    # 不排 —— 否则上一段的过滤被这一段的补录洗掉（服务器实测：三句外部题
+    # 就是从这里被加回待学队列的）。
     try:
         import routing
         for item in routing.pending_for_scene(scene_id) or []:
             q = str((item or {}).get("question") or "").strip()
+            if latest_db.get(q) is False:
+                continue
             if q and q not in learned_done and q not in todo:
                 todo.append(q)
     except Exception:
