@@ -1134,7 +1134,11 @@ async def _start_learning_impl(
                                 return _mg.check(
                                     _q1, _ans, [_d], evidence=_ev,
                                     env_obs=_env1,
-                                    prior_questions=_asked)
+                                    prior_questions=_asked,
+                                    # DeepSeek「判定以材料为准」同构（2026-10-29）：
+                                    # SQL = 计算过程的地面真话，不给它闸门只能
+                                    # 对着一行结果反复追问「请提供计算过程」。
+                                    sql=str(getattr(ag, "last_sql", "") or ""))
                             except Exception as _ge:
                                 return {"passed": True, "questions": [],
                                         "origin": "failed",

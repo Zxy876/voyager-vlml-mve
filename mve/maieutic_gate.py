@@ -121,8 +121,14 @@ def _material_block(evidence: Any, limit: int = 3, per: int = 1200) -> str:
 def render(question: str, answer: str,
            dimensions: list[dict[str, Any]], *, critique: str = "",
            evidence: Any = None, env_obs: str = "",
-           prior_questions: list[str] | None = None) -> str:
+           prior_questions: list[str] | None = None,
+           sql: str = "") -> str:
     """照 spec-examiner 的 user 模板：任务 + 维度清单（含内部理由）+ 它交上来的回答。
+
+    `sql` = 本轮实际执行的 SQL（2026-10-29 补，DeepSeek「判定以材料为准」同构）：
+    不给 SQL，闸门看不见「计算过程」，只能对着一行结果反复追问「请提供计算
+    过程和结果」—— 过程明明就在 SQL 里（过滤了哪列、按什么聚合），它却看不见，
+    循环空转。给 SQL = 过程成为可核对的材料。
 
     `env_obs` = 环境实查清单（数据源真实的表/列/取值）—— 口径真实性的判据：
     答案的计算口径必须能在清单里指认，指认不了 = 假设业务参数 = 未答到
@@ -151,9 +157,12 @@ def render(question: str, answer: str,
     env_block = (f"\n环境实查清单（数据源真实的表/列/取值，实查不手写 —— "
                  f"答案的计算口径必须能在这里指认）：\n{env_obs}\n"
                  if str(env_obs or "").strip() else "")
+    sql_block = (f"\n本轮实际执行的 SQL（计算过程在这里 —— 过滤了哪些列、"
+                 f"按什么聚合，以它为准核对）：\n{str(sql or '').strip()[:800]}\n"
+                 if str(sql or "").strip() else "")
     return (f"任务：{question}\n\n"
             f"必须回答的维度清单：\n{dim_block or '  （无）'}\n{prior}"
-            f"{asked_block}{env_block}\n"
+            f"{asked_block}{env_block}{sql_block}\n"
             f"助手取到的材料（执行层剪裁，失败项已剔除）：\n"
             f"{_material_block(evidence)}\n\n"
             f"它交上来的回答：\n\"\"\"\n{str(answer or '')[:2500]}\n\"\"\"\n\n"
@@ -164,7 +173,8 @@ def check(question: str, answer: str, dimensions: list[dict[str, Any]], *,
           llm: Callable | None = None, critique: str = "",
           max_retries: int = 2, evidence: Any = None,
           env_obs: str = "",
-          prior_questions: list[str] | None = None) -> dict[str, Any]:
+          prior_questions: list[str] | None = None,
+          sql: str = "") -> dict[str, Any]:
     """闸门判定。返回 {"passed","addressed","open","questions","emergent","origin"}。
 
     `origin="failed"` = 模型/解析不可用（调用方应退回原版 critic，不假装判过）。
@@ -196,7 +206,8 @@ def check(question: str, answer: str, dimensions: list[dict[str, Any]], *,
                          {"role": "user", "content": render(
                              question, answer, dims, critique=critique,
                              evidence=evidence, env_obs=env_obs,
-                             prior_questions=prior_questions)}])
+                             prior_questions=prior_questions,
+                             sql=sql)}])
         except Exception as e:
             last = f"LLM 调用失败：{type(e).__name__}: {e}"
             continue
