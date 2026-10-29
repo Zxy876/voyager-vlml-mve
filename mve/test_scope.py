@@ -303,6 +303,29 @@ def main() -> int:
           str(_names))
     check("query_sql 关外部文件访问（read_text 不能绕过读密钥）",
           "enable_external_access=false" in _la_src)
+    # 2026-10-29 用户拍板 B 方案：只留场景目录，应用工作区不再可读 ——
+    # 学习循环读不到应用自己的源码（原来 read_file("mve/.env") 就是这么读到
+    # 密钥的）。想让它读某份代码 → 放进场景目录，或 MVE_READ_ROOTS 点名授权。
+    check("应用工作区不在可读根里（只留场景目录）",
+          str(_la._APP_ROOT.resolve()) not in [str(r) for r in _la._roots(_d)],
+          str(_la._roots(_d)))
+    try:
+        _la.read_file(_d, str(_la._APP_ROOT / "mve" / "local_agent.py"))
+        _app_open = True
+    except PermissionError:
+        _app_open = False
+    check("读应用自己的源码被拒", not _app_open)
+    _d2 = _tf.mkdtemp()
+    _P(_d2, "b.txt").write_text("额外授权的目录", encoding="utf-8")
+    os.environ["MVE_READ_ROOTS"] = _d2
+    try:
+        _ok_extra = "额外授权" in str(_la.read_file(_d, str(_P(_d2, "b.txt"))).get("text"))
+    except Exception as _e:
+        _ok_extra = False
+        print("   （MVE_READ_ROOTS 失败：", type(_e).__name__, _e, "）")
+    finally:
+        os.environ.pop("MVE_READ_ROOTS", None)
+    check("MVE_READ_ROOTS 点名授权后可读（不点名就不给）", _ok_extra)
     print(f"== 结果：{PASS} 过 / {FAIL} 挂 ==")
     return 1 if FAIL else 0
 

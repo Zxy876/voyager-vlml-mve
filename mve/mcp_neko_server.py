@@ -111,6 +111,20 @@ def _format_result(py_obj: object) -> dict:
 
     客户端 `call_remote` 把整段 result 透传给调用方；`_unwrap_mcp`（local_agent）
     优先取 structuredContent，没有再解析 text。
+
+    ⚠️ `structuredContent` **必须是 JSON 对象（dict）** —— MCP 规范如此，
+    桥接层（mcp-proxy / 官方 SDK）的 `CallToolResult` 会拿 pydantic 校验，
+    塞 list/str/int 直接被拒。2026-10-29 生产实测（这是「mcp_neko_web_search
+    一直报 schema 错」的真根因，原以为是 N.E.K.O 那边的问题）：
+
+        1 validation error for CallToolResult
+        structuredContent
+          Input should be a valid dictionary
+          [type=dict_type, input_value=[{'title': 'Speedtest by ...'}], input_type=list]
+
+    → 整个 result 变 `isError: true`，模型看到一串 pydantic 报错文本，
+    维度该取的数一个都取不到。这里按形状包壳：list → `{"results": [...]}`
+    （客户端 `_mcp_listify` 认这个键，正好剥回列表，模型侧 `hits[:3]` 照常能用）。
     """
     if isinstance(py_obj, dict) and "__error__" in py_obj:
         err = str(py_obj["__error__"])
@@ -120,10 +134,16 @@ def _format_result(py_obj: object) -> dict:
             "structuredContent": {"error": err},
         }
     text = json.dumps(py_obj, ensure_ascii=False)
+    if isinstance(py_obj, dict):
+        sc: object = py_obj
+    elif isinstance(py_obj, list):
+        sc = {"results": py_obj}
+    else:
+        sc = {"value": py_obj}
     return {
         "content": [{"type": "text", "text": text}],
         "isError": False,
-        "structuredContent": py_obj,
+        "structuredContent": sc,
     }
 
 

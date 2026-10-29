@@ -150,6 +150,13 @@ class MCPServerConfig:
     url: str = ""
     fallback_command: str = ""
     fallback_args: list[str] = field(default_factory=list)
+    # 工具级准入口径（2026-10-29 用户问「MCP 挂进来的工具不受这套守卫管，怎么办」）：
+    # 本仓库管不了 server 内部读什么，但**管得了让它挂几个工具进来**。
+    #   `expose` 非空 = 白名单（只暴露列出的）；`deny` = 黑名单（排除列出的）。
+    #   两边都不配 = 全暴露（保持既有部署行为不变）。
+    # 名字写**工具原名**（不带 mcp_<server>_ 前缀），如 "web_search"。
+    expose: list[str] = field(default_factory=list)
+    deny: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -186,6 +193,35 @@ def _parse_tools(result: Any, server_name: str) -> list[MCPTool]:
 
 
 # ---------------------------------------------------------------------------
+# 子进程环境：不给它面板的全部家当
+# ---------------------------------------------------------------------------
+# 原先是 `env = os.environ.copy()` + cfg.env —— 等于把面板进程的**全部环境变量**
+# 交给每一个 stdio MCP server，包括 `ZHIPU_API_KEY` / `GITHUB_TOKEN` 之类。
+# 2026-10-29 用户问「MCP 挂进来的工具不受这套守卫管，怎么办」时查出来的：
+# 文件读能力我们已经在 local_agent 收窄了，但**子进程环境是另一条路** ——
+# server 只要能被 prompt 牵着读一遍自己的 environ，密钥就出去了，跟文件守卫无关。
+# 口径：默认只给「跑起来必需、且不含秘密」的几个；server 真要什么，在
+# mcp_servers.json 的 `env` 里**显式声明**（最小权限，看得见）。
+# 逃生口 `MVE_MCP_ENV_PASSTHROUGH=1` 恢复旧行为（老部署里某个 server 忽然缺
+# token 时可以临时打开，但要知道这意味着密钥又回到了子进程里）。
+_ENV_KEYS = ("PATH", "HOME", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL",
+             "USER", "LOGNAME", "SHELL", "SYSTEMROOT", "COMSPEC", "PATHEXT",
+             "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+             "http_proxy", "https_proxy", "no_proxy")
+
+
+def _child_env(config: MCPServerConfig) -> dict[str, str]:
+    """stdio MCP server 的环境：白名单 + 配置里显式声明的那几项。"""
+    passthrough = str(os.environ.get("MVE_MCP_ENV_PASSTHROUGH") or "").strip().lower()
+    if passthrough in ("1", "true", "yes", "all"):
+        env = os.environ.copy()
+    else:
+        env = {k: os.environ[k] for k in _ENV_KEYS if k in os.environ}
+    env.update({str(k): str(v) for k, v in (config.env or {}).items()})
+    return env
+
+
+# ---------------------------------------------------------------------------
 # MCPClient：一个 stdio MCP server 的连接（同构猫娘 MCPClient）
 # ---------------------------------------------------------------------------
 class MCPClient:
@@ -211,8 +247,7 @@ class MCPClient:
             self.error = "stdio 传输必须配 command"
             return False
         try:
-            env = os.environ.copy()
-            env.update({str(k): str(v) for k, v in (self.config.env or {}).items()})
+            env = _child_env(self.config)
             self.process = await asyncio.create_subprocess_exec(
                 self.config.command, *[str(a) for a in (self.config.args or [])],
                 stdin=asyncio.subprocess.PIPE,
@@ -605,6 +640,10 @@ class MCPGateway:
                 url=str(cfg.get("url") or "").strip(),
                 fallback_command=(_resolve_command(fb_cmd) if fb_cmd else ""),
                 fallback_args=[_resolve_arg(str(a)) for a in fb_args],
+                expose=[str(x) for x in (cfg.get("expose") or [])
+                        if isinstance(x, str)],
+                deny=[str(x) for x in (cfg.get("deny") or [])
+                      if isinstance(x, str)],
             )
         return {"servers": servers, "reason": ""}
 
@@ -746,6 +785,26 @@ class MCPGateway:
         return await client.call_tool(tool_name, arguments)
 
     # ---- 暴露 / 撤回（同构「远端工具注入聊天」）----
+    def tool_allowed(self, tool_id: str) -> tuple[bool, str]:
+        """这个工具准不准挂进场景（按配置的 expose/deny）。
+
+        本仓库管不了 server 内部读什么，但**管得了让它挂几个工具进来** ——
+        这是「MCP 能力边界」里唯一由我们说了算的一层（另两层：进程环境见
+        `_child_env`，工具自身行为在 server 代码里，只能靠不暴露/换 server）。
+        两边都没配 = 全放行（老配置行为不变）。
+        """
+        idx = self.tool_index()
+        server = idx.get(str(tool_id))
+        cfg = (self._configs or {}).get(str(server or ""))
+        if cfg is None:
+            return True, ""
+        name = str(tool_id)[len(f"mcp_{server}_"):]
+        if cfg.expose and name not in cfg.expose:
+            return False, f"不在 server '{server}' 的 expose 白名单里"
+        if name in (cfg.deny or []):
+            return False, f"在 server '{server}' 的 deny 黑名单里"
+        return True, ""
+
     def expose_as_actions(self, scene_id: Any) -> dict[str, Any]:
         """把已连接 server 的工具注册成场景动作条目（origin="mcp"）。
 
@@ -769,7 +828,12 @@ class MCPGateway:
             raise ValueError("expose_as_actions 需要场景 id，收到空值")
         exposed: list[str] = []
         skipped: list[str] = []
+        blocked: list[dict[str, str]] = []
         for t in _dedup_tools(self.list_tools()):
+            ok, why = self.tool_allowed(t.tool_id)
+            if not ok:
+                blocked.append({"tool_id": t.tool_id, "reason": why})
+                continue
             if actions.register(scene_id, _make_remote_entry(self, t),
                                 origin="mcp"):
                 exposed.append(t.tool_id)
@@ -777,7 +841,8 @@ class MCPGateway:
                 skipped.append(t.tool_id)
         self._exposed[scene_id] = exposed
         return {"scene_id": scene_id, "exposed": exposed, "skipped": skipped,
-                "reason": "" if exposed else "没有可暴露的远端工具（未连接/无工具）"}
+                "blocked": blocked,
+                "reason": "" if exposed else "没有可暴露的远端工具（未连接/无工具/全被配置挡住）"}
 
     def withdraw_from_scene(self, scene_id: str) -> list[str]:
         """把本网关暴露过的条目从场景撤下（远端断了，抓手段不该还在）。"""

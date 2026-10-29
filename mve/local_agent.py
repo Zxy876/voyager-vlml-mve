@@ -14,16 +14,17 @@
 本模块给非 VLML 场景一个「本机原语 + 写代码执行」的执行层（原版 Voyager 就是
 写代码调 control_primitives，不是写 SQL）：
 
-    list_files(path="", pattern="*")     列文件（限定在应用工作区 / 场景目录）
+    list_files(path="", pattern="*")     列文件（**只在场景目录内**）
     read_file(path, max_bytes=200_000)   读文本（限定只读、限长）
     read_json(path)                      读 JSON 并解析（别逼模型自己解析）
     query_sql(sql)                        仅当本机场景目录里有 .duckdb 时可用
 
 安全边界（必须守）：
   · 只读：不提供 write/delete/exec；
-  · 路径限制在**应用工作区**与**场景目录**下，禁止跳出（.. 与绝对路径都做
-    校验）；**不碰操作者的家目录** —— 用户 2026-10-19：「一般用户下载下来放
-    本机用啊，不需要我的本机数据的」；
+  · 路径限制在**场景目录**内（2026-10-29 用户拍板：应用工作区不再可读 ——
+    学习循环只能读你给它的数据，读不到应用自己的源码）；禁止跳出（.. 与
+    绝对路径都做校验）；**不碰操作者的家目录** —— 用户 2026-10-19：「一般
+    用户下载下来放本机用啊，不需要我的本机数据的」；
   · 模型写的代码在受限命名空间里跑：禁 `import`、禁 `__builtins__` 逃逸；
   · 单次执行有超时（线程 + join）。
 
@@ -36,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -79,27 +81,57 @@ _SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules",
               ".mypy_cache", ".pytest_cache", ".idea"}
 
 
+def _extra_roots() -> list[Path]:
+    """显式授权的额外只读根（env `MVE_READ_ROOTS`，冒号/分号分隔）。
+
+    默认空 —— 想让它读某份代码/文档，就**放进场景目录**，或者在这里点名
+    授权一个目录（如 `MVE_READ_ROOTS=/srv/docs`）。默认敞着整个工作区是
+    2026-10-29 那个漏洞的根子，所以这里改成"不点名就不给"。
+    """
+    raw = str(os.environ.get("MVE_READ_ROOTS") or "").strip()
+    if not raw:
+        return []
+    out: list[Path] = []
+    for s in raw.replace(";", ":").split(":"):
+        s = s.strip()
+        if not s:
+            continue
+        try:
+            out.append(Path(s).expanduser().resolve())
+        except Exception:
+            continue
+    return out
+
+
 def _roots(scene_dir: str) -> list[Path]:
-    """允许的根 = **应用自己的工作区** + 场景目录。
+    """允许的根 = **场景目录**（+ env 显式授权的额外根）。
 
     ⚠️ 刻意不含 `Path.home()`（用户 2026-10-19 纠正：一般用户是把应用下载下来
     放本机用，**不需要**让程序去翻操作者的私人文件）。「数据源就是本机」指的是
     「应用就跑在这台机器上，数据在它自己的工作区里」，不是"去读我的家目录"。
+
+    ⚠️ **也不含应用工作区**（2026-10-29 用户拍板 B 方案）：原来可读根含
+    `/root/mve`，于是 `read_file("mve/.env")` 读得到密钥。用户选了"只能读我
+    给它的数据" —— 学习循环读不到应用自己的源码。想让它读某份代码，
+    放进场景目录，或用 MVE_READ_ROOTS 点名授权。
     """
-    out = []
-    for p in (scene_dir, str(_APP_ROOT)):
-        if p:
-            try:
-                out.append(Path(p).expanduser().resolve())
-            except Exception:
-                pass
+    out: list[Path] = []
+    for p in [str(scene_dir or "")] + [str(x) for x in _extra_roots()]:
+        if not p:
+            continue
+        try:
+            rp = Path(p).expanduser().resolve()
+        except Exception:
+            continue
+        if rp not in out:
+            out.append(rp)
     return out
 
 
 def _resolve_under(path: str, scene_dir: str) -> Path:
     p = Path(str(path or "")).expanduser()
     if not p.is_absolute():
-        p = Path(scene_dir or _APP_ROOT) / p
+        p = Path(scene_dir or ".") / p
     p = p.resolve()
     for r in _roots(scene_dir):
         try:
@@ -108,7 +140,7 @@ def _resolve_under(path: str, scene_dir: str) -> Path:
         except ValueError:
             continue
     else:
-        raise PermissionError(f"路径不在应用工作区/场景目录内：{p}")
+        raise PermissionError(f"路径不在场景目录内：{p}")
     if _is_sensitive(p):
         raise PermissionError(
             f"不读密钥类文件：{p.name}（.env/私钥/凭据不在可读范围 —— "
@@ -785,6 +817,28 @@ def _first_mcp_text(inner: dict) -> str:
     return ""
 
 
+# 工具级「本轮已判死」账（tool_id → (连续失败次数, 最近原因)）。
+# 为什么需要（2026-10-29 Scene H 实跑）：`mcp_neko_web_search` 因为 structuredContent
+# 形状不合法一直返回 `1 validation error for CallToolResult`，但菜单里仍然列着它，
+# 模型连点 3 轮 —— prompt 里「报错就换工具」是**软约束**，它照样撞同一堵墙。
+# 这里把「连续失败 ≥ _MCP_FAIL_LIMIT 次」的工具从**菜单**里摘掉、单独列成
+# 「本轮已证实不可用」，把软约束换成硬事实。注入（`_ns_base`）照旧不动 ——
+# 旧技能可能还在调它，拔掉名字会让重放 NameError。
+_MCP_FAILS: dict[str, tuple[int, str]] = {}
+_MCP_FAIL_LIMIT = 2
+
+
+def _note_mcp_fail(tool_id: str, why: str) -> None:
+    n = _MCP_FAILS.get(str(tool_id), (0, ""))[0] + 1
+    _MCP_FAILS[str(tool_id)] = (n, str(why).replace("\n", " ")[:120])
+
+
+def _mcp_dead(tool_id: str) -> str:
+    """已判死的工具返回「失败次数+原因」，否则空串。"""
+    n, why = _MCP_FAILS.get(str(tool_id), (0, ""))
+    return f"本轮已连续失败 {n} 次（{why}）" if n >= _MCP_FAIL_LIMIT else ""
+
+
 def _mcp_listify(obj: Any) -> Any:
     """MCP 工具常把结果包一层 `{results|items|data|rows|docs: [...]}`。
 
@@ -815,8 +869,11 @@ def _unwrap_mcp(payload: Any) -> Any:
         return inner
     if inner.get("isError"):
         sc = inner.get("structuredContent") or {}
+        # `structuredContent` 不一定是对象（不守规范的 server 会塞 list/str），
+        # 直接 .get 会 AttributeError 把「工具报错」变成「执行崩了」。
+        err = sc.get("error") if isinstance(sc, dict) else ""
         raise RuntimeError(
-            f"MCP 工具报错：{sc.get('error') or _first_mcp_text(inner) or '未知错误'}")
+            f"MCP 工具报错：{err or _first_mcp_text(inner) or '未知错误'}")
     sc = inner.get("structuredContent")
     if sc is not None:
         return _mcp_listify(sc)
@@ -862,7 +919,13 @@ def _make_mcp_callable(gw: Any, tool_id: str, loop: Any,
                 kwargs.setdefault(key, val)
         cfut = asyncio.run_coroutine_threadsafe(
             gw.call_remote(tool_id, **kwargs), loop)
-        return _unwrap_mcp(cfut.result(timeout=60))
+        try:
+            ret = _unwrap_mcp(cfut.result(timeout=60))
+        except Exception as e:
+            _note_mcp_fail(str(tool_id), f"{type(e).__name__}: {e}")
+            raise
+        _MCP_FAILS.pop(str(tool_id), None)
+        return ret
     _sync.__name__ = str(tool_id)
     if props:
         _sync.__doc__ = f"{tool_id}({', '.join(props)}) —— MCP 远端工具"
@@ -1007,10 +1070,15 @@ def _mcp_prompt_section(scene_id: str) -> str:
     try:
         import actions
         items: list[str] = []
+        dead: list[str] = []
         for e in actions.enabled_entries(scene_id):
             if str(e.get("origin") or "") != "mcp":
                 continue
             name = str(e.get("name"))
+            why_dead = _mcp_dead(name)
+            if why_dead:
+                dead.append(f"  {name} —— {why_dead}，别再调它，换同类工具")
+                continue
             schema = e.get("input_schema") or {}
             props = schema.get("properties") or {}
             required = set(schema.get("required") or [])
@@ -1022,9 +1090,15 @@ def _mcp_prompt_section(scene_id: str) -> str:
             sig = ", ".join(parts) if parts else ""
             desc = str(e.get("description") or "")[:48].replace("\n", " ")
             items.append(f"  {name}({sig})  → {desc}")
+        out = ""
         if items:
-            return ("\n此外，以下**经 MCP 接入的远端工具（猫娘计划 mcp 同构）**可直接调用"
+            out += ("\n此外，以下**经 MCP 接入的远端工具（猫娘计划 mcp 同构）**可直接调用"
                     "（名字就是函数名，联网优先用它们）：\n" + "\n".join(items))
+        if dead:
+            out += ("\n以下工具**本轮已实测不可用**，别浪费步数去调（报错就换同类）：\n"
+                    + "\n".join(dead))
+        if out:
+            return out
     except Exception:
         pass
     return ""
