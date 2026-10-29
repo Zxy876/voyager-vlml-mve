@@ -1885,9 +1885,13 @@ async def consume(
         if _no_reply and not str(answer or "").strip():
             # 兜底的兜底：inference / 工具线都没产出 —— 也必须句句有回复，
             # 判官结论与局限原样交代（用户 2026-10-28：判官可以看到局限性）。
-            _lim = (str(critic_why or "")
-                    or "；".join(str(x) for x in reuse_errors[-2:])
-                    or str((tool_line.get("note") or "")))
+            # ⚠️ 2026-10-29：critic_why 的「真空/无结果」是**查过库**才成立的判词；
+            # 规划没排 db 路的题（纯工具线）不该把它抄进回复（服务器实测：
+            # 腾讯校招起薪的回复里出现「判官结论：没取到真数（真空/无结果）」，
+            # 人看到会以为库里有数据只是空）。没查库 → 只交代联网这半场的实情。
+            _lim = ((str(critic_why or "") if _use_env else "")
+                    or str((tool_line.get("note") or ""))
+                    or "；".join(str(x) for x in reuse_errors[-2:]))
             answer = ("这题这轮没答出来 —— 不编数。"
                       + (f"判官结论：{_lim[:220]} " if _lim.strip() else "")
                       + ("已自动拉起后台学习。" if learn_kick.get("kicked")
@@ -1982,7 +1986,12 @@ async def consume(
                                   else str(nar.get("why") or "")[:200]),
             "errors": [str(o.get("error") or "") for o in obs if not o.get("ok")],
             "answer": answer, "sql": code,
-            "rows": sum(int(o.get("rows") or 0) for o in obs if o.get("ok")),
+            # rows = 实查行数：**没执行过任何查询就是 None**，不是 0。
+            # 0 的含义是「查了、返回 0 行」（真空判据要看的那个 0）；没查库的题
+            # （规划没排 db 路 / 未学）报 0 会在面板写成「实查返回 0 行」，
+            # 对纯联网题是假证据（2026-10-29 服务器实测）。
+            "rows": (sum(int(o.get("rows") or 0) for o in obs if o.get("ok"))
+                     if obs else None),
             # 多技能编排：把**每条**执行到的已学技能都披露出来（原版同构：
             # 注入的 skills 就是 agent 实际可调用的集合）；单技能复用仍走
             # reused_skill 兜底，口径不变。

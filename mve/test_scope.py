@@ -200,6 +200,12 @@ def main() -> int:
           "规划里没有 db 路 —— 这一问走工具线（联网），不查场景库：" in src_plan
           and '("" if critic_ok else str(critic_why or "")[:300])\n'
               '                            if _use_env else "")' in src_plan)
+    # 同一条实测的第三处：回复尾巴抄了「判官结论：没取到真数（真空/无结果）」，
+    # 面板照 rows=0 写「实查返回 0 行」—— 没查库的题这两条都是假证据。
+    check("回复尾巴不抄真空判词（没查库时）",
+          'str(critic_why or "") if _use_env else ""' in src_plan)
+    check("没执行过查询时 rows=None（不是 0）",
+          'if obs else None)' in src_plan)
     # 2026-10-29 撤销自创的「web 题学方法不学数值」（qa_cache 方法沉淀 + 消费侧复用）。
     # 事实口径：DeepSeek 的联网经验在训练期进权重，运行时不留检索记忆；MVE 侧仿造属发明。
     # 这条是回归守卫：机制不许复活，否则又是一份自创。
