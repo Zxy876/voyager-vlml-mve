@@ -3356,16 +3356,37 @@ def _web_reachable(scene_id: str) -> tuple[bool, str]:
     """联网步骤的可达性检查（斯坦福 Generative Agents 同构：计划里的动作
     要对真实环境核 —— 世界上没有的东西，计划就得修订）。
 
-    机制判据：场景动作注册表里有 origin=net 的原语（与面板「联网能力 · N」
-    同一事实源；猫爪总开关关掉后原语就没了）。不可达 → 计划如实修订，
-    不假装查过、不编数。
+    机制判据（三层，全对齐面板「联网能力 · N」的口径）：
+    ① 场景动作注册表里有 origin=net 的原语（同一事实源）；
+    ② 注册表为空先 restore 快照 —— 面板进程启动时才 restore，CLI /
+       pilot 子进程里注册表可能还没填，没填 ≠ 没这个能力；
+    ③ 条目在 ≠ 可用：猫爪总开关 + 该组开关都开才可达（开关关掉不是删
+       条目，是不暴露 + 拒调用，同 neko 插件语义）。
+    不可达 → 计划如实修订，不假装查过、不编数。
     """
     try:
         import actions as _act
         bucket = getattr(_act, "_REGISTRY", {}).get(str(scene_id)) or {}
-        names = [str(a.name) for a in bucket.values()
-                 if str(getattr(a, "origin", "")) == "net"]
-        return bool(names), "、".join(names[:4])
+
+        def _net_names(b: dict) -> list[str]:
+            return [str(a.name) for a in b.values()
+                    if str(getattr(a, "origin", "")) == "net"]
+
+        names = _net_names(bucket)
+        if not names:
+            try:
+                _act.restore()
+            except Exception:
+                pass
+            bucket = getattr(_act, "_REGISTRY", {}).get(str(scene_id)) or {}
+            names = _net_names(bucket)
+        if not names:
+            return False, "动作注册表里没有联网原语"
+        _gs = sorted({str(_act.group_of(a)) for a in bucket.values()
+                      if str(getattr(a, "origin", "")) == "net"})
+        if not any(_act.group_enabled(str(scene_id), g) for g in _gs):
+            return False, f"联网能力开关没开（{'、'.join(_gs)}）"
+        return True, "、".join(names[:4])
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
 
