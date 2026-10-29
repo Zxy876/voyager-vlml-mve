@@ -1334,7 +1334,6 @@ async def consume(
             try:
                 import actions as _act
                 _act.register_local(_scene_id, _scene_dir)
-                _act.register_net(_scene_id)
             except Exception:
                 pass
             # 远端 MCP 工具必须先挂上：复用配方时 `_ns_base` 只注入**注册表里已有**
@@ -1344,6 +1343,18 @@ async def consume(
             mcp_ready = await _la.ensure_mcp_tools(_scene_id)
         if _env is not None:
             mcp_ready = {"skipped": "场景库形态（query_sql 只读本场景 duckdb），消费不接 MCP"}
+        # ---- 联网原语：local + scene 两种非 VLML 形态**都要**注册 ----
+        # 2026-10-29 用户实测：H 场景「今天天气如何」规划排了 web 路，却因
+        # 注册表没有联网原语而不可达 —— 之前 register_net 只挂在 kind=local
+        # 分支里，场景库形态（kind=scene）整段跳过。天气/汇率/外部行情这类
+        # **时变题**本来就只能走工具线（2026-10-28 两分：可复现→学习线，
+        # 时变→工具线，入库即污染）—— 联网原语不注册，这类题在所有场景库
+        # 形态里永远不可答。查询原语（只读本场景 duckdb）与联网互不冲突。
+        try:
+            import actions as _act_net
+            _act_net.register_net(_scene_id)
+        except Exception:
+            pass
         # ③a 复用优先（同构 Voyager：retrieve → 重放 → 取不到才写新代码）。
         # 只认「本机形态」的配方（代码里有 RESULT、能 run_saved 重放）；
         # VLML 的 SQL 配方在本机场景重放不了 —— 那是另一个数据源的东西，

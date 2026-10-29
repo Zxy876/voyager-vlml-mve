@@ -239,6 +239,14 @@ def main() -> int:
           and "_web_tips(" not in _all_src
           and '"method_learned"' not in _all_src
           and '"method_reused"' not in _all_src)
+    # 2026-10-29 用户实测：场景库形态（kind=scene）不注册联网原语 → 规划排了
+    # web 路却「注册表里没有联网原语」→ 时变题（天气/汇率）在所有场景库形态
+    # 永远不可答。两分原则：时变→工具线，所以联网原语必须两种形态都注册。
+    _i_mcp = _all_src.find('mcp_ready = {"skipped"')
+    _i_net = _all_src.rfind("register_net(")
+    check("场景库形态也注册联网原语（时变题走工具线的前提）",
+          _i_mcp != -1 and _i_net > _i_mcp,
+          f"mcp_skip@{_i_mcp} register_net@{_i_net}")
     print(f"== 结果：{PASS} 过 / {FAIL} 挂 ==")
     return 1 if FAIL else 0
 
