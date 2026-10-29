@@ -954,7 +954,8 @@ def _compose_halves(question: str, db_part: str, web_part: str) -> str:
         return ""
 
 
-async def _tool_line_fallback(question: str, context: str = "") -> dict[str, Any]:
+async def _tool_line_fallback(question: str, context: str = "",
+                              scene_id: str = "") -> dict[str, Any]:
     """工具线兜底（第 4 步，DeepSeek 消费同构）：库场景答不出 → 联网取公开
     资料、当场作答、用完即弃。
 
@@ -995,6 +996,15 @@ async def _tool_line_fallback(question: str, context: str = "") -> dict[str, Any
             return o
         o["sources"] = [{"title": str(r.get("title") or "")[:120],
                          "url": str(r.get("url") or "")} for r in results]
+        # 联网资料落库（web_ingest，2026-10-29 接线）：「联网时候的方法给到
+        # 消费侧」—— 搜索结果先进 web_docs（按 url 去重），下次同类问题
+        # 不用重新撞限流；claim 落账后经人确认才升级 fact。失败不挡路。
+        try:
+            if scene_id:
+                import web_ingest
+                web_ingest.save_docs(scene_id, qry, results)
+        except Exception:
+            pass
         # ② 取页正文（多源重试，2026-10-29 用户拍板「一定做」）：
         # 反爬/超时是常态，只抓 top2 且各试一次命中率太低（实测同一题
         # 「搜索有结果但正文都没取到」）。现在：最多试 top4，每个失败再
@@ -1041,6 +1051,22 @@ async def _tool_line_fallback(question: str, context: str = "") -> dict[str, Any
             if ans and bool((cj or {}).get("grounded", True)):
                 o["used"] = True
                 o["answer"] = ans
+                # claim 落账（confirmed=False）：调研回答给到消费侧的另一半 ——
+                # 人确认后升级 fact，下次走学习线直接答（回路 2026-10-28 拍板）。
+                try:
+                    if scene_id:
+                        import web_ingest
+                        _s0 = (o["sources"] or [{}])[0]
+                        web_ingest.save_evidence(
+                            scene_id,
+                            [{"item": question[:200], "attribute": "claim",
+                              "value": ans[:200],
+                              "source_title": str(_s0.get("title") or ""),
+                              "source_url": str(_s0.get("url") or ""),
+                              "confidence": 0.5, "confirmed": False}],
+                            question=question, method="web")
+                except Exception:
+                    pass
             elif ans:
                 o["note"] = "资料不足以回答（grounded=false，如实不答）"
             else:
@@ -2056,7 +2082,8 @@ async def consume(
                                           "不编数")}
                 else:
                     try:
-                        tool_line = await _tool_line_fallback(question, context=_file_ctx)
+                        tool_line = await _tool_line_fallback(
+                            question, context=_file_ctx, scene_id=_scene_id)
                     except Exception as e:  # pragma: no cover
                         tool_line = {"used": False, "answer": "", "sources": [],
                                      "note": (f"工具线异常：{type(e).__name__}: "
@@ -2089,8 +2116,8 @@ async def consume(
             _web_ok, _web_names = _web_reachable(_scene_id)
             if _web_ok:
                 try:
-                    tool_line = await _tool_line_fallback(question,
-                                                          context=_file_ctx)
+                    tool_line = await _tool_line_fallback(
+                        question, context=_file_ctx, scene_id=_scene_id)
                 except Exception as e:  # pragma: no cover
                     tool_line = {"used": False, "answer": "", "sources": [],
                                  "note": (f"工具线异常：{type(e).__name__}: "
@@ -2645,8 +2672,8 @@ async def consume(
                                       "不编数")}
             else:
                 try:
-                    tool_line = await _tool_line_fallback(question,
-                                                          context=_file_ctx)
+                    tool_line = await _tool_line_fallback(
+                        question, context=_file_ctx, scene_id=_scene_id)
                 except Exception as e:  # pragma: no cover
                     tool_line = {"used": False, "answer": "", "sources": [],
                                  "note": f"工具线异常：{type(e).__name__}: {str(e)[:140]}"}

@@ -1075,6 +1075,7 @@ def _ns_base(scene_dir: str, scene_id: str = "",
             # 重放不能依赖「调用方刚好注册过」。
             actions.register_local(scene_id, str(scene_dir))
             actions.register_net(scene_id)
+            actions.register_gh(scene_id)
             names = {str(e.get("name")) for e in actions.enabled_entries(scene_id)
                      if str(e.get("origin") or "") in allowed_origins} & set(full)
             # 场景自带数据源不受猫爪门控（2026-10-24 用户实测：「只有开了猫爪才能
@@ -1179,6 +1180,7 @@ def run_saved(code: str, scene_dir: str, timeout: float = 30.0,
             import actions
             actions.register_local(scene_id, str(scene_dir))
             actions.register_net(scene_id)
+            actions.register_gh(scene_id)
         except Exception:
             pass
         ns = _ns_base(scene_dir, scene_id, loop=loop, evidence=evidence)

@@ -196,6 +196,11 @@ def available_grabs(scene_id: str, scene_dir: str = "") -> list[str]:
         if scene_dir:
             actions.register_local(scene_id, scene_dir)
         actions.register_net(scene_id)
+        # GitHub 原语同 net 同理（2026-10-29 实测：人导入的调研任务
+        # 「联网去仓库地址」学习侧 5 条全 failed —— 学习子进程没注册 gh 组，
+        # 模型调 gh_read 直接 NameError；技能是跨入口复用的资产，
+        # 学习侧与消费侧必须同一份工具菜单）
+        actions.register_gh(scene_id)
         return [str(e.get("name") or "").strip()
                 for e in actions.enabled_entries(scene_id)
                 if str(e.get("name") or "").strip()]
@@ -873,6 +878,7 @@ async def _start_learning_impl(
                 try:
                     _act.register_local(scene, local_dir)
                     _act.register_net(scene)
+                    _act.register_gh(scene)
                 except Exception:
                     pass
                 try:

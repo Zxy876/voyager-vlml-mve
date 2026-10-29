@@ -299,8 +299,12 @@ def main() -> int:
     check("kick 注明同构语义（答不了就进入学习）", "进入学习" in src)
     # 两处调用现在都带上下文（context=_file_ctx）—— 只认函数名，别认实参写法
     # 认**调用点**（带 = 号），别认定义（定义在文件末尾，index 会先撞上它）
+    # （2026-10-29 起 _tool_line_fallback 调用改成多行、还带 scene_id=_scene_id
+    #  —— 断言只认「await _tool_line_fallback(」调用形态，不锁实参写法）
     check("非数据题先 inference 后工具线",
-          src.index("= _inference_answer(question") < src.index("= await _tool_line_fallback(question"))
+          src.index("= _inference_answer(question") < src.index("await _tool_line_fallback("))
+    check("工具线调用带 scene_id（联网资料落库 web_ingest 的钥匙）",
+          "scene_id=_scene_id" in src and "web_ingest" in src)
     check("上传文件当上下文：四条模型调用都收到它",
           src.count("context=_file_ctx") >= 4, str(src.count("context=_file_ctx")))
     check("内部数据题不联网（_internal_hit 闸）", "_internal_hit" in src)
