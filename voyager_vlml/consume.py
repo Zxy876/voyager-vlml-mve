@@ -1263,13 +1263,15 @@ async def consume(
                             if _gwhy:
                                 reuse_errors.append(
                                     f"{_label} 被字面量守卫拒用（幻觉取值）：{_gwhy[:120]}")
-                                _fails.append({"name": _label, "sql": _sql, "why": _gwhy[:200]})
+                                _fails.append({"name": _label, "sql": _sql,
+                                               "why": _gwhy[:200], "guard": "literal"})
                                 continue
                             _fwhy = _fanout_guard(_sql, _dbp)
                             if _fwhy:
                                 reuse_errors.append(
                                     f"{_label} 被 fan-out 闸门拒用（JOIN 乘爆）：{_fwhy[:120]}")
-                                _fails.append({"name": _label, "sql": _sql, "why": _fwhy[:200]})
+                                _fails.append({"name": _label, "sql": _sql,
+                                               "why": _fwhy[:200], "guard": "fanout"})
                                 continue
                             # 单位守卫已删（2026-10-29）：题面口径/单位语义
                             # 不在代码里判，交给执行后的全貌判官（_fits_judge）。
@@ -1279,7 +1281,8 @@ async def consume(
                             if _rwhy:
                                 reuse_errors.append(
                                     f"{_label} 被费率守卫拒用：{_rwhy[:120]}")
-                                _fails.append({"name": _label, "sql": _sql, "why": _rwhy[:200]})
+                                _fails.append({"name": _label, "sql": _sql,
+                                               "why": _rwhy[:200], "guard": "rate"})
                                 continue
                             _rr = await _env.run_sql(_sql)
                             _d = _rr.get("data") or {}
@@ -1398,15 +1401,20 @@ async def consume(
                     # 工资 + 津贴」这类合成关系 —— 业务口径不再写进代码。
                     # 判不过 → 带着全貌与拒因重填一轮（原版 step 迭代同构）；仍
                     # 不过就当没答出来（data=None 走学习线），绝不交片面数。
+                    # 技能目录在判官**之前**取（2026-10-29 用户拍板「守卫根据
+                    # 技能更新」）：判官眼中的「库里可算口径」锚在技能库现状上，
+                    # 每学一条技能，可算集合自动扩一圈 —— 守卫不再依赖写死的
+                    # 假设，跟原版 Voyager 以技能库/环境现状为判定锚同构。
+                    _cat, _all_sk = _scene_skill_catalog(_scene_id)
                     if _executed:
                         _fit = _fits_judge(question, code, data, _dbp,
-                                           items=_executed, fails=_fails)
+                                           items=_executed, fails=_fails,
+                                           catalog=_cat)
                         if not _fit["ok"]:
                             reuse_errors.append(
                                 f"作答被对题判官退回：{_fit['why'][:160]}")
                             print(f"  · 对题判官退回：{_fit['why'][:110]}"
                                   f" → 带全库目录重填一轮", flush=True)
-                            _cat, _all_sk = _scene_skill_catalog(_scene_id)
                             _fb_lines = [f"- 上一轮结果被判官退回：{_fit['why']}"]
                             if _fails:
                                 # 执行报错也是地面真话，必须一起喂回去：
@@ -1507,7 +1515,10 @@ async def consume(
                     # 迭代，再回填性价比低 —— 直接当没答出来走学习线（宁可空手
                     # 也不交片面数）。有 skills 时上面已判过，不重复花钱。
                     _fit2 = _fits_judge(
-                        question, code, data, str((_prof or {}).get("db_path") or ""))
+                        question, code, data,
+                        str((_prof or {}).get("db_path") or ""),
+                        catalog=(_scene_skill_catalog(_scene_id)[0]
+                                 if _scene_id else ""))
                     if not _fit2["ok"]:
                         data = None
                         reuse_errors.append(
@@ -3072,7 +3083,8 @@ def _numeric_columns(db_path: str, limit: int = 80) -> list[str]:
 def _fits_judge(question: str, sql: str, data: Any,
                 db_path: str = "",
                 items: list[dict[str, Any]] | None = None,
-                fails: list[dict[str, str]] | None = None) -> dict[str, Any]:
+                fails: list[dict[str, str]] | None = None,
+                catalog: str = "") -> dict[str, Any]:
     """作答对题判官（**看全貌**判，不靠写死词表）。
 
     替代 _scope_guard/_subject_guard/_completeness_guard 三张词表：它把
@@ -3135,11 +3147,17 @@ def _fits_judge(question: str, sql: str, data: Any,
         sql_block = f"SQL：\n{str(sql)[:1500]}\n\n结果（前几行）：\n{preview}"
     _fails = [f for f in (fails or []) if isinstance(f, dict)]
     if _fails:
+        _guard_names = {str(f.get("name") or "") for f in _fails
+                        if f.get("guard")}
         sql_block += ("\n\n⚠️ 本轮这些配方**取数失败**（它们的结果不在上面 —— "
                       "逐个表态是否影响本题）：\n"
-                      + "\n".join(f"- {f.get('name') or '?'}："
-                                  f"{str(f.get('why') or '')[:160]}"
-                                  for f in _fails[:5]))
+                      + "\n".join(
+                          (f"- {f.get('name') or '?'}：已被确定性守卫拒"
+                           f"（机制事实，不可上诉）—— {str(f.get('why') or '')[:160]}"
+                           if f.get("guard") else
+                           f"- {f.get('name') or '?'}："
+                           f"{str(f.get('why') or '')[:160]}")
+                          for f in _fails[:5]))
     sys_p = (
         "你是核对员。给你题面、实际执行的 SQL 与取回的结果、库里真实存在的"
         "表/列/取值全貌、**数值列白名单**，以及本轮取数失败的配方。判断"
@@ -3151,16 +3169,25 @@ def _fits_judge(question: str, sql: str, data: Any,
         "② measure_ok 口径：题面问的量是哪一种，SQL 聚合的列必须就是它；\n"
         "③ missing 完整性：题面说「总共/一共/总额/全部/应发」时，结果要覆盖"
         "库里**实际存在**的各组成部分。缺了哪一项，就把那一项对应的列写进 "
-        "missing —— 格式必须是白名单里逐字存在的 `表.列`。\n"
+        "missing —— 格式必须是白名单里逐字存在的 `表.列`。完整性以"
+        "**「库全貌 + 已学技能目录」**为准：目录里的方法 = 库里已被验证可算"
+        "的口径；目录和全貌里都找不到换算参数的量，就是库里没有的口径。\n"
         "④ failed 逐项表态：对每个取数失败的配方单独回答 needed（题面需要它、"
         "缺了它答案就不对 → true；与题面无关、或库里本来没有费率/单价列根本"
         "算不出 → false）。拿不准就写 true（宁可不答，也不交片面数）。\n"
+        "⚠️ 被标注「已被确定性守卫拒」的配方：needed **必须 false** —— 守卫"
+        "已经机制性地证明这条 SQL 假设了库里不存在的参数（乘常量=造费率、"
+        "幻觉取值、JOIN 乘爆），该量按库里可算部分覆盖，缺它不算不完整；"
+        "你不再对它表态 true。\n"
         "⚠️ 硬约束：missing 只准从白名单里挑；想不出具体列（只是「感觉应该还"
         "有别的组成部分」）就留空数组 []。别用行业常识补全貌里没有的东西。\n"
-        "⚠️ 完整性只数**库里算得出来**的部分：某一项需要的换算参数列（费率/"
-        "单价/系数这类）在全貌里不存在时，那一项就**不可计算** —— missing "
-        "不写它、对应失败项 needed=false（缺它不算不完整，答案只能覆盖库里"
-        "算得出的部分）。全貌里没有的量不许假设。\n"
+        "⚠️ 完整性只数**库里算得出来**的部分：某一项需要的换算参数（费率/"
+        "单价/系数/折算标准）**没有任何一列能逐字充当**时，那一项就**不可"
+        "计算** —— 注意：它需要的**数量列**（小时/天数/件数）在全貌里存在，"
+        "**不等于**该量可计算；把两列相乘/相除**合成**换算参数同样是假设"
+        "业务参数。不可计算的项：missing 不写它、对应失败项 needed=false"
+        "（缺它不算不完整，答案只覆盖库里算得出的部分）。全貌里没有的量"
+        "不许假设。\n"
         "⚠️ 多条 SQL 时，每条只负责题面的一部分（上层负责合并/相加），不要要求"
         "单条 SQL 自己答完整题。\n"
         "只返回 JSON：{\"subject_ok\": true/false, \"measure_ok\": true/false, "
@@ -3169,7 +3196,10 @@ def _fits_judge(question: str, sql: str, data: Any,
         "\"why\": \"一句话说清哪里不对；对就写口径一致\"}")
     user = (f"题面：{question}\n\n{sql_block}\n\n"
             f"数值列白名单（missing 只准从这里挑）：\n{_num_block}\n\n"
-            f"库全貌（实查）：\n{obs}")
+            + (f"已学技能目录（库里已被验证可算的方法 —— 完整性对照它，"
+               f"它随每次学习自动更新）：\n{str(catalog)[:2000]}\n\n"
+               if str(catalog or "").strip() else "")
+            + f"库全貌（实查）：\n{obs}")
     try:
         # 判官模型走 MVE_CRITIC_MODEL（同 task_critic.py:275 的契约：判官不能省
         # 模型钱）。2026-10-29 实测踩到：判官用 flash 时**同一份技术部口径的
@@ -3208,8 +3238,15 @@ def _fits_judge(question: str, sql: str, data: Any,
     # 只采信白名单里真有的列 —— 判官凭常识编出来的「缺奖金/缺补贴」在这里
     # 被机械地否掉（不是靠提示词求它别编）。读不到 schema 时退回旧行为。
     _real = [m for m in _asked if m in set(_nums)] if _nums else _asked
-    _needed = any(bool(f.get("needed")) for f in (cj.get("failed") or [])
-                  if isinstance(f, dict))
+    # 守卫裁定不被翻案（DeepSeek 原则：规则判过的，LLM 不复判）：
+    # 被确定性守卫拒的配方（费率/字面量/fan-out）= 机制证明这条 SQL 假设了
+    # 库里不存在的参数 —— 判官对它们说 needed=true 一律无效。2026-10-29
+    # 九连拒实证：判官把「数量列存在」当「可算钱」，坚持要库里算不出的
+    # 加班费/扣款项，把本可成立的答案整体打成真空。
+    _guard_names = {str(f.get("name") or "") for f in _fails if f.get("guard")}
+    _needed = any(bool(f.get("needed"))
+                  and str(f.get("name") or "") not in _guard_names
+                  for f in (cj.get("failed") or []) if isinstance(f, dict))
     why = str(cj.get("why") or "")[:300]
     ok = sub and mea and not _real and not _needed
     if sub and mea and _asked and not _real:
@@ -3219,6 +3256,16 @@ def _fits_judge(question: str, sql: str, data: Any,
         why = (why + "｜实查确认缺失：" + "、".join(_real[:3]))[:300]
     if _needed:
         why = (why + "｜判官认为本轮取数失败的配方里有题面需要的项")[:400]
+    elif _guard_names and (cj.get("failed") or []):
+        try:
+            _g_true = [str(f.get("name") or "") for f in cj["failed"]
+                       if isinstance(f, dict) and f.get("needed")
+                       and str(f.get("name") or "") in _guard_names]
+        except Exception:
+            _g_true = []
+        if _g_true:
+            why = (why + "｜（守卫已拒的配方 " + "、".join(_g_true[:3])
+                   + " 被判官点名，按机制事实不计入缺失）")[:400]
     return {"ok": ok, "why": why, "missing": _real}
 
 
