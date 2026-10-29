@@ -595,12 +595,15 @@ async def solve(question: str, scene_dir: str, *, llm=None,
             _fx = next((n for n in _names if "fetch" in n), "")
             if _fx:
                 _code_ex = (
-                    f"hits = {_ex}(query=\"<本题关键词>\")\n"
+                    f"r = {_ex}(query=\"<本题关键词>\")\n"
+                    f"# 返回形状别猜：list 直接用；dict 外壳取 results/items/data\n"
+                    f"hits = [x for x in (r if isinstance(r, list) else [])\n"
+                    f"        if isinstance(x, dict)]\n"
                     f"for h in hits[:3]:                 # 抓不到就换下一个\n"
-                    f"    page = {_fx}(url=h[\"url\"])    # 参数名以它的签名为准\n"
+                    f"    page = {_fx}(url=h.get(\"url\") or h.get(\"link\") or \"\")\n"
                     f"    if ok_text(page):              # 403/超时/解析失败都会是 False\n"
                     f"        RESULT = {{\"answer\": <只写 page 正文里能印证的要点>, "
-                    f"\"source\": h[\"url\"]}}\n"
+                    f"\"source\": h.get(\"url\") or \"\"}}\n"
                     f"        break\n"
                     f"else:\n"
                     f"    RESULT = {{\"error\": \"3 个来源都没取到正文\"}}")
@@ -622,6 +625,10 @@ async def solve(question: str, scene_dir: str, *, llm=None,
                 "gh_tree/gh_read（原文，不是搜索摘要）；要公开网页上的事实就 "
                 "web_search 找种子再抓正文；本机/上传的文件用 list_files/"
                 "read_file；场景库里的数用 query_sql。\n"
+                "**工具报错就换工具，别拿同一句重试**：MCP 报错（validation "
+                "error）、TypeError/KeyError 都说明这个工具当前不可用或返回形状"
+                "与预期不同 —— 换一个同类工具（还有 web_search/gh_*/别的 mcp_*）"
+                "或换参数；同一条错误重试三次以上等于这轮没做。"
                 + ("搜索结果只是摘要：够用就直接据实组织（标来源）；摘要不够就"
                    "对最相关的 1~2 个结果抓**正文**再提炼。\n"
                    "**抓回来的东西是不是正文，一律用 `ok_text(page)` 判**（我们提供的"
@@ -725,6 +732,23 @@ def _first_mcp_text(inner: dict) -> str:
     return ""
 
 
+def _mcp_listify(obj: Any) -> Any:
+    """MCP 工具常把结果包一层 `{results|items|data|rows|docs: [...]}`。
+
+    模型的习惯写法是 `hits = tool(...)` 然后 `hits[:3]`（2026-10-29 实测
+    Scene H：`KeyError: slice(None, 3, None)` —— 它拿到的是 dict，一切片就炸，
+    整条维度 0 闭合）。客户端该把外壳剥掉、把列表交出去 —— 这是解包，不是
+    替模型猜业务。
+    """
+    if isinstance(obj, dict):
+        for k in ("results", "items", "data", "rows", "docs", "matches",
+                  "documents", "records"):
+            v = obj.get(k)
+            if isinstance(v, list):
+                return v
+    return obj
+
+
 def _unwrap_mcp(payload: Any) -> Any:
     """把 mcp_gateway.call_remote 的返回（`{result:{...}}` 或 `{error:...}`）
     翻回模型能用的 Python 对象。错误如实抛 RuntimeError —— 执行层会把它记成
@@ -742,12 +766,12 @@ def _unwrap_mcp(payload: Any) -> Any:
             f"MCP 工具报错：{sc.get('error') or _first_mcp_text(inner) or '未知错误'}")
     sc = inner.get("structuredContent")
     if sc is not None:
-        return sc
+        return _mcp_listify(sc)
     # 兜底：解析 content[0].text 的 JSON
     for c in (inner.get("content") or []):
         if isinstance(c, dict) and c.get("type") == "text":
             try:
-                return json.loads(c["text"])
+                return _mcp_listify(json.loads(c["text"]))
             except Exception:
                 return c["text"]
     return inner
