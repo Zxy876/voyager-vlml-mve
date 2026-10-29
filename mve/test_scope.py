@@ -122,6 +122,38 @@ def main() -> int:
     check("coach 落盘白名单带 tool_line_used",
           "tool_line_used" in _coach_src and "referee_compared" in _coach_src)
 
+    print("== 6. 信息路规划接线（2026-10-29 拍板：先规划、再可达性检查）==")
+    src_plan = inspect.getsource(C.consume)
+    check("consume 主流程调用 _plan_routes", "_plan_routes(" in src_plan)
+    check("计划外动作不执行（规划 web=False → 不联网）",
+          '_plan.get("planned") and not _plan.get("web")' in src_plan)
+    check("web 步骤执行前核可达性（_web_reachable）",
+          "_web_reachable(" in src_plan)
+    check("不可达 → 如实缺失不编数", "外部信息如实缺失" in src_plan)
+    check("对比题 web 半场追加（claim 只挂答案尾部）",
+          "外部信息（联网检索）" in src_plan)
+    # 行为断言：_web_reachable 对空注册表 → 不可达（False + 说明）
+    ok, names = C._web_reachable("__no_such_scene__")
+    check("_web_reachable 空注册表 → False", ok is False, f"names={names[:40]}")
+    # 行为断言：规划员挂掉 → 兜底 planned=False（执行层退回旧行为，不比现状差）
+    _orig_cj2 = C.chat_json
+    try:
+        C.chat_json = lambda msgs, **kw: (_ for _ in ()).throw(
+            RuntimeError("规划员不可用"))
+        pf = C._plan_routes("汇率现在多少", scene_id="__t__", has_file=False)
+        check("规划员挂掉 → 兜底 planned=False", pf.get("planned") is False)
+        check("兜底不含 web（可达性与旧行为接管）", pf.get("web") is False)
+        # 行为断言：规划成功 → planned=True + 按模型输出取路
+        C.chat_json = lambda msgs, **kw: {"db": True, "web": True,
+                                          "file": False, "infer": False,
+                                          "why": "内部+外部对比题"}
+        pg = C._plan_routes("待遇好不好", scene_id="__t__", has_file=False)
+        check("规划成功 → planned=True + web=True（对比题双路）",
+              pg.get("planned") is True and pg.get("web") is True
+              and pg.get("db") is True)
+    finally:
+        C.chat_json = _orig_cj2
+
     print(f"== 结果：{PASS} 过 / {FAIL} 挂 ==")
     return 1 if FAIL else 0
 

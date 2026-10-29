@@ -933,6 +933,22 @@ async def consume(
     except Exception:
         _scene_tables = []
 
+    # ---- ⓪' 信息路规划（斯坦福 Generative Agents 同构：先规划、再对真实
+    # 环境做可达性检查；不可达的步骤如实修订，绝不假装走到过）----
+    # 用户 2026-10-29 拍板的闭环：LLM 先生成可达性规划 → 按规划逐路执行
+    # （db 路走既有消费/学习线：技能复用 → 取数 → 进技能库 → 里程碑重试；
+    # web 路执行时另核联网工具可不可达）→ 综合作答。DeepSeek V3.2 同构点：
+    # 工具菜单外挂给模型、模型自主规划；MVE 特有的三线记账规则不变。
+    _plan: dict[str, Any] = {}
+    tool_line: dict[str, Any] = {"used": False, "answer": "", "sources": [],
+                                 "note": ""}
+    try:
+        _plan = _plan_routes(question, scene_id=_scene_id,
+                             has_file=bool(_file_ctx),
+                             scene_tables=_scene_tables)
+    except Exception:
+        _plan = {}
+
     # ---- ① 归题（找评分点）----
     topic_id, hit, task = _infer(question)
 
@@ -1749,16 +1765,29 @@ async def consume(
                                  "不计入学习曲线）"))
                     inference_used = True
             if not str(answer or "").strip():
-                try:
-                    tool_line = await _tool_line_fallback(question, context=_file_ctx)
-                except Exception as e:  # pragma: no cover
+                # 斯坦福 Generative Agents 同构（2026-10-29 拍板）：计划里
+                # 有 web 这一步才联网 —— 计划外的动作不执行；规划员挂掉
+                # （planned=False）→ 退回旧行为，兜底不会比现状更差。
+                if _plan.get("planned") and not _plan.get("web"):
                     tool_line = {"used": False, "answer": "", "sources": [],
-                                 "note": (f"工具线异常：{type(e).__name__}: "
-                                          f"{str(e)[:140]}")}
-                if tool_line.get("answer"):
-                    answer = (str(tool_line["answer"]).rstrip()
-                              + "（⚠️ 工具线 claim：来自联网资料，未经库内验证；"
-                                "不进能力账、不计入学习曲线）")
+                                 "note": "规划里没有联网这一步（计划外的动作不执行）"}
+                elif not _web_reachable(_scene_id)[0]:
+                    _wn = _web_reachable(_scene_id)[1]
+                    tool_line = {"used": False, "answer": "", "sources": [],
+                                 "note": ("规划里有联网步骤，但本场景的联网工具当前"
+                                          f"不可达（{_wn}）—— 外部信息如实缺失，"
+                                          "不编数")}
+                else:
+                    try:
+                        tool_line = await _tool_line_fallback(question, context=_file_ctx)
+                    except Exception as e:  # pragma: no cover
+                        tool_line = {"used": False, "answer": "", "sources": [],
+                                     "note": (f"工具线异常：{type(e).__name__}: "
+                                              f"{str(e)[:140]}")}
+                    if tool_line.get("answer"):
+                        answer = (str(tool_line["answer"]).rstrip()
+                                  + "（⚠️ 工具线 claim：来自联网资料，未经库内验证；"
+                                    "不进能力账、不计入学习曲线）")
         if _no_reply and not str(answer or "").strip():
             # 兜底的兜底：inference / 工具线都没产出 —— 也必须句句有回复，
             # 判官结论与局限原样交代（用户 2026-10-28：判官可以看到局限性）。
@@ -1769,6 +1798,33 @@ async def consume(
                       + (f"判官结论：{_lim[:220]} " if _lim.strip() else "")
                       + ("已自动拉起后台学习。" if learn_kick.get("kicked")
                          else "可到面板查看判定明细。"))
+        # ---- 对比题的 web 半场（2026-10-29 拍板）----
+        # db 半场答出了、规划里还有联网这一步 → 执行联网半场补「场景外」
+        # 那一半（如「待遇好不好」= 库内 137100 + 外部行情对比）。可达才
+        # 执行；不可达如实缺失。claim 只追加在答案尾部：不入库、不计入
+        # 学习曲线（时变数据入库即污染，同 75120 教训）。
+        if (answer and _plan.get("planned") and _plan.get("web")
+                and not tool_line.get("used") and not tool_line.get("answer")):
+            _web_ok, _web_names = _web_reachable(_scene_id)
+            if _web_ok:
+                try:
+                    tool_line = await _tool_line_fallback(question,
+                                                          context=_file_ctx)
+                except Exception as e:  # pragma: no cover
+                    tool_line = {"used": False, "answer": "", "sources": [],
+                                 "note": (f"工具线异常：{type(e).__name__}: "
+                                          f"{str(e)[:140]}")}
+                if tool_line.get("answer"):
+                    answer = (str(answer).rstrip()
+                              + "\n\n—— 外部信息（联网检索） ——\n"
+                              + str(tool_line["answer"]).rstrip()
+                              + "（⚠️ 工具线 claim：来自联网资料，未经库内验证；"
+                                "不进能力账、不计入学习曲线）")
+            else:
+                tool_line = {"used": False, "answer": "", "sources": [],
+                             "note": ("规划里有联网步骤，但本场景的联网工具当前"
+                                      f"不可达（{_web_names}）—— 外部信息如实"
+                                      "缺失，不编数")}
         base = {
             "question": question, "mode": "voyager_consume",
             "topic_id": topic_id, "topic_hit": hit,
@@ -2226,15 +2282,27 @@ async def consume(
                             "不计入学习曲线）")
                 inference_used = True
         if not str(answer or "").strip():
-            try:
-                tool_line = await _tool_line_fallback(question, context=_file_ctx)
-            except Exception as e:  # pragma: no cover
+            # 与场景分支同款：计划里有 web 这一步才联网（斯坦福同构）；
+            # 规划员挂掉 → 退回旧行为。
+            if _plan.get("planned") and not _plan.get("web"):
                 tool_line = {"used": False, "answer": "", "sources": [],
-                             "note": f"工具线异常：{type(e).__name__}: {str(e)[:140]}"}
-            if tool_line.get("answer"):
-                answer = (str(tool_line["answer"]).rstrip()
-                          + "（⚠️ 工具线 claim：来自联网资料，未经库内验证；"
-                            "不进能力账、不计入学习曲线）")
+                             "note": "规划里没有联网这一步（计划外的动作不执行）"}
+            elif not _web_reachable(_scene_id)[0]:
+                _wn = _web_reachable(_scene_id)[1]
+                tool_line = {"used": False, "answer": "", "sources": [],
+                             "note": ("规划里有联网步骤，但本场景的联网工具当前"
+                                      f"不可达（{_wn}）—— 外部信息如实缺失，"
+                                      "不编数")}
+            else:
+                try:
+                    tool_line = await _tool_line_fallback(question, context=_file_ctx)
+                except Exception as e:  # pragma: no cover
+                    tool_line = {"used": False, "answer": "", "sources": [],
+                                 "note": f"工具线异常：{type(e).__name__}: {str(e)[:140]}"}
+                if tool_line.get("answer"):
+                    answer = (str(tool_line["answer"]).rstrip()
+                              + "（⚠️ 工具线 claim：来自联网资料，未经库内验证；"
+                                "不进能力账、不计入学习曲线）")
 
     # ---- 答完了 → 这题进能力库 → 掌握（判据是"答没答出来"，不是覆盖率）----
     # 判据是"答没答出来"（取到数 + 给出了回答 + **critic 判过**），**不是**有没有
@@ -3268,6 +3336,90 @@ def _fits_judge(question: str, sql: str, data: Any,
                    + " 被判官点名，按机制事实不计入缺失）")[:400]
     return {"ok": ok, "why": why, "missing": _real}
 
+
+
+_PLAN_SYSTEM = (
+    "你是信息路规划员（斯坦福 Generative Agents 的「先规划、再可达性检查」"
+    "同构）。给你一道题和本场景的**信息路菜单**，规划这道题需要哪几路信息"
+    "（可多选）。判断口径：\n"
+    "- 题面的量能从场景数据源/已学技能算出来（口径能指认到真实表/列）→ db；\n"
+    "- 题面要**场景之外**的信息（外部对比基准、时变行情、公开数据）→ web；"
+    "内部与外部混合的对比题 → db 和 web 都选；\n"
+    "- 用户上传的文件能提供答案或部分答案 → file；\n"
+    "- 纯概念/方法/观点解释，不需要任何取数 → infer。\n"
+    "web 只是「规划里有这一步」，不代表可达 —— 可达性执行时另核。\n"
+    "只输出 JSON：{\"db\": bool, \"web\": bool, \"file\": bool, \"infer\": bool, "
+    "\"why\": \"一句话\"}")
+
+
+def _web_reachable(scene_id: str) -> tuple[bool, str]:
+    """联网步骤的可达性检查（斯坦福 Generative Agents 同构：计划里的动作
+    要对真实环境核 —— 世界上没有的东西，计划就得修订）。
+
+    机制判据：场景动作注册表里有 origin=net 的原语（与面板「联网能力 · N」
+    同一事实源；猫爪总开关关掉后原语就没了）。不可达 → 计划如实修订，
+    不假装查过、不编数。
+    """
+    try:
+        import actions as _act
+        bucket = getattr(_act, "_REGISTRY", {}).get(str(scene_id)) or {}
+        names = [str(a.name) for a in bucket.values()
+                 if str(getattr(a, "origin", "")) == "net"]
+        return bool(names), "、".join(names[:4])
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _plan_routes(question: str, *, scene_id: str, has_file: bool,
+                 scene_tables: list[str] | None = None) -> dict[str, Any]:
+    """信息路规划：先让模型对着**能力菜单**规划这道题要哪几路，再逐路执行。
+
+    斯坦福 Generative Agents 同构（用户 2026-10-29 拍板）：规划先行，执行
+    时逐步做可达性检查；DeepSeek V3.2 同构：工具菜单外挂给模型、模型自主
+    规划。菜单是事实（当前有什么），不是路由词表（词表是猜）。
+    规划 ≠ 可达：web 路执行时还要过 `_web_reachable`（工具开关核不核得上）
+    —— 两步分开，不可达就如实修订计划。
+    LLM 不可用 → 按旧词表兜底（安全方向：行为退回现状，不会更差）。
+    """
+    try:
+        _cat = _scene_skill_catalog(scene_id)[0][:1200]
+    except Exception:
+        _cat = ""
+    _old_data = _is_data_question(question)
+    _fallback = {"db": _old_data, "web": False, "file": bool(has_file),
+                 "infer": not _old_data,
+                 "why": "规划员不可用，按词表兜底", "planned": False}
+    try:
+        cj = chat_json(
+            [{"role": "system", "content": _PLAN_SYSTEM},
+             {"role": "user", "content": (
+                 f"题面：{question}\n\n"
+                 f"信息路菜单：\n"
+                 f"- db：场景数据源/已学技能（"
+                 f"{'有表：' + '、'.join((scene_tables or [])[:6]) if (scene_tables or []) else '当前没有表'}）\n"
+                 f"- web：场景**外**的信息（外部对比基准/时变行情/公开数据）"
+                 f"—— 规划里允许有这一步，可达性执行时另核\n"
+                 f"- file：用户上传的文件"
+                 f"{'（本次检测到上传）' if has_file else '（本次没有上传）'}\n"
+                 f"- infer：概念/方法解释，不需要任何取数\n\n"
+                 + (f"已学技能目录（库内已被验证可算的方法）：\n{_cat}\n\n"
+                    if _cat else "")
+                 + "这道题需要哪几路？只输出 JSON。")}],
+            temperature=0.0)
+    except Exception:
+        return _fallback
+    if not isinstance(cj, dict):
+        return _fallback
+    out: dict[str, Any] = {}
+    for k in ("db", "web", "file", "infer"):
+        v = cj.get(k)
+        out[k] = (bool(v) if isinstance(v, bool)
+                  else str(v).strip().lower() in ("true", "1", "yes"))
+    if not any(out.values()):
+        return _fallback
+    out["why"] = str(cj.get("why") or "")[:160]
+    out["planned"] = True
+    return out
 
 
 def _is_data_question(question: str) -> bool:
