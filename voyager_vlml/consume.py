@@ -1681,9 +1681,15 @@ async def consume(
             except Exception as _ke:
                 learn_kick = {"kicked": False, "manual": True,
                               "why": f"自动学习拉起失败：{type(_ke).__name__}: {_ke}"}
+        elif data is None and _plan.get("web"):
+            learn_kick = {"kicked": False, "manual": True,
+                          "why": ("工具线题：检索方法已记进攻略缓存"
+                                  "（数值不入库、不计学习曲线）"
+                                  if web_method.get("ok") else
+                                  f"工具线题：方法没记成（{web_method.get('why') or '未知'}）")}
         elif data is None:
             learn_kick = {"kicked": False, "manual": True,
-                          "why": "非数据题（概念/解释类），无需学习流程"}
+                          "why": "规划里没有 db 路（概念/解释类），无需学习流程"}
         answer = ""
         # 叙事层：取到的数是**素材**，答案得是人话。
         # 同构猫娘的「参考资料 → 回答」（config/prompts/prompts_knowledge.py:31-36
@@ -2210,6 +2216,16 @@ async def consume(
     # run_log —— 自动抢跑的轮次人看不见、也不落账，才有截图里「轨迹 0 轮」。
     # 原版铁律不变：任务做成（取到值）才固化；没做成就留在学习账上继续学。
     if not real_calls:
+        # web 半场的方法也学（与场景分支同口径，2026-10-29）：方法进攻略
+        # 缓存、数值仍是 claim。先记方法再决定学不学 db（互不连坐）。
+        web_method: dict[str, Any] = {}
+        if _plan.get("web"):
+            try:
+                import learn_orchestrate as _lo_wm3
+                web_method = _lo_wm3.record_web_method(question, _scene_id)
+            except Exception as _wme3:
+                web_method = {"ok": False,
+                              "why": f"{type(_wme3).__name__}: {_wme3}"[:120]}
         # 自动拉起学习（2026-10-28 用户改设计，与场景分支同款）：答不了数据题
         # 就**进入学习**（同构 R1「答不了就进入思考」），回复里明说「正在学」。
         if _use_env:
