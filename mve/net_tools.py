@@ -18,6 +18,7 @@ MVE 这里把联网做成**一组条目**（origin="net" / group="联网能力"�
 
 from __future__ import annotations
 
+import base64
 import ipaddress
 import json
 import os
@@ -120,8 +121,9 @@ def _http_get(url: str, timeout: int = _TIMEOUT) -> tuple[int, bytes]:
 def web_search(query: str, max_results: int = 5) -> list[dict[str, Any]]:
     """联网搜索（带节流与退避）。返回 [{"title","url","snippet"}]。
 
-    后端顺序：智谱 web-search-pro（厂商侧抓取，摘要即正文片段）→ DuckDuckGo
-    html/lite（免 key 兜底）。全失败就抛错（调用方如实报），**不返回编造的结果**。
+    后端顺序：智谱 web-search-pro（厂商侧抓取，摘要即正文片段）→ Bing →
+    DuckDuckGo html/lite（免 key 兜底）。全失败就抛错并**列全链错误**
+    （调用方如实报），**不返回编造的结果**。
 
     ⚠️ 撞限流要退避，不要原地重打（2026-10-28 实测：连打 16 次只回来 2 条）。
     调用方（工具线/多跳）应把**取回的结果落库**（web_ingest），别隔一会儿
@@ -142,21 +144,39 @@ def web_search(query: str, max_results: int = 5) -> list[dict[str, Any]]:
 
 
 def _search_once(query: str, max_results: int = 5) -> list[dict[str, Any]]:
-    """单次搜索（不节流、不重试；web_search 负责这两件事）。"""
+    """单次搜索（不节流、不重试；web_search 负责这两件事）。
+
+    后端链：智谱 web-search-pro → Bing → DuckDuckGo。每个后端的失败
+    都记进 errors，全灭时报错**列全链**——2026-10-29 实测踩到：智谱对
+    天气/实时类 query 返回空 search_result（大多数 query 正常），错误
+    被 DDG 的报错覆盖，最后只看到「页面里解析不出结果」，智谱为什么
+    空完全没交代，排查半天。
+    """
     q = str(query or "").strip()
     if not q:
         raise ValueError("搜索词是空的")
     n = max(1, min(int(max_results or 5), 10))
+    errors: list[str] = []
     # 1) 智谱：有 key 就走（快、稳、摘要带正文）
-    _zhipu_err = ""
     try:
         return _zhipu_search(q, n)
     except _NoBackend:
-        pass
+        errors.append("智谱: 未配置 ZHIPU_API_KEY")
     except Exception as e:
-        _zhipu_err = f"{type(e).__name__}: {str(e)[:120]}"
-    # 2) DuckDuckGo（免 key 兜底；多数被限流的机器上会是超时）
-    last_err = _zhipu_err
+        errors.append(f"智谱: {type(e).__name__}: {str(e)[:120]}")
+    # 2) Bing（2026-10-29 新增兜底：VPS 实测 200 稳定、b_algo 结构可解析；
+    #    带 setmkt=zh-CN 时直接给明文链接，不带时给 ck/a 加密跳转）
+    try:
+        _status, raw = _http_get(
+            f"https://www.bing.com/search?q={urllib.request.quote(q)}&setmkt=zh-CN",
+            timeout=_SEARCH_TIMEOUT)
+        results = _parse_bing(raw.decode("utf-8", errors="replace"))
+        if results:
+            return results[:n]
+        errors.append("Bing: 页面里解析不出结果")
+    except Exception as e:
+        errors.append(f"Bing: {type(e).__name__}: {str(e)[:120]}")
+    # 3) DuckDuckGo（免 key 再兜底；多数被限流的机器上会是 403/超时）
     for endpoint in (f"https://html.duckduckgo.com/html/?q={urllib.request.quote(q)}",
                      f"https://lite.duckduckgo.com/lite/?q={urllib.request.quote(q)}"):
         try:
@@ -165,15 +185,17 @@ def _search_once(query: str, max_results: int = 5) -> list[dict[str, Any]]:
             results = _parse_ddg(html)
             if results:
                 return results[:n]
-            last_err = "页面里解析不出结果（可能被限流）"
+            errors.append("DDG: 页面里解析不出结果（可能被限流）")
         except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
+            err = f"DDG: {type(e).__name__}: {e}"
             # 2026-10-22 场景 B：VPS 出口 IP 被 DDG 限流（403），24 次撞墙没一次
             # 换关键词 —— 报错里必须给出路，别让模型对着同一堵墙原地重试。
-            if "403" in last_err or "429" in last_err:
-                last_err += ("（可能被搜索服务限流：换个更具体的关键词重试，"
-                             "或稍后再试；不要用同一个关键词反复撞）")
-    raise RuntimeError(f"联网搜索失败：{last_err} —— 取不到就如实说，不编造")
+            if "403" in err or "429" in err:
+                err += ("（可能被搜索服务限流：换个更具体的关键词重试，"
+                        "或稍后再试；不要用同一个关键词反复撞）")
+            errors.append(err)
+    raise RuntimeError(
+        "联网搜索失败（后端全灭：" + "；".join(errors) + "）—— 取不到就如实说，不编造")
 
 
 class _NoBackend(Exception):
@@ -250,6 +272,42 @@ def _parse_ddg(html: str) -> list[dict[str, Any]]:
     return out
 
 
+def _parse_bing(html: str) -> list[dict[str, Any]]:
+    """Bing 结果页解析（2026-10-29 新增兜底后端）。
+
+    结构：`<li class="b_algo">…<h2><a href="…">标题</a></h2>…`，
+    摘要在 `b_caption` 里的 `<p>`（与结果同序）。
+    链接两种形态都处理：
+      · setmkt=zh-CN 时 href 直接是真实 URL；
+      · 不带时是 `bing.com/ck/a?...&u=a1<base64url>` 加密跳转 —— 解 base64
+        还原真实地址，解不开就丢弃（跳转链接对 web_fetch 没意义还绕远）。
+    """
+    out: list[dict[str, Any]] = []
+    for m in re.finditer(
+            r'<li class="?b_algo[^>]*>.*?<h2[^>]*><a[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+            html, re.S):
+        url = m.group(1).replace("&amp;", "&")
+        if "bing.com/ck/a" in url:
+            mm = re.search(r"[?&]u=a1([^&]+)", url)
+            if not mm:
+                continue
+            b = mm.group(1)
+            b += "=" * (-len(b) % 4)
+            try:
+                url = base64.urlsafe_b64decode(b).decode("utf-8", "replace")
+            except Exception:
+                continue
+        title = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+        if title and url.startswith("http"):
+            out.append({"title": title[:120], "url": url, "snippet": ""})
+    # 摘要：b_caption 里的 <p>，与结果同序
+    for i, m in enumerate(re.finditer(
+            r'class="b_caption[^"]*"[^>]*>.*?<p[^>]*>(.*?)</p>', html, re.S)):
+        if i < len(out) and not out[i]["snippet"]:
+            out[i]["snippet"] = re.sub(r"<[^>]+>", "", m.group(1)).strip()[:300]
+    return out
+
+
 def web_fetch(url: str, max_bytes: int = _MAX_BYTES) -> dict[str, Any]:
     """抓一个公网页面的**文本**（去标签，限长）。返回 {url,status,text}。"""
     n = max(1000, min(int(max_bytes or _MAX_BYTES), _MAX_BYTES))
@@ -270,7 +328,7 @@ def web_fetch(url: str, max_bytes: int = _MAX_BYTES) -> dict[str, Any]:
 PRIMITIVES: list[dict[str, Any]] = [
     {"name": "web_search",
      "fn": web_search,
-     "desc": "联网搜索（智谱 web-search-pro，摘要即正文片段；DDG 兜底），"
+     "desc": "联网搜索（智谱 web-search-pro，摘要即正文片段；Bing/DDG 兜底），"
              "返回 [{title,url,snippet}]",
      "schema": {"type": "object", "properties": {
          "query": {"type": "string"}, "max_results": {"type": "integer"}},

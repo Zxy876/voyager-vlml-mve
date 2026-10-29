@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""搜索后端链的测试（2026-10-29 修复「页面里解析不出结果」盲点）。
+
+背景（当天实测）：智谱 web-search-pro 对天气/实时类 query 返回空
+search_result（大多数 query 正常），错误被 DDG 的报错覆盖，最后只看到
+「页面里解析不出结果（可能被限流）」，智谱为什么空完全没交代。
+修复：① 后端链补 Bing 兜底（VPS 实测 200 稳定、b_algo 可解析）；
+     ② 全灭时报错列全链错误，不再吞智谱的。
+
+跑法：python mve/test_net_search.py（服务器无 pytest，同 test_*.py 口径）。
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+PASS = FAIL = 0
+
+
+def check(name: str, cond: bool, detail: str = "") -> None:
+    global PASS, FAIL
+    if cond:
+        PASS += 1
+        print(f"  ✅ {name}" + (f" —— {detail}" if detail else ""))
+    else:
+        FAIL += 1
+        print(f"  ❌ {name}" + (f" —— {detail}" if detail else ""))
+
+
+_BING_HTML_ZH = """<html><body><ol>
+<li class="b_algo"><h2><a href="https://weather.example.cn/bj">北京天气预报</a></h2>
+<div class="b_caption"><p>今天北京晴转多云，气温 8~16 ℃。</p></div></li>
+<li class="b_algo"><h2><a href="https://www.example.com/x?a=1&amp;b=2">示例二</a></h2>
+<div class="b_caption"><p>第二条摘要。</p></div></li>
+</ol></body></html>"""
+
+_BING_HTML_CK = """<html><body><ol>
+<li class="b_algo"><h2><a href="https://www.bing.com/ck/a?!&amp;p=xx&amp;u=a1aHR0cHM6Ly9yZWFsLmV4YW1wbGUuY24vcGFnZQ==&amp;ntb=1">跳转形态</a></h2></li>
+<li class="b_algo"><h2><a href="https://www.bing.com/ck/a?!&amp;p=yy">解不开 u= 的</a></h2></li>
+</ol></body></html>"""
+
+
+def main() -> int:
+    import base64
+    import net_tools
+
+    print("== 1. _parse_bing：明文链接形态（setmkt=zh-CN）==")
+    r = net_tools._parse_bing(_BING_HTML_ZH)
+    check("解析出 2 条", len(r) == 2, str(len(r)))
+    check("标题去标签", r and r[0]["title"] == "北京天气预报", r[0]["title"] if r else "")
+    check("链接 &amp; 还原", r and r[1]["url"] == "https://www.example.com/x?a=1&b=2",
+          r[1]["url"] if len(r) > 1 else "")
+    check("snippet 取到", r and "8~16" in r[0]["snippet"], r[0]["snippet"][:40] if r else "")
+
+    print("== 2. _parse_bing：ck/a 跳转形态 ==")
+    want = base64.urlsafe_b64decode("aHR0cHM6Ly9yZWFsLmV4YW1wbGUuY24vcGFnZQ==").decode()
+    r2 = net_tools._parse_bing(_BING_HTML_CK)
+    check("u=a1<base64> 解出真实 URL", r2 and r2[0]["url"] == want,
+          r2[0]["url"] if r2 else "")
+    check("解不开 u= 的丢弃", len(r2) == 1, str(len(r2)))
+
+    print("== 3. _search_once：后端链与全链报错 ==")
+    _orig_zhipu, _orig_get = net_tools._zhipu_search, net_tools._http_get
+    try:
+        # 3a. 智谱成功 → 不碰 Bing/DDG
+        calls = []
+
+        def _ok_zhipu(q, n):
+            calls.append("zhipu")
+            return [{"title": "t", "url": "https://a.example/", "snippet": "s"}]
+
+        net_tools._zhipu_search = _ok_zhipu
+        out = net_tools._search_once("q")
+        check("智谱成功直接返回", len(out) == 1 and calls == ["zhipu"])
+
+        # 3b. 智谱空 → Bing 接住
+        calls.clear()
+
+        def _empty_zhipu(q, n):
+            calls.append("zhipu")
+            raise RuntimeError("智谱 web-search-pro 没返回 search_result 条目")
+
+        def _bing_hit(url, timeout=10):
+            calls.append(url.split("/")[2] if "://" in url else url)
+            if "bing.com" in url:
+                return 200, _BING_HTML_ZH.encode()
+            raise AssertionError("不该走到 " + url[:60])
+
+        net_tools._zhipu_search = _empty_zhipu
+        net_tools._http_get = _bing_hit
+        out = net_tools._search_once("北京今天天气")
+        check("智谱空 → Bing 接住", len(out) == 2 and calls[:1] == ["zhipu"]
+              and "bing.com" in calls[1], str(calls))
+
+        # 3c. 全灭 → 报错列全链（智谱错误不被覆盖）
+        def _all_fail(url, timeout=10):
+            raise OSError("HTTP Error 403: Forbidden")
+
+        net_tools._http_get = _all_fail
+        try:
+            net_tools._search_once("x")
+            check("全灭要抛错", False)
+        except RuntimeError as e:
+            msg = str(e)
+            check("全灭要抛错", "后端全灭" in msg, msg[:60])
+            check("报错带智谱的原因", "智谱" in msg and "没返回 search_result" in msg)
+            check("报错带 Bing/DDG 的原因", "Bing" in msg and "DDG" in msg)
+
+        # 3d. 智谱没配 key → errors 里如实说，仍走兜底
+        def _no_backend(q, n):
+            raise net_tools._NoBackend()
+
+        net_tools._zhipu_search = _no_backend
+        net_tools._http_get = _bing_hit
+        out = net_tools._search_once("q")
+        check("无 key 仍走 Bing 兜底", len(out) == 2)
+    finally:
+        net_tools._zhipu_search, net_tools._http_get = _orig_zhipu, _orig_get
+
+    print("== 4. web_search：空 query / 退避结构 ==")
+    try:
+        net_tools.web_search("   ")
+        check("空搜索词抛 ValueError", False)
+    except ValueError:
+        check("空搜索词抛 ValueError", True)
+    src = open(net_tools.__file__, encoding="utf-8").read()
+    check("保留退避重试（别撞限流原地重打）", "_RETRY_WAITS" in src)
+    check("保留节流", "_throttle" in src)
+
+    print(f"\n通过 {PASS} / 挂 {FAIL}")
+    return 1 if FAIL else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
