@@ -834,6 +834,26 @@ if (!store.current){
 renderHist(); paint();
 loadModels();
 ta.focus();
+/* ---------------- 学习完成自动回访（2026-10-29） ----------------
+   学习侧学出东西后会把排队没答上的题自动重答（revisit.py）；答出来的
+   结果在这里拉取展示 —— 人不用自己回来重问。拉走即标记已送达，不重复弹。 */
+function pullRevisit(){
+  fetch(P + '/api/revisit').then(function(r){ return r.json(); }).then(function(d){
+    (d && d.items || []).forEach(function(it){
+      var a = String(it.answer || '');
+      noteMsg('🔁 学习完成后自动回访：之前没答上的「' + String(it.question || '') +
+              '」现在能答了 —— ' + a + (a ? '' : '（详情见轨迹页）'));
+    });
+    if (d && d.pending > 0){
+      // 提示条不重复堆（每次刷新都会拉到 pending 数，记过就不再记）
+      var t = '⏳ 还有 ' + d.pending + ' 个排队问题没答上，学会后我会自动回来重答，不用你盯着。';
+      var s = cur();
+      var has = s && (s.messages || []).some(function(m){ return m.content === t; });
+      if (!has) noteMsg(t);
+    }
+  }).catch(function(){});
+}
+pullRevisit();
 // 分享链：/mve/chat?q=问题 → 打开就自动问（也方便回归截图）。
 var urlQ = '';
 try { urlQ = new URLSearchParams(location.search).get('q') || ''; } catch(e) {}

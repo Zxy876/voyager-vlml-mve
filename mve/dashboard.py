@@ -3242,6 +3242,19 @@ class Handler(BaseHTTPRequestHandler):
                 st["learn_recent"] = []
             body = json.dumps(st, ensure_ascii=False, default=str).encode("utf-8")
             ctype = "application/json; charset=utf-8"
+        elif path == "/api/revisit":
+            # 对话页轮询：学习完成后自动回访的结果（只给当前场景、
+            # 拉走即标记已送达 —— 同一气泡不会反复弹）。
+            try:
+                import revisit as _rv
+                import scenes as _sc9
+                _sid = str(_sc9.current_scene_id() or "A")
+                self._json(200, {"scene": _sid,
+                                 "pending": len(_rv.pending(_sid)),
+                                 "items": _rv.deliver(_sid)})
+            except Exception as e:
+                self._json(500, {"error": f"{type(e).__name__}: {e}"[:200]})
+            return
         elif path == "/api/graph":
             body = _graph_json().encode("utf-8")
             ctype = "application/json; charset=utf-8"

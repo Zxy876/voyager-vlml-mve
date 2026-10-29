@@ -1776,6 +1776,9 @@ def kick_learning(question: str, scene_id: str = "", *,
         except Exception as e:  # 后台任务自己兜住，绝不无声死掉
             _record({"question": question, "scene_id": scene_id,
                      "status": "failed", "why": f"{type(e).__name__}: {e}"})
+        # （学习完成 → 自动回访的信号挂在 _record：那是所有学习路径的唯一
+        #   收账点 —— kick 线程、scene_learn 子进程、面板按钮全走那里，
+        #   在这里挂会跟子进程路径重复触发。见 revisit.py。）
 
     t = threading.Thread(target=_run, name=f"learn-{question[:16]}",
                          daemon=True)
@@ -1912,8 +1915,7 @@ def _record(result: dict[str, Any]) -> None:
     try:
         import causal_timeline
         causal_timeline.append(
-            "learn",
-            topic_id=str(result.get("absorbed", {}).get("topic_id") or ""),
+            "learn",            topic_id=str(result.get("absorbed", {}).get("topic_id") or ""),
             summary=(f"学习[{result.get('status')}] "
                      f"{str(result.get('question') or '')[:40]}"
                      + (f" —— {result['why'][:60]}" if result.get("why") else "")),
@@ -1930,6 +1932,26 @@ def _record(result: dict[str, Any]) -> None:
         )
     except Exception:
         pass                                # 留痕失败不拦学习本身
+    # ---- 学习完成信号 → 自动回访（2026-10-29 用户拍板）----
+    # 「MVE 什么时候学好了、可以来消费了」：一轮学习真学出东西
+    # （status ∈ learned/partial = 有技能落库）就是信号 —— 此刻把排队里
+    # 没答上的题自动重答，人不用回来重问/调试。_record 是**所有学习路径的
+    # 唯一收账点**（kick 线程 / scene_learn 子进程 / 面板按钮），信号挂这里
+    # 才不会漏也不会重。回访在自己线程里跑（_record 常在事件循环内被调，
+    # asyncio.run 不能内联）；revisit 内部有重入锁与 auto_learn=False，
+    # 不会跟学习互相触发转圈。
+    try:
+        _st = str(result.get("status") or "")
+        if _st in ("learned", "partial"):
+            import revisit as _rv
+            _sid = str(result.get("scene_id") or "")
+            if _rv.pending(_sid):
+                import threading as _th
+                _th.Thread(target=_rv.revisit_pending, args=(_sid,),
+                           kwargs={"limit": 1}, daemon=True,
+                           name="revisit-after-learn").start()
+    except Exception:
+        pass                                # 回访拉起失败不拦学习本身
 
 
 def last_learn_results(limit: int = 10) -> list[dict[str, Any]]:

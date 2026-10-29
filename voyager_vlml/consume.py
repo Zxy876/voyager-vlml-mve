@@ -1082,6 +1082,7 @@ async def consume(
     env: VLMLMCPEnv | None = None,
     web_allowed: bool | None = None,
     history: list[dict[str, str]] | None = None,
+    auto_learn: bool = True,
 ) -> dict[str, Any]:
     # ⚠️ 环境**延迟创建**：下面按场景后果判断要不要 VLML。非 VLML 场景
     # （用户 2026-10-19：「别的场景下，voyager 的学习和 VLML 没有关系」）
@@ -1777,7 +1778,13 @@ async def consume(
         # 没取到 → 还是没学会。同样**不自动后台学**（2026-10-19 用户改设计）：
         # 这条问题已在场景学习账上（coach_log 判读 = 没答出来），人点驾驶舱
         # 「▶ 启动 Voyager」时 scene_learn.py 会排到它 —— 每轮落 run_log 可见。
-        if data is None and _use_env:
+        if data is None and _use_env and not auto_learn:
+            # 回访模式（2026-10-29）：重试排队问题时**不再**连环拉学习 ——
+            # 否则回访失败又起一轮学习，回访↔学习互相触发转圈烧钱。
+            learn_kick = {"kicked": False, "manual": True,
+                          "why": "自动回访：本轮失败不拉学习（由学习侧收尾"
+                                 "统一回访，见 revisit.py）"}
+        elif data is None and _use_env:
             # 自动拉起学习（2026-10-28 用户改设计，原 2026-10-19「只人工触发」
             # 作废）：「发送新的对话内容，就顺带拉取一个新的学习流程」—— 同构
             # R1「答不了就进入思考」：MVE 答不了数据题就**进入学习**，回复里
@@ -1794,6 +1801,15 @@ async def consume(
                             if _kk.get("kicked") else
                             f"自动学习没拉起：{_kk.get('why') or '未知'}——"
                             "可在驾驶舱 ▶ 启动 Voyager 人工触发")}
+                if _kk.get("kicked"):
+                    # 排进回访队列（2026-10-29 用户拍板「学好了自动重答」）：
+                    # 学习轮真学出东西时，revisit 会自动重答这一句，人不用
+                    # 自己回来重问/调试。
+                    try:
+                        import revisit as _rv
+                        _rv.mark_pending(_scene_id, question)
+                    except Exception:
+                        pass
             except Exception as _ke:
                 learn_kick = {"kicked": False, "manual": True,
                               "why": f"自动学习拉起失败：{type(_ke).__name__}: {_ke}"}
@@ -2338,7 +2354,11 @@ async def consume(
     if not real_calls:
         # 自动拉起学习（2026-10-28 用户改设计，与场景分支同款）：答不了数据题
         # 就**进入学习**（同构 R1「答不了就进入思考」），回复里明说「正在学」。
-        if _use_env:
+        if _use_env and not auto_learn:
+            learn_kick = {"kicked": False, "manual": True,
+                          "why": "自动回访：本轮失败不拉学习（由学习侧收尾"
+                                 "统一回访，见 revisit.py）"}
+        elif _use_env:
             try:
                 import learn_orchestrate as _lo3
                 _kk = _lo3.kick_learning(
@@ -2350,6 +2370,12 @@ async def consume(
                     "why": ("已自动拉起后台学习（学完再问同一句即可复用）"
                             if _kk.get("kicked") else
                             f"自动学习没拉起：{_kk.get('why') or '未知'}")}
+                if _kk.get("kicked"):
+                    try:
+                        import revisit as _rv2
+                        _rv2.mark_pending(_scene_id, question)
+                    except Exception:
+                        pass
             except Exception as _ke2:
                 learn_kick = {"kicked": False, "manual": True,
                               "why": f"自动学习拉起失败：{type(_ke2).__name__}: {_ke2}"}
