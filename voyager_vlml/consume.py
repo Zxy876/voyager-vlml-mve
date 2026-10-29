@@ -996,15 +996,6 @@ async def _tool_line_fallback(question: str, context: str = "",
             return o
         o["sources"] = [{"title": str(r.get("title") or "")[:120],
                          "url": str(r.get("url") or "")} for r in results]
-        # 联网资料落库（web_ingest，2026-10-29 接线）：「联网时候的方法给到
-        # 消费侧」—— 搜索结果先进 web_docs（按 url 去重），下次同类问题
-        # 不用重新撞限流；claim 落账后经人确认才升级 fact。失败不挡路。
-        try:
-            if scene_id:
-                import web_ingest
-                web_ingest.save_docs(scene_id, qry, results)
-        except Exception:
-            pass
         # ② 取页正文（多源重试，2026-10-29 用户拍板「一定做」）：
         # 反爬/超时是常态，只抓 top2 且各试一次命中率太低（实测同一题
         # 「搜索有结果但正文都没取到」）。现在：最多试 top4，每个失败再
@@ -1028,7 +1019,28 @@ async def _tool_line_fallback(question: str, context: str = "",
         if not pages:
             o["note"] = (f"搜索有结果但页面正文都没取到（试了 {tries} 次）"
                          " —— 如实不答")
+            # 正文没抓到也把搜索摘要落库：下次同类问题至少知道「有哪些页面」。
+            try:
+                if scene_id:
+                    import web_ingest
+                    web_ingest.save_docs(scene_id, qry, results)
+            except Exception:
+                pass
             return o
+        # 联网资料落库（web_ingest，2026-10-29 接线；同日补正文）：
+        # 「联网时候的方法给到消费侧」—— 搜索结果 **+ 抓到的正文** 一起进
+        # web_docs（按 url 去重 / 覆写）。只存 snippet 时学习侧拿到的是
+        # 「有表没料」，调研题永远答不出（生产实测 4 次重试全在打磨
+        # `WHERE query LIKE ...`）；正文进库后它才查得到东西。
+        # 失败不挡路（落库是副产物，不是答题前提）。
+        try:
+            if scene_id:
+                import web_ingest
+                web_ingest.save_docs(
+                    scene_id, qry, results,
+                    bodies={p["url"]: p["text"] for p in pages})
+        except Exception:
+            pass
         # ③ claim 综合：只准用取回的资料，缺了就说缺
         material = "\n\n".join(
             f"【资料{i+1}】{p['title']}\n{p['url']}\n{p['text']}"

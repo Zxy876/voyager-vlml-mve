@@ -271,7 +271,7 @@ def ai_check_task_success(task: str, context: str, result: dict[str, Any], *,
             # 带环境观察的输入 3 次全放行一个明显错误的答案 —— 判官不能省
             # 模型钱；出题/执行层可继续用 flash）。env MVE_CRITIC_MODEL
             # 一设即切，不设回落全局模型，行为不变。
-            text = str(chat(msgs, temperature=0,
+            text = str(chat(msgs, temperature=0, max_tokens=2400,
                             model=_os.getenv("MVE_CRITIC_MODEL", "")) or "")
     except Exception:
         return False, ""

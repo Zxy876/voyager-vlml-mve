@@ -112,6 +112,27 @@ def main() -> int:
     actions.unregister("TEST_GH", "gh_repo_info")
     actions.unregister("TEST_GH", "gh_search")
 
+    print("== 4b. 执行域真的注入（注册 ≠ 注入）==")
+    # 2026-10-29 生产实测的坑：register_gh 把 4 条写进 action_registry.json，
+    # 但 `_ns_base` 的 `full` 里没有 gh_tools 的函数 → `注册表 & set(full)`
+    # 交集为空 → 模型拿不到 gh_read 这个名字。于是调研题 4 次重试全在
+    # `SELECT * FROM web_docs WHERE query LIKE ...` 上打磨过滤条件
+    # （「感觉还是一直在试错 sql」）。这条守卫必须钉死。
+    import tempfile
+
+    import local_agent
+    _tmp = tempfile.mkdtemp()
+    actions.register_gh("TEST_GH")
+    try:
+        ns = local_agent._ns_base(_tmp, "TEST_GH")
+    finally:
+        for _n in ("gh_repo_info", "gh_tree", "gh_read", "gh_search"):
+            actions.unregister("TEST_GH", _n)
+    check("执行域里有 4 个 gh 原语（不是只登记在注册表）",
+          {"gh_read", "gh_tree", "gh_repo_info", "gh_search"} <= set(ns),
+          str(sorted(k for k in ns if not k.startswith("__")))[:120])
+    check("gh_read 是真的可调用函数", callable(ns.get("gh_read")))
+
     print("== 5. consume 接线（源码断言）==")
     src = open(__import__("voyager_vlml.consume", fromlist=["x"]).__file__,
                encoding="utf-8").read()

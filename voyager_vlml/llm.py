@@ -96,12 +96,17 @@ def chat(
             else:
                 r.raise_for_status()
                 data = r.json()
-                return (
-                    (data.get("choices") or [{}])[0]
-                    .get("message", {})
-                    .get("content", "")
-                    or ""
-                )
+                msg = ((data.get("choices") or [{}])[0]
+                       .get("message", {}) or {})
+                text = str(msg.get("content") or "").strip()
+                if not text:
+                    # glm-4.5/4.6 的思考模式：思考段可能把 max_tokens 吃光，
+                    # 正文落到 reasoning_content 而 content 为空
+                    # （2026-10-29 生产实证：内层 critic 连续 5 次「回复不是
+                    # {reasoning, success, critique} 形状」→ 学习必然失败）。
+                    # 兜底取 reasoning_content —— 它是模型真说的话，不是编的。
+                    text = str(msg.get("reasoning_content") or "").strip()
+                return text
         except Exception as e:
             last = f"{type(e).__name__}: {e}"
         time.sleep(1.5)

@@ -546,9 +546,15 @@ async def solve(question: str, scene_dir: str, *, llm=None,
                    "会带着评语让你重写；\n"
                    "  3. 只有全部调用失败（报错）时，才允许自己写取数代码。")
     if require_tools and _can_fetch:
+        # ⚠️ 这里**不许写死工具名单**（原先写的是 list_files/read_file/…/
+        # web_search/web_fetch/mcp_*，GitHub 原语接进来后它一句都没提到 →
+        # 模型看不见 gh_read，调研类题只能在 web_docs 上磨 SQL）。
+        # 名单从真实注入的命名空间里取，注册什么就说什么（见人说人话）。
+        _menu = [n for n in sorted(_probe) if not n.startswith("__")
+                 and n != "ok_text"]
         system += ("\n\n【这是**学习环节**，不是答题】你的答案必须来自你**真正调用"
-                   "数据源取回的内容**（list_files / read_file / read_json / "
-                   "query_sql / web_search / web_fetch / mcp_*）。直接凭记忆写一段"
+                   "数据源取回的内容**（" + "、".join(_menu[:14]) + "）。"
+                   "直接凭记忆写一段"
                    "「正确」答案 = 没有取证 = 这轮判不通过，也不会被记成能力。"
                    "先调工具取证，再据实组织答案；取不到就如实说取到了什么。")
     for _i in range(max(1, max_iters)):
@@ -1078,6 +1084,18 @@ def _ns_base(scene_dir: str, scene_id: str = "",
         import net_tools
         full["web_search"] = net_tools.web_search
         full["web_fetch"] = net_tools.web_fetch
+    except Exception:
+        pass
+    # GitHub 原语**必须进 full**：下面 `names = 注册表启用条目 & set(full)`
+    # 是按名字取交集的，注册表里有 gh_*、full 里没有 → 交集里也没有 →
+    # 模型连 `gh_read` 这个名字都拿不到，只能拿场景库里那张 web_docs 表写 SQL
+    # 打磨过滤条件（2026-10-29 生产实测：调研题 4 次重试全在
+    # `SELECT * FROM web_docs WHERE query LIKE ...`，零次 gh_read）。
+    # 同 net_tools：注册进 action_registry 之外，执行域也得有真身。
+    try:
+        import gh_tools
+        for _gp in gh_tools.bind():
+            full[str(_gp["name"])] = _gp["fn"]
     except Exception:
         pass
     # 套调用记录：每个原语被调用时往 tracer 记一笔（可读性让位于「真的取了数吗」）。

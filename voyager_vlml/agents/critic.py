@@ -225,7 +225,14 @@ class VLMLCriticAgent:
         # 判官模型可单配（同 task_critic.ai_check_task_success 的口径：
         # 2026-10-24 实测 glm-4-flash 当 judge 3 次全放行明显错误的答案，
         # 判官不能省模型钱）。内层 critic 是 solve 每步的唯一判定。
-        obj = chat_json(messages, temperature=0,
+        #
+        # `max_tokens=2400`：glm-4.5/4.6 是**思考模型**，思考段与正文共用
+        # 这个额度。默认 1200 时实测同长度输入 completion_tokens=1128
+        # （其中 reasoning 967）—— 只剩 72 个 token 给正文，思考稍长就整段
+        # 被截在思考里、content 为空 → `chat_json` 返回 {} → 这里连续重试
+        # 5 次「回复不是 {reasoning, success, critique} 形状」→ 整轮学习必败
+        # （2026-10-29 生产日志实证）。判官不产长文，放宽额度没有代价。
+        obj = chat_json(messages, temperature=0, max_tokens=2400,
                         model=_os.getenv("MVE_CRITIC_MODEL", ""))
         if not isinstance(obj, dict) or obj.get("success") not in (True, False):
             # 原版这里 `assert response["success"] in [True, False]` 失败 → 递归重试

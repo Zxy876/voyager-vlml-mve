@@ -81,8 +81,24 @@ def _connect(db_path: str, write: bool = False):
     return duckdb.connect(db_path, read_only=not write)
 
 
+def _cols(con, table: str) -> list[str]:
+    try:
+        return [str(r[1]) for r in
+                con.execute(f"PRAGMA table_info('{table}')").fetchall()]
+    except Exception:
+        return []
+
+
 def ensure(db_path: str) -> None:
-    """数据源侧建表（幂等）。"""
+    """数据源侧建表（幂等）。
+
+    ⚠️ `body`（正文）是 2026-10-29 补的：第一版只存搜索摘要 snippet，
+    学习侧拿到的 `web_docs` 是一张「只有标题+两行摘要」的表 —— 调研类问题
+    （「这个仓库是干什么的」）在 SQL 上**永远答不出来**，于是它反复给
+    WHERE 条件打磨过滤（生产实测 4 次重试全是同一句 SELECT 换 LIKE），
+    而摘要在语义上根本不含答案。表里必须放**能查的东西**（本模块头那条
+    分层原则），正文才是资料本体。老库用 ADD COLUMN 补列，不重建。
+    """
     con = _connect(db_path, write=True)
     try:
         con.execute(f"""
@@ -91,8 +107,11 @@ def ensure(db_path: str) -> None:
                 title      VARCHAR,
                 url        VARCHAR,
                 snippet    VARCHAR,
+                body       VARCHAR,
                 fetched_at TIMESTAMP
             )""")
+        if "body" not in _cols(con, DOCS):
+            con.execute(f"ALTER TABLE {DOCS} ADD COLUMN body VARCHAR")
     finally:
         con.close()
 
@@ -154,8 +173,13 @@ def _eid(item: str, attribute: str, value: str) -> str:
     return h[:16]
 
 
-def save_docs(scene_id: str, query: str, results: list[dict[str, Any]]) -> int:
+def save_docs(scene_id: str, query: str, results: list[dict[str, Any]],
+              bodies: dict[str, str] | None = None) -> int:
     """原始资料入库（**按 url 去重**：同一个页面只留一行，query 记最后一次）。
+
+    `bodies`：{url: 正文}。搜索只给摘要，摘要答不了「这项目干什么」，正文
+    才是证据（2026-10-29：学习侧在只有 snippet 的表上必败）。给了就一起存，
+    没抓到的 url 只存摘要 —— 如实存，不留空壳。
 
     ⚠️ 2026-10-28 实测踩到：原来按 (query, url) 去重，同一个页面被不同关键词
     搜到就存成好几行；学习侧拿 `web_docs JOIN web_facts ON url` 一算，每行事实
@@ -165,6 +189,7 @@ def save_docs(scene_id: str, query: str, results: list[dict[str, Any]]) -> int:
     db = _db(scene_id)
     ensure(db)
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    bodies = {str(k): str(v) for k, v in (bodies or {}).items() if str(v).strip()}
     n = 0
     con = _connect(db, write=True)
     try:
@@ -175,9 +200,11 @@ def save_docs(scene_id: str, query: str, results: list[dict[str, Any]]) -> int:
             try:
                 con.execute(f"DELETE FROM {DOCS} WHERE url = ?", [url])
                 con.execute(
-                    f"INSERT INTO {DOCS} VALUES (?, ?, ?, ?, ?)",
+                    f"INSERT INTO {DOCS} (query, title, url, snippet, body, "
+                    f"fetched_at) VALUES (?, ?, ?, ?, ?, ?)",
                     [str(query), str(r.get("title") or "")[:200], url,
-                     str(r.get("snippet") or "")[:2000], ts])
+                     str(r.get("snippet") or "")[:2000],
+                     bodies.get(url, "")[:20000], ts])
                 n += 1
             except Exception:
                 continue
