@@ -85,45 +85,69 @@ def material_text(evidence: list[dict[str, Any]] | None, *,
 
 
 def _norm(s: str) -> str:
-    """归一化到「可比对」的形态：转义序列还原 + 空白压缩。
+    """归一化到「可比对」的形态：转义序列还原 + Markdown 标记剥离 + 空白压缩。
 
-    ⚠️ 2026-10-31 实测踩到：运行时交给判据的 answer 常是 `json.dumps` 过的字符串，
-    里面的换行是**两个字符** `\\n`；材料是原始正文（真换行）。只压缩空白的话，
-    跨行的材料片段永远匹配不上 → 搬运判据形同失效（README 全文照样通过）。
+    ⚠️ 2026-10-31 实测踩到两件事：
+      ① 运行时交给判据的 answer 常是 `json.dumps` 过的字符串，里面的换行是
+         **两个字符** `\\n`；材料是真换行。只压空白 → 跨行片段永远匹配不上
+         → 搬运判据形同失效（README 全文照样通过）。
+      ② 模型引用 Markdown 时常把 `>` `**` 这类标记丢掉，或反过来加回来。
+         留着标记就变成"引文对不上"，会误伤真引文。
     """
     t = str(s or "")
     for a, b in (("\\r\\n", " "), ("\\n", " "), ("\\t", " "),
                  ('\\"', '"'), ("\\/", "/")):
         t = t.replace(a, b)
+    t = re.sub(r"[>#*`|]+", " ", t)          # Markdown 标记/表格竖线不算内容
     return re.sub(r"\s+", " ", t).strip()
 
 
+def _probe_hit(quote: str, material: str, *, span: int = 30) -> bool:
+    """引文是否**有材料支撑**：整句命中，或任一 span 字滑窗命中。
+
+    滑窗是为了容忍省略号、截断、前后缀（模型复述时常带"根据材料…"）。
+    只认逐字，不做语义相似 —— 语义相似就等于把判据交回给模型自称。
+    """
+    q = _norm(quote)
+    if not q:
+        return False
+    if q in material:
+        return True
+    n = max(8, int(span))
+    if len(q) < n:
+        return False
+    step = max(1, (len(q) - n) // 10)
+    for i in range(0, len(q) - n + 1, step):
+        if q[i:i + n] in material:
+            return True
+    return False
+
+
 def is_material_dump(answer: str, material: str, *,
-                     slices: int = 3, span: int = 120) -> tuple[bool, int]:
+                     win: int = 60, floor: float = 0.6) -> tuple[bool, int]:
     """答案是不是**材料原文的搬运**（确定性判据，不花 LLM）。
 
     为什么必须有一条确定性判据（2026-10-31 生产实证）：
         同一个行为「gh_read → RESULT = 整篇 README」，10:0x 被 flash 判官连拒
-        5 次，10:3x 又被放过 2 次（`vlml_details` r=1.0，答案里就是 15145 字节
-        的 README 原文）。**判官会抖，判据不能抖。**
+        5 次，10:3x 又被放过 2 次（`vlml_details` r=1.0）。**判官会抖，判据不能抖。**
 
-    判法：从材料里均匀取 `slices` 段各 `span` 字，若多数能在答案里逐字找到，
-    就是搬运（对 JSON 包裹、截断、前后加话都成立 —— 因为查的是"材料片段是否
-    出现在答案里"）。答案本身很短（< 2×span）不会触发。
+    判法（覆盖率高就是搬运）：把**答案**切成 `win` 字的窗口，逐窗看能否在材料
+    里逐字找到；命中率 ≥ floor 判搬运。
+    为什么按"答案的覆盖率"而不是"材料的切片"：答案在上游被截到 1200 字
+    （`_answer_text`），材料上万字 —— 按材料切片抽查时只会命中第 1 段，
+    永远判不出搬运（2026-10-31 实测踩到）。
     """
     a = _norm(answer)
     m = _norm(material)
-    if not a or len(m) < span * 2:
+    if len(a) < 200 or len(m) < 200:
         return False, 0
-    if len(a) < span:
+    probes = [a[i:i + win] for i in range(0, max(1, len(a) - win + 1), win)]
+    probes = [p for p in probes if len(p) >= win // 2]
+    if not probes:
         return False, 0
-    hits = 0
-    for i in range(max(1, slices)):
-        start = int(len(m) * (i / max(1, slices)))
-        probe = m[start:start + span]
-        if probe and probe in a:
-            hits += 1
-    return hits >= 2, hits
+    hits = sum(1 for p in probes if p in m)
+    pct = int(100 * hits / len(probes))
+    return (hits / len(probes)) >= floor, pct
 
 
 def verify_quotes(quotes: list[dict[str, Any]], material: str) -> tuple[bool, str]:
@@ -137,19 +161,21 @@ def verify_quotes(quotes: list[dict[str, Any]], material: str) -> tuple[bool, st
         return False, "没有材料"
     if not quotes:
         return False, "没有指认任何引文（判断没有材料支撑）"
-    hit, miss = 0, 0
+    hit, miss, first_miss = 0, 0, ""
     for q in quotes:
         s = _norm((q or {}).get("quote") or "")
         if not s:
             continue
-        # 长引文允许截断匹配（模型常带省略号/换行）；短引文必须逐字
-        probe = s[:60] if len(s) > 60 else s
-        if probe and probe in mat:
+        if _probe_hit(s, mat):
             hit += 1
         else:
             miss += 1
+            if not first_miss:
+                first_miss = s[:60]
     if hit == 0:
-        return False, f"{miss} 条引文在材料里都对不上（像是编的）"
+        # 把第一条对不上的引文带出去：日志/判词里能看出是"编的"还是"抄歪了"
+        return False, (f"{miss} 条引文在材料里都对不上（像是编的）"
+                       + (f"；例：{first_miss}" if first_miss else ""))
     return True, ""
 
 

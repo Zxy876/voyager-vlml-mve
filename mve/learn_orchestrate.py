@@ -1409,6 +1409,24 @@ async def _start_learning_impl(
                             _mat = _rp.material_text(_ev1)
                         except Exception:
                             _rp, _mat = None, ""
+                        # 执行账按**材料账**对齐（2026-10-31 实测）：solve 最终步
+                        # 没产出 RESULT 时 real_calls/rows 会记成 0，但材料账里
+                        # 明明有 ok 条目 + 上万字正文。不校对的话，真空防线会抢在
+                        # 闸门前面把维度判死，判词还写成「每行都是空值(NULL/0)」
+                        # —— 说了一句跟事实相反的话（材料就在手上）。
+                        _ok_ev = [e for e in _ev1
+                                  if isinstance(e, dict) and e.get("ok")
+                                  and str(e.get("text") or "").strip()]
+                        if _ok_ev:
+                            _ex1 = dict(r1.get("execution") or {})
+                            _ex1["real_calls"] = max(
+                                int(_ex1.get("real_calls") or 0), len(_ok_ev))
+                            _ex1["rows"] = max(int(_ex1.get("rows") or 0), len(_ok_ev))
+                            _ex1["calls"] = max(int(_ex1.get("calls") or 0), len(_ok_ev))
+                            _ex1["ok"] = True
+                            _ex1["data_sources"] = sorted(
+                                {str(e.get("tool") or "") for e in _ok_ev})
+                            r1["execution"] = _ex1
                         # ---- 搬运材料 ≠ 回答（确定性判据，先于判官）----
                         # 2026-10-31 实测：同一个行为「gh_read → RESULT = 整篇
                         # README」被判官连拒 5 次、又放过 2 次（vlml_details
@@ -1424,10 +1442,11 @@ async def _start_learning_impl(
                             if _is_dump:
                                 ok1 = False
                                 _inner_ok = False
-                                crit1 = ("你交回的是材料原文（答案里能逐字找到 "
-                                         f"{_nhit} 段材料），不是对问题的判断 —— "
-                                         "材料已经到手，直接在它上面作答："
-                                         "先给判断，再指认依据")[:300]
+                                crit1 = ("你交回的是材料原文（答案里 "
+                                         f"{_nhit}% 的片段能在材料里逐字找到），"
+                                         "不是对问题的判断 —— 材料已经到手，"
+                                         "直接在它上面作答：先给判断，再指认依据"
+                                         )[:300]
                                 print("  · 答案是材料搬运 → 判未闭合"
                                       "（确定性判据，不听判官心情）", flush=True)
                         if not (ok1 and _inner_ok) and _bind_ok:
@@ -1439,28 +1458,6 @@ async def _start_learning_impl(
                                 if _r_out.get("ok"):
                                     _r2 = dict(r1)
                                     _r2["answer"] = str(_r_out.get("answer") or "")
-                                    # 执行账按**材料账**重算（2026-10-31 实测）：
-                                    # learning_mechanism 那次材料 12004 字已在手，
-                                    # 但 solve 最终步没产出 RESULT → real_calls=0
-                                    # → 真空防线抢在闸门前面把语义答案判死，
-                                    # 判词还写成「每行都是空值」。材料账里 ok 条目
-                                    # 就是"真取到了内容"的直接证据，按它算才对。
-                                    _ex2 = dict(r1.get("execution") or {})
-                                    _ok_ev = [e for e in _ev1
-                                              if isinstance(e, dict) and e.get("ok")
-                                              and str(e.get("text") or "").strip()]
-                                    if _ok_ev:
-                                        _ex2["real_calls"] = max(
-                                            int(_ex2.get("real_calls") or 0),
-                                            len(_ok_ev))
-                                        _ex2["rows"] = max(
-                                            int(_ex2.get("rows") or 0), len(_ok_ev))
-                                        _ex2["calls"] = max(
-                                            int(_ex2.get("calls") or 0), len(_ok_ev))
-                                        _ex2["ok"] = True
-                                        _ex2["data_sources"] = sorted(
-                                            {str(e.get("tool") or "") for e in _ok_ev})
-                                    _r2["execution"] = _ex2
                                     try:
                                         import task_critic as _tc3
                                         import reward as _rw3

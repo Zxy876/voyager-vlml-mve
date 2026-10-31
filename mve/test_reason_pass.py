@@ -135,8 +135,8 @@ def main() -> int:
     check("JSON 包裹材料原文 → 仍判搬运",
           rp.is_material_dump('{"answer": {"text": "' + big + '"}}',
                               mat_big)[0] is True)
-    check("只搬了一半（后 2/3 丢失）→ 不误判为搬运",
-          rp.is_material_dump(big[: len(big) // 3], mat_big)[0] is False)
+    check("答案被截断（只搬了前 1/3）→ 仍判搬运（按答案覆盖率判）",
+          rp.is_material_dump(big[: len(big) // 3], mat_big)[0] is True)
     check("正常判断（一句话）→ 不判搬运",
           rp.is_material_dump("部分属实：更新时间可指认，实现无法核对。",
                               mat_big)[0] is False)
@@ -164,8 +164,8 @@ def main() -> int:
     check("dim_codes 记事实：这条是取证闭合还是语义闭合", '"how": "reason"' in lo)
     check("搬运判据接进主循环（判官放过也拦得住）",
           "_rp.is_material_dump(" in lo and "答案是材料搬运" in lo)
-    check("语义收口重判时按材料账算执行账（否则真空防线抢在闸门前）",
-          '_ex2["real_calls"] = max(' in lo and '_r2["execution"] = _ex2' in lo)
+    check("执行账按材料账对齐（否则真空防线抢在闸门前）",
+          '_ex1["real_calls"] = max(' in lo and 'r1["execution"] = _ex1' in lo)
     # 工具确实关掉了：语义层不 import 执行层、不 exec
     _src = (Path(__file__).resolve().parent / "reason_pass.py").read_text(
         encoding="utf-8")
