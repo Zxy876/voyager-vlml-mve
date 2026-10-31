@@ -1737,7 +1737,15 @@ async def _start_learning_impl(
                 # 的 critic 用 LLM 判，别一刀切判死（2026-10-19 用户实测踩过）。
                 try:
                     import task_critic as _tc
-                    _needs = _tc.needs_data(question)
+                    # ⚠️ has_env 必须传（2026-10-31 H 实测踩到）：needs_data 的
+                    # 签名是 (question, has_env=False)，只传一个参数 = 永远判
+                    # 「不需要取数」→ 下面这条真空防线对**所有场景**都失效。
+                    # 那一轮里程碑重试 calls=4 / rows=0 / ok=False，本该判
+                    # no_data 不写掌握，却被放行成 learned 并「里程碑解锁：是」。
+                    # 分型权威 = 环境（task_critic 头注释 2026-10-28 已拍板），
+                    # 题面措辞不再参与判断。
+                    import reward as _rw_n
+                    _needs = _tc.needs_data(question, _rw_n.scene_has_env(scene))
                 except Exception:
                     _needs = True
                 if _needs:

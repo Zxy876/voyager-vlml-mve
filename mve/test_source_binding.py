@@ -156,6 +156,29 @@ def main() -> int:
     check("read_file 说明写清返回 text 字段", "text" in _desc["read_file"])
     check("list_files 说明写清是对象列表", "is_dir" in _desc["list_files"])
 
+    print("== 8. 真空防线不许被「单参调用」悄悄关掉 ==")
+    # 2026-10-31 H 实测：needs_data(question) 少传 has_env → 恒 False →
+    # 「没取到真数」这条防线对所有场景失效（那一轮 calls=4/rows=0 被判 learned
+    # 且「里程碑解锁：是」）。这里扫源码，任何生产调用都必须带第二个实参。
+    import re as _re
+    _bad = []
+    for f in sorted((Path(__file__).resolve().parent).glob("*.py")):
+        if f.name.startswith("test_"):
+            continue
+        src = f.read_text(encoding="utf-8")
+        for mm in _re.finditer(r"needs_data\(\s*([^)]*)\)", src):
+            args = mm.group(1).strip()
+            if args.startswith("question") and "," not in args:
+                _bad.append(f"{f.name}: needs_data({args[:30]})")
+            if args and not args.startswith(("question", "q", "task", "has_env")):
+                continue
+    check("生产代码里没有「只传 question」的 needs_data 调用", not _bad,
+          "；".join(_bad))
+    _lo2 = (Path(__file__).resolve().parent / "learn_orchestrate.py").read_text(
+        encoding="utf-8")
+    check("学习侧把环境判定传进去（scene_has_env）",
+          "needs_data(question, _rw_n.scene_has_env(scene))" in _lo2)
+
     print(f"== 结果：{PASS} 过 / {FAIL} 挂 ==")
     return 1 if FAIL else 0
 

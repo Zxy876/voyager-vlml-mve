@@ -3388,7 +3388,11 @@ class Handler(BaseHTTPRequestHandler):
                 _needs_data = True
                 try:
                     import task_critic as _tc2
-                    _needs_data = bool(_tc2.needs_data(q))
+                    import reward as _rw2
+                    # has_env 必须传（2026-10-31）：不传 = 恒 False = 所有场景
+                    # 都当「不需要取数」，面板这份诊断跟着失真。
+                    _needs_data = bool(_tc2.needs_data(
+                        q, _rw2.scene_has_env(sid)))
                 except Exception:
                     pass
                 self._json(200, {
