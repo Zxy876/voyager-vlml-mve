@@ -34,6 +34,14 @@ def main() -> int:
     import maieutic_scaffold as ms
     import source_snapshot as ss
 
+    # ⚠️ 测试必须用自己的场景 id：`scaffold()` 即使 use_cache=False **也会写缓存
+    # 文件**（缓存写是正常职责），拿真场景 id 跑测试会把假 LLM 的占位维度写进
+    # 生产骨架 —— 2026-10-31 在服务器上实测污染过 Scene H（骨架变成 1 条 `q`，
+    # 锚点也被带偏）。测试碰生产账，和判据出错一样严重。
+    S = "_TEST_SNAPSHOT"
+    import shutil
+    shutil.rmtree(ms.CKPT / S, ignore_errors=True)
+
     print("== 1. 按「最具体目标」决定要不要取快照 ==")
     check("没点名任何来源 → 不取快照",
           ss.snapshot("这批员工的工资合计是多少？").get("text") == "")
@@ -71,7 +79,7 @@ def main() -> int:
     print("== 4. 观察面进材料：render_material 会把它拼进去并回填 state ==")
     _st: dict = {}
     _mat = ms.render_material("仓库 Zxy876/voyager-vlml-mve 的 README 是否属实？",
-                              "H", state=_st)
+                              S, state=_st)
     if _r.get("text"):
         check("材料里有「实际存在的内容」这一段",
               "实际存在" in _mat, _mat[-80:].replace("\n", " "))
@@ -91,7 +99,7 @@ def main() -> int:
                '{"id": "a", "question": "q", "why": "w"}], ' \
                '"expected_drifts": [], "material_note": null}'
 
-    ms.scaffold("仓库 Zxy876/voyager-vlml-mve 的 README 是否属实？", "H",
+    ms.scaffold("仓库 Zxy876/voyager-vlml-mve 的 README 是否属实？", S,
                 llm=_fake_llm, use_cache=False)
     if _r.get("text"):
         check("有观察面 → system 里有来源约束",
@@ -119,7 +127,7 @@ def main() -> int:
         return '{"milestone": {"name": "n", "why": "w"}, "dimensions": [' \
                '{"id": "a", "question": "q", "why": "w"}], "expected_drifts": []}'
 
-    _o = ms.scaffold("仓库 Zxy876/voyager-vlml-mve 的 README 是否属实？", "H",
+    _o = ms.scaffold("仓库 Zxy876/voyager-vlml-mve 的 README 是否属实？", S,
                      llm=_bad_then_ok, use_cache=False)
     check("截断的输出会重试，第 3 次成功就收下（一次解析失败≠这题拆不出来）",
           _o.get("origin") == "llm" and len(_o.get("dimensions") or []) == 1,
@@ -131,12 +139,15 @@ def main() -> int:
         _n2["c"] += 1
         return "我不知道该怎么拆。"
 
-    _o2 = ms.scaffold("仓库 Zxy876/x 的 README 是否属实？", "H",
+    _o2 = ms.scaffold("仓库 Zxy876/x 的 README 是否属实？", S,
                       llm=_always_bad, use_cache=False)
     check("一直拆不出 → 如实报 failed（不编维度）", _o2.get("origin") == "failed")
     check(f"重试上限 = {ms.SCAFFOLD_LLM_RETRIES}（原版同口径，不无限重试）",
           _n2["c"] == ms.SCAFFOLD_LLM_RETRIES, f"调用 {_n2['c']} 次")
     check("失败原因带出去（面板/日志能看出是哪一步）", bool(_o2.get("reason")))
+
+    # 清掉测试场景的骨架/进度（不留垃圾）
+    shutil.rmtree(ms.CKPT / S, ignore_errors=True)
 
     print(f"\n== 结果：{PASS} 过 / {FAIL} 挂 ==")
     return 0 if FAIL == 0 else 1
