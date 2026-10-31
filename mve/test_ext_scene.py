@@ -92,12 +92,20 @@ def main() -> int:
         ok(env2 is None, "本机场景不给 SQL 环境")
         ok("没有 .duckdb" in why2, "why 说清缺什么", why2[:60])
 
-        # ---- ③ 配了不存在的路径 → missing，也如实报 ----
+        # ---- ③ 配了不存在的路径 → 降级分配标准库，不再 missing 空转 ----
+        # 2026-10-28 改（scene_profile.profile 的 source_missing 分支）：场景 G 配的
+        # 目录不存在 → 每轮 unreachable、160 轮 0 里程碑。改成先给场景分配标准库
+        # 并把 source_missing=True 写进 profile 让人看得见，环境照给（SceneDBEnv）。
+        # 旧断言「missing + 无环境」与该行为矛盾，是测试没跟上，不是代码错。
         scene_profile._scene = lambda sid: {"id": sid, "name": "坏的",
                                            "data_source": "nope/x.duckdb"}
         env3, p3, why3 = scene_env.env_for_scene("Z")
-        ok(env3 is None and p3["kind"] == scene_profile.MISSING,
-           "配了不存在的库 → missing + 无环境", str(why3)[:60])
+        ok(p3["kind"] == scene_profile.SCENE and p3.get("source_missing") is True,
+           "配了不存在的库 → 降级标准库 + source_missing=True",
+           str(p3.get("why") or why3)[:70])
+        ok(env3 is not None and type(env3).__name__ == "SceneDBEnv",
+           "降级后仍给 SQL 环境（不再空转）", type(env3).__name__)
+        ok(bool(p3.get("db_path")), "降级后有真实 db_path", p3.get("db_path", ""))
     finally:
         scene_profile._scene = orig_scene
         scene_profile._default_scene_id = orig_default

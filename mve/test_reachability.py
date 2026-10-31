@@ -42,6 +42,13 @@ class _FakeActions:
         self.registered.append(("net", scene_id))
         return {}
 
+    def register_gh(self, scene_id):
+        # 2026-10-29 起 available_grabs 会注册 gh 组（学习侧与消费侧同一份
+        # 工具菜单），假注册表必须跟着有这个入口 —— 否则 available_grabs
+        # 走 except 分支返回空列表，下面两个用例会假阴性。
+        self.registered.append(("gh", scene_id))
+        return {}
+
     def enabled_entries(self, scene_id):
         return [{"name": n, "origin": "local"} for n in self.names]
 
