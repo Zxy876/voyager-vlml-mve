@@ -1218,6 +1218,15 @@ async def _start_learning_impl(
                                         "origin": "failed",
                                         "reason": f"{type(_ge).__name__}: {_ge}"}
 
+                        # 来源绑定（2026-10-31，A 项）：维度题面点名了本库哪张表，
+                        # 就在执行前把「答案必须来自这几张表」讲成硬约束 —— 判据
+                        # （下方 _bind）与这句提示同一口径，不做事后才知道的坑。
+                        _bind_db = exec_db or db_path
+                        try:
+                            import source_binding as _sb
+                            _bind_tip = _sb.bind_hint(_q1, _bind_db)
+                        except Exception:
+                            _bind_tip = ""
                         if _code_exec:
                             obs1, code1 = await local_agent.solve(
                                 _q1, local_dir or exec_dir, llm=llm,
@@ -1231,7 +1240,7 @@ async def _start_learning_impl(
                                 # 里面是正文还是两行摘要"全靠猜）；给了它才判得出
                                 # 「这张表里没有答案」→ 换 gh_read 去读仓库。
                                 # 这就是"见人说人话"，不是我们替它分类。
-                                context=(_env1 if exec_db else ""))
+                                context=((_env1 if exec_db else "") + _bind_tip))
                         else:
                             obs1, code1 = await agent.solve(
                                 _q1, skills=skills, grabs=grabs,
@@ -1365,6 +1374,24 @@ async def _start_learning_impl(
                             _timed_out_dims += 1
                             ok1 = False
                             _inner_ok = False
+                        # ---- 来源绑定判定（A 项，确定性，不花 LLM）----
+                        # 旧判据只问「取到没有」：H 实测 dim4 调 gh_repo_info 拿仓库
+                        # description 回答「web_facts 表 claim 字段是什么」，材料非空、
+                        # 措辞也对得上 → 闭合 → 里程碑假亮。这里补问一句
+                        # 「取的是不是这一份」：题面点名的真实表，必须有一条成功
+                        # 调用其**入参**点到它（判据见 source_binding.py）。
+                        try:
+                            import source_binding as _sb2
+                            _bind_ok, _bind_why = _sb2.check(_q1, _ev1, _bind_db)
+                        except Exception:
+                            _bind_ok, _bind_why = True, ""
+                        if not _bind_ok:
+                            ok1 = False
+                            _inner_ok = False
+                            _tail = str(crit1 or "").strip()
+                            crit1 = (_bind_why + ("；" + _tail if _tail else ""))[:400]
+                            print(f"  · 来源未绑定 → 判未闭合：{_bind_why[:90]}",
+                                  flush=True)
                         # ---- (success, critique) 不可分契约（2026-10-26 补）----
                         # 原版 check_task_success **一次调用同时产出** success 与
                         # critique（voyager.py:232-238 返回二元组），结构上不存在

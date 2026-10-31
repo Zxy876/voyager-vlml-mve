@@ -1068,7 +1068,29 @@ def _clip(s: Any, n: int = _EVIDENCE_CHARS) -> str:
     return str(s or "")[:n]
 
 
-def _evidence_item(name: str, ret: Any) -> dict[str, Any]:
+def _args_text(a: tuple[Any, ...], k: dict[str, Any],
+               *, chars: int = 300) -> str:
+    """这次调用**问了什么**（入参压成一行）——「我查的是哪张表/哪个仓库」。
+
+    2026-10-31（A 项）：材料账过去只记「取了什么」（`text`），不记「问的谁」，
+    于是「调 gh_repo_info 回答 web_facts 表字段问题」在判据眼里是合法材料
+    （返回非空、答案措辞对得上）。入参才是来源凭据 —— 见 source_binding.py。
+    """
+    parts: list[str] = []
+    for v in a:
+        try:
+            parts.append(v if isinstance(v, str) else repr(v))
+        except Exception:
+            parts.append("?")
+    for kk, vv in (k or {}).items():
+        try:
+            parts.append(f"{kk}={vv if isinstance(vv, str) else repr(vv)}")
+        except Exception:
+            parts.append(str(kk))
+    return _clip(" ".join(parts), chars)
+
+
+def _evidence_item(name: str, ret: Any, args: str = "") -> dict[str, Any]:
     """把一次**成功**调用的返回剪成一条证据（同构 maieutic 的 `gathered`）。
 
     助产士的口径（`src/lib/research/agent.ts`）：
@@ -1078,7 +1100,8 @@ def _evidence_item(name: str, ret: Any) -> dict[str, Any]:
     MVE 这里补同一层：失败（带 error / status>=400 / 空 / **工具把失败包成文本**）
     记 ok=False，不成材料。
     """
-    item: dict[str, Any] = {"tool": str(name), "ok": True, "text": ""}
+    item: dict[str, Any] = {"tool": str(name), "ok": True, "text": "",
+                            "args": _clip(args, 300) if args else ""}
     if isinstance(ret, dict):
         err = ret.get("error")
         try:
@@ -1126,9 +1149,13 @@ def _env_receipt(evidence: list[dict[str, Any]] | None,
         lines.append("调用过的数据源：" + "、".join(dict.fromkeys(called)))
     for it in items[-limit:]:
         name = str(it.get("tool") or "?")
+        # 入参进回执 = 原版 events 里「bot 真做了什么」那一半（2026-10-31 补）：
+        # 只说「gh_repo_info 取到 300 字」，模型判不出「我问错了对象」。
+        q = str(it.get("args") or "").replace("\n", " ")[:100]
+        head = f"· {name}({q})" if q else f"· {name}"
         if it.get("ok"):
             body = str(it.get("text") or "").replace("\n", " ")
-            lines.append(f"· {name} → 取到 {len(body)} 字：{body[:chars]}")
+            lines.append(f"{head} → 取到 {len(body)} 字：{body[:chars]}")
         else:
             why = str(it.get("error") or "").replace("\n", " ")
             lines.append(f"· {name} → 失败：{why[:chars]}")
@@ -1150,16 +1177,18 @@ def _recorder(tracer: list[str] | None, name: str,
         def _w(*a: Any, **k: Any) -> Any:
             if tracer is not None:
                 tracer.append(name)
+            _args = _args_text(a, k) if evidence is not None else ""
             try:
                 ret = fn(*a, **k)
             except Exception as e:
                 if evidence is not None:
                     evidence.append({"tool": str(name), "ok": False,
+                                     "args": _args,
                                      "error": _clip(f"{type(e).__name__}: {e}",
                                                     200)})
                 raise
             if evidence is not None:
-                evidence.append(_evidence_item(name, ret))
+                evidence.append(_evidence_item(name, ret, args=_args))
             return ret
         _w.__name__ = str(name)
         return _w
@@ -1266,13 +1295,14 @@ async def ensure_mcp_tools(scene_id: str) -> dict[str, Any]:
 PRIMITIVES: list[dict[str, Any]] = [
     {"name": "list_files",
      "fn": list_files,
-     "desc": "列出场景目录/应用工作区里的文件（path 相对场景目录）",
+     "desc": ("列出场景目录/应用工作区里的文件（path 相对场景目录）。"
+              "返回 [{\"path\",\"name\",\"is_dir\",\"size\",\"mtime\"}, ...]"),
      "schema": {"type": "object", "properties": {
          "path": {"type": "string"}, "pattern": {"type": "string"},
          "limit": {"type": "integer"}}, "required": []}},
     {"name": "read_file",
      "fn": read_file,
-     "desc": "读一个文本文件（只读、限长）",
+     "desc": "读一个文本文件（只读、限长）。返回 {\"text\": ..., \"path\": ...}",
      "schema": {"type": "object", "properties": {
          "path": {"type": "string"}, "max_bytes": {"type": "integer"}},
          "required": ["path"]}},
@@ -1283,7 +1313,12 @@ PRIMITIVES: list[dict[str, Any]] = [
                 "required": ["path"]}},
     {"name": "query_sql",
      "fn": query_sql,
-     "desc": "查场景目录里的 .duckdb（只读；没有库时如实报没有）",
+     # 返回形状必须写在说明书里（2026-10-31 H 实测）：不写 → 模型按「行是
+     # dict / 结果可直接迭代」写代码（`for c in r: c[1]`、`r[0][0]`），
+     # 撞的永远是 IndexError/KeyError，而判词只说「报错」，它不知道错在形状。
+     "desc": ("查场景目录里的 .duckdb（只读；没有库时如实报没有）。"
+              "返回 {\"columns\": [列名...], \"rows\": [[值...], ...]} —— "
+              "取第一行第一列 = r[\"rows\"][0][0]；不要直接 for 循环 r"),
      "schema": {"type": "object", "properties": {"sql": {"type": "string"}},
                 "required": ["sql"]}},
 ]
