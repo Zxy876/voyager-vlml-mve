@@ -1224,9 +1224,14 @@ async def _start_learning_impl(
                         _bind_db = exec_db or db_path
                         try:
                             import source_binding as _sb
+                            _bind_names = _sb.named_sources(_q1, _bind_db)
                             _bind_tip = _sb.bind_hint(_q1, _bind_db)
                         except Exception:
-                            _bind_tip = ""
+                            _bind_names, _bind_tip = [], ""
+                        if _bind_names:
+                            print(f"  · 来源绑定：本题点名了库里的 "
+                                  f"{'、'.join(_bind_names)} → 答案必须真查它",
+                                  flush=True)
                         if _code_exec:
                             obs1, code1 = await local_agent.solve(
                                 _q1, local_dir or exec_dir, llm=llm,
