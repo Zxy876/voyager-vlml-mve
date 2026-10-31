@@ -105,6 +105,28 @@ def main() -> int:
     check("纯答案仍不算（凭记忆不许入库）",
           _recipe('RESULT = {"answer": "许可证是 MIT"}') is False)
 
+    print("== 6. 里程碑重试不再无限原地撞（同构原版 learn() 的失败处置）==")
+    # 原版没有「整题总验收」层：inference() 的任务完成 = 最后一条子目标成功
+    # （voyager.py:417，progress = len(completed_tasks)，curriculum.py:133-135）。
+    # 原版对做不出的任务也从不原地无限重试：单任务封顶 4 步
+    # （voyager.py:30,277-280）→ update_exploration_progress 记 failed +
+    # "Skipping to next task."（curriculum.py:340-344）→ 下一轮换题。
+    # 2026-10-31 实测：3/3 闭合但整题 KeyError: 0 → no_data → 26 轮同一题。
+    _sl = (Path(__file__).resolve().parent / "scene_learn.py").read_text(
+        encoding="utf-8")
+    check("单任务重试上限 = 原版 action_agent_task_max_retries",
+          "MAX_RETRY_STREAK = 4" in _sl)
+    check("到顶后按原版记 failed（挂冷却换题）",
+          "_msf.note_milestone_round(scene, question, new_closed=0)" in _sl)
+    check("带原版措辞 Skipping to next task.", "Skipping to next task." in _sl)
+    check("重试失败不再 continue 原地重撞",
+          "下一轮 while 继续重试同一里程碑" not in _sl)
+    check("冷却未清先换题（全闭合分支也认冷却）",
+          "milestone_cooldown(scene, _tgt) > 0" in _sl
+          and "_unclosed and _cool > 0" in _sl)
+    check("成功清零失败计数（换题回来后能重新起算）",
+          "_light_up_milestone._fail_streak = 0" in _sl)
+
     print(f"== 结果：{PASS} 过 / {FAIL} 挂 ==")
     return 1 if FAIL else 0
 
