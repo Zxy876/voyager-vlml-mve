@@ -32,6 +32,18 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 def main() -> int:
     import source_binding as sb
 
+    print("== 0. 真库直查（有 duckdb + 场景库时才算；本地无 duckdb 则跳过）==")
+    _real = sb.table_names("/root/mve/scene_data/H/scene.duckdb")
+    if _real:
+        check("真库表清单读得出来（show tables）", "web_facts" in _real,
+              "、".join(_real[:6]))
+        _H = "/root/mve/scene_data/H/scene.duckdb"
+        check("真库题面点名识别正确",
+              sb.named_sources("web_facts 表中该仓库的 confirmed 字段值", _H)
+              == ["web_facts"])
+    else:
+        print("  （跳过：这台机器没有那个场景库，或没装 duckdb）")
+
     # 本地没有 duckdb / 没有场景库都不影响这几项：表清单直接注入。
     sb.table_names = lambda _p: ["web_facts", "web_docs", "web"]
     DB = "ignored.duckdb"
