@@ -360,6 +360,81 @@ def _clean_dims(data: dict[str, Any]) -> list[dict[str, str]]:
     return out
 
 
+# 喂给出题器的失败账封顶（原版 `failed_tasks` 全量拼进 observation；这里是
+# 一条条中文问句，比 "Mine 1 wood log" 长得多，按条数封顶而不是按字符截断，
+# 截断会把问句砍半反而误导）。
+FAILED_SHOWN = 8
+
+
+def failed_dims(scene_id: str, question: str,
+                *, limit: int = FAILED_SHOWN) -> list[tuple[str, str]]:
+    """试过但**没做成**的维度 + 最后一轮判词 → [(问句, 为什么失败)]。
+
+    为什么要有这一条（原版对照，2026-10-31 核对源码后补）：
+
+        voyager.py:inference() 里 `decompose_task(task)` 排在
+        `completed_tasks = []` / `failed_tasks = []` **之前**，所以拆子目标时
+        看到的正是上一阶段留下的两本账；而 `decompose_task` 的 messages 是
+
+            [system(拆解 prompt), render_human_message(events), "Final task: ..."]
+
+        `render_human_message` → `render_observation` 里带着
+        `Completed tasks so far:` 与 `Failed tasks that are too hard:`，且这两项
+        `warm_up` 都是 0（`should_include = True`）—— **每次必带、不随机**。
+
+    所以「失败账进拆解观察面」不是新设计，是原版一直有的东西；MVE 的骨架拆解器
+    此前只有 completed 侧（「已学过的节点」），failed 侧空着。
+
+    口径（照 `clean_up_tasks`）：**已闭合的从 failed 里删掉** —— 同一条维度后来
+    做成了就不该再算"太硬"。
+    """
+    try:
+        qmap = {str(d.get("id") or ""): str(d.get("question") or "")
+                for d in milestone_dimensions(scene_id, question)}
+    except Exception:
+        qmap = {}
+    try:
+        iters = load_progress_iterations(scene_id, question)
+    except Exception:
+        iters = {}
+    if not iters:
+        return []
+    try:
+        done = load_progress(scene_id, question)      # clean_up_tasks：完成的移出 failed
+    except Exception:
+        done = set()
+    rows: list[tuple[str, str]] = []
+    for did, it in iters.items():
+        if did in done:
+            continue
+        q = (qmap.get(did) or "").strip()
+        if not q:
+            continue
+        why = str(it.get("asked") or "").strip() or str(it.get("gap") or "").strip()
+        rows.append((q, why))
+    return rows[-max(1, int(limit)):]
+
+
+def completed_dims(scene_id: str, question: str, *,
+                   limit: int = 10) -> list[str]:
+    """已经闭合的维度问句（原版 `Completed tasks so far:` 的 MVE 对应物）。
+
+    原版拆解时两本账一起喂（failed 靠 `failed_tasks`，completed 靠
+    `completed_tasks`）。MVE 的"已完成任务"就是 progress.learned，问句从骨架里取。
+    """
+    try:
+        qmap = {str(d.get("id") or ""): str(d.get("question") or "")
+                for d in milestone_dimensions(scene_id, question)}
+    except Exception:
+        return []
+    try:
+        done = load_progress(scene_id, question)
+    except Exception:
+        return []
+    out = [qmap[d].strip() for d in done if str(qmap.get(d) or "").strip()]
+    return out[-max(1, int(limit)):]
+
+
 def render_material(question: str, scene_id: str, *, extras: str = "",
                     state: dict[str, Any] | None = None) -> str:
     """把「材料」渲染给模型：人问的那句话 + 这个场景现在有什么（复用观测，不另造）。
@@ -368,17 +443,48 @@ def render_material(question: str, scene_id: str, *, extras: str = "",
     要不要追加来源观察面专属约束（同构原版：喂了环境观察，才配得上"看得见环境"的规则）。
     """
     lines = [f"人想弄清楚的问题：{question}"]
+    _done: list[str] = []
+    try:
+        _done += completed_dims(scene_id, question)
+    except Exception:
+        pass
     try:
         import task_decompose
         obs = task_decompose.scene_observation(question, scene_id)
         nodes = obs.get("nodes") or []
         ents = obs.get("entities") or {}
-        if nodes:
-            lines.append("这个场景**已经学过**的节点（别重复拆成维度）："
-                         + "；".join(nodes[:20]))
+        for n in nodes:
+            if str(n).strip() and str(n) not in _done:
+                _done.append(str(n))
         if ents:
             lines.append("已确认的实体：" +
                          "；".join(f"{k}: {', '.join(v[:6])}" for k, v in list(ents.items())[:5]))
+    except Exception:
+        pass
+    if _done:
+        # 原版措辞：`Completed tasks so far: ...`（拆解时必带、不随机）
+        lines.insert(1, "Completed tasks so far（已经做过/学过的，别重复拆成维度）："
+                     + "；".join(_done[:24]))
+        if state is not None:
+            state["completed"] = len(_done[:24])
+    # ---- 失败账（原版 `Failed tasks that are too hard:`，decompose_task 必带）----
+    # 2026-10-31 核对源码后补：voyager.py:inference() 的 decompose_task 排在清空
+    # 两本账之前，所以拆子目标时看得到上一阶段失败的账；render_observation 里
+    # completed/failed 的 warm_up 都是 0 → 每次必带、不随机。MVE 的拆解器此前
+    # 只有 completed 侧，"太硬的"一律看不见 → 换个新里程碑还会重蹈同一类不可答。
+    try:
+        _fd = failed_dims(scene_id, question)
+        if _fd:
+            lines.append("Failed tasks that are too hard（试过没做成的，别原样重出）："
+                         + "；".join(q for q, _ in _fd))
+            _why = "；".join(f"{q[:40]}（{w[:80]}）" for q, w in _fd if w)
+            if _why:
+                lines.append("为什么失败：" + _why)
+            lines.append("（按原版规则处理失败题：**不要**原样或换个说法重出。要么拆出"
+                         "它前置的、现在就能做成的子维度；要么把问法换成「说法与"
+                         "观察面对照」这种可指认的形式。）")
+            if state is not None:
+                state["failed"] = len(_fd)
     except Exception:
         pass
     try:
@@ -469,6 +575,9 @@ def scaffold(question: str, scene_id: str = "A", *, llm: Callable | None = None,
         + (SCAFFOLD_SYSTEM_SOURCE if _st.get("snapshot") else "")
     if _st.get("snapshot"):
         print(f"  · 拆骨架前先看来源观察面：{_st['snapshot']}", flush=True)
+    if _st.get("failed"):
+        print(f"  · 拆骨架前带上失败账：{_st['failed']} 条试过没做成的"
+              "（原版 Failed tasks that are too hard）", flush=True)
     messages = [{"role": "system", "content": system_content},
                 {"role": "user", "content": _material
                  + "\n\n请产出追问骨架，只输出 JSON。"}]
