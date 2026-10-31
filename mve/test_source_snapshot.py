@@ -41,9 +41,15 @@ def main() -> int:
           ss.snapshot("web_facts 表中该仓库的 claim 是什么？",
                       db_path="").get("kind") != "table")
     _u = ss.snapshot("https://github.com/Zxy876/voyager-vlml-mve 上写了什么？")
-    check("点名 URL → 如实说「没有预取正文」（不假装看过）",
-          _u.get("kind") == "url" and "没有预取" in _u.get("text", ""),
+    check("URL 指向 GitHub 仓库 → 按仓库取（不然观察面只剩一句「没预取」，等于没给环境）",
+          _u.get("kind") == "slug" and "github.com" not in _u.get("target", ""),
           _u.get("target", ""))
+    check("仓库快照真的取到内容（文件清单/README），不是一句空话",
+          ("文件清单" in _u.get("text", "")) or ("没取到" in _u.get("text", "")),
+          f"{len(_u.get('text', ''))} 字")
+    _plain = ss.snapshot("看看 https://example.com/a/b 这个页面里写了什么？")
+    check("非 GitHub 的 URL 仍然如实说「没预取正文」（不假装看过）",
+          _plain.get("kind") == "url" and "没有预取" in _plain.get("text", ""))
 
     print("== 2. 仓库：清单 + README 正文（有网才取得到，取不到也要如实说）==")
     _r = ss.snapshot("仓库 Zxy876/voyager-vlml-mve 的 README 是否属实？")

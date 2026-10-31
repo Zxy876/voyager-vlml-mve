@@ -32,13 +32,32 @@ MVE 里这个机制的数据场景版本是 `curriculum_auto.db_observation`（�
 from __future__ import annotations
 
 import os
-from pathlib import Path
+import re
 from typing import Any
 
 # 观察面的预算：文件清单 60 条 + 正文 2600 字。骨架只要"有没有这个事实"，
 # 不需要全文；给太多会把拆维度的 prompt 挤爆（原版也只用 blockRecords 前若干条）。
 TREE_LIMIT = 60
 TEXT_LIMIT = 2600
+
+# URL 指向 GitHub 仓库时**按仓库取**：`targets()` 的优先级（file>url>slug）是为
+# 「绑定判定」定的，快照这里要的是「哪份材料最有用」。H 的题面就是
+# `https://github.com/Zxy876/voyager-vlml-mve 的readme…`，若照 url 分支走，
+# 观察面只剩一句「没有预取正文」（93 字）—— 等于没给环境（2026-10-31 实测）。
+_GH_URL_RE = re.compile(
+    r"https?://(?:www\.)?github\.com/([A-Za-z0-9][A-Za-z0-9_.\-]{0,38})/"
+    r"([A-Za-z0-9][A-Za-z0-9_.\-]{0,38})", re.IGNORECASE)
+
+
+def _repo_from_url(text: str) -> str:
+    """`https://github.com/owner/repo/...` → `owner/repo`（其它 URL 返回空）。"""
+    m = _GH_URL_RE.search(str(text or ""))
+    if not m:
+        return ""
+    repo = m.group(2)
+    if repo.lower().endswith(".git"):
+        repo = repo[:-4]
+    return f"{m.group(1)}/{repo}" if repo else ""
 
 
 def _read_local(path: str, scene_id: str, limit: int = TEXT_LIMIT) -> str:
@@ -97,6 +116,12 @@ def snapshot(text: str, scene_id: str = "", *, db_path: str = "") -> dict[str, A
     text 为空 = 没点名 / 取不到（调用方照旧走原路径，不多说一句）。
     """
     out: dict[str, Any] = {"kind": "", "target": "", "text": ""}
+    repo = _repo_from_url(text)
+    if repo:
+        # 优先按仓库取：URL 指向仓库时，仓库结构 + README 才是真正有用的观察面
+        out["kind"], out["target"] = "slug", repo
+        out["text"] = _repo_snapshot(repo)
+        return out
     try:
         import source_binding as _sb
         kind, toks = _sb.targets(text, "")
