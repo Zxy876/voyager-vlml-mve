@@ -106,6 +106,36 @@ def main() -> int:
               "Failed tasks that are too hard" in _seen.get("user", ""))
         check("拆解 prompt 的 user 侧也有 completed 侧（原版两本账一起）",
               "Completed tasks so far" in _seen.get("user", ""))
+
+        print("== 6. 场景级：上一道题失败的，下一道题拆解时要看得见 ==")
+        # 原版两本账挂在 CurriculumAgent 上（一份 completed_tasks.json +
+        # failed_tasks.json），跨任务共享；MVE 的账存在 per-(scene,question)
+        # 文件里，只读本文件 = 换题就断片（2026-10-31 发现并修）。
+        Q2 = "面板是否已上线并可供访问？"
+        p2 = ms._cache_path("_T", Q2)
+        ms._atomic_write(p2, {
+            "question": Q2,
+            "dimensions": [{"id": "old1", "question": "上一道题里没做成的那条？"},
+                           {"id": "old2", "question": "上一道题里已经做成的那条？"}],
+            "progress": {"learned": ["old2"],
+                         "iterations": [{"id": "old1", "rounds": 2,
+                                         "asked": "上题：仓库没有 releases",
+                                         "passed": False}]}})
+        _fd3 = ms.failed_dims("_T", Q2)          # 注意：问的是新题 Q2
+        check("新题拆解时看得见旧题的失败账",
+              any("上一道题里没做成" in q for q, _ in _fd3),
+              str([q[:14] for q, _ in _fd3]))
+        check("旧题的判词一起带过来",
+              any("没有 releases" in w for _, w in _fd3))
+        _cd = ms.completed_dims("_T", Q2)
+        check("completed 侧也同样跨题", any("已经做成" in q for q in _cd),
+              str([q[:14] for q in _cd]))
+        _m3 = ms.render_material(Q2, "_T")
+        check("两本账都出现在新题的材料里",
+              "Failed tasks that are too hard" in _m3
+              and "Completed tasks so far" in _m3)
+        check("旧题里已做成的那条**不**出现在 failed 段（clean_up_tasks）",
+              "上一道题里已经做成" not in _m3.split("Failed tasks that are too hard")[-1])
     finally:
         ms.CKPT = old
         shutil.rmtree(tmp, ignore_errors=True)
