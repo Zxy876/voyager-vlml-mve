@@ -1008,7 +1008,15 @@ def _make_mcp_callable(gw: Any, tool_id: str, loop: Any,
     return _sync
 
 
-_EVIDENCE_CHARS = 4000
+_EVIDENCE_CHARS = 12000
+# 证据正文的上限（2026-10-31 从 4000 提到 12000）。
+# 4000 是「一行日志看着舒服」的量级，不是「够答一道题」的量级：README 真实长度
+# 8~20KB，砍到 4000 只留下开头一段，于是语义层被要求在**残料**上下整体判断
+# （「README 有没有写功能/安装/使用方法」），它只能按常识补 —— 判官随即判
+# 「你的结论与材料账不符，材料账中只展示了部分README内容」，而引文核验也只会
+# 判「编的」。生产实测（H readme_content，材料 4048 字）就是这一条。
+# 12000 与 `reason_pass` 的材料预算对齐：gh_read/web_fetch 自己的上限是 20000，
+# 剩下的差额由截断标注说清楚（见 `_clip_ev`）。
 
 # fetch/搜索工具把失败包成**普通文本**返回时的措辞（2026-10-22 场景 B 实测）。
 # 这些是「工具自己的失败说明」，不是网页正文；必须配合长度闸一起用。
@@ -1021,6 +1029,36 @@ _TOOL_ERR_HINTS = (
     "client error '5",
     "server error '5",
 )
+
+
+def _render_lines(obj: Any, *, depth: int = 0, limit: int = 80) -> str:
+    """把结构化成**一行一条**的可读文本（证据正文用）。
+
+    为什么不能直接 `json.dumps`（2026-10-31 生产实测，两处真实失败都源于此）：
+      · `gh_repo_info` 的返回是一行 JSON `{"license": "", ...}`，语义层照人话
+        写成引文 `license: ""` —— 逐字核对时**对不上**，一条「没有声明许可证」
+        的正确判断被判成「引文像是编的」。
+      · `gh_tree` 的返回是 `["A.md", "B.md", ...]`，模型引用时写成 `A.md, B.md`
+        —— 同样对不上，3 条真引文全判 miss。
+    一行一条（`license: ` / `- A.md`）既让人能读，也让引文能抄对：材料长什么样，
+    引文就该长什么样。这只是**呈现**，不改任何字段值。
+    """
+    if isinstance(obj, dict):
+        lines: list[str] = []
+        for k, v in list(obj.items())[:limit]:
+            if isinstance(v, (dict, list, tuple)):
+                sub = _render_lines(v, depth=depth + 1, limit=limit)
+                lines.append(f"{k}:\n{sub}" if "\n" in sub else f"{k}: {sub}")
+            else:
+                lines.append(f"{k}: {'' if v is None else v}")
+        return "\n".join(lines)
+    if isinstance(obj, (list, tuple)):
+        items = list(obj)[:limit]
+        if all(not isinstance(x, (dict, list, tuple)) for x in items):
+            return "\n".join(f"- {x}" for x in items)
+        return "\n".join(_render_lines(x, depth=depth + 1, limit=limit)
+                         for x in items)
+    return str("" if obj is None else obj)
 
 
 def _flat_text(ret: Any) -> str:
@@ -1036,10 +1074,10 @@ def _flat_text(ret: Any) -> str:
         else:
             body = (ret.get("text") or ret.get("content") or ret.get("answer")
                     or ret.get("rows") or ret)
-            return body if isinstance(body, str) else json.dumps(
-                _jsonable(body), ensure_ascii=False)
+            return body if isinstance(body, str) else _render_lines(
+                _jsonable(body))
     if isinstance(ret, (list, tuple)):
-        return json.dumps(_jsonable(list(ret)), ensure_ascii=False)
+        return _render_lines(_jsonable(list(ret)))
     return str(ret or "")
 
 
@@ -1066,6 +1104,20 @@ def _looks_like_tool_error(text: Any) -> bool:
 
 def _clip(s: Any, n: int = _EVIDENCE_CHARS) -> str:
     return str(s or "")[:n]
+
+
+def _clip_ev(s: Any, n: int = _EVIDENCE_CHARS) -> str:
+    """剪证据正文，并在**剪短时如实说明**剪了多少。
+
+    为什么必须标注（2026-10-31 实测）：材料被静默截断时，模型不知道后半段存在，
+    会把「我没看到」当成「文档里没有」；判官看材料账也只看得到同一段，于是两边
+    各说各话。标注之后，语义层能按「已给出部分」下判断，把缺的写进 gap。
+    """
+    t = str(s or "")
+    if len(t) <= n:
+        return t
+    return t[:n] + (f"\n…（正文共 {len(t)} 字，这里只给前 {n} 字，"
+                    "未给出的部分不许假设、不许按常识补）")
 
 
 def _args_text(a: tuple[Any, ...], k: dict[str, Any],
@@ -1116,7 +1168,7 @@ def _evidence_item(name: str, ret: Any, args: str = "") -> dict[str, Any]:
             return item
         if ret.get("url"):
             item["source"] = _clip(ret.get("url"), 200)
-    item["text"] = _clip(_flat_text(ret))
+    item["text"] = _clip_ev(_flat_text(ret))
     if not item["text"].strip():
         item["ok"] = False
         item["error"] = "返回为空"

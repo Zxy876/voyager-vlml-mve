@@ -51,13 +51,40 @@ SYSTEM = """你是判定者，不是检索器。材料已经取到手，工具�
 规则：
 - 必须给出判断，不能只复述材料；
 - 每条判断都要指认材料里的具体句子/字段值，quote 必须能在材料里**逐字**找到；
+- 引文要**照材料的样子抄**：材料写成 `license: ` 就抄 `license:`，材料一行一个
+  文件名就抄那一行，不要自己拼接、不要加解释；
+- 材料注明「只给前 N 字」时，只对已给出的部分下判断，未给出的部分写进 gap，
+  **不许按常识补**；
 - 材料不足以判断 → verdict 写「无法判断」，gap 写清缺什么，**不许猜**；
 - answer 不许整段照抄材料；引用只许短句。
 """
 
+# 引文核验的最小长度：一两个字的引文（「是」「有」）满材料都是，不构成「指认」，
+# 但也不能因此就把「作者是张三」这种**编造短句**归到「太短」里去 —— 4 个字
+# （一个中文词组）是能指认的最小单位。
+MIN_QUOTE = 4
+
+# 材料预算：与 local_agent._EVIDENCE_CHARS（单条证据 12000）配套。
+# 一条证据刚好放得下；两条证据（如 gh_tree + gh_read）时按此预算依次放，
+# 放不下的部分**标注**出来，不静默丢。
+MATERIAL_LIMIT = 20000
+
+_TRUNC_MARK = "\n…（这里已到材料预算上限，后面还有内容没放进来，不许假设）"
+
+# 引文没过时的第二次提示（同构原版 propose_next_ai_task 的重试：
+# 一次没写好 ≠ 这题不可答；但**只照材料重抄**，不许换说法蒙过核对）
+_QUOTE_HINT = (
+    "\n\n上一次的引文没有一条能在材料里逐字找到（或根本没给引文）。\n"
+    "请重做一次，并且：\n"
+    "- quotes 至少给 1 条，quote 必须是材料里**连着的原字**，直接复制，不要改写、"
+    "不要拼接、不要在引文里写你自己的解释；\n"
+    "- 材料里若写成 `key: value`，就抄 `key: value`；若是一行一个文件名，就抄那一行；\n"
+    "- 材料确实没有支撑这条判断的内容 → verdict 写「无法判断」，gap 写缺什么。"
+)
+
 
 def material_text(evidence: list[dict[str, Any]] | None, *,
-                  limit: int = 12000) -> str:
+                  limit: int = MATERIAL_LIMIT) -> str:
     """把材料账压成一段可读正文（只取 ok 的；带来源标注，便于指认）。
 
     只放**真取到的内容**，失败项不进材料（与 _evidence_item 同一口径）。
@@ -76,7 +103,11 @@ def material_text(evidence: list[dict[str, Any]] | None, *,
         label = head + (f"({q[:80]})" if q else "") + (f" [{src}]" if src else "")
         chunk = f"【材料·{label}】\n{body}"
         if used + len(chunk) > limit:
-            chunk = chunk[: max(0, limit - used)]
+            keep = max(0, limit - used)
+            if keep <= 0:
+                break
+            # 预算不够时**说清楚**：静默截断等于让模型「没看到=不存在」
+            chunk = chunk[:keep] + _TRUNC_MARK
         parts.append(chunk)
         used += len(chunk)
         if used >= limit:
@@ -85,21 +116,43 @@ def material_text(evidence: list[dict[str, Any]] | None, *,
 
 
 def _norm(s: str) -> str:
-    """归一化到「可比对」的形态：转义序列还原 + Markdown 标记剥离 + 空白压缩。
+    """归一化到「可比对」的形态：转义序列还原 + 标记剥离 + JSON 标点当分隔符。
 
-    ⚠️ 2026-10-31 实测踩到两件事：
+    ⚠️ 三次生产实测踩到的（2026-10-31，Scene H）：
       ① 运行时交给判据的 answer 常是 `json.dumps` 过的字符串，里面的换行是
          **两个字符** `\\n`；材料是真换行。只压空白 → 跨行片段永远匹配不上
          → 搬运判据形同失效（README 全文照样通过）。
       ② 模型引用 Markdown 时常把 `>` `**` 这类标记丢掉，或反过来加回来。
          留着标记就变成"引文对不上"，会误伤真引文。
+      ③ **材料是 JSON**（`gh_repo_info` / `gh_tree` 的返回）时，字段值被
+         `"` `,` `{}` 包着，模型按人话抄成 `license: ""`、`A.md, B.md` →
+         逐字对不上，「没有声明许可证」这种**正确**判断被判成「引文像是编的」。
+         引号/逗号/括号/冒号是结构标点，不是内容 —— 两边都抹平成分隔符即可，
+         抹平后仍然要求字面连续命中，不引入任何语义相似。
     """
     t = str(s or "")
     for a, b in (("\\r\\n", " "), ("\\n", " "), ("\\t", " "),
                  ('\\"', '"'), ("\\/", "/")):
         t = t.replace(a, b)
+    t = re.sub(r"(?m)^\s*[-*+]\s+", "", t)   # 行首列表符号（材料一行一条时用）
     t = re.sub(r"[>#*`|]+", " ", t)          # Markdown 标记/表格竖线不算内容
+    t = re.sub(r"[\"'“”‘’]", " ", t)          # 引号只是 JSON/Markdown 的包装
+    t = re.sub(r"[{}\[\](),，、;；:：]", " ", t)  # JSON 标点、顿号、冒号同理
     return re.sub(r"\s+", " ", t).strip()
+
+
+# 多段引文的切分：模型常把「A…B…C」写成一条引文（省略号表示中间略过）
+_SEG_SPLIT = re.compile(r"…+|\.{3,}|。{2,}")
+
+
+def _window_hit(q: str, material: str, span: int) -> bool:
+    if len(q) < span:
+        return False
+    step = max(1, (len(q) - span) // 10)
+    for i in range(0, len(q) - span + 1, step):
+        if q[i:i + span] in material:
+            return True
+    return False
 
 
 def _probe_hit(quote: str, material: str, *, span: int = 30) -> bool:
@@ -107,20 +160,22 @@ def _probe_hit(quote: str, material: str, *, span: int = 30) -> bool:
 
     滑窗是为了容忍省略号、截断、前后缀（模型复述时常带"根据材料…"）。
     只认逐字，不做语义相似 —— 语义相似就等于把判据交回给模型自称。
+
+    多段引文（`A…B`）按段核验：任一**够长**的段落在材料里逐字命中即算有支撑
+    （省略号本来就表示"中间省略"，不能要求整条连着出现）。
     """
     q = _norm(quote)
     if not q:
         return False
     if q in material:
         return True
-    n = max(8, int(span))
-    if len(q) < n:
-        return False
-    step = max(1, (len(q) - n) // 10)
-    for i in range(0, len(q) - n + 1, step):
-        if q[i:i + n] in material:
+    for seg in _SEG_SPLIT.split(str(quote or "")):
+        s = _norm(seg)
+        if len(s) < MIN_QUOTE:
+            continue
+        if s in material or _window_hit(s, material, span):
             return True
-    return False
+    return len(q) >= MIN_QUOTE and _window_hit(q, material, span)
 
 
 def is_material_dump(answer: str, material: str, *,
@@ -161,12 +216,15 @@ def verify_quotes(quotes: list[dict[str, Any]], material: str) -> tuple[bool, st
         return False, "没有材料"
     if not quotes:
         return False, "没有指认任何引文（判断没有材料支撑）"
+    valid = [q for q in quotes
+             if len(_norm((q or {}).get("quote") or "")) >= MIN_QUOTE]
+    if not valid:
+        return False, (f"引文都太短（不足 {MIN_QUOTE} 字），不能当作指认"
+                       "（要抄材料里的一句话/一个字段值）")
     hit, miss, first_miss = 0, 0, ""
-    for q in quotes:
+    for q in valid:
         s = _norm((q or {}).get("quote") or "")
-        if not s:
-            continue
-        if _probe_hit(s, mat):
+        if _probe_hit(str((q or {}).get("quote") or ""), mat):
             hit += 1
         else:
             miss += 1
@@ -196,42 +254,50 @@ def answer_over_material(task: str, material: str, *,
     if not mat:
         return {"ok": False, "why": "没有材料可读（取证阶段没取到内容）",
                 "answer": "", "verdict": "", "quotes": [], "gap": ""}
-    user = ((str(demos_text).strip() + "\n\n") if str(demos_text or "").strip() else "") \
+    base = ((str(demos_text).strip() + "\n\n") if str(demos_text or "").strip() else "") \
         + (f"问题：{task}\n\n"
             + (f"上一轮被判未闭合的原因（供参考）：{str(critique)[:300]}\n\n"
                if str(critique or "").strip() else "")
-            + f"材料（取自本次取证，未能再取新的）：\n{mat[:12000]}\n\n"
+            + f"材料（取自本次取证，未能再取新的）：\n{mat[:MATERIAL_LIMIT]}\n\n"
             "请按系统要求输出 JSON。")
-    msgs = [{"role": "system", "content": SYSTEM},
-            {"role": "user", "content": user}]
-    try:
-        if llm is not None:
-            out = llm(msgs)
-        else:
-            import llm_client
-            out = llm_client.chat_json(msgs, max_tokens=max_tokens, retries=2)
-    except Exception as e:
-        return {"ok": False, "why": f"语义层调用失败：{type(e).__name__}: {e}",
-                "answer": "", "verdict": "", "quotes": [], "gap": ""}
-    if not isinstance(out, dict) or not out:
-        return {"ok": False, "why": "语义层没返回可解析的 JSON",
-                "answer": "", "verdict": "", "quotes": [], "gap": ""}
-    verdict = str(out.get("verdict") or "").strip()
-    quotes = [q for q in (out.get("quotes") or []) if isinstance(q, dict)]
-    answer = str(out.get("answer") or "").strip()
-    gap = str(out.get("gap") or "").strip()
-    if not answer:
-        return {"ok": False, "why": "语义层没给出回答正文",
-                "answer": "", "verdict": verdict, "quotes": quotes, "gap": gap}
-    good, why = verify_quotes(quotes, mat)
-    if not good:
-        return {"ok": False, "why": f"语义层的判断没有材料支撑：{why}",
-                "answer": answer, "verdict": verdict, "quotes": quotes,
+    # 引文没过就**重来一次**（同构原版 propose_next_ai_task 的 max_retries：
+    # 一次没写好不等于这道题不可答）。2026-10-31 实测 dependencies_list 直接交了
+    # 「没有指认任何引文」的空结论，而材料就在手上 —— 那是没照格式做，不是不能做。
+    last: dict[str, Any] = {}
+    for attempt in range(2):
+        user = base if attempt == 0 else (base + _QUOTE_HINT)
+        msgs = [{"role": "system", "content": SYSTEM},
+                {"role": "user", "content": user}]
+        try:
+            if llm is not None:
+                out = llm(msgs)
+            else:
+                import llm_client
+                out = llm_client.chat_json(msgs, max_tokens=max_tokens, retries=2)
+        except Exception as e:
+            return {"ok": False, "why": f"语义层调用失败：{type(e).__name__}: {e}",
+                    "answer": "", "verdict": "", "quotes": [], "gap": ""}
+        if not isinstance(out, dict) or not out:
+            return {"ok": False, "why": "语义层没返回可解析的 JSON",
+                    "answer": "", "verdict": "", "quotes": [], "gap": ""}
+        verdict = str(out.get("verdict") or "").strip()
+        quotes = [q for q in (out.get("quotes") or []) if isinstance(q, dict)]
+        answer = str(out.get("answer") or "").strip()
+        gap = str(out.get("gap") or "").strip()
+        last = {"answer": answer, "verdict": verdict, "quotes": quotes,
                 "gap": gap}
-    if verdict == "无法判断" and gap:
-        # 如实说材料不够 —— 这不是答到，但它是**有用的**下一步线索
-        return {"ok": False, "why": f"材料不足以判断：{gap[:160]}",
-                "answer": answer, "verdict": verdict, "quotes": quotes,
-                "gap": gap}
-    return {"ok": True, "why": "", "answer": answer, "verdict": verdict,
-            "quotes": quotes, "gap": gap}
+        if not answer:
+            return {"ok": False, "why": "语义层没给出回答正文", **last}
+        good, why = verify_quotes(quotes, mat)
+        if not good:
+            last["why"] = f"语义层的判断没有材料支撑：{why}"
+            if attempt == 0:
+                print(f"  · 引文没通过（{why[:60]}）→ 让它照材料重抄一遍",
+                      flush=True)
+                continue
+            return {"ok": False, **last}
+        if verdict == "无法判断" and gap:
+            # 如实说材料不够 —— 这不是答到，但它是**有用的**下一步线索
+            return {"ok": False, "why": f"材料不足以判断：{gap[:160]}", **last}
+        return {"ok": True, "why": "", **last}
+    return {"ok": False, **last}

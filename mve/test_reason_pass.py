@@ -177,6 +177,83 @@ def main() -> int:
     check("语义层不碰执行原语（工具关闭）",
           "import local_agent" not in _src and "exec(" not in _src)
 
+    print("== 9. 回放 2026-10-31 那一轮的判词：闸门不许把对的判成编的 ==")
+    # 生产事实（Scene H，面板 11:36 那一轮，9 条维度 0 闭合）：
+    #   repo_structure 「3 条引文在材料里都对不上（像是编的）；例：MVE跑通记录.md,
+    #                   README.md, docs, …」← 引文是**文件清单**，材料是 JSON 数组
+    #   license_check  「1 条引文对不上；例：license: ""」← 材料是 JSON 的
+    #                   `{"license": ""}`，模型按人话抄，逐字对不上
+    # 两句都是**抄对了而判据说抄错了**。标点不是内容，抹平后仍要求字面连续命中。
+    mat_repo = ('【材料·gh_tree(Zxy876/voyager-vlml-mve)】\n'
+                '- MVE跑通记录.md\n- README.md\n- docs\n- requirements.txt\n')
+    ok, why = rp.verify_quotes(
+        [{"quote": "MVE跑通记录.md, README.md, docs", "why": "仓库里有这些文件"}],
+        mat_repo)
+    check("文件清单按人话抄（逗号分隔）→ 通过", ok is True, why)
+
+    mat_info = ('【材料·gh_repo_info(Zxy876/voyager-vlml-mve)】\n'
+                'name: voyager-vlml-mve\nlicense: \ndescription: 在线强化学习系统\n')
+    ok, why = rp.verify_quotes(
+        [{"quote": 'license: ""', "why": "license 字段是空的"}], mat_info)
+    check('JSON 里抄字段值 `license: ""` → 通过', ok is True, why)
+
+    ok, why = rp.verify_quotes(
+        [{"quote": "license: MIT", "why": "编的"}], mat_info)
+    check("抹平标点后编造值仍然不过（不许把假话变真）", ok is False, why)
+    ok, why = rp.verify_quotes(
+        [{"quote": "README 明确写了作者是张三"}], mat_repo)
+    check("与材料无关的句子仍然不过", ok is False, why)
+
+    ok, _ = rp.verify_quotes(
+        [{"quote": "MVE跑通记录.md…requirements.txt", "why": "省略号跳读"}],
+        mat_repo)
+    check("省略号多段引文：任一段逐字命中即算有支撑", ok is True)
+    check("太短的引文不当指认（不是判「编的」，是判「没指认」）",
+          rp.verify_quotes([{"quote": "是"}], MAT)[0] is False
+          and "太短" in rp.verify_quotes([{"quote": "是"}], MAT)[1])
+
+    print("== 10. 引文没过要按原版重来一次（一次没写好 ≠ 这题不可答）==")
+    seen = {"n": 0}
+
+    def _llm_retry(_msgs):
+        seen["n"] += 1
+        if seen["n"] == 1:
+            return {"verdict": "是", "quotes": [],
+                    "answer": "是，材料能证明。", "gap": ""}
+        return {"verdict": "是",
+                "quotes": [{"quote": "最后更新：2026-10-30", "why": "更新时间"}],
+                "answer": "是：README 写了最后更新时间 2026-10-30。", "gap": ""}
+
+    r = rp.answer_over_material("README 里写的属实吗？", MAT, llm=_llm_retry)
+    check("第一次没给引文 → 重来一次拿到真引文 → ok",
+          r["ok"] is True and seen["n"] == 2, r.get("why") or f"调用 {seen['n']} 次")
+    check("重来的提示要求照材料重抄，不许换说法蒙过",
+          "照" in rp._QUOTE_HINT or "复制" in rp._QUOTE_HINT)
+
+    seen2 = {"n": 0}
+
+    def _llm_never(_msgs):
+        seen2["n"] += 1
+        return {"verdict": "是", "quotes": [{"quote": "作者是张三"}],
+                "answer": "属实。", "gap": ""}
+
+    r = rp.answer_over_material("README 里写的属实吗？", MAT, llm=_llm_never)
+    check("两次都给编的引文 → 仍然 ok=False（重试不是放水）",
+          r["ok"] is False and seen2["n"] == 2, r.get("why"))
+
+    print("== 11. 材料截断必须说清楚（不然模型把「没看到」当「不存在」）==")
+    long_mat = "【材料·gh_read(README.md)】\n" + ("正文段落。" * 6000)
+    cap = rp.material_text([{"tool": "gh_read", "ok": True, "args": "README.md",
+                             "text": "正文段落。" * 6000}])
+    check("材料吃到预算上限时带标注", "预算" in cap and len(cap) <= rp.MATERIAL_LIMIT + 80,
+          f"{len(cap)} 字")
+    check("系统提示写明截断时只判已给部分",
+          "只对已给出的部分下判断" in rp.SYSTEM and "不许按常识补" in rp.SYSTEM)
+    check("材料预算与证据正文上限配套（一条证据放得下）", rp.MATERIAL_LIMIT >= 12000)
+    check("单条证据被剪时由证据层标注（两处都不静默）",
+          "只给前" in (Path(__file__).resolve().parent
+                       / "local_agent.py").read_text(encoding="utf-8"))
+
     print(f"== 结果：{PASS} 过 / {FAIL} 挂 ==")
     return 1 if FAIL else 0
 

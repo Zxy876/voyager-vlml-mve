@@ -164,6 +164,36 @@ def _has_real(obs: list[dict[str, Any]]) -> bool:
         return any(o.get("ok") and int(o.get("rows") or 0) > 0 for o in obs)
 
 
+# 「表格类」工具：它们的真空由 is_vacuous（有没有真值）判。
+_SQL_TOOLS = ("query_sql", "run_sql", "sql_query", "duckdb", "exec_sql")
+_MIN_BODY = 20
+
+
+def _material_real(ev: Any) -> list[dict[str, Any]]:
+    """材料账里**正文类**工具真取回内容的条目（真空防线的文档侧口径）。
+
+    为什么需要（2026-10-31 生产实测，Scene H dependencies_list）：真空防线
+    `has_real_data` 只看观察里的 `data` 有没有真值 —— 这对表格成立，对
+    「gh_read / web_fetch / read_file 取回一篇正文」不成立：那类工具**没有行**，
+    data 里也没有数字，`is_vacuous` 会把满篇正文判成真空。那一轮材料账里躺着
+    12004 字、来源也绑对了，却因为 solve 最终步没写 RESULT 而记成
+    calls=4 / 真取到=0 / 行数=0 → status=no_data → 整条维度判死、0 技能入库。
+
+    SQL 工具**不**走这条：表格的空结果（全 NULL / 0）必须继续被判真空，
+    不许靠「正文非空」自救（那是 75120 那类乘爆/空表的老坑）。
+    """
+    out: list[dict[str, Any]] = []
+    for e in (ev or []):
+        if not isinstance(e, dict) or not e.get("ok"):
+            continue
+        name = str(e.get("tool") or "").lower()
+        if any(k in name for k in _SQL_TOOLS):
+            continue
+        if len(str(e.get("text") or "").strip()) >= _MIN_BODY:
+            out.append(e)
+    return out
+
+
 # 一次 rollout（跑一段取证代码）的墙钟上限。
 # 为什么不是默认的 30s（2026-10-20 实测致命点）：单次 MCP 调用自己就有 60s
 # 上限（local_agent.py:680），外层比内层短 → 工具还没回来就判超时，而超时又
@@ -1427,6 +1457,11 @@ async def _start_learning_impl(
                             _ex1["data_sources"] = sorted(
                                 {str(e.get("tool") or "") for e in _ok_ev})
                             r1["execution"] = _ex1
+                            # 整轮口径也要对齐：no_data 闸门看的是 out（见 _material_real）
+                            _mat_ok = _material_real(_ok_ev)
+                            if _mat_ok:
+                                out["_mat_real"] = max(
+                                    int(out.get("_mat_real") or 0), len(_mat_ok))
                         # ---- 搬运材料 ≠ 回答（确定性判据，先于判官）----
                         # 2026-10-31 实测：同一个行为「gh_read → RESULT = 整篇
                         # README」被判官连拒 5 次、又放过 2 次（vlml_details
@@ -1816,17 +1851,28 @@ async def _start_learning_impl(
                     for o in observations]
 
             real = _has_real(list(observations or []))
+            # 正文类材料也算「真取到」（真空防线的文档侧口径，见 _material_real）。
+            # 放在这里而不是只改 r1：`real` 是 no_data 闸门的判据，r1 那份只给日志看
+            # —— 2026-10-31 实测「只对齐 r1」等于没对齐，闸门照样判死这一轮。
+            _mat_n = max(int(out.get("_mat_real") or 0),
+                         len(_material_real(out.get("evidence"))))
+            out.pop("_mat_real", None)      # 只是轮内口径，不进 run_log
+            if _mat_n:
+                real = True
             out["execution"] = {
                 "ok": real, "sql": sql,
-                "calls": len(observations or []),
+                "calls": max(len(observations or []), _mat_n),
                 # 「真取到」只数**真的有数据源支撑**的观察：知识型答案（RESULT 是一段
                 # 回答、没有任何数据源调用）不该记成"取到数"——否则日志会自欺
                 # （2026-10-19 实测：养育问题打出了"真取到=1"）。
-                "real_calls": sum(1 for o in (observations or [])
-                                  if _has_real([o])
-                                  and (o.get("data_sources") or [])),
-                "rows": sum(int(o.get("rows") or 0)
-                            for o in (observations or []) if o.get("ok")),
+                "real_calls": max(
+                    sum(1 for o in (observations or [])
+                        if _has_real([o]) and (o.get("data_sources") or [])),
+                    _mat_n),
+                "rows": max(
+                    sum(int(o.get("rows") or 0)
+                        for o in (observations or []) if o.get("ok")),
+                    _mat_n),
                 "data_sources": sorted({s for o in (observations or [])
                                         for s in (o.get("data_sources") or [])}),
                 "evidence": ("data" if any(o.get("data_sources")
