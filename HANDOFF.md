@@ -225,3 +225,4 @@ systemctl restart mve-panel
 ## 10. 变更记录（向下追加）
 
 - 2026-10-31 上一个 agent 建此文件：整理代码地图、两层调度、判定铁律、四个判据 bug、当前状态、协作方式。
+- 2026-11-01 接手 agent 建本机开发环境：venv+依赖、面板本机 8877 跑通、1→n 插拔活体演示（场景 L）；修 2 处陈旧测试断言（ext_scene 缺库降级 / reachability 补 register_gh 桩）→ PR #1；test_judge_entry_parity 确认打桩陈旧（10-29 代码路径改造欠账）；新增 工作流程.md 与 预期差台账.md（主线=文档声明与产品能力一致）。
