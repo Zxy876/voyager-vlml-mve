@@ -3239,6 +3239,12 @@ def _ability_universe() -> set[str]:
 _RECIPE_CALL = re.compile(
     r"\b(list_files|read_file|read_json|read_csv|query_sql"
     r"|web_search|web_fetch|http_get|fetch_url)\s*\("
+    # 仓库取证原语（2026-10-31 补）：gh_* 是 H 场景唯一合法的取证手段，
+    # 白名单漏了它们 → 每一轮都判「没调取数动作，不是配方」→ 技能库 0 涨
+    # （面板 11:36 那一轮 4 条维度靠取证闭合，技能入库 0 条）。
+    # 与 2026-10-22「纯计算式 SELECT」那次漏判同一类错：原语族进了执行域，
+    # 就必须同时在配方判据里认它（注册 ≠ 注入，白名单也要跟着补）。
+    r"|\bgh_(?:repo_info|tree|read|api|search)\s*\("
     r"|\bmcp_[A-Za-z0-9_]+\s*\("
     # SQL 配方：SELECT…FROM 之外，**纯计算式 SELECT**（`SELECT (6-2)/(3-1) AS k
     # … LIMIT 1`，无 FROM —— 2026-10-22 数学场景实测被这条漏判成"知识型答案"

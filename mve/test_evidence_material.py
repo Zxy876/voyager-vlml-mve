@@ -92,6 +92,19 @@ def main() -> int:
     check("闸门的 real 认材料账", "real = True" in src and "_mat_n" in src)
     check("轮内口径不进 run_log", 'out.pop("_mat_real", None)' in src)
 
+    print("== 5. 仓库取证也算配方（否则 H 学一整轮技能库 0 涨）==")
+    # 面板 11:36 那一轮：4 条维度靠 gh_* 取证闭合，技能入库 0 条 —— 判词是
+    # 「没调取数动作，不是配方」。因为配方白名单只认 list_files/query_sql/web_*，
+    # 不认 gh_*（与 2026-10-22「纯计算式 SELECT」漏判同一类错）。
+    from voyager_vlml.consume import _looks_like_recipe as _recipe
+    check("gh_read 取证代码算配方", _recipe('r = gh_read("o/r", "README.md")') is True)
+    check("gh_tree / gh_repo_info / gh_api 也算",
+          all(_recipe(c) for c in ('t = gh_tree("o/r")',
+                                   'i = gh_repo_info("o/r")',
+                                   'a = gh_api("o/r", "commits")')))
+    check("纯答案仍不算（凭记忆不许入库）",
+          _recipe('RESULT = {"answer": "许可证是 MIT"}') is False)
+
     print(f"== 结果：{PASS} 过 / {FAIL} 挂 ==")
     return 1 if FAIL else 0
 
