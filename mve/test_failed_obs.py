@@ -107,11 +107,11 @@ def main() -> int:
         check("拆解 prompt 的 user 侧也有 completed 侧（原版两本账一起）",
               "Completed tasks so far" in _seen.get("user", ""))
 
-        print("== 6. 场景级：上一道题失败的，下一道题拆解时要看得见 ==")
-        # 原版两本账挂在 CurriculumAgent 上（一份 completed_tasks.json +
-        # failed_tasks.json），跨任务共享；MVE 的账存在 per-(scene,question)
-        # 文件里，只读本文件 = 换题就断片（2026-10-31 发现并修）。
-        Q2 = "面板是否已上线并可供访问？"
+        print("== 6. 不做跨题共享：别的题的账不许带进这道题的拆解 ==")
+        # 原版 agent 的生命周期里任务同域，且 inference() 一进来就清空两本账
+        # —— 一次调用一个域。MVE 一个 scene 里问题异构，按"场景级"实现过一版，
+        # 实测立刻串台：新题「面板是否已上线」拆出的 6 条维度里 5 条是 README 的。
+        Q2 = "MVE 的面板是否已上线并可供访问？"
         p2 = ms._cache_path("_T", Q2)
         ms._atomic_write(p2, {
             "question": Q2,
@@ -121,21 +121,20 @@ def main() -> int:
                          "iterations": [{"id": "old1", "rounds": 2,
                                          "asked": "上题：仓库没有 releases",
                                          "passed": False}]}})
-        _fd3 = ms.failed_dims("_T", Q2)          # 注意：问的是新题 Q2
-        check("新题拆解时看得见旧题的失败账",
-              any("上一道题里没做成" in q for q, _ in _fd3),
+        # 本节的 "当前题" 用 Q（它自己也有账）；Q2 是别人的题
+        _fd3 = ms.failed_dims("_T", Q)
+        check("别的题失败的那条**不**进来（否则出题器被带跑）",
+              not any("上一道题里没做成" in q for q, _ in _fd3),
               str([q[:14] for q, _ in _fd3]))
-        check("旧题的判词一起带过来",
-              any("没有 releases" in w for _, w in _fd3))
-        _cd = ms.completed_dims("_T", Q2)
-        check("completed 侧也同样跨题", any("已经做成" in q for q in _cd),
-              str([q[:14] for q in _cd]))
-        _m3 = ms.render_material(Q2, "_T")
-        check("两本账都出现在新题的材料里",
-              "Failed tasks that are too hard" in _m3
-              and "Completed tasks so far" in _m3)
-        check("旧题里已做成的那条**不**出现在 failed 段（clean_up_tasks）",
-              "上一道题里已经做成" not in _m3.split("Failed tasks that are too hard")[-1])
+        _cd = ms.completed_dims("_T", Q)
+        check("别的题已完成的那条也不进来", not any("已经做成" in q for q in _cd))
+        _own = ms.failed_dims("_T", Q2)
+        check("那道题**自己**的账照样读得到（不是把功能关掉）",
+              any("上一道题里没做成" in q for q, _ in _own),
+              str([q[:14] for q, _ in _own]))
+        check("自己题里已闭合的那条不进 failed（clean_up_tasks）",
+              not any("已经做成" in q for q, _ in _own))
+
     finally:
         ms.CKPT = old
         shutil.rmtree(tmp, ignore_errors=True)

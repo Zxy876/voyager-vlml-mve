@@ -366,64 +366,48 @@ def _clean_dims(data: dict[str, Any]) -> list[dict[str, str]]:
 FAILED_SHOWN = 8
 
 
-def _scene_ckpts(scene_id: str) -> list[dict]:
-    """该场景下所有骨架文件（新→旧；跳过备份）。
-
-    ⚠️ 为什么是**场景级**而不是按 question：原版两本账挂在 `CurriculumAgent`
-    上（`ckpt_dir/curriculum/completed_tasks.json` 一份），是**跨任务共享**的；
-    MVE 的进度账存在 per-(scene,question) 的骨架文件里，换一道题就换一把钥匙
-    —— 照抄单文件读法，等于"上一个里程碑失败的，下一个里程碑完全看不见"，
-    正好丢掉原版最有用的一半（2026-10-31 核对源码时发现）。
-    """
-    d = CKPT / str(scene_id or "A")
-    try:
-        ps = [p for p in d.glob("*.json") if ".bak" not in p.name]
-        ps.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    except Exception:
-        return []
-    out: list[dict] = []
-    for p in ps[:12]:                      # 只看最近 12 个骨架，够用且不扫全盘
-        data, _st = _read_cache(p)
-        if isinstance(data, dict) and data.get("dimensions"):
-            out.append(data)
-    return out
-
-
 def _ledger(scene_id: str, question: str) -> tuple[list[str], list[tuple[str, str]]]:
-    """场景级两本账 → (已完成问句, [(没做成的问句, 为什么)])。当前这道题排前面。"""
-    cur = str(question or "").strip()
-    files = _scene_ckpts(scene_id)
+    """**这道题**的两本账 → (已完成问句, [(没做成的问句, 为什么)])。
 
-    def _ordered() -> list[dict]:
-        return ([d for d in files if str(d.get("question") or "").strip() == cur]
-                + [d for d in files if str(d.get("question") or "").strip() != cur])
+    为什么作用域是「一道题」而不是整个场景（2026-10-31 两次实测定下来的）：
 
+      · 原版两本账挂在 CurriculumAgent 上，看着是"全局"，但那个 agent 的
+        生命周期里所有任务同域（都在同一个 Minecraft 世界里挖东西）；而且
+        `inference()` 一进来就 `completed_tasks = []` / `failed_tasks = []`
+        —— **一次调用一个域，域内才共享**。
+      · MVE 的一个 scene 里问题彼此异构（抓 README 真实性 vs 面板是否上线）。
+        先按"场景级"实现过一版，实测立刻串台：新题「面板是否已上线」拆出的
+        6 条维度里 5 条是 README/仓库的 —— 失败账把出题器带跑了。
+      · 所以作用域 = 一个里程碑（= 原版一次 inference 调用）= 一道题。
+        ⚠️ 代价：骨架命中缓存就不重拆，所以这份账只在**重拆同一题**时生效
+        （缓存损坏 / 面板清库 / 首次）。这是原版"decompose 只做一次"的直接
+        后果，不是漏做。
+    """
+    path = _cache_path(scene_id, question)
+    data, _st = _read_cache(path)
+    if not isinstance(data, dict) or not data.get("dimensions"):
+        return [], []
+    pr = data.get("progress") or {}
+    qmap = {str(d.get("id") or ""): str(d.get("question") or "")
+            for d in (data.get("dimensions") or []) if isinstance(d, dict)}
+    learned = {str(x) for x in (pr.get("learned") or [])}
     done: list[str] = []
+    for did in (pr.get("learned") or []):
+        q = str(qmap.get(str(did)) or "").strip()
+        if q and q not in done:
+            done.append(q)
     failed: list[tuple[str, str]] = []
-    seen_d: set[str] = set()
-    seen_f: set[str] = set()
-    for data in _ordered():
-        pr = data.get("progress") or {}
-        qmap = {str(d.get("id") or ""): str(d.get("question") or "")
-                for d in (data.get("dimensions") or []) if isinstance(d, dict)}
-        learned = {str(x) for x in (pr.get("learned") or [])}
-        for did in learned:
-            q = str(qmap.get(did) or "").strip()
-            if q and q not in seen_d:
-                seen_d.add(q)
-                done.append(q)
-        for it in (pr.get("iterations") or []):
-            if not isinstance(it, dict):
-                continue
-            did = str(it.get("id") or "")
-            if not did or did in learned:
-                continue                   # clean_up_tasks：做成的移出 failed
-            q = str(qmap.get(did) or "").strip()
-            if not q or q in seen_f:
-                continue
-            why = str(it.get("asked") or "").strip() or str(it.get("gap") or "").strip()
-            seen_f.add(q)
-            failed.append((q, why))
+    for it in (pr.get("iterations") or []):
+        if not isinstance(it, dict):
+            continue
+        did = str(it.get("id") or "")
+        if not did or did in learned:
+            continue                       # clean_up_tasks：做成的移出 failed
+        q = str(qmap.get(did) or "").strip()
+        if not q or any(q == x for x, _ in failed):
+            continue
+        why = str(it.get("asked") or "").strip() or str(it.get("gap") or "").strip()
+        failed.append((q, why))
     return done, failed
 
 
