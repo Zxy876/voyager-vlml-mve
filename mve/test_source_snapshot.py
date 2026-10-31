@@ -109,6 +109,35 @@ def main() -> int:
     check("③ 截断时只许检查已给出部分", "正文被截断时" in _s)
     check("④ 「没取到」时只许出取证维度", "取证维度" in _s)
 
+    print("== 7. 出题器解析失败按原版重试（propose_next_ai_task max_retries=5）==")
+    _n = {"c": 0}
+
+    def _bad_then_ok(messages):
+        _n["c"] += 1
+        if _n["c"] < 3:
+            return '{"dimensions": [{"id": "a", "quest'   # 截断的 JSON
+        return '{"milestone": {"name": "n", "why": "w"}, "dimensions": [' \
+               '{"id": "a", "question": "q", "why": "w"}], "expected_drifts": []}'
+
+    _o = ms.scaffold("仓库 Zxy876/voyager-vlml-mve 的 README 是否属实？", "H",
+                     llm=_bad_then_ok, use_cache=False)
+    check("截断的输出会重试，第 3 次成功就收下（一次解析失败≠这题拆不出来）",
+          _o.get("origin") == "llm" and len(_o.get("dimensions") or []) == 1,
+          f"调用 {_n['c']} 次")
+
+    _n2 = {"c": 0}
+
+    def _always_bad(messages):
+        _n2["c"] += 1
+        return "我不知道该怎么拆。"
+
+    _o2 = ms.scaffold("仓库 Zxy876/x 的 README 是否属实？", "H",
+                      llm=_always_bad, use_cache=False)
+    check("一直拆不出 → 如实报 failed（不编维度）", _o2.get("origin") == "failed")
+    check(f"重试上限 = {ms.SCAFFOLD_LLM_RETRIES}（原版同口径，不无限重试）",
+          _n2["c"] == ms.SCAFFOLD_LLM_RETRIES, f"调用 {_n2['c']} 次")
+    check("失败原因带出去（面板/日志能看出是哪一步）", bool(_o2.get("reason")))
+
     print(f"\n== 结果：{PASS} 过 / {FAIL} 挂 ==")
     return 0 if FAIL == 0 else 1
 

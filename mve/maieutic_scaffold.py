@@ -131,9 +131,40 @@ SCAFFOLD_SYSTEM_SOURCE = """
   不许出以它的内容为前提的判断维度。"""
 
 
+# 原版 curriculum.propose_next_ai_task(max_retries=5)：解析失败不是"这题拆不出来"，
+# 是"这次没拆成"，重发再试。MVE 原先一次失败就降级自由出题 —— 2026-10-31 加了
+# 来源观察面之后（prompt 变长、why 字段变长）更容易撞上输出被截断，实测一次
+# 「骨架无维度 → 释放锚点降级」就是这么来的。
+SCAFFOLD_LLM_RETRIES = 5
+# 原版对失败是**原样重发**，但实测同一个截断会稳定重现；重试时补一句纠正更有效，
+# 这不改变判据（仍然是"拆不出就如实报 failed"，只是先把话说完）。
+_RETRY_HINT = ("上一次输出不是合法 JSON（很可能被截断）。只输出那个 JSON 对象本身，"
+               "不要代码围栏，why / material_note 各写一句话，维度控制在你认为必要的条数。")
+
+
 def _default_llm(messages: list[dict[str, str]]) -> str:
     from llm_client import chat
-    return chat(messages, temperature=0.3, max_tokens=1200)
+    # 1200 → 2400：观察面进来后 why 写得更长，1200 会把 JSON 砍断（实测）。
+    return chat(messages, temperature=0.3, max_tokens=2400)
+
+
+def _call_llm(llm: Callable | None, messages: list[dict[str, str]]) -> tuple[dict, list, str]:
+    """调出题器并解析，失败按原版重试（返回 (data, dims, 最后一次失败原因)）。"""
+    last = ""
+    msgs = list(messages)
+    for _ in range(SCAFFOLD_LLM_RETRIES):
+        try:
+            text = (llm or _default_llm)(msgs)
+        except Exception as e:
+            last = f"LLM 调用失败：{type(e).__name__}: {e}"
+            continue
+        data = _parse(text)
+        dims = _clean_dims(data)
+        if dims:
+            return data, dims, ""
+        last = "LLM 输出里没有可用维度（解析失败/空列表）"
+        msgs = list(messages) + [{"role": "user", "content": _RETRY_HINT}]
+    return {}, [], last
 
 
 def _cache_path(scene_id: str, question: str, db_path: str = "") -> Path:
@@ -441,13 +472,7 @@ def scaffold(question: str, scene_id: str = "A", *, llm: Callable | None = None,
     messages = [{"role": "system", "content": system_content},
                 {"role": "user", "content": _material
                  + "\n\n请产出追问骨架，只输出 JSON。"}]
-    try:
-        text = (llm or _default_llm)(messages)
-    except Exception as e:
-        out["reason"] = f"LLM 调用失败：{type(e).__name__}: {e}"
-        return out
-    data = _parse(text)
-    dims = _clean_dims(data)
+    data, dims, _fail = _call_llm(llm, messages)
     if not dims:
         # ⚠️ 2026-10-26 拆掉「关键词兜底分解」（原 _schema_decompose）：它靠
         # 三张关键词表（聚合意图词 / 「月」→month+date+period / 「薪」→salary+wage…）
@@ -455,9 +480,9 @@ def scaffold(question: str, scene_id: str = "A", *, llm: Callable | None = None,
         # 它正是「哪些员工在九月是活跃的？」这类**限定词库里根本落不了地**的错位
         # 维度的源头之一。拆维度的活儿本就该由出题器（LLM）看着**实查到的库结构**
         # 做（render_material 已经把 db_observation 喂进去了）。
-        # 现在：LLM 拆不出维度就**如实报 failed**，调用方（task_decompose.plan）
-        # 据此退回原版 decompose —— 不编、不猜（原版同构：拿不到就走原路）。
-        out["reason"] = "LLM 输出里没有可用维度（解析失败/空列表）"
+        # 现在：**按原版重试 5 次**（propose_next_ai_task 同口径）仍拆不出，才如实
+        # 报 failed，调用方（task_decompose.plan）据此退回原版 decompose —— 不编、不猜。
+        out["reason"] = _fail or "LLM 输出里没有可用维度（解析失败/空列表）"
         return out
     drifts = [d for d in (data.get("expected_drifts") or []) if isinstance(d, dict)]
     out.update(dimensions=dims, expected_drifts=drifts,
