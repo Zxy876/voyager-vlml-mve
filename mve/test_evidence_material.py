@@ -127,6 +127,34 @@ def main() -> int:
     check("成功清零失败计数（换题回来后能重新起算）",
           "_light_up_milestone._fail_streak = 0" in _sl)
 
+    print("== 7. 执行反馈只陈述事实：错在哪一行 + 返回是什么形状 ==")
+    # 2026-10-31 H 实测：`KeyError: 0` 连犯 4 步 —— 反馈里连错在哪一行都没有，
+    # 模型蒙着眼睛改。原版 mineflayer 把完整执行报错回灌进 events；
+    # DeepSeek §2.3 同构：只陈述事实（行号/形状），不教怎么改、不限语言。
+    # 「菜单说明书」是原版 Minecraft 的做法（原语固定、形状单一），钉不完
+    # 23 个原语 × 任意 Python 的形状空间 —— 事实要来自环境实跑。
+    res = L._run_restricted(
+        "rows = query_sql('SELECT 1')\nRESULT = {'n': rows[0]}\n",
+        {"query_sql": lambda q: {"columns": ["t"], "rows": [{"t": 1}]}})
+    check("KeyError 带出错行号", "错在第 2 行" in str(res.get("error") or ""),
+          res.get("error"))
+    check("带出错那行的原文", "rows[0]" in str(res.get("error") or ""),
+          res.get("error"))
+    check("无 traceback 的错误原样透出",
+          L._run_restricted("x=1\n", {})["ok"])  # 正常执行不崩
+    check("形状：dict 报 keys",
+          "keys=['columns', 'rows']" in L._shape_of({"columns": [], "rows": []}),
+          L._shape_of({"columns": [], "rows": []}))
+    check("形状：list 报长度和元素类型",
+          "长度 2" in L._shape_of([{"a": 1}, {"a": 2}])
+          and "dict" in L._shape_of([{"a": 1}, {"a": 2}]))
+    check("形状：MCP 网关的 {result:...} 剥壳后再看",
+          "keys=" in L._shape_of({"result": {"text": "x"}}))
+    _rc = L._env_receipt([{"tool": "query_sql", "ok": True, "args": "SELECT 1",
+                           "shape": "dict，keys=['columns', 'rows']",
+                           "text": "columns rows"}], ["query_sql"])
+    check("环境回执带形状事实", "返回dict，keys=" in _rc, _rc)
+
     print(f"== 结果：{PASS} 过 / {FAIL} 挂 ==")
     return 1 if FAIL else 0
 

@@ -345,7 +345,27 @@ def _run_restricted(code: str, ns: dict[str, Any], timeout: float = 30.0
                             "JSON 用 read_json，别用 os/json 模块")
         except Exception as e:
             box["ok"] = False
-            box["error"] = f"{type(e).__name__}: {e}"
+            # 只回 "{type}: {msg}" 等于让模型蒙着眼睛改：H 实测 4 步迭代同一个
+            # `KeyError: 0`，每步重犯 —— 它连「错在哪一行、那行写了什么」都
+            # 看不见。原版 mineflayer 把完整执行报错回灌进 events（
+            # action_agent_show_execution_error=True），模型下一步看着栈改。
+            # DeepSeek §2.3 同构：只陈述事实（哪一行、那行是什么），不教怎么改
+            # —— 改法是模型在事实之上自己推出来的。
+            import traceback as _tb
+            _frames = [f for f in _tb.extract_tb(e.__traceback__)
+                       if f.filename == "<local_skill>"]
+            if _frames:
+                _f = _frames[-1]
+                # exec 的字符串没有文件，linecache 取不到 f.line —— 按行号
+                # 从源码本身取（错误行的原文是模型改错的唯一依据）。
+                _src = str(code or "").splitlines()
+                _line = (_src[_f.lineno - 1].strip()
+                         if 0 < (_f.lineno or 0) <= len(_src) else "")
+                box["error"] = (
+                    f"{type(e).__name__}: {e} —— 错在第 {_f.lineno} 行："
+                    f"{_line[:200]}")
+            else:
+                box["error"] = f"{type(e).__name__}: {e}"
 
     t = threading.Thread(target=_target, daemon=True)
     t.start()
@@ -1142,6 +1162,31 @@ def _args_text(a: tuple[Any, ...], k: dict[str, Any],
     return _clip(" ".join(parts), chars)
 
 
+def _shape_of(ret: Any) -> str:
+    """这次工具调用**返回了什么形状**（一句话，只陈述事实，语言无关）。
+
+    为什么需要（2026-10-31 H 实测）：模型把 `query_sql` 的 `{columns, rows}`
+    当 list 用 → `rows[0]` → `KeyError: 0`，4 步迭代同一个错。根因不是缺一份
+    "菜单说明书"——那是原版 Minecraft 的做法（控制原语固定、返回形状单一）；
+    我们 23 个原语、输出语言不限死，说明书钉不完。DeepSeek 的对应物是：
+    §2.3 **只约束格式/事实、不加内容偏好** —— 把"这次实际返回了什么形状"
+    作为事实放回上下文，模型在工具返回之上继续推理（V3.2 "Thinking in
+    Tool-Use"），下一步自己改对，不替它写"SQL 该怎么取"。
+    """
+    try:
+        if isinstance(ret, dict) and set(ret) == {"result"}:
+            ret = ret["result"]
+        if isinstance(ret, dict):
+            keys = [str(k) for k in list(ret.keys())[:8]]
+            return f"dict，keys={keys}"
+        if isinstance(ret, (list, tuple)):
+            inner = type(ret[0]).__name__ if ret else "空"
+            return f"list，长度 {len(ret)}，元素是 {inner}"
+        return f"{type(ret).__name__}，{len(str(ret))} 字"
+    except Exception:
+        return ""
+
+
 def _evidence_item(name: str, ret: Any, args: str = "") -> dict[str, Any]:
     """把一次**成功**调用的返回剪成一条证据（同构 maieutic 的 `gathered`）。
 
@@ -1173,6 +1218,7 @@ def _evidence_item(name: str, ret: Any, args: str = "") -> dict[str, Any]:
         item["ok"] = False
         item["error"] = "返回为空"
         return item
+    item["shape"] = _shape_of(ret)
     if _looks_like_tool_error(item["text"]):
         item["ok"] = False
         item["error"] = "工具返回的是失败说明，不是正文：" + _clip(item["text"], 120)
@@ -1207,7 +1253,12 @@ def _env_receipt(evidence: list[dict[str, Any]] | None,
         head = f"· {name}({q})" if q else f"· {name}"
         if it.get("ok"):
             body = str(it.get("text") or "").replace("\n", " ")
-            lines.append(f"{head} → 取到 {len(body)} 字：{body[:chars]}")
+            shape = str(it.get("shape") or "").strip()
+            # 形状事实（2026-10-31 补）：只说「取到 N 字」，模型判不出
+            # 「拿到的是 dict 还是 list」→ `rows[0]` 这类 KeyError 照犯。
+            lines.append(f"{head} → 返回{shape}；取到 {len(body)} 字："
+                         f"{body[:chars]}" if shape else
+                         f"{head} → 取到 {len(body)} 字：{body[:chars]}")
         else:
             why = str(it.get("error") or "").replace("\n", " ")
             lines.append(f"· {name} → 失败：{why[:chars]}")
