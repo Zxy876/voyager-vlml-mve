@@ -1547,8 +1547,15 @@ async def _start_learning_impl(
                                         crit1 = ("语义层给了判断，判官仍不认："
                                                  + str(crit2 or ""))[:400]
                                 else:
-                                    crit1 = (str(_r_out.get("why") or "")
-                                             + "；" + str(crit1 or ""))[:400]
+                                    # 失败原因要**可执行**（原版 critique 就是下一轮的
+                                    # 输入）：语义层说「材料不足以判断：缺 X」时，把 X
+                                    # 带进判词，下一轮才知道该去取哪一份材料。
+                                    # 只说「没有指认任何引文」等于让下一轮原地重撞。
+                                    _w = str(_r_out.get("why") or "")
+                                    _g = str(_r_out.get("gap") or "").strip()
+                                    if _g and _g[:40] not in _w:
+                                        _w += f"（材料缺：{_g[:120]}）"
+                                    crit1 = (_w + "；" + str(crit1 or ""))[:400]
                         # ---- (success, critique) 不可分契约（2026-10-26 补）----
                         # 原版 check_task_success **一次调用同时产出** success 与
                         # critique（voyager.py:232-238 返回二元组），结构上不存在
