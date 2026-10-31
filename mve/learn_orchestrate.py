@@ -1397,6 +1397,57 @@ async def _start_learning_impl(
                             crit1 = (_bind_why + ("；" + _tail if _tail else ""))[:400]
                             print(f"  · 来源未绑定 → 判未闭合：{_bind_why[:90]}",
                                   flush=True)
+                        # ---- 语义收口（2026-10-31，用户按 DeepSeek 定的职责划分）----
+                        # 取证归工具、判断归模型：材料已经取到手却没答到（判官说
+                        # 「你只交回了原文」），就**关掉工具**，只让模型在材料上
+                        # 作答 —— 这正是 V3.2 "Thinking in Tool-Use" 的分工，
+                        # 也是「发现一直回答不上 → 启动模型能力」。
+                        # 只在来源已绑定时才做：材料取错了对象时，再推理只会错得更远。
+                        _via_reason = False
+                        if not (ok1 and _inner_ok) and _bind_ok:
+                            try:
+                                import reason_pass as _rp
+                                _mat = _rp.material_text(_ev1)
+                            except Exception:
+                                _mat = ""
+                            if _mat and len(_mat) >= 120:
+                                print(f"  · 材料已到手（{len(_mat)} 字）但没答到 → "
+                                      f"关掉工具，在材料上作答", flush=True)
+                                _r_out = _rp.answer_over_material(
+                                    _q1, _mat, critique=str(crit1 or ""))
+                                if _r_out.get("ok"):
+                                    _r2 = dict(r1)
+                                    _r2["answer"] = str(_r_out.get("answer") or "")
+                                    try:
+                                        import task_critic as _tc3
+                                        import reward as _rw3
+                                        ok2, crit2 = _tc3.check_task_success(
+                                            _q1, str(crit1 or ""), _r2,
+                                            dimensions=[_d],
+                                            env_obs=_env_obs_block(exec_db or db_path),
+                                            prior_questions=list(
+                                                (_iters.get(_did) or {}).get("asked_q")
+                                                or []),
+                                            has_env=_rw3.scene_has_env(scene))
+                                    except Exception as e2:
+                                        ok2, crit2 = False, (
+                                            f"判官异常：{type(e2).__name__}: {e2}")
+                                    if ok2:
+                                        ok1, _inner_ok, _via_reason = True, True, True
+                                        crit1 = crit2
+                                        r1["answer"] = _r2["answer"]
+                                        r1["reason_pass"] = {
+                                            "verdict": _r_out.get("verdict"),
+                                            "quotes": len(_r_out.get("quotes") or []),
+                                            "material_chars": len(_mat)}
+                                        print("  · 语义收口通过同一把尺子 → 本条维度闭合",
+                                              flush=True)
+                                    else:
+                                        crit1 = ("语义层给了判断，判官仍不认："
+                                                 + str(crit2 or ""))[:400]
+                                else:
+                                    crit1 = (str(_r_out.get("why") or "")
+                                             + "；" + str(crit1 or ""))[:400]
                         # ---- (success, critique) 不可分契约（2026-10-26 补）----
                         # 原版 check_task_success **一次调用同时产出** success 与
                         # critique（voyager.py:232-238 返回二元组），结构上不存在
@@ -1442,6 +1493,11 @@ async def _start_learning_impl(
                             dim_codes.append({"id": _did, "question": _q1,
                                               "code": str(code1 or ""),
                                               "answer": str(a1 or ""),
+                                              # 事实记录：这条是靠取证后的语义收口
+                                              # 闭合的，还是取证当轮就闭合的
+                                              # （判据不变，只是让人看得出路径）
+                                              "how": "reason" if _via_reason
+                                              else "tool",
                                               "tools": list(tools_map.get(_did)
                                                             or []),
                                               # critic 出口沉淀的标量 reward

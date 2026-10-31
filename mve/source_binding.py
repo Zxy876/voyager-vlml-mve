@@ -1,28 +1,33 @@
-"""来源绑定：维度点名的数据源，必须**真的被查过**（2026-10-31，A 项）。
+"""来源绑定：题面点名的来源，必须**真的被取证过**（2026-10-31，A 项）。
 
-为什么需要这一层（生产实证，Scene H 2026-10-31 09:36 那轮）：
+为什么需要这一层（生产实证，Scene H）：
 
-    维度问：「web_facts 表中该仓库的 claim 字段内容是什么？」
-    执行层做：调了一次 `gh_repo_info("Zxy876/voyager-vlml-mve")`，
-              把仓库 description 当 "claim" 交上去。
-    闸门看到：材料非空（真取到一段正文）+ 答案措辞对得上 → 闭合。
-    结果：里程碑 3/5 → 4/5 → 5/5 全亮，技能库里多出一条「用仓库元数据
-          回答表字段问题」的错误配方。
+    ① 2026-10-31 09:36 维度问「web_facts 表中该仓库的 claim 字段内容是什么？」
+       执行层调 `gh_repo_info`，把仓库 description 当 claim 交上去 → 闸门看到
+       材料非空、措辞对得上就闭合 → 里程碑 3/5→4/5→5/5 全亮。
+    ② 同一天 10:14 维度问「README.md 文件中提供的仓库**最后更新时间**是什么
+       时候？」→ 执行层调 `gh_repo_info` 答 `updated_at` = 仓库元数据时间，
+       而问题要的是 **README 里写的**时间 → 又放行（r=1.0）。
 
-材料是真的，来源是错的。旧判据只问「取到没有」（`is_vacuous` / `real_calls`），
-从没问过「取的是不是**这一份**」。原版 Voyager 不会遇到这个：Minecraft 里
-问题与末态在同一空间，看得见 `iron_ore ×1` 就算数；SQL/文档场景里「别处的
-真数据」和「这里的答案」长得一模一样，必须显式判来源。
+两次都是：材料是真的、来源是错的。旧判据只问「取到没有」（is_vacuous /
+real_calls），从没问「取的是不是**这一份**」。
 
-判据是**结构化**的，不含任何词表：
+判据是**结构化**的，不含任何领域词表：
 
-    「维度题面里出现了本库 `show tables` 里的哪张表」→ 环境指认（表名来自
-    真实库，不是我们写的同义词表）
-    → 这些表里至少一张，必须有**一条 ok 的调用**其入参点到了它
-    → 没碰到 / 碰了失败 / 只用了别的工具 → 不闭合，判词指名道姓说清楚。
+    题面里出现了哪些「可指认来源」→ 按**最具体的目标**取一类：
+        带扩展名的文件名（README.md / payroll.duckdb…）
+        > URL（https://…）
+        > 仓库 slug（owner/repo）
+        > 本库 show tables 的真实表名
+    → 这一类里至少一个 token，必须有**一条 ok 的调用**其入参点到了它
+    → 没碰到 / 碰了失败 / 只用了别的工具 → 不闭合，判词指名道姓。
 
-为什么看「入参」而不是「返回文本」：返回里通常只有列名和值，不重复表名；
-入参（SQL 语句、仓库 slug、URL）才是"我问了谁"的原始凭据。
+为什么看「入参」而不是「返回文本」：返回里通常只有列名和值，不重复来源名；
+入参（SQL、仓库 slug、文件路径、URL）才是"我问了谁"的原始凭据。
+
+⚠️ 与「语义」的分界（2026-10-31 用户指出）：这一层只管**取证有没有打到对象上**，
+不管「答得对不对」。判断"是否准确/是否完整"是模型能力（见 reason_pass.py）——
+拿工具去代答语义问题，和拿语义去冒充取数，是同一类错。
 """
 
 from __future__ import annotations
@@ -33,6 +38,20 @@ from pathlib import Path
 from typing import Any
 
 _CACHE: dict[str, tuple[float, list[str]]] = {}
+
+# 带扩展名的文件名：**扩展名表是文件系统事实，不是领域词表**。
+# 只认这些扩展名，避免把 "1.5"/"a.b" 之类误当文件。
+_FILE_EXT = ("md", "markdown", "json", "jsonl", "csv", "tsv", "txt", "log",
+             "py", "js", "ts", "yaml", "yml", "toml", "ini", "cfg", "sql",
+             "duckdb", "db", "sqlite", "html", "htm", "pdf", "xlsx", "ipynb")
+_FILE_RE = re.compile(
+    r"(?<![A-Za-z0-9_.\-])([A-Za-z0-9_\-][A-Za-z0-9_.\-]{0,80}\."
+    r"(?:" + "|".join(_FILE_EXT) + r"))(?![A-Za-z0-9_])", re.IGNORECASE)
+_URL_RE = re.compile(r"https?://[^\s<>\"'）)，。；;]+", re.IGNORECASE)
+# owner/repo：两段 ASCII，各至少 1 字，允许 . - _；不含 CJK 段（"练习线/消费线"不匹配）
+_SLUG_RE = re.compile(
+    r"(?<![A-Za-z0-9_.\-/])([A-Za-z0-9][A-Za-z0-9_.\-]{0,38}"
+    r"/[A-Za-z0-9][A-Za-z0-9_.\-]{0,38})(?![A-Za-z0-9_.\-/])")
 
 
 def table_names(db_path: str) -> list[str]:
@@ -73,38 +92,72 @@ def _mentions(hay: str, name: str) -> bool:
     return re.search(pat, hay, re.IGNORECASE) is not None
 
 
-def named_sources(dim_text: str, db_path: str) -> list[str]:
-    """维度题面点名了本库的哪几张表（顺序按表清单，稳定）。"""
+def _dedup(xs: list[str]) -> list[str]:
+    out: list[str] = []
+    for x in xs:
+        if x and x.lower() not in {y.lower() for y in out}:
+            out.append(x)
+    return out
+
+
+def targets(dim_text: str, db_path: str) -> tuple[str, list[str]]:
+    """题面点名的来源，按「最具体的目标」取一类 → (kind, tokens)。
+
+    kind ∈ file / url / slug / table / ""（空 = 没点名，不约束）。
+    为什么要"取一类"而不是"全都要"：一个 URL 里同时含 slug 和文件名，
+    要求三者都命中会把「读 README」这种正确做法也判死；而只要求"任意一个"
+    又会让 `gh_repo_info` 冒充「README 里的时间」。取最具体那一类是唯一
+    既不漏也不冤的口径。
+    """
     txt = str(dim_text or "")
     if not txt:
-        return []
-    return [t for t in table_names(db_path) if _mentions(txt, t)]
+        return "", []
+    files = _dedup([m.group(1) for m in _FILE_RE.finditer(txt)])
+    if files:
+        return "file", files
+    urls = _dedup([m.group(0).rstrip(".,;") for m in _URL_RE.finditer(txt)])
+    if urls:
+        return "url", urls
+    slugs = _dedup([m.group(1) for m in _SLUG_RE.finditer(txt)])
+    if slugs:
+        return "slug", slugs
+    tables = [t for t in table_names(db_path) if _mentions(txt, t)]
+    if tables:
+        return "table", tables
+    return "", []
+
+
+def named_sources(dim_text: str, db_path: str) -> list[str]:
+    """兼容旧调用：返回被点名的那一类 token（顺序稳定）。"""
+    return targets(dim_text, db_path)[1]
+
+
+_KIND_CN = {"file": "文件", "url": "网址", "slug": "仓库", "table": "表"}
 
 
 def bind_hint(dim_text: str, db_path: str) -> str:
-    """执行前给模型的**硬约束**（和判据同一口径，先讲清再判）。
-
-    不给人看的一句话，是给模型的一句话：本题答案必须来自这几张表。
-    """
-    names = named_sources(dim_text, db_path)
-    if not names:
+    """执行前给模型的**硬约束**（和判据同一口径，先讲清再判）。"""
+    kind, toks = targets(dim_text, db_path)
+    if not toks:
         return ""
-    return ("\n\n【来源绑定】这条问题的答案在库里的 "
-            + "、".join(names)
-            + " 中 —— 必须真的查这几张表并把取到的值作为答案；"
-            "用别的数据源（仓库元数据、网页、记忆）顶替不算答到，判未闭合。"
-            "先 `SELECT * FROM " + names[0] + " LIMIT 1` 看清列名与真实取值。")
+    what = _KIND_CN.get(kind, "来源")
+    more = ("（先取它，再在材料上作答）" if kind in ("file", "url") else "")
+    return ("\n\n【来源绑定】这条问题点名了" + what + " "
+            + "、".join(toks)
+            + " —— 必须真的把" + what + "取到手并把取到的内容作为答案依据"
+            + more + "；用别的来源（仓库元数据、别的表、记忆）顶替不算答到，"
+            "判未闭合。")
 
 
 def check(dim_text: str, evidence: list[dict[str, Any]] | None,
           db_path: str) -> tuple[bool, str]:
-    """返回 (是否绑定, 不绑定的判词)。无点名表 / 无法归因 → (True, "")。
+    """返回 (是否绑定, 不绑定的判词)。无点名来源 / 无法归因 → (True, "")。
 
     「无法归因」= 证据条目里一条 `args` 都没有（老路径产的材料账没记入参）。
     这时不拦：判据只能判它看得见的东西，凭空判死比放过更糟。
     """
-    names = named_sources(dim_text, db_path)
-    if not names:
+    kind, toks = targets(dim_text, db_path)
+    if not toks:
         return True, ""
     items = [e for e in (evidence or []) if isinstance(e, dict)]
     if not any(str(e.get("args") or "").strip() for e in items):
@@ -115,19 +168,19 @@ def check(dim_text: str, evidence: list[dict[str, Any]] | None,
         hay = str(e.get("args") or "")
         if not hay:
             continue
-        for t in names:
+        for t in toks:
             if _mentions(hay, t):
                 (ok_hit if e.get("ok") else tried).add(t)
     if ok_hit:
         return True, ""
+    what = _KIND_CN.get(kind, "来源")
     if tried:
-        why = (f"本轮确实查了 {'、'.join(sorted(tried))}，但那次调用**没取到内容**"
-               "（报错/空结果）—— 表是对的，查询条件或列名要按实查清单改")
-    else:
-        used = [str(e.get("tool") or "?") for e in items if e.get("ok")]
-        uniq = sorted({u for u in used if u})[:4]
-        why = (f"这条问题问的是 {'、'.join(names)} 里的内容，但本轮**一步都没查它**"
-               f"（实际只用了 {'、'.join(uniq) if uniq else '没有可用调用'}）——"
-               "别处的真数据不能当它的答案。用能查库的原语（如 query_sql）"
-               f"直接查 {'、'.join(names)}，先 `SELECT * … LIMIT 1` 看清列与取值")
-    return False, why
+        return False, (f"本轮确实取了 {'、'.join(sorted(tried))}，但那次调用**没取到内容**"
+                       f"（报错/空结果）—— {what}是对的，换一种取法或换个路径再试")
+    used = sorted({str(e.get("tool") or "?") for e in items if e.get("ok")})
+    used = [u for u in used if u][:4]
+    return False, (
+        f"这条问题点名了{what} {'、'.join(toks)}，但本轮**一步都没取它**"
+        f"（实际只用了 {'、'.join(used) if used else '没有可用调用'}）——"
+        f"别处的真数据不能当它的答案。先把 {toks[0]} 取到手，再在取到的内容上作答"
+    )

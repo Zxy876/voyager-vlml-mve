@@ -156,7 +156,39 @@ def main() -> int:
     check("read_file 说明写清返回 text 字段", "text" in _desc["read_file"])
     check("list_files 说明写清是对象列表", "is_dir" in _desc["list_files"])
 
-    print("== 8. 真空防线不许被「单参调用」悄悄关掉 ==")
+    print("== 8. 题面点名的「文件 / 网址 / 仓库」也要绑定 ==")
+    # 生产实证 ②（2026-10-31 10:14）：维度问「README.md 文件中提供的仓库最后
+    # 更新时间是什么时候？」→ 执行层调 gh_repo_info 答 updated_at（仓库元数据），
+    # 不是 README 里写的时间 → 被放行 r=1.0。文件级绑定要拦住它。
+    qf = "README.md 文件中提供的仓库最后更新时间是什么时候？"
+    kind, toks = sb.targets(qf, DB)
+    check("识别出文件类目标（最具体优先）", kind == "file" and toks == ["README.md"],
+          f"{kind} {toks}")
+    ok, why = sb.check(qf, [{"tool": "gh_repo_info", "ok": True,
+                             "args": "Zxy876/voyager-vlml-mve",
+                             "text": "{\"updated_at\": \"2026-10-31T01:51:35Z\"}"}], DB)
+    check("拿仓库元数据答「README 里写的时间」→ 不绑定", ok is False, why)
+    check("判词写明点的是文件、实际用了什么", "README.md" in why
+          and "gh_repo_info" in why, why)
+    ok, why = sb.check(qf, [{"tool": "gh_read", "ok": True,
+                             "args": "Zxy876/voyager-vlml-mve README.md",
+                             "text": "# Voyager-VLML ... 最后更新：2026-10-30"}], DB)
+    check("真读了 README.md → 绑定", ok is True and why == "", why)
+
+    qu = "https://github.com/Zxy876/voyager-vlml-mve 的 readme 是否属实？"
+    check("识别出 URL 类目标", sb.targets(qu, DB)[0] == "url", str(sb.targets(qu, DB)))
+
+    qs = "Zxy876/voyager-vlml-mve 有多少 star？"
+    check("识别出仓库 slug 类目标", sb.targets(qs, DB) == (
+        "slug", ["Zxy876/voyager-vlml-mve"]), str(sb.targets(qs, DB)))
+    check("slug 题：只查了库表 → 不绑定",
+          sb.check(qs, [{"tool": "query_sql", "ok": True, "args": "select 1",
+                         "text": "1"}], DB)[0] is False)
+    check("文件名优先于库表（同题都点名时按最具体判）",
+          sb.targets("web_facts 里的 README.md 写了什么", DB) == ("file", ["README.md"]))
+    check("绑定提示指名道姓说出文件", "README.md" in sb.bind_hint(qf, DB))
+
+    print("== 9. 真空防线不许被「单参调用」悄悄关掉 ==")
     # 2026-10-31 H 实测：needs_data(question) 少传 has_env → 恒 False →
     # 「没取到真数」这条防线对所有场景失效（那一轮 calls=4/rows=0 被判 learned
     # 且「里程碑解锁：是」）。这里扫源码，任何生产调用都必须带第二个实参。
