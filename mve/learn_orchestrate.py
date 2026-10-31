@@ -1453,8 +1453,22 @@ async def _start_learning_impl(
                             if _mat and len(_mat) >= 120:
                                 print(f"  · 材料已到手（{len(_mat)} 字）但没答到 → "
                                       f"关掉工具，在材料上作答", flush=True)
+                                # 同类问题**验得对**的示范（DeepSeek cold-start 同构，
+                                # 见 reason_demos.py）：只教"怎么下判断"，材料仍是
+                                # 唯一事实来源。召回按题面词面重叠，不硬塞。
+                                _demos = ""
+                                try:
+                                    import reason_demos as _rd
+                                    _demos = _rd.render(_rd.recall(scene, _q1))
+                                    if _demos:
+                                        print("  · 带上 "
+                                              f"{_demos.count('示范 ')} 条同类示范"
+                                              "（已验对的判断过程）", flush=True)
+                                except Exception:
+                                    _demos = ""
                                 _r_out = _rp.answer_over_material(
-                                    _q1, _mat, critique=str(crit1 or ""))
+                                    _q1, _mat, critique=str(crit1 or ""),
+                                    demos_text=_demos)
                                 if _r_out.get("ok"):
                                     _r2 = dict(r1)
                                     _r2["answer"] = str(_r_out.get("answer") or "")
@@ -1482,6 +1496,18 @@ async def _start_learning_impl(
                                             "material_chars": len(_mat)}
                                         print("  · 语义收口通过同一把尺子 → 本条维度闭合",
                                               flush=True)
+                                        # 收一条示范：**只在验得对之后**（quotes 逐字
+                                        # 核验过 + 判官判过）—— 这就是 DeepSeek 的
+                                        # rejection sampling 口径：只留对的轨迹。
+                                        try:
+                                            import reason_demos as _rd2
+                                            if _rd2.add(scene, _q1, _r_out,
+                                                        material=_mat):
+                                                print("  · 这条判断收进示范库"
+                                                      f"（共 {_rd2.count(scene)} 条）",
+                                                      flush=True)
+                                        except Exception:
+                                            pass
                                     else:
                                         crit1 = ("语义层给了判断，判官仍不认："
                                                  + str(crit2 or ""))[:400]

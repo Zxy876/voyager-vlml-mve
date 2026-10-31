@@ -181,18 +181,23 @@ def verify_quotes(quotes: list[dict[str, Any]], material: str) -> tuple[bool, st
 
 def answer_over_material(task: str, material: str, *,
                          critique: str = "", llm: Any = None,
-                         max_tokens: int = 1800) -> dict[str, Any]:
+                         max_tokens: int = 1800, demos_text: str = "") -> dict[str, Any]:
     """在材料上作答一次（工具已关，不重取数）。
 
     返回 {"ok", "answer", "verdict", "quotes", "gap", "why"}。
     `ok=False` 表示这一步没产出可用答案（材料空/调用失败/引文核验不过），
     调用方据此保持"未闭合"，不要拿它当成功。
+
+    `demos_text` = 同类问题**验得对**的示范（见 reason_demos.py，DeepSeek 的
+    cold-start / rejection sampling 同构）。它只教"怎么下判断"，材料仍然是唯一
+    事实来源 —— 所以放在材料**前面**、并且明说"别照抄它的内容"。
     """
     mat = str(material or "").strip()
     if not mat:
         return {"ok": False, "why": "没有材料可读（取证阶段没取到内容）",
                 "answer": "", "verdict": "", "quotes": [], "gap": ""}
-    user = (f"问题：{task}\n\n"
+    user = ((str(demos_text).strip() + "\n\n") if str(demos_text or "").strip() else "") \
+        + (f"问题：{task}\n\n"
             + (f"上一轮被判未闭合的原因（供参考）：{str(critique)[:300]}\n\n"
                if str(critique or "").strip() else "")
             + f"材料（取自本次取证，未能再取新的）：\n{mat[:12000]}\n\n"

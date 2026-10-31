@@ -113,6 +113,24 @@ SCAFFOLD_SYSTEM_DB = """
   （如"Get salary of Zhou Lin"），也不要把整道大题当成一条维度。"""
 
 
+# 文档/仓库场景专属约束（2026-10-31）：只有在**真的把来源观察面取到手**时才追加。
+# 对应原版 Voyager 的 render_observation —— 出题器看得见环境，才不会拆出
+# 「README 里写的最后更新时间」这种环境里根本不存在的事实（H 实测踩到）。
+SCAFFOLD_SYSTEM_SOURCE = """
+
+【来源观察面专属约束 —— 必须严格遵守】
+下面给出了「题面点名的那个来源里**实际存在**的内容」（文件清单 + 正文节选，
+或明确写着没取到）。你拆维度时：
+- 每条维度断言的事实，必须在观察面里**找得到落点**（文件里确实有这段、清单里确实
+  有这个文件）；找不到落点的不许出；
+- 观察面里**看不见**的东西，不许假设它存在 —— 例如观察面里没有任何日期/时间字样，
+  就不许出「文件里写的更新时间是什么时候」；正文被截断时，只许检查"已给出的这部分"；
+- 验证类问题要写成「**说法与观察面对照**」的形式（「X 的描述与文件里写的 Y 是否一致」），
+  不要写成「X 是什么」（那会把取数当成作答，实测模型会交原文）；
+- 观察面写着「没取到」时，只许出「去取它 / 确认它是否存在」这类**取证维度**，
+  不许出以它的内容为前提的判断维度。"""
+
+
 def _default_llm(messages: list[dict[str, str]]) -> str:
     from llm_client import chat
     return chat(messages, temperature=0.3, max_tokens=1200)
@@ -311,8 +329,13 @@ def _clean_dims(data: dict[str, Any]) -> list[dict[str, str]]:
     return out
 
 
-def render_material(question: str, scene_id: str, *, extras: str = "") -> str:
-    """把「材料」渲染给模型：人问的那句话 + 这个场景现在有什么（复用观测，不另造）。"""
+def render_material(question: str, scene_id: str, *, extras: str = "",
+                    state: dict[str, Any] | None = None) -> str:
+    """把「材料」渲染给模型：人问的那句话 + 这个场景现在有什么（复用观测，不另造）。
+
+    `state` 是出参：把「这次到底喂进了哪份观察面」带回给 scaffold，用来决定
+    要不要追加来源观察面专属约束（同构原版：喂了环境观察，才配得上"看得见环境"的规则）。
+    """
     lines = [f"人想弄清楚的问题：{question}"]
     try:
         import task_decompose
@@ -331,6 +354,21 @@ def render_material(question: str, scene_id: str, *, extras: str = "") -> str:
         import scene_profile
         prof = scene_profile.profile(scene_id)
         lines.append(f"数据源：{prof.get('kind')}（{prof.get('why') or '本机/知识型'}）")
+    except Exception:
+        pass
+    # 文档/仓库场景：把题面点名的**那个来源里真有什么**喂进去（2026-10-31）。
+    # 数据场景靠上面那段 db_observation；文档场景一直没有同构物，于是 H 拆出了
+    # 「README.md 里写的仓库最后更新时间」——README 里根本没有时间这回事。
+    # 原版 Voyager 的 propose_next_task / decompose_task 都喂 render_observation，
+    # 出题器看得见环境才不会拆出不存在的子目标，这里补的就是那一份。
+    try:
+        import source_snapshot as _ss
+        _snap = _ss.snapshot(question, scene_id)
+        if _snap.get("text"):
+            lines.append("题面点名的来源里**实际存在**的内容（实查；维度只能指向"
+                         "这里面看得见的东西）：\n" + str(_snap["text"]))
+            if state is not None:
+                state["snapshot"] = _ss.describe(_snap)
     except Exception:
         pass
     if extras:
@@ -392,9 +430,16 @@ def scaffold(question: str, scene_id: str = "A", *, llm: Callable | None = None,
                     "milestone": _clean_milestone(cached, q),
                     "material_note": str(cached.get("material_note") or ""),
                     "origin": "cache", "reason": ""}
-    system_content = SCAFFOLD_SYSTEM + (SCAFFOLD_SYSTEM_DB if db_path else "")
+    # 先取观察面再拼 prompt：喂进了来源观察面，才配得上「看得见环境」的规则
+    # （同构原版 render_observation → propose_next_task 的先后顺序）。
+    _st: dict[str, Any] = {}
+    _material = render_material(q, scene_id, extras=extras, state=_st)
+    system_content = SCAFFOLD_SYSTEM + (SCAFFOLD_SYSTEM_DB if db_path else "") \
+        + (SCAFFOLD_SYSTEM_SOURCE if _st.get("snapshot") else "")
+    if _st.get("snapshot"):
+        print(f"  · 拆骨架前先看来源观察面：{_st['snapshot']}", flush=True)
     messages = [{"role": "system", "content": system_content},
-                {"role": "user", "content": render_material(q, scene_id, extras=extras)
+                {"role": "user", "content": _material
                  + "\n\n请产出追问骨架，只输出 JSON。"}]
     try:
         text = (llm or _default_llm)(messages)
