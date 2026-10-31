@@ -4,7 +4,7 @@
 
 > **线上面板**：<https://43.161.203.50:8443/mve/>（腾讯云，无鉴权，任何设备直接打开）
 > **仓库**：<https://github.com/Zxy876/voyager-vlml-mve>
-> **AI 解读（白皮书）**：<https://zread.ai/Zxy876/voyager-vlml-mve>
+> **AI 解读（白皮书）**：<https://zxy876.github.io/voyager-vlml-mve/>
 > **最后更新**：2026-10-31（判据修正：引文核验不误伤 JSON 字段值、材料截断如实标注、
 > 文档侧真空口径、配方白名单补 gh_*、里程碑重试封顶+冷却换题、执行反馈带错误行+返回形状；
 > 全局模型 glm-4-flash → glm-4.6，里程碑首次点亮）
@@ -24,7 +24,7 @@
 | 部署（服务器/面板/场景接入） | `部署.md` |
 | 跑通记录 | `MVE跑通记录.md` |
 
-AI 问答式解读（自动索引整个仓库、可追问任意模块）：**<https://zread.ai/Zxy876/voyager-vlml-mve>**
+AI 问答式解读（自动索引整个仓库、可追问任意模块）：**<https://zxy876.github.io/voyager-vlml-mve/>**
 
 ---
 
