@@ -1439,6 +1439,28 @@ async def _start_learning_impl(
                                 if _r_out.get("ok"):
                                     _r2 = dict(r1)
                                     _r2["answer"] = str(_r_out.get("answer") or "")
+                                    # 执行账按**材料账**重算（2026-10-31 实测）：
+                                    # learning_mechanism 那次材料 12004 字已在手，
+                                    # 但 solve 最终步没产出 RESULT → real_calls=0
+                                    # → 真空防线抢在闸门前面把语义答案判死，
+                                    # 判词还写成「每行都是空值」。材料账里 ok 条目
+                                    # 就是"真取到了内容"的直接证据，按它算才对。
+                                    _ex2 = dict(r1.get("execution") or {})
+                                    _ok_ev = [e for e in _ev1
+                                              if isinstance(e, dict) and e.get("ok")
+                                              and str(e.get("text") or "").strip()]
+                                    if _ok_ev:
+                                        _ex2["real_calls"] = max(
+                                            int(_ex2.get("real_calls") or 0),
+                                            len(_ok_ev))
+                                        _ex2["rows"] = max(
+                                            int(_ex2.get("rows") or 0), len(_ok_ev))
+                                        _ex2["calls"] = max(
+                                            int(_ex2.get("calls") or 0), len(_ok_ev))
+                                        _ex2["ok"] = True
+                                        _ex2["data_sources"] = sorted(
+                                            {str(e.get("tool") or "") for e in _ok_ev})
+                                    _r2["execution"] = _ex2
                                     try:
                                         import task_critic as _tc3
                                         import reward as _rw3

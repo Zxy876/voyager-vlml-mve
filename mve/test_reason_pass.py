@@ -142,6 +142,16 @@ def main() -> int:
                               mat_big)[0] is False)
     check("材料太短不触发（避免误伤短文）",
           rp.is_material_dump("x" * 400, "短材料。")[0] is False)
+    # 真实踩坑（2026-10-31 10:5x）：运行时 answer 是 json.dumps 过的字符串，
+    # 换行变成**两个字符** `\n`；材料是真换行 → 跨行片段永远匹配不上，
+    # 判据形同失效，README 全文照样通过。这条钉死它。
+    import json as _json
+    big_nl = "\n".join(f"第{i}段：本项目是一个在线强化学习系统，技能库即参数更新。"
+                       for i in range(40))
+    mat_nl = f"【材料·gh_read(README.md)】\n{big_nl}"
+    check("答案里换行被转义成 \\n 两字符 → 仍判搬运",
+          rp.is_material_dump(_json.dumps(big_nl, ensure_ascii=False),
+                              mat_nl)[0] is True)
 
     print("== 8. 接进学习主循环：只在来源已绑定时做，且过同一把尺子 ==")
     from pathlib import Path
@@ -154,6 +164,8 @@ def main() -> int:
     check("dim_codes 记事实：这条是取证闭合还是语义闭合", '"how": "reason"' in lo)
     check("搬运判据接进主循环（判官放过也拦得住）",
           "_rp.is_material_dump(" in lo and "答案是材料搬运" in lo)
+    check("语义收口重判时按材料账算执行账（否则真空防线抢在闸门前）",
+          '_ex2["real_calls"] = max(' in lo and '_r2["execution"] = _ex2' in lo)
     # 工具确实关掉了：语义层不 import 执行层、不 exec
     _src = (Path(__file__).resolve().parent / "reason_pass.py").read_text(
         encoding="utf-8")

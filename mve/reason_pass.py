@@ -85,7 +85,17 @@ def material_text(evidence: list[dict[str, Any]] | None, *,
 
 
 def _norm(s: str) -> str:
-    return re.sub(r"\s+", " ", str(s or "")).strip()
+    """归一化到「可比对」的形态：转义序列还原 + 空白压缩。
+
+    ⚠️ 2026-10-31 实测踩到：运行时交给判据的 answer 常是 `json.dumps` 过的字符串，
+    里面的换行是**两个字符** `\\n`；材料是原始正文（真换行）。只压缩空白的话，
+    跨行的材料片段永远匹配不上 → 搬运判据形同失效（README 全文照样通过）。
+    """
+    t = str(s or "")
+    for a, b in (("\\r\\n", " "), ("\\n", " "), ("\\t", " "),
+                 ('\\"', '"'), ("\\/", "/")):
+        t = t.replace(a, b)
+    return re.sub(r"\s+", " ", t).strip()
 
 
 def is_material_dump(answer: str, material: str, *,
