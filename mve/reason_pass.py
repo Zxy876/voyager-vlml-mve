@@ -88,6 +88,34 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", str(s or "")).strip()
 
 
+def is_material_dump(answer: str, material: str, *,
+                     slices: int = 3, span: int = 120) -> tuple[bool, int]:
+    """答案是不是**材料原文的搬运**（确定性判据，不花 LLM）。
+
+    为什么必须有一条确定性判据（2026-10-31 生产实证）：
+        同一个行为「gh_read → RESULT = 整篇 README」，10:0x 被 flash 判官连拒
+        5 次，10:3x 又被放过 2 次（`vlml_details` r=1.0，答案里就是 15145 字节
+        的 README 原文）。**判官会抖，判据不能抖。**
+
+    判法：从材料里均匀取 `slices` 段各 `span` 字，若多数能在答案里逐字找到，
+    就是搬运（对 JSON 包裹、截断、前后加话都成立 —— 因为查的是"材料片段是否
+    出现在答案里"）。答案本身很短（< 2×span）不会触发。
+    """
+    a = _norm(answer)
+    m = _norm(material)
+    if not a or len(m) < span * 2:
+        return False, 0
+    if len(a) < span:
+        return False, 0
+    hits = 0
+    for i in range(max(1, slices)):
+        start = int(len(m) * (i / max(1, slices)))
+        probe = m[start:start + span]
+        if probe and probe in a:
+            hits += 1
+    return hits >= 2, hits
+
+
 def verify_quotes(quotes: list[dict[str, Any]], material: str) -> tuple[bool, str]:
     """确定性核验：引文必须能在材料里逐字找到（可规则验证，不花 LLM）。
 

@@ -1224,14 +1224,14 @@ async def _start_learning_impl(
                         _bind_db = exec_db or db_path
                         try:
                             import source_binding as _sb
+                            _bind_desc = _sb.describe(_q1, _bind_db)
                             _bind_names = _sb.named_sources(_q1, _bind_db)
                             _bind_tip = _sb.bind_hint(_q1, _bind_db)
                         except Exception:
-                            _bind_names, _bind_tip = [], ""
-                        if _bind_names:
-                            print(f"  · 来源绑定：本题点名了库里的 "
-                                  f"{'、'.join(_bind_names)} → 答案必须真查它",
-                                  flush=True)
+                            _bind_desc, _bind_names, _bind_tip = "", [], ""
+                        if _bind_desc:
+                            print(f"  · 来源绑定：本题点名了{_bind_desc} → "
+                                  f"必须真的取到手", flush=True)
                         if _code_exec:
                             obs1, code1 = await local_agent.solve(
                                 _q1, local_dir or exec_dir, llm=llm,
@@ -1404,12 +1404,33 @@ async def _start_learning_impl(
                         # 也是「发现一直回答不上 → 启动模型能力」。
                         # 只在来源已绑定时才做：材料取错了对象时，再推理只会错得更远。
                         _via_reason = False
-                        if not (ok1 and _inner_ok) and _bind_ok:
+                        try:
+                            import reason_pass as _rp
+                            _mat = _rp.material_text(_ev1)
+                        except Exception:
+                            _rp, _mat = None, ""
+                        # ---- 搬运材料 ≠ 回答（确定性判据，先于判官）----
+                        # 2026-10-31 实测：同一个行为「gh_read → RESULT = 整篇
+                        # README」被判官连拒 5 次、又放过 2 次（vlml_details
+                        # r=1.0，答案就是 15145 字节原文）。**判官会抖，判据不能抖**。
+                        # 材料已经到手还交原文，说明它在用取数逻辑冒答语义题 ——
+                        # 判未闭合，接着走下面的语义收口（同一份材料上作答）。
+                        if _mat and ok1 and _inner_ok:
                             try:
-                                import reason_pass as _rp
-                                _mat = _rp.material_text(_ev1)
+                                _is_dump, _nhit = _rp.is_material_dump(
+                                    str(r1.get("answer") or ""), _mat)
                             except Exception:
-                                _mat = ""
+                                _is_dump, _nhit = False, 0
+                            if _is_dump:
+                                ok1 = False
+                                _inner_ok = False
+                                crit1 = ("你交回的是材料原文（答案里能逐字找到 "
+                                         f"{_nhit} 段材料），不是对问题的判断 —— "
+                                         "材料已经到手，直接在它上面作答："
+                                         "先给判断，再指认依据")[:300]
+                                print("  · 答案是材料搬运 → 判未闭合"
+                                      "（确定性判据，不听判官心情）", flush=True)
+                        if not (ok1 and _inner_ok) and _bind_ok:
                             if _mat and len(_mat) >= 120:
                                 print(f"  · 材料已到手（{len(_mat)} 字）但没答到 → "
                                       f"关掉工具，在材料上作答", flush=True)

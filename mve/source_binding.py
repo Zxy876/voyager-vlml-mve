@@ -135,6 +135,14 @@ def named_sources(dim_text: str, db_path: str) -> list[str]:
 _KIND_CN = {"file": "文件", "url": "网址", "slug": "仓库", "table": "表"}
 
 
+def describe(dim_text: str, db_path: str) -> str:
+    """日志用的一句话：`文件 README.md` / `表 web_facts` / 空串。"""
+    kind, toks = targets(dim_text, db_path)
+    if not toks:
+        return ""
+    return f"{_KIND_CN.get(kind, '来源')} {'、'.join(toks)}"
+
+
 def bind_hint(dim_text: str, db_path: str) -> str:
     """执行前给模型的**硬约束**（和判据同一口径，先讲清再判）。"""
     kind, toks = targets(dim_text, db_path)

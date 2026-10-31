@@ -125,7 +125,25 @@ def main() -> int:
     r = rp.answer_over_material("q", MAT, llm=_boom)
     check("调用异常 → ok=False 带原因", r["ok"] is False and "429" in r["why"], r["why"])
 
-    print("== 7. 接进学习主循环：只在来源已绑定时做，且过同一把尺子 ==")
+    print("== 7. 搬运材料 ≠ 回答（确定性判据，判官会抖判据不能抖）==")
+    # 2026-10-31 实测：gh_read→RESULT=整篇 README 被判官连拒 5 次、又放过 2 次
+    # （vlml_details r=1.0，答案是 15145 字节原文）。这条判据必须与判官无关。
+    big = "".join(f"第{i}段：本项目是一个在线强化学习系统，技能库即参数更新。"
+                  for i in range(40))
+    mat_big = f"【材料·gh_read(README.md)】\n{big}"
+    check("答案=材料全文 → 判搬运", rp.is_material_dump(big, mat_big)[0] is True)
+    check("JSON 包裹材料原文 → 仍判搬运",
+          rp.is_material_dump('{"answer": {"text": "' + big + '"}}',
+                              mat_big)[0] is True)
+    check("只搬了一半（后 2/3 丢失）→ 不误判为搬运",
+          rp.is_material_dump(big[: len(big) // 3], mat_big)[0] is False)
+    check("正常判断（一句话）→ 不判搬运",
+          rp.is_material_dump("部分属实：更新时间可指认，实现无法核对。",
+                              mat_big)[0] is False)
+    check("材料太短不触发（避免误伤短文）",
+          rp.is_material_dump("x" * 400, "短材料。")[0] is False)
+
+    print("== 8. 接进学习主循环：只在来源已绑定时做，且过同一把尺子 ==")
     from pathlib import Path
     lo = (Path(__file__).resolve().parent / "learn_orchestrate.py").read_text(
         encoding="utf-8")
@@ -134,6 +152,8 @@ def main() -> int:
           "_tc3.check_task_success(" in lo and "ok2, crit2" in lo)
     check("材料取错对象的轮次不启动（避免错上加错）", "and _bind_ok:" in lo)
     check("dim_codes 记事实：这条是取证闭合还是语义闭合", '"how": "reason"' in lo)
+    check("搬运判据接进主循环（判官放过也拦得住）",
+          "_rp.is_material_dump(" in lo and "答案是材料搬运" in lo)
     # 工具确实关掉了：语义层不 import 执行层、不 exec
     _src = (Path(__file__).resolve().parent / "reason_pass.py").read_text(
         encoding="utf-8")
