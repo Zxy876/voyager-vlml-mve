@@ -354,6 +354,16 @@ def main() -> int:
     # 不调 mark_used → H 场景 17 条技能 hits 全 0 → 面板全「未验证」、
     # 检索质量项恒 0 → 学到的配方永远爬不上来（人看到「学了没用」）。
     check("学习侧注入记账：retrieve 后必须 mark_used", "mark_used(" in _lo)
+    # 整题层换题（原版 learn() 语义，2026-10-31 用户拍板按原版改）：
+    # 一轮 0 闭合 = 这次 rollout 失败 → 记 failed、下一轮换题；
+    # 子目标层（inference）才 while progress < len(sub_goals)。两条都要在。
+    _sl = (Path(__file__).resolve().parent
+           / "scene_learn.py").read_text(encoding="utf-8")
+    check("整题层：一轮跑完要记 note_milestone_round", "note_milestone_round(" in _sl)
+    check("整题层：失败挂 cooldown → 下一轮换题（gate 在选题前）",
+          "milestone_cooldown(" in _sl and "tick_milestone_cooldown(" in _sl)
+    check("整题层：0 闭合不许 continue（要落到自由出题换题）",
+          "if _new:\n                        continue" in _sl)
     print(f"== 结果：{PASS} 过 / {FAIL} 挂 ==")
     return 1 if FAIL else 0
 

@@ -1457,6 +1457,13 @@ async def _start_learning_impl(
                                   + (f"｜执行报错：{_e1}" if _e1 else "")
                                   + f"｜调过：{','.join(sorted({s for o in obs1 for s in (o.get('data_sources') or [])})) or '无'}",
                                   flush=True)
+                            # 可观测性缺口（2026-10-31 用户指出「tools=[] 时看不到
+                            # 模型写了什么」）：失败必须留下它最后那段代码的指纹，
+                            # 否则只能靠判词猜它是"没写"、"写错"还是"根本没取数"。
+                            _code_hint = str(code1 or "").strip().replace("\n", " ⏎ ")
+                            print(f"  · 上次代码（{len(str(code1 or ''))} 字）："
+                                  f"{_code_hint[:300] or '（没产出代码）'}",
+                                  flush=True)
                         # 记一条追问历史（同 maieutic 的 appendPhase1Iteration）：
                         # **成没闭合都要记** —— 下次才知道这题问过、卡在哪一句。
                         #

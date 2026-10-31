@@ -443,10 +443,20 @@ def main() -> int:
             if _tgt:
                 _dbp = str((_sp.profile(scene) or {}).get("db_path") or "")
                 _unclosed = _ms.milestone_unclosed(scene, _tgt, db_path=_dbp)
-                if _unclosed:
+                _cool = _ms.milestone_cooldown(scene, _tgt)
+                if _unclosed and _cool > 0:
+                    # 整题层节流（原版 learn() 语义，2026-10-31）：上一次整题
+                    # rollout 0 闭合 = 这个 task 失败 → 下一轮**换题**，先做
+                    # N 道自由出题把前置能力长出来再回来（不是把维度判死）。
+                    _log(f"[场景学习] 里程碑「{_tgt[:36]}」上一轮整题 0 闭合"
+                         f"（原版 learn()：失败进 failed_tasks、下一轮换题）；"
+                         f"先做 {_cool} 道自由出题再回来重试"
+                         f"（还剩 {len(_unclosed)} 条未闭合维度，不跳过）。")
+                elif _unclosed:
                     _log(f"\n[场景学习] 当前里程碑「{_tgt[:42]}」有 {len(_unclosed)}"
                          f" 个未闭合维度 → 驾驶舱优先闭合它们"
                          f"（而不是自由出题）")
+                    _before = set(_ms.load_progress(scene, _tgt))
                     for _d in _unclosed:
                         if _asked_to_stop():
                             break
@@ -463,12 +473,24 @@ def main() -> int:
                         _log_learning_detail(_r0)
                         # 里程碑维度不进 cur.failed_tasks（那是自由课程的账）；
                         # 进度由 maieutic_scaffold.save_progress 记，断点续学认得。
+                    # 整题层记账（原版 update_exploration_progress）：本轮有几条
+                    # 新闭合 = 有没有进展。0 闭合 → 这次 rollout 算失败，挂
+                    # cooldown、**不 continue**（下一轮换题）；否则继续攻剩下的。
+                    _after = set(_ms.load_progress(scene, _tgt))
+                    _new = len(_after - _before)
+                    _rec = _ms.note_milestone_round(scene, _tgt, new_closed=_new)
+                    _log(f"[场景学习] 整题记账：本轮新闭合 {_new} 条"
+                         f"（累计轮次 {_rec.get('rounds')}、失败轮 "
+                         f"{_rec.get('fail_rounds')}）"
+                         + ("" if _new else
+                            " → 按原版 learn() 记 failed，下一轮让 curriculum 出新题"))
                     # 维度闭合只是**前置任务完成**，里程碑本身要重跑取到真数才算
                     # 成功（用户 2026-10-25：「完成前置任务后重试里程碑直至里程碑
                     # 任务成功为止」）。重试统一走下方「全闭合」分支，这里不再
                     # 顺手点亮 —— 旧版「失败也点亮 + 降级自由出题」正是缺的
                     # 「直至成功为止」循环语义、假掌握就是从这漏出去的。
-                    continue
+                    if _new:
+                        continue
                 # ---- 前置维度全闭合 → 重试里程碑直至成功（原版 inference 语义）----
                 # 子目标失败下一轮 while 立刻重试、无重试上限，唯一上限是外层
                 # max_iter；成功（重跑取到真数）才点亮解锁、清锚点降级自由出题。
@@ -582,6 +604,17 @@ def main() -> int:
                         critique=retry_critique)
         # 原版 curriculum.update_exploration_progress：成功进 completed、失败进 failed
         cur.update_exploration_progress(info)
+        # 整题层节流：做完一道自由出题 → 里程碑的 cooldown 减一（原版「学完
+        # 相邻任务再回来」）。到了 0，下一轮 while 才会重新进里程碑维度循环。
+        try:
+            import maieutic_scaffold as _msc
+            _t2 = _msc.current_target(scene)
+            if _t2 and _msc.milestone_cooldown(scene, _t2) > 0:
+                _left = _msc.tick_milestone_cooldown(scene, _t2)
+                _log(f"[场景学习] 自由出题完成一道 → 里程碑重试冷却 -1"
+                     f"（还剩 {_left}）")
+        except Exception:
+            pass
         _log(f"[场景学习] 进度 {iteration}/{max_iter}：已完成 "
              f"{len(cur.completed_tasks)} / 失败 {len(cur.failed_tasks)}"
              + ("（失败→Skipping to next task）" if not info.get("success") else ""))

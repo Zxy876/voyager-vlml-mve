@@ -830,6 +830,77 @@ def test_scaffold_llm_empty_is_failed_no_keyword_fallback() -> None:
     print("PASS  test_scaffold_llm_empty_is_failed_no_keyword_fallback")
 
 
+def test_milestone_round_failed_switches_task() -> None:
+    """整题层记账（原版 learn()）：0 闭合 → 记失败 + 冷却；有闭合 → 继续攻。
+
+    `voyager.py:313-336` 的 learn() 是 propose_next_task → rollout →
+    update_exploration_progress：失败**不重跑同一题**，下一轮换题；
+    只有 `inference(task, sub_goals)` 那一层才 while progress < len(sub_goals)。
+    MVE 的「一轮把未闭合维度试一遍」= 一次 rollout，所以：
+      · 本轮 0 新闭合 → fail_rounds+1，cooldown=MILESTONE_COOLDOWN（下一轮换题）；
+      · 本轮有闭合 → zero_rounds 归零、cooldown 不设（继续攻剩下的维度）。
+    还要守住一条：记账**不许碰 progress**（learned/codes/iterations 同住那儿）。
+    """
+    import maieutic_scaffold as M
+
+    tmp = Path(tempfile.mkdtemp())
+    old = M.CKPT
+    M.CKPT = tmp
+    try:
+        q = "这个仓库的readme写的属实吗"
+        M._atomic_write(M._cache_path("H", q), {
+            "question": q, "milestone": {"name": "仓库README真实性验证"},
+            "dimensions": [{"id": "dim1", "question": "维度一"},
+                           {"id": "dim2", "question": "维度二"}]})
+        M.save_progress("H", q, ["dim1"])
+        assert M.milestone_cooldown("H", q) == 0, "初始没有冷却"
+
+        rec = M.note_milestone_round("H", q, new_closed=0)
+        assert rec["zero_rounds"] == 1 and rec["fail_rounds"] == 1, rec
+        assert rec["rounds"] == 1, rec
+        assert M.milestone_cooldown("H", q) == M.MILESTONE_COOLDOWN, rec
+        # 不碰进度账
+        assert M.load_progress("H", q) == {"dim1"}, M.load_progress("H", q)
+
+        # 冷却要能被自由出题一道一道消掉
+        assert M.tick_milestone_cooldown("H", q) == M.MILESTONE_COOLDOWN - 1
+        while M.milestone_cooldown("H", q) > 0:
+            M.tick_milestone_cooldown("H", q)
+        assert M.milestone_cooldown("H", q) == 0
+
+        # 有进展 → 不算失败，零进展计数归零、不挂冷却
+        rec2 = M.note_milestone_round("H", q, new_closed=1)
+        assert rec2["zero_rounds"] == 0, rec2
+        assert rec2["rounds"] == 2 and rec2["fail_rounds"] == 1, rec2
+        assert M.milestone_cooldown("H", q) == 0
+    finally:
+        M.CKPT = old
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("PASS  test_milestone_round_failed_switches_task")
+
+
+def test_env_receipt_is_structured_not_a_verdict() -> None:
+    """失败回灌必须带**环境回执**（原版 `events` 同构），不是只有一句评语。
+
+    `voyager.py:255-272` 每步重建 human_message，带的是 events：bot 真做了什么、
+    环境怎么回它。我们此前只回灌 error 字符串 + 判官评语 → 模型只能照评语改
+    措辞，同一面墙连撞 10 轮（H 的 dim3/dim4 实测）。
+    """
+    import local_agent as LA
+
+    ev = [
+        {"tool": "query_sql", "ok": True, "text": '{"columns":["body"],"rows":[]}'},
+        {"tool": "gh_read", "ok": False, "error": "仓库里没有这个路径（404）"},
+    ]
+    out = LA._env_receipt(ev, ["query_sql", "gh_read"])
+    assert "调用过的数据源：query_sql、gh_read" in out, out
+    assert "query_sql → 取到" in out and "rows" in out, out
+    assert "gh_read → 失败：仓库里没有这个路径" in out, out
+    # 空轮次不硬凑一段空话
+    assert LA._env_receipt([], []) == ""
+    print("PASS  test_env_receipt_is_structured_not_a_verdict")
+
+
 def test_milestone_achieved_persist_and_readback() -> None:
     """里程碑点亮：mark_milestone_achieved 写盘后，milestone_state 读回（即便不传
     learned_ids 也 achieved=True、verified_real/lit_at 都在）—— "点亮变实"持久化。"""
@@ -933,6 +1004,8 @@ def main() -> None:
     test_rebuild_keeps_progress_account()
     test_save_progress_keeps_codes_and_iterations()
     test_given_up_dims_still_retried()
+    test_milestone_round_failed_switches_task()
+    test_env_receipt_is_structured_not_a_verdict()
     test_scaffold_llm_empty_is_failed_no_keyword_fallback()
     test_milestone_achieved_persist_and_readback()
     test_milestone_lit_retry_criterion()

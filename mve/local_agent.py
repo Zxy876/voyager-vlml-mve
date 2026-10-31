@@ -824,6 +824,11 @@ async def solve(question: str, scene_dir: str, *, llm=None,
         if o["ok"]:
             break
         fb = o["error"] or "RESULT 为空"
+        # 环境回执（原版 `events` 同构）：失败时不能只给一句评语，否则模型
+        # 只能照着评语改措辞 → 同一面墙连撞（见 _env_receipt 的说明）。
+        _rc = _env_receipt(evidence, tracer)
+        if _rc:
+            fb += "\n\n【上一次的环境回执】\n" + _rc
     return obs, code
 
 
@@ -1097,6 +1102,37 @@ def _evidence_item(name: str, ret: Any) -> dict[str, Any]:
         item["ok"] = False
         item["error"] = "工具返回的是失败说明，不是正文：" + _clip(item["text"], 120)
     return item
+
+
+def _env_receipt(evidence: list[dict[str, Any]] | None,
+                 tracer: list[str] | None,
+                 *, limit: int = 5, chars: int = 260) -> str:
+    """把上一轮的**环境回执**压成结构化文本（原版 `events` 同构）。
+
+    2026-10-31 用户按原版指出：`voyager.py:255-272` 每一步都重建 human_message，
+    里面带的是 `events` —— bot 真做了什么、环境怎么回它；不是一句自然语言评语。
+    我们此前只把 `error` 字符串（外加判官一句话）回灌给模型，于是它只能照着
+    评语改措辞，同一面墙连撞 10 轮（H 的 dim3/dim4 实测，判词几乎逐字相同）。
+
+    这里只陈述事实，**不判对错、不认任何词**：哪个工具、成功与否、返回正文前
+    N 字。没调过工具的轮次返回 ""（不硬凑一段空话）。
+    """
+    items = [x for x in (evidence or []) if isinstance(x, dict)]
+    called = [str(t) for t in (tracer or [])]
+    if not items and not called:
+        return ""
+    lines: list[str] = []
+    if called:
+        lines.append("调用过的数据源：" + "、".join(dict.fromkeys(called)))
+    for it in items[-limit:]:
+        name = str(it.get("tool") or "?")
+        if it.get("ok"):
+            body = str(it.get("text") or "").replace("\n", " ")
+            lines.append(f"· {name} → 取到 {len(body)} 字：{body[:chars]}")
+        else:
+            why = str(it.get("error") or "").replace("\n", " ")
+            lines.append(f"· {name} → 失败：{why[:chars]}")
+    return "\n".join(lines)
 
 
 def _recorder(tracer: list[str] | None, name: str,

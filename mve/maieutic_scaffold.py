@@ -1014,3 +1014,108 @@ def milestone_lit(scene_id: str, question: str) -> dict[str, Any]:
         }
     except Exception:
         return dict(empty)
+
+
+# ---------------------------------------------------------------------------
+# 整题（里程碑）层的 rollout 记账 —— 原版 learn() 的 update_exploration_progress
+# ---------------------------------------------------------------------------
+# 为什么必须有（2026-10-31 用户按原版指出）：原版 `voyager.py:313-336` 的
+# learn() 是
+#
+#     while True:
+#         task, context = curriculum.propose_next_task(...)   # 每轮出新题
+#         rollout(task)
+#         if info["success"]: skill_manager.add_new_skill(info)
+#         curriculum.update_exploration_progress(info)        # 失败只记 failed
+#
+# 失败 **不重跑同一题**，下一轮照旧让 curriculum 出新题；只有
+# `inference(task, sub_goals)` 那一层是 `while progress < len(sub_goals)`
+# —— 同一题的子目标才不跳过。
+#
+# MVE 此前把两层混成一层：里程碑（= 一个 task）每轮把所有未闭合维度重跑一遍，
+# 既不换题、也没有"整题失败"这个信号 → 一个跑不动的里程碑会永远吃掉一半预算
+# （实测 H：dim3/dim4 各撞 10 轮，每轮固定占掉 6~7 轮 iteration）。
+#
+# 映射：一轮"把所有未闭合维度试一遍" = 一次 rollout。
+#   · 本轮有维度新闭合 → 有进展（≈ progress+1），继续攻剩下的维度；
+#   · 本轮 0 闭合 → 这次 rollout 失败 → 记 failed，**下一轮换题**
+#     （落到自由出题），并挂一个 cooldown：先做 N 道自由出题把前置能力长出来，
+#     再回来重试一次（MVE_MILESTONE_COOLDOWN，默认 1）。
+#   这与"子目标不跳过"不冲突：cooldown 是整题层的节流，不是把维度判死。
+MILESTONE_COOLDOWN = int(os.environ.get("MVE_MILESTONE_COOLDOWN") or 1)
+
+
+def _rounds_rec(scene_id: str, question: str) -> tuple[Path, dict, dict]:
+    path = _cache_path(str(scene_id or "A"), str(question or ""))
+    data, _st = _read_cache(path)
+    if not isinstance(data, dict):
+        data = {}
+    rec = data.get("milestone_rounds")
+    return path, data, (dict(rec) if isinstance(rec, dict) else {})
+
+
+def note_milestone_round(scene_id: str, question: str, *,
+                         new_closed: int = 0) -> dict[str, Any]:
+    """记一次整题 rollout 的结果（见上方原版对照）。返回记账后的 dict。
+
+    只写 `milestone_rounds` 这一个键 —— 不碰 `progress`（learned/codes/
+    iterations 三本账同住 progress，整包替换会连坐，见 save_progress 的教训）。
+    """
+    q = str(question or "").strip()
+    if not q:
+        return {}
+    path, data, rec = _rounds_rec(scene_id, q)
+    zero = int(rec.get("zero_rounds") or 0)
+    fails = int(rec.get("fail_rounds") or 0)
+    tries = int(rec.get("rounds") or 0) + 1
+    if int(new_closed or 0) > 0:
+        zero = 0                       # 有进展 → 不是"打不动的题"
+    else:
+        zero += 1
+        fails += 1
+        rec["cooldown"] = max(0, MILESTONE_COOLDOWN)
+    rec.update({"rounds": tries, "zero_rounds": zero, "fail_rounds": fails})
+    data["milestone_rounds"] = rec
+    try:
+        _atomic_write(path, data)
+    except Exception:
+        pass
+    return rec
+
+
+def milestone_cooldown(scene_id: str, question: str) -> int:
+    """还要先做几道自由出题才回来重试这个里程碑（0 = 可以试）。"""
+    try:
+        _p, _d, rec = _rounds_rec(scene_id, str(question or ""))
+        return max(0, int(rec.get("cooldown") or 0))
+    except Exception:
+        return 0
+
+
+def tick_milestone_cooldown(scene_id: str, question: str) -> int:
+    """自由出题做完一道 → cooldown 减一（原版"学完相邻任务再回来"的节流）。"""
+    q = str(question or "").strip()
+    if not q:
+        return 0
+    try:
+        path, data, rec = _rounds_rec(scene_id, q)
+        if not rec:
+            return 0
+        cur = max(0, int(rec.get("cooldown") or 0))
+        if cur <= 0:
+            return 0
+        rec["cooldown"] = cur - 1
+        data["milestone_rounds"] = rec
+        _atomic_write(path, data)
+        return rec["cooldown"]
+    except Exception:
+        return 0
+
+
+def milestone_rounds(scene_id: str, question: str) -> dict[str, Any]:
+    """只读：整题层的记账（面板/日志用）。"""
+    try:
+        _p, _d, rec = _rounds_rec(scene_id, str(question or ""))
+        return rec
+    except Exception:
+        return {}
