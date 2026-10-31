@@ -166,6 +166,11 @@ def main() -> int:
           "_rp.is_material_dump(" in lo and "答案是材料搬运" in lo)
     check("执行账按材料账对齐（否则真空防线抢在闸门前）",
           '_ex1["real_calls"] = max(' in lo and 'r1["execution"] = _ex1' in lo)
+    # 白名单坑（2026-10-31 又踩一次）：dim_codes 写了 "how"，save_progress_codes
+    # 只搬白名单里的键 → 落盘后 how 全是 None。新字段必须同时进白名单。
+    _sc = (Path(__file__).resolve().parent / "maieutic_scaffold.py").read_text(
+        encoding="utf-8")
+    check("codes 白名单里有 how（新字段不许静默丢）", '"how"' in _sc)
     # 工具确实关掉了：语义层不 import 执行层、不 exec
     _src = (Path(__file__).resolve().parent / "reason_pass.py").read_text(
         encoding="utf-8")

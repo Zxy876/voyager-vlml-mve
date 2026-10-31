@@ -614,7 +614,11 @@ def save_progress_codes(scene_id: str, question: str,
                                     "code": str(c.get("code") or ""),
                                     "answer": str(c.get("answer") or ""),
                                     "tools": list(c.get("tools") or []),
-                                    "r": float(c.get("r", -1.0))}
+                                    "r": float(c.get("r", -1.0)),
+                                    # 事实记录：取证当轮闭合 / 语义收口闭合
+                                    # ⚠️ 新字段必须进这个白名单，否则静默丢失
+                                    # （"how" 2026-10-31 就丢了一次）
+                                    "how": str(c.get("how") or "")}
     for c in codes:                       # 本轮新跑的覆盖旧的
         cid = str(c.get("id") or "").strip()
         if cid and (str(c.get("code") or "").strip()
@@ -624,10 +628,11 @@ def save_progress_codes(scene_id: str, question: str,
                            "answer": str(c.get("answer") or "")[:800],
                            "tools": [str(x) for x in (c.get("tools") or [])
                                      if str(x).strip()],
-                           "r": float(c.get("r", -1.0))}
+                           "r": float(c.get("r", -1.0)),
+                           "how": str(c.get("how") or "")}
     pr["codes"] = [{"id": k, "question": v["question"], "code": v["code"],
                     "answer": v["answer"], "tools": v["tools"],
-                    "r": v["r"]}
+                    "r": v["r"], "how": v["how"]}
                    for k, v in merged.items()]
     data["progress"] = pr
     try:
