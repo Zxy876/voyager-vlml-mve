@@ -19,8 +19,11 @@ python mve/test_reason_pass.py        # 45 项 —— 本地实测 45/45 过
 python mve/test_evidence_material.py  # 34 项
 # 改环境变量时：模板见 mve/.env.example；真实值只存在于 mve/.env（已被 .gitignore 忽略，永不入库）
 
-# 服务器（43.161.203.50，ssh 私钥 ~/WorkBuddy/2026-09-24-23-06-19/outputs/neko_cloud/neko_deploy_key）
-ssh -i <key> root@43.161.203.50
+# 服务器（43.161.203.50）
+# SSH 私钥：2026-11-01 为重签的专用 key（mve_agent_20261101，公钥已装 authorized_keys）。
+#   不在本机工作的 agent：向管理员索取私钥文本，存为 ~/.ssh/mve_agent 并 chmod 600。
+#   登录测试：ssh -i ~/.ssh/mve_agent root@43.161.203.50 'echo OK'
+ssh -i ~/.ssh/mve_agent root@43.161.203.50
 systemctl restart mve-panel           # 改完代码必须重启，否则跑的是旧进程
 curl http://172.18.0.1:8777/mve/api/overview   # 面板 API（127.0.0.1 不通，必须走 docker 网桥 IP）
 ```
