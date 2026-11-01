@@ -69,3 +69,8 @@ scene_data/*/
 mve/failed_tasks.json
 # Maieutic 断点（里程碑锚点/骨架缓存：运行时状态，每台机器各自一份）
 mve/ckpt_maieutic/
+
+# 密钥与环境（永不入库）
+mve/.env
+.env
+*.env.bak.*
