@@ -12,9 +12,12 @@
 # 本地开发（代码在 ~/mve-repo，/tmp 里那些是旧快照，别用）
 cd ~/mve-repo && ls mve/ voyager_vlml/ docs/
 
-# 单测（本地能跑大部分；数据类要服务器）
-python mve/test_reason_pass.py        # 45 项
+# 本地环境（2026-11-01 已就绪，直接用）
+#   mve/.env 已从服务器拷齐（ZHIPU_API_KEY/BASE_URL/MODEL、MVE_CRITIC_MODEL、GITHUB_TOKEN，权限 600）
+#   依赖已装：duckdb + httpx + pypdf（requirements.txt 全集，其余全是标准库）
+python mve/test_reason_pass.py        # 45 项 —— 本地实测 45/45 过
 python mve/test_evidence_material.py  # 34 项
+# 改环境变量时：模板见 mve/.env.example；真实值只存在于 mve/.env（已被 .gitignore 忽略，永不入库）
 
 # 服务器（43.161.203.50，ssh 私钥 ~/WorkBuddy/2026-09-24-23-06-19/outputs/neko_cloud/neko_deploy_key）
 ssh -i <key> root@43.161.203.50
@@ -208,6 +211,13 @@ systemctl restart mve-panel
 - 他在意「百分百复现」：删任何仓库文件前想清楚，删了要有恢复办法（2026-10-31 恢复过 18 个 vectordb 文件）。
 - 提交信息写清楚「为什么」，他要的是可追溯的证据链。
 
+### 8.1 开发流程约定（2026-11-01 拍板，逐条照做）
+
+1. **本机优先**：所有改动先在本机（`~/mve-repo`）试过、测试全绿，他拍板后才推腾讯云。本机要能跑 MVE 系统本体（不依赖云服务器）；可以暂缺 vlml 以外的场景数据，但**必须支持 1→n 可插拔场景的版本——不能只 clone vlml 场景的分支**。
+2. **预览路由不污染主面板**：改动推上服务器时，在腾讯云多开一个路由（如 `/mve-preview/` 之类，仿照 `/mve*` 的 Caddy handle 块）存放/预览改动效果；**绝对不可以污染主面板 `/mve/`**。
+3. **日常工作流**：`看文档 → 想验证文档中的某个能力 → 去面板交互 → 写与预期之差 → 根据差决定要不要继续开发`。**不要改白皮书里的章节能力标题**；如果预期差大到他要去否定某能力，先停下来说明，那已经是要进开发了。
+4. **主线服务目标：文档声明和产品能力一致**。文档说了的能力，面板上必须真的能跑出来；跑不出来就修产品或改文档（改文档要他拍板）。
+
 ---
 
 ## 9. 文档索引（按需深挖）
@@ -225,4 +235,5 @@ systemctl restart mve-panel
 ## 10. 变更记录（向下追加）
 
 - 2026-10-31 上一个 agent 建此文件：整理代码地图、两层调度、判定铁律、四个判据 bug、当前状态、协作方式。
-- 2026-11-01 接手 agent 建本机开发环境：venv+依赖、面板本机 8877 跑通、1→n 插拔活体演示（场景 L）；修 2 处陈旧测试断言（ext_scene 缺库降级 / reachability 补 register_gh 桩）→ PR #1；test_judge_entry_parity 确认打桩陈旧（10-29 代码路径改造欠账）；新增 工作流程.md 与 预期差台账.md（主线=文档声明与产品能力一致）。
+- 2026-11-01 接手 agent 建本机开发环境：venv+依赖、面板本机 8877 跑通、1→n 插拔活体演示（场景 L）；修 2 处陈旧测试断言（ext_scene 缺库降级 / reachability 补 register_gh 桩）→ PR #1；test_judge_entry_parity 确认打桩陈旧（10-29 代码路径改造欠账）；新增 工作流程.md 与 预期差台账.md（主线=文档声明和产品能力一致）。
+- 2026-11-01 合并用户更新版：§0 本地环境说明、新增 §8.1 开发流程约定（四条拍板）。⚠️ 勘误：§0「.env 已从服务器拷齐」指原开发机（~/mve-repo）——当前工作机（/Users/zhangbing/WorkBuddy/MVE）没有该文件，mve/.env 为空 key 模板，ZHIPU_API_KEY / MVE_CRITIC_MODEL / GITHUB_TOKEN 待拷。
