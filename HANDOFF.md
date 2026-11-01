@@ -177,12 +177,18 @@ systemctl restart mve-panel
 - 中文白皮书 HTML 已上 GitHub Pages；deepwiki-open 已部署到 VPS（见 §8）。
 
 ### 没通 / 待办（按优先级）
-1. **3 条维度闭不上**（dependencies_list / code_quality / community_support 类）：gap 已进判词，但没跑够轮次验证是否收敛 → 先跑 3~5 轮看闭合率是否上升，再决定是加工具还是改判据。
-2. **「换值回测」佐证方案**（`docs/判官与技能真实性验证_会议纪要与论文对照.md` §4，已写待拍板）：技能入库后用 `:slot` 换真实实体值经 `_refill_sql` 重放 1~2 次 → `verified` / `unverified-variant`。对照 2010.02840 的 neighbor queries 思路，但**不做随机库 fuzzing**（我们没有 gold SQL）。
-3. **消费侧与学习侧是两把尺子**：`coach.explain` 未接 `source_binding` / 搬运判据 / 示范召回。
-4. **「组合多条配方」缺口**：学一堆原子技能答不出合成题（原版技能是可组合函数）。
-5. **技能语义去重**：`verify_table_existence` 存了 10 份；检索 `topic` 恒空。
-6. **EnvAdapter** 路线：天授 env 二分排除 → 修 → 判定作用域 → 回 SQL 验幻觉 → 消费同构（补联网工具线）。做完才能砍掉「知识型/数据型」分类，改用「环境指认」当判据。
+
+> 2026-11-01 逐条核实过（对着服务器真实数据 + 代码 grep），结论写在每条末尾。
+> **核实方法可复用**：`ckpt_maieutic/<场景>/*.json` 里比对 `dimensions` 与 `progress.learned`。
+
+1. **3 条维度闭不上** ✅**属实**（实测）：`3460ee02`（Voyager-VLML-MVE 仓库真实性验证）9 维闭合 6，未闭合的正是 `dependencies_list` / `code_quality` / `community_support`。gap 已进判词，但没跑够轮次验证是否收敛 → 先跑 3~5 轮看闭合率是否上升，再决定加工具还是改判据。
+   **补充事实**：该里程碑 6/9 却是 `achieved=True / lit=True / real=True` —— **点亮判据不是全维闭合**（原版语义：最后一条子目标成功即完成）。别为了"点亮"去凑全闭合。
+   **另**：H 场景共 8 个里程碑 34 维、闭合 23（68%）；除 3460ee02 外还有 4 个里程碑 `achieved=None`（未点亮），未闭合维度合计 11 条 —— 这 11 条是历史遗留，不是同一条线，别混为一谈。
+2. **「换值回测」佐证方案** ✅**属实（未实现）**：全仓 grep `unverified-variant|换值` 零命中；方案见 `docs/判官与技能真实性验证_会议纪要与论文对照.md` §4（89 行起）。技能入库后用 `:slot` 换真实实体值经 `_refill_sql` 重放 1~2 次 → `verified` / `unverified-variant`。对照 2010.02840 的 neighbor queries，但**不做随机库 fuzzing**（我们没有 gold SQL）。
+3. **消费侧与学习侧是两把尺子** ✅**属实**：`coach.py` 里 `source_binding|answer_over_material|reason_demos|搬运` 引用计数 **0**（`explain` 定义在 `coach.py:528`）。
+4. ~~「组合多条配方」缺口~~ ❌**已不成立（2026-10-29 已实现）**：`consume.py:1692/1702/1733` 真实调用 `_compose_sql`（③b 通道，把检索到的配方当材料让执行层写**一条**组合 SQL，配守卫 + 对题判官 + 双口径披露，`_compose_sql` 定义在 :372）。**剩余的真问题是效果**：组合题在实跑里是否被正确触发、口径是否稳 —— 这是要验证的问题，不是"没实现"。
+5. ~~技能语义去重 / 检索 topic 恒空~~ ❌**已不成立（数据已清）**：`/root/mve/mve/skill_store.json` 实测 25 条、无重名（`verify_table_existence` **0 条**，不是 10 份）、`topic` 为空条目 **0/25**。历史上有过（`skill_store.json.bak_clean1` 是清理前），现已不复现。**若再出现重复，先查是不是新代码又没走 generalize 去重。**
+6. **EnvAdapter 路线** ✅**属实（未接线）**：`mve/env_adapter.py` 221 行，但全仓（除自身）无 import/调用。路线：天授 env 二分排除 → 修 → 判定作用域 → 回 SQL 验幻觉 → 消费同构（补联网工具线）。做完才能砍掉「知识型/数据型」分类，改用「环境指认」当判据。
 
 ### 运行中的环境（别重复搭）
 - **deepwiki-open 中文白皮书**：`/root/deepwiki`，docker compose，Caddy 子域名 `wiki.zxthxinyue.xyz:8443`（自签证书），口令 `xinyue-wiki-2026`，生成走 glm-4.6 + 智谱 embedding-3。域名实名若未过审，解析会 `server hold`。
