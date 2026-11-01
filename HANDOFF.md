@@ -219,12 +219,13 @@ systemctl restart mve-panel
 7. **考核线未迁新后端**：练习线已迁，摸底/结业考仍走旧 `exam.py`。
 8. **掌握度挂在 `topic_id` 上**，不是「组合归档成的类」：设计要按组合类算，代码目前按题聚合。
 
-> 白皮书全文：`docs/index.html`（GitHub Pages: https://zxy876.github.io/voyager-vlml-mve/）——它的「已知限制」章节比本文件更全，改动架构相关逻辑前建议对着读一遍。
+> **文档迁就项目**（2026-11-01 用户定）：白皮书 `docs/index.html` 由**用户本人维护**（计划改用 deepwiki 问答 + 复制架构图的方式重写），以项目实际能力为准。HANDOFF 的基线是**代码 + 服务器数据实测**，不是任何文档——两边冲突时先实测，再改文档（改文档要用户拍板）。
+> 白皮书入口：`docs/index.html`（GitHub Pages: https://zxy876.github.io/voyager-vlml-mve/）——「已知限制」章节仍然值得对着读，它是产品级限制的完整清单。
 > ⚠️ 白皮书**完全不提** EnvAdapter / 天授诊断 / 换值回测 —— 印证它们不属于产品能力（前两个是内部工具，换值回测是未拍板的新方案），**别混进产品限制清单**。
 
 ### 6.2 运行中的环境（别重复搭）
 
-- **deepwiki-open 中文白皮书**：`/root/deepwiki`，docker compose，Caddy 子域名 `wiki.zxthxinyue.xyz:8443`（自签证书），口令 `xinyue-wiki-2026`，生成走 glm-4.6 + 智谱 embedding-3。域名实名若未过审，解析会 `server hold`。
+- **deepwiki-open 中文白皮书工作台**：`/root/deepwiki`，docker compose，入口 `https://wiki.zxthxinyue.xyz:8443`（**带 Basic Auth**，bcrypt 是用户新设的，凭证在用户手里，不在仓库/文档里），后端 glm-4.6 + 智谱 embedding-3。用途（2026-11-01 用户定）：**在 deepwiki 上提问 + 复制架构图来写白皮书**，不是全自动生成。域名实名已过审（serverHold 已解除）。
 - Caddy 配置由 `/root/neko/加一层口令.sh` 生成 —— **改 Caddyfile 必须同步改脚本模板**，否则重跑脚本就覆盖。单文件 bind mount 必须 `cat` 回写（`sed -i` 换 inode、`docker cp` 报 device busy）。
 - zread.ai 对本仓库索引失败（已弃用），GitHub Pages 是白皮书正路。
 
