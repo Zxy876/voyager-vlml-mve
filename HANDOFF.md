@@ -188,7 +188,10 @@ systemctl restart mve-panel
 3. **消费侧与学习侧是两把尺子** ✅**属实**：`coach.py` 里 `source_binding|answer_over_material|reason_demos|搬运` 引用计数 **0**（`explain` 定义在 `coach.py:528`）。
 4. ~~「组合多条配方」缺口~~ ❌**已不成立（2026-10-29 已实现）**：`consume.py:1692/1702/1733` 真实调用 `_compose_sql`（③b 通道，把检索到的配方当材料让执行层写**一条**组合 SQL，配守卫 + 对题判官 + 双口径披露，`_compose_sql` 定义在 :372）。**剩余的真问题是效果**：组合题在实跑里是否被正确触发、口径是否稳 —— 这是要验证的问题，不是"没实现"。
 5. ~~技能语义去重 / 检索 topic 恒空~~ ❌**已不成立（数据已清）**：`/root/mve/mve/skill_store.json` 实测 25 条、无重名（`verify_table_existence` **0 条**，不是 10 份）、`topic` 为空条目 **0/25**。历史上有过（`skill_store.json.bak_clean1` 是清理前），现已不复现。**若再出现重复，先查是不是新代码又没走 generalize 去重。**
-6. **EnvAdapter 路线** ✅**属实（未接线）**：`mve/env_adapter.py` 221 行，但全仓（除自身）无 import/调用。路线：天授 env 二分排除 → 修 → 判定作用域 → 回 SQL 验幻觉 → 消费同构（补联网工具线）。做完才能砍掉「知识型/数据型」分类，改用「环境指认」当判据。
+6. **EnvAdapter / 天授诊断** ✅**属实，但性质不是“待办”**：`mve/env_adapter.py`（221 行）+ `mve/tianshou_diagnose.py` 是一套**排除法诊断工具**——把 gymnasium env 包成「代码即动作」，reward/terminated 直接透传 env（**判官这个变量被设计掉**），用来回答「MVE 循环本身对不对」：机制正常 → 根因在判官；机制不正常 → 先修机制，别急着归因幻觉。**按设计就不接进主循环**，不是漏了接线（2026-11-01 用户澄清）。
+   **已经跑过并出过结论**（`eb8dc10` 提交正文，2026-10-28）：MOCK 自检均值 471（正常无趋势）；**LLM 真诊断序列 `0→9→9→214→…→68`，后半均值 115.6 ≥ 100 且上升 → 机制正常，根因锁定判官**；附带发现第 6 轮起漂移下降（214→68）= 没有「保留最优版本」机制的活证据，印证组内择优入库的必要性。
+   **复跑注意**：① 开关是**命令行参数**不是环境变量 —— `python mve/tianshou_diagnose.py MOCK`（2026-11-01 踩过：用 `MOCK=1` 会走真 LLM 路径）；② 2026-11-01 复跑真 LLM 版报「返回空内容」——疑似 glm-4.6 推理模型的 `content` / `reasoning_content` 分离所致，重跑前先看 `llm_client.chat_json` 的取值口径；③ 需要 `pip install gymnasium`。
+   **路线含义**（原「未做/路线」）：天授二分排除 → 修 → 判定作用域 → 回 SQL 验幻觉 → 消费同构（补联网工具线）；做完才能砍掉「知识型/数据型」分类，改用「环境指认」当判据。
 
 ### 运行中的环境（别重复搭）
 - **deepwiki-open 中文白皮书**：`/root/deepwiki`，docker compose，Caddy 子域名 `wiki.zxthxinyue.xyz:8443`（自签证书），口令 `xinyue-wiki-2026`，生成走 glm-4.6 + 智谱 embedding-3。域名实名若未过审，解析会 `server hold`。
