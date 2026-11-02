@@ -4,7 +4,7 @@
 
 > **线上面板**：<https://43.161.203.50:8443/mve/>（腾讯云，无鉴权，任何设备直接打开）
 > **仓库**：<https://github.com/Zxy876/voyager-vlml-mve>
-> **AI 解读（白皮书）**：<https://zxy876.github.io/voyager-vlml-mve/>
+> **技术白皮书**：<https://zxy876.github.io/voyager-vlml-mve/>（deepwiki 深读版，glm-4.6 阅读全仓生成）
 > **最后更新**：2026-11-01（定位改写：**面向开发者的端侧大模型能力验证框架**——习得是手段，
 > 验证是目的；标题与 §0 §11 按此口径重写）
 
