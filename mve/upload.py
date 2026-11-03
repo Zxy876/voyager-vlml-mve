@@ -212,6 +212,62 @@ def context_block(scene_id: str, max_rows: int = 12,
     return "\n".join(lines)[:budget + 2000]
 
 
+def uploads_manifest(scene_id: str, fresh_minutes: int = 0) -> str:
+    """给**学习侧**用的文件清单（read_file 该读哪个文件）。
+
+    为什么要这份清单（2026-11-03 场景 J 实测）：学习侧就算拿到了 read_file，
+    也不知道 uploads/ 里躺着 3 万字的文集 —— 它只会看见场景库里的 web_docs
+    表，于是把联网缓存当材料结晶。2026-10-29 的同类实测（工具菜单只给函数名，
+    模型不知道 gh_read 是"读 GitHub 仓库文件"）已经证明：**工具说明书就是
+    能力边界**。所以这里把「有什么文件、多少字、路径怎么写」直接写进提示。
+
+    `fresh_minutes=0` 表示不按时间过滤（学习可能在上传后很久才被拉起；
+    文件属于场景而不是某一次对话 —— 与消费侧 `context_block` 的 30 分钟
+    语义不同，那边是"本次请求的上下文"，这边是"场景里可读的材料"）。
+    """
+    items = _load_meta(scene_id)
+    if fresh_minutes > 0:
+        items = _fresh(items, fresh_minutes)
+    _db, sdir, _kind = _scene_db_path(scene_id)
+    rows: list[str] = []
+    for it in items[-8:]:
+        if str(it.get("kind") or "") not in ("text", "image"):
+            continue
+        tp = str(it.get("text_path") or "")
+        if not tp or not Path(tp).exists():
+            continue
+        try:
+            rel = str(Path(tp).resolve().relative_to(Path(sdir).resolve()))
+        except Exception:
+            rel = f"uploads/{Path(tp).name}"
+        _chars = int(it.get("chars") or 0)
+        rows.append(f"  · {it.get('name')}（{_chars} 字）→ read_file('{rel}')")
+    if not rows:
+        return ""
+    return ("【本场景 uploads/ 里可读的上传文件（用 read_file 读全文，"
+            "内容以文件为准，找不到的原话/数字绝不编造）】\n" + "\n".join(rows)
+            + "\n  ⚠️ uploads_meta.json / 上传索引只是元数据（文件名、字数），"
+              "**不是正文**；回答问题必须读上面列出的正文文件。")
+
+
+def uploads_corpus(scene_id: str, limit: int = 2_000_000) -> str:
+    """本场景所有上传文档的**全文拼接**（给引文字面守卫做确定性定位用）。"""
+    items = _load_meta(scene_id)
+    parts: list[str] = []
+    total = 0
+    for it in items:
+        if str(it.get("kind") or "") not in ("text", "image"):
+            continue
+        t = _item_text(it)
+        if not t:
+            continue
+        parts.append(t)
+        total += len(t)
+        if total >= limit:
+            break
+    return "\n".join(parts)[:limit]
+
+
 def _safe_stem(name: str) -> str:
     """文件名 → 合法表名后缀（中文保留，只把标点/空格折成下划线）。
 

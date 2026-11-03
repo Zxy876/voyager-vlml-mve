@@ -45,7 +45,7 @@ _FILE_EXT = ("md", "markdown", "json", "jsonl", "csv", "tsv", "txt", "log",
              "py", "js", "ts", "yaml", "yml", "toml", "ini", "cfg", "sql",
              "duckdb", "db", "sqlite", "html", "htm", "pdf", "xlsx", "ipynb")
 _FILE_RE = re.compile(
-    r"(?<![A-Za-z0-9_.\-])([A-Za-z0-9_\-][A-Za-z0-9_.\-]{0,80}\."
+    r"(?<![A-Za-z0-9_.\-])([A-Za-z0-9_\-\u4e00-\u9fff][A-Za-z0-9_.\-\u4e00-\u9fff]{0,80}\."
     r"(?:" + "|".join(_FILE_EXT) + r"))(?![A-Za-z0-9_])", re.IGNORECASE)
 _URL_RE = re.compile(r"https?://[^\s<>\"'）)，。；;]+", re.IGNORECASE)
 # owner/repo：两段 ASCII，各至少 1 字，允许 . - _；不含 CJK 段（"练习线/消费线"不匹配）

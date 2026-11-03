@@ -96,7 +96,15 @@ def profile(scene_id: str = "") -> dict[str, Any]:
         d = scene_dir(sid)
         dbs = sorted(Path(d).glob("*.duckdb")) if d else []
         if dbs:
-            out.update(kind=SCENE, db_path=str(dbs[0]),
+            # ⚠️ scene_dir **必须带上**（2026-11-03 场景 J 实测）：这个分支
+            # 只给了 db_path，profile["scene_dir"] 于是恒为 None —— 而学习侧
+            # `learn_orchestrate.py:695` 和消费侧 `consume.py:1311` 都读
+            # `prof.get("scene_dir")`，拿到 None → 本机原语（read_file/
+            # list_files）不注册 → 上传的文档（uploads/ 下的 sidecar）谁都
+            # 读不到 → 学习器只能把联网缓存的 web_docs 当材料结晶。
+            # 场景目录本来就是这个场景的「数据面」（upload.py 也把文件落这里），
+            # 与 kind=scene 不冲突：库仍是唯一可查的库，文件只是只读原语。
+            out.update(kind=SCENE, db_path=str(dbs[0]), scene_dir=str(d),
                        why=f"本机场景目录里的库：{Path(dbs[0]).name}")
             out["tables"] = _tables(str(dbs[0]))
         else:

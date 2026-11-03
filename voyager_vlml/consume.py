@@ -1168,6 +1168,18 @@ async def consume(
         # 一个上下文窗口。所以按**这一句话**去文件里挑相关段落（upload._pick_text），
         # 开头永远保留（文档的摘要/目录通常在前面）。
         _file_ctx = str(_upl.context_block(_scene_id, question=question) or "")
+        # ⚠️ 2026-11-03：上下文有 30 分钟时效（DeepSeek 语义），但**文件本身
+        # 一直在场景目录里**。原来过期后 _file_ctx 变空 → 规划员判「本次没有
+        # 上传」→ file 路直接不规划 → 只能去查 web_docs 缓存（场景 J 实测）。
+        # 现在把「可读文件清单」附上：read_file/list_files 已注册成本机原语，
+        # 过期只代表"不再自动贴进上下文"，不代表"读不到"。
+        try:
+            _upl_list = str(_upl.uploads_manifest(_scene_id) or "")
+        except Exception:
+            _upl_list = ""
+        if _upl_list:
+            _file_ctx = ((_file_ctx + "\n\n" + _upl_list).strip()
+                         if _file_ctx else _upl_list)
     except Exception:
         _file_ctx = ""
 
@@ -1308,7 +1320,7 @@ async def consume(
         _prof = _sp.profile(_scene_id)
         _scene_kind = str(_prof.get("kind") or "")
         _scene_why = str(_prof.get("why") or "")
-        _scene_dir = str(_prof.get("scene_dir") or "")
+        _scene_dir = str(_prof.get("scene_dir") or "") or _sp.scene_dir(_scene_id)
     except Exception as e:
         _scene_kind = ""
         _scene_why = f"场景后端判定失败：{type(e).__name__}: {e}"
@@ -1390,6 +1402,19 @@ async def consume(
         if _scene_kind == "scene":
             from scene_db import SceneDBEnv
             _env = SceneDBEnv(str((_prof or {}).get("db_path") or ""))
+            # ⚠️ 2026-11-03 场景 J 实测：scene 形态原来**只**给 SceneDBEnv（纯
+            # SQL），本机原语一个都不注册 → 用户上传的文档（uploads/ 下的
+            # sidecar）在消费侧只能靠 30 分钟过期的 context_block 读到，
+            # 过期后连「按文件作答」都做不到；同时技能里若用了 read_file，
+            # 重放直接 NameError。库形态与文件形态不冲突：query_sql 仍绑本场景
+            # 库（db_path 传进去），read_file/list_files 只读本场景目录
+            # （_resolve_under 沙箱 + 拒密钥文件）。
+            try:
+                import actions as _act
+                _act.register_local(_scene_id, _scene_dir,
+                                    db_path=str((_prof or {}).get("db_path") or ""))
+            except Exception:
+                pass
         else:
             # 本机原语注册成条目（origin=local / group=本机能力）——同构猫娘：
             # 插件（能力来源）+ 猫爪总开关（这一组的开关）+ 开关下面的条目。
@@ -2151,11 +2176,20 @@ async def consume(
                     # 规划负责合成（2026-10-29）：两半都有材料 → 让 LLM 对照
                     # 给出结论；合成失败退回机械拼接（如实分段，不假装合成）。
                     _syn = _compose_halves(question, _db_part, _wpart)
+                    # 口径按**被复用技能的材料来源**写（2026-11-03 场景 J）：
+                    # 从上传文档结晶的技能复现要同一份文件，说成"库内已验证"
+                    # 就是冒名（实测：标库内，实际查的是联网缓存的 web_docs）。
+                    _provs = {str((s or {}).get("provenance") or "")
+                              for s in (_ans_skills or skills or [])}
+                    _half_label = (
+                        "上传文件半场：引文可定位（复现需同一份文件）；"
+                        if _provs == {"upload"} else
+                        "库内半场：已验证取数（可复现）；")
                     if _syn:
                         answer = (_syn + "\n\n—— 口径 ——\n"
-                                  "库内半场：已验证取数（可复现）；"
-                                  "外部半场：联网 claim（未验证、不入库、"
-                                  "不计入学习曲线）")
+                                  + _half_label
+                                  + "外部半场：联网 claim（未验证、不入库、"
+                                    "不计入学习曲线）")
                     else:
                         answer = (_db_part
                                   + "\n\n—— 外部信息（联网检索） ——\n"

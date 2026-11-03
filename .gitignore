@@ -74,3 +74,5 @@ mve/ckpt_maieutic/
 mve/.env
 .env
 *.env.bak.*
+mve/plugins/
+mve/skill_emb.json

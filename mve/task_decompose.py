@@ -345,7 +345,8 @@ def _content_query(need: str) -> str:
 # 汇总：一次拆分 + 逐个子目标过可达性（学习循环的入口视图）
 # ---------------------------------------------------------------------------
 def plan(task: str, scene_id: str, *, llm: Callable | None = None,
-         db_path: str = "", scaffold: bool = False) -> dict[str, Any]:
+         db_path: str = "", scaffold: bool = False,
+         extras: str = "") -> dict[str, Any]:
     """拆分一次任务并给每个子目标标注抓手状态。
 
     `scaffold=True`（本机/知识型场景用）：**先**走 Maieutic 的追问骨架
@@ -376,7 +377,12 @@ def plan(task: str, scene_id: str, *, llm: Callable | None = None,
     if scaffold:
         try:
             import maieutic_scaffold
-            sc = maieutic_scaffold.scaffold(task, scene_id, llm=llm)
+            # `extras` 进材料块（render_material 已支持）：上传文档清单从这里
+            # 透传，否则拆骨架子只看得到场景库 —— 空库里会给「在 scene.duckdb
+            # 中查…」这种维度，把真正的材料（uploads/ 里的文集）挡在门外
+            # （2026-11-03 场景 J 实测）。
+            sc = maieutic_scaffold.scaffold(task, scene_id, llm=llm,
+                                            extras=str(extras or ""))
             dims = sc.get("dimensions") or []
             if dims:
                 dec = {"task": task, "scene_id": str(scene_id),

@@ -42,6 +42,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -309,6 +310,20 @@ def learn_milestone_skills(scene_id: str, topic_id: str, question: str,
         except Exception:
             _raw_dim = code
             pass
+        # ---- 材料来源标记 + 文本侧确定性守卫（2026-11-03 场景 J 事故后加）----
+        # 来源按**实际调用的工具**判（read_file/list_files → 上传文档；
+        # web_*/gh_* → 联网；其余 → 场景库）。来源不标记的后果是实测过的：
+        # 从 web 缓存结晶的技能被当成"库内已验证"复用，回访一路传下去。
+        _prov = _provenance_of(list(item.get("tools") or []), code)
+        _text_dim = (f"【{out['milestone'] or question[:30]}】"
+                     f"{item.get('question') or question}"
+                     f"：闭合这个维度时跑通的取数做法")
+        if _prov == "upload":
+            _qg = _upload_quote_guard(_text_dim, code, scene_id)
+            if _qg:
+                out["skipped"].append(did)
+                out.setdefault("quote_guard", []).append(_qg)
+                continue
         try:
             _act, key = skill_store.add(
                 # key = f"{topic}::{name}"（skill_store._key），所以 name 直接用
@@ -317,11 +332,10 @@ def learn_milestone_skills(scene_id: str, topic_id: str, question: str,
                 # ⚠️ 技能描述必须够长：`add()` 对 <MIN_LESSON_LEN(12) 的 text
                 # 直接 skipped（照原版 "Deposit useless items" 特判）。
                 # 光写维度问句在短问题上会静默丢技能 —— 补一句固定后缀。
-                f"【{out['milestone'] or question[:30]}】"
-                f"{item.get('question') or question}"
-                f"：闭合这个维度时跑通的取数做法",
+                _text_dim,
                 code=code,
                 source="learn",
+                provenance=_prov,
                 # 维度 id 是精确主键：不许相似度合并（实测把 differences 并进
                 # 了叫 def 的老条目，key 与实际维度对不上，面板报的配方名失真）。
                 exact_only=True,
@@ -473,9 +487,18 @@ async def learn_milestone_composite(scene_id: str, topic_id: str, question: str,
     text = (f"【里程碑{('：' + milestone_name[:40]) if milestone_name else ''}】"
             f"{question}：全维度闭合后组合出的整体取数做法"
             f"（维度配方组合，非单维度）")
+    # 材料来源 + 文本侧守卫：组合技能的配方由维度代码合成，来源按合成后的
+    # 代码实际调用的工具判（同一套口径，别让两条写入通道不同构）。
+    _prov_c = _provenance_of([], code)
+    if _prov_c == "upload":
+        _qg_c = _upload_quote_guard(text, code, str(scene_id or ""))
+        if _qg_c:
+            out["skipped"] = _qg_c
+            return out
     try:
         _act, key = skill_store.add(
             topic_id, "milestone", text, code=code, source="learn",
+            provenance=_prov_c,
             exact_only=True,
             # 组合技能的 r = 组成维度 r 的均值（全部无 r 时 -1，不计入择优）
             r=(lambda _rs: round(sum(_rs) / len(_rs), 3) if _rs else -1.0)(
@@ -494,6 +517,53 @@ async def learn_milestone_composite(scene_id: str, topic_id: str, question: str,
     except Exception as e:
         out["skipped"] = f"入库失败：{type(e).__name__}: {e}"
     return out
+
+
+def _provenance_of(tools: list[str], code: str = "") -> str:
+    """这条技能的材料**来自哪一面**：db / upload / web（2026-11-03）。
+
+    判据是**实际调用的工具**，不是场景种类：同一个场景里，读上传文档结晶的
+    技能和查库结晶的技能可信度不同 —— 前者复现要同一份文件，后者同库同 SQL
+    同结果。不标来源，「库内已验证（可复现）」这个口径就会被 web 缓存冒名
+    （场景 J 实测：标着库内验证，实际查的是联网抓回来的 web_docs）。
+    """
+    names = {str(t or "").lower() for t in (tools or [])}
+    try:
+        names |= {str(t).lower() for t in _called_tools(code)}
+    except Exception:
+        pass
+    if any(("read_file" in n) or ("list_files" in n) for n in names):
+        return "upload"
+    if any(n.startswith(("web_", "gh_")) for n in names):
+        return "web"
+    return "db"
+
+
+_UPLOAD_QUOTE_RE = re.compile(r"「([^」]{4,120})」|“([^”]{4,120})”")
+
+
+def _upload_quote_guard(text: str, code: str, scene_id: str) -> str:
+    """上传材料技能的确定性守卫：技能里的**引文**必须在文档全文中字面可定位。
+
+    与 `consume._sql_literal_guard` 同构（那边查库的取值域，这边查文档全文）：
+    LLM 判官有随机性，"文档里到底有没有这句话"不该赌它。返回拒绝原因；
+    '' = 通过。没有引文可查时放行（确定性只判可判的部分，不扩大否决面）。
+    """
+    try:
+        import upload as _upl_g
+        corpus = str(_upl_g.uploads_corpus(scene_id) or "")
+    except Exception:
+        return ""
+    if not corpus:
+        return ""
+    _c = re.sub(r"\s+", "", corpus)
+    for src in (text, code):
+        for m in _UPLOAD_QUOTE_RE.finditer(str(src or "")):
+            q = re.sub(r"\s+", "", (m.group(1) or m.group(2) or ""))
+            if len(q) >= 4 and q not in _c:
+                return (f"引文「{q[:30]}」在文档全文里定位不到 —— "
+                        f"大概率是幻觉原文，拒绝入库")
+    return ""
 
 
 def _called_tools(code: str) -> list[str]:
@@ -692,7 +762,14 @@ async def _start_learning_impl(
         return out
     use_vlml = prof["kind"] == scene_profile.VLML
     is_local = prof["kind"] == scene_profile.LOCAL
-    local_dir = str(prof.get("scene_dir") or "") if is_local else ""
+    # ⚠️ 2026-11-03 场景 J 实测：kind=scene（有库）的场景原来 local_dir 恒 ""，
+    # 于是 `available_grabs` 里 `if scene_dir:` 为假、register_local 不调用 ——
+    # 学习侧拿不到 read_file/list_files，lib/uploads/ 下用户上传的文档
+    # （sidecar 全文）谁都读不到，只能把 web_docs 联网缓存当材料结晶。
+    # 场景目录对 lib/ 只读原语是安全面（_resolve_under 只认本场景目录内、
+    # 拒密钥文件），库仍是唯一可查的库（query_sql 绑 db_path），不破隔离。
+    local_dir = ("" if use_vlml else
+                 str(prof.get("scene_dir") or scene_profile.scene_dir(scene)))
     scene_db = "" if (use_vlml or is_local) else str(prof["db_path"])
     db_path = db_path or scene_db          # 调用方显式给的优先
     out["backend"]["vlml"] = use_vlml
@@ -715,7 +792,10 @@ async def _start_learning_impl(
     # 开关（env，不给就 auto）：
     #   MVE_CODE_EXEC=0    → 全部退回旧路径（vlml→VLML agent，scene→SceneDBEnv）
     #   MVE_CODE_EXEC=all  → 连 VLML 场景也走代码路径（query_sql 只读它自己的库）
-    exec_dir = str(prof.get("scene_dir") or "")
+    # 场景目录：profile 没带（老场景数据）就用同一套推导兜底 —— 学习侧要读
+    # uploads/ 里的 sidecar，目录指错就白给了工具（2026-11-03）。
+    exec_dir = str(prof.get("scene_dir") or "") or (
+        "" if use_vlml else scene_profile.scene_dir(scene))
     # 代码路径要能查库：scene 用契约库，VLML 用它的数据面库（只读）
     exec_db = str(db_path or prof.get("db_path") or "")
     _mode = str(os.environ.get("MVE_CODE_EXEC", "auto")).strip().lower()
@@ -753,8 +833,16 @@ async def _start_learning_impl(
     # 拆解路线——传进来的就是一条已知可达、已知有 DB 落点的维度。
     if preset_dimension is not None:
         _use_scaffold = True
+    # 上传文件清单：**拆骨架前**就要给。规划员看不见 uploads/ 的话，空库里
+    # 只能拆出「在 scene.duckdb 中查…」这类维度，真正的材料被挡在门外
+    # （2026-11-03 场景 J：文集在库里查不到，维度全指向空库）。
+    try:
+        import upload as _upl_plan
+        _upl_manifest = str(_upl_plan.uploads_manifest(scene) or "")
+    except Exception:
+        _upl_manifest = ""
     plan = task_decompose.plan(question, scene, llm=llm, db_path=db_path,
-                               scaffold=_use_scaffold)
+                               scaffold=_use_scaffold, extras=_upl_manifest)
     out["plan"] = plan
     out["plan_origin"] = str(plan.get("origin") or "")
     # 预设维度（驾驶舱逐维度闭合里程碑）：这条维度已知可达、已知有 DB 落点，
@@ -956,14 +1044,24 @@ async def _start_learning_impl(
             # 题目上下文（口径说明：哪张表、字面量用哪个真实值）随维度进去——
             # 原版 voyager.py:419-424 的 context 槽。场景数据题执行层据此写
             # dept='技术' 而非常识的 '技术部'（2026-10-23 实测坑）。
-            _hint_ctx = [str(x).strip() for x in (str(context or ""), str(critique or ""))
+            # ⚠️ 2026-11-03 追加：**上传文件清单**也进 context 槽。不给清单，
+            # 学习器拿到 read_file 也不知道 uploads/ 里有什么（场景 J 实测：
+            # 只有 web_docs 表可见 → 把联网缓存当材料结晶）。
+            # 清单在上面的拆骨架前已算好（同一个字符串，别算两遍口径分叉）。
+            _upl_hint = _upl_manifest
+            out["uploads_hint"] = bool(_upl_hint)
+            _hint_ctx = [str(x).strip()
+                         for x in (str(context or ""), str(critique or ""),
+                                   _upl_hint)
                          if str(x or "").strip()]
             if _use_scaffold:
                 import local_agent
                 # 本机原语先注册成条目（origin=local / group=本机能力），
                 # 才谈得上被 `enabled_entries` 当抓手段交给执行层。
+                # db_path 一起传：scene 形态的库不在场景目录里时，query_sql
+                # 也要认它（2026-10-29 的「一个执行工具」口径）。
                 try:
-                    _act.register_local(scene, local_dir)
+                    _act.register_local(scene, local_dir, db_path=db_path)
                     _act.register_net(scene)
                     _act.register_gh(scene)
                 except Exception:

@@ -318,6 +318,7 @@ def add(
     source_scene: str = "default",
     exact_only: bool = False,
     r: float = -1.0,
+    provenance: str = "",
 ) -> tuple[str, str]:
     """写一条技能。返回 (动作, key)，动作 ∈ added / rewritten / skipped。
 
@@ -351,6 +352,13 @@ def add(
     实测 `consume_010245c5::def` 这条的 key 还叫 `def`，blueprint 已经是
     `differences` —— 面板与 CLI 报的配方名和它真正干的事对不上，人没法核。
     这与课程侧那条教训同一个口径（去重只许精确，相似度阈值撞过两次）。
+
+    `provenance`：这条技能的材料**来自哪一面**（2026-11-03 场景 J 事故后加）：
+      - `db`     —— 场景库里的表（取数、可复现：同库同 SQL 同结果）
+      - `upload` —— 用户上传的文档（引文可定位，但复现要同一份文件）
+      - `web`    —— 联网取回的正文（claim，未验证，不入"库内已验证"账）
+    场景 J 的教训：从 web 缓存结晶的技能被当成「库内已验证」复用，回访一路
+    传下去。来源不标记，人就没法判断一条技能到底该不该信。
     """
     text = str(text or "").strip()
     # 照 "Deposit useless items" 特判：没内容的经验不入库
@@ -415,6 +423,8 @@ def add(
         s["updated"] = now
         s["versions"] = int(s.get("versions") or 1) + 1
         s["source"] = str(source or s.get("source") or "practice")
+        if provenance:
+            s["provenance"] = str(provenance)
         # 场景归属：已有则保持原场景（技能属于它学到的那个场景），否则按本次标注
         s.setdefault("source_scene", str(source_scene or "default"))
         if blueprint:
@@ -433,6 +443,7 @@ def add(
         "versions": 1, "history": [],
         "source": str(source or "practice"),
         "source_scene": str(source_scene or "default"),
+        "provenance": str(provenance or ""),
         "blueprint": dict(blueprint or {}),
         "code": str(code or ""),
         **({"r": float(r)} if r >= 0 else {}),
