@@ -286,3 +286,4 @@ systemctl restart mve-panel
 - 2026-10-31 上一个 agent 建此文件：整理代码地图、两层调度、判定铁律、四个判据 bug、当前状态、协作方式。
 - 2026-11-01 接手 agent 建本机开发环境：venv+依赖、面板本机 8877 跑通、1→n 插拔活体演示（场景 L）；修 2 处陈旧测试断言（ext_scene 缺库降级 / reachability 补 register_gh 桩）→ PR #1；test_judge_entry_parity 确认打桩陈旧（10-29 代码路径改造欠账）；新增 工作流程.md 与 预期差台账.md（主线=文档声明和产品能力一致）。
 - 2026-11-01 合并用户更新版：§0 本地环境说明、新增 §8.1 开发流程约定（四条拍板）。⚠️ 勘误：§0「.env 已从服务器拷齐」指原开发机（~/mve-repo）——当前工作机（/Users/zhangbing/WorkBuddy/MVE）没有该文件，mve/.env 为空 key 模板，ZHIPU_API_KEY / MVE_CRITIC_MODEL / GITHUB_TOKEN 待拷。
+- 2026-11-03 接上传文档：根因是 `scene_profile.profile()` 的 kind=scene 分支不给 `scene_dir`，`read_file/list_files` 原语存在却从未注册进场景型环境 → 文档型场景学不到东西，只能把联网缓存结晶成技能（场景 J 心悦文集实证）。9 处改动见 PR #3；服务器已切到 `feat/learn-upload-path`（`20d6ca5`），回滚备份 `/root/_rollback_20261103_193545`（HEAD=68aaaf1）。⚠️ 旧 `ckpt_maieutic/<场景>` 缓存不重拆，要用新口径学需先清缓存。
