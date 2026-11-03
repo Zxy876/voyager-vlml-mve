@@ -8,7 +8,7 @@
 :root{
   --bg:#ffffff; --bg-soft:#f7f8fa; --text:#24292f; --text-soft:#57606a;
   --border:#e1e4e8; --accent:#0b57d0; --accent-soft:#e8f0fe;
-  --cover:#10214b; --cover-text:#eaf1ff; --gold:#c9a227;
+  --cover:#10214b; --cover-text:#eaf1ff;
 }
 *{box-sizing:border-box}
 body{
@@ -53,6 +53,11 @@ code{
   background:var(--bg-soft); border:1px solid var(--border); border-radius:4px;
   padding:1px 6px; font-size:.88em; font-family:"SF Mono",Menlo,Consolas,monospace;
 }
+pre{
+  background:#10214b; color:#dbe7ff; padding:18px 22px; border-radius:8px;
+  overflow-x:auto; font:13.5px/1.7 "SF Mono",Menlo,Consolas,monospace;
+}
+pre code{background:none; border:none; color:inherit; padding:0}
 
 /* ---------- 目录 ---------- */
 .toc{
@@ -95,7 +100,6 @@ th,td{border:1px solid var(--border); padding:9px 12px; vertical-align:top}
 .flow.split{align-items:stretch}
 .flow .branch{display:flex; flex-direction:column; gap:6px}
 .flow .ok{background:#e6f4ea; border-color:#bfe3cd; color:#137333}
-.flow .bad{background:#fdecea; border-color:#f5c6c0; color:#b3261e}
 
 /* ---------- 术语表 ---------- */
 dl.terms dt{font-weight:700; margin-top:16px}
@@ -124,9 +128,9 @@ footer{margin-top:80px; padding-top:24px; border-top:1px solid var(--border);
   <div class="doc" style="padding:0">
     <div class="kicker">TECHNICAL WHITEPAPER</div>
     <h1>Voyager-VLML-MVE<br>技术白皮书 · 导读版</h1>
-    <div class="subtitle">一个可运行的 LLM Agent 在线强化学习系统</div>
+    <div class="subtitle">让 LLM Agent 在真实数据世界里「越用越强」<br>—— 一个可复现的在线强化学习系统</div>
     <div class="meta">
-      <span>版本 1.0</span><span>2026 年 11 月</span><span>
+      <span>版本 2.0</span><span>2026 年 11 月</span><span>
       <a href="https://zxy876.github.io/voyager-vlml-mve/" style="color:#9db8e8">完整版白皮书 →</a></span>
     </div>
   </div>
@@ -136,82 +140,95 @@ footer{margin-top:80px; padding-top:24px; border-top:1px solid var(--border);
 
 <!-- ============ 摘要 ============ -->
 <div class="abstract">
-  <h2>摘要（一页看懂）</h2>
-  <p><strong>Voyager-VLML-MVE 把「Voyager」的在线学习方法从游戏世界搬到了真实数据库世界</strong>：系
-  统像一名学生一样刷题——从课程出题、动手查库取证、被判卷、到把做对的题沉淀成可复用的「技能」；
-  当人真正提问时，系统检索这些技能编排作答，并按复用情况记账「掌握度」。</p>
-  <p>三个核心能力：<strong>① 双线架构</strong>（学习线刷题积累、消费线复用作答，共享同一份技能库）；
-  <strong>② 防幻觉三闸</strong>（进技能库的东西必须真实取到数、字面量可指认、且不会无限膨胀）；
-  <strong>③ 1→n 可插拔场景</strong>（新接一个数据库领域，不改一行代码）。</p>
-  <p>本文是<strong>导读版</strong>：用最少的前提知识讲清系统是什么、怎么工作、凭什么可信、边界在哪。
-  所有技术细节（含代码行号级对照）见<a href="https://zxy876.github.io/voyager-vlml-mve/">完整版白皮书</a>。</p>
+  <h2>摘要</h2>
+  <p><strong>问题</strong>：大语言模型擅长「说」怎么做，但无法证明自己「做到过」。在真实数据库场景里，
+  它会幻觉出不存在的表名和数值，且每次回答都从零开始，问一百次不会比第一次更好。</p>
+  <p><strong>方案</strong>：本项目把 Voyager 的在线学习范式从游戏世界迁移到数据库世界——不重新训练模型，
+  而是让模型像学生一样刷题：出题、动手查库取证、被判卷、把做对的做法沉淀为技能；人提问时检索技能
+  编排作答，复用情况逐笔记账。三道闸门保证「进技能库的每一条都附带真实证据」。</p>
+  <p><strong>结果</strong>：知识图谱消融实验覆盖率 0% → 100%；新数据域一条命令接入、零代码改动、20 分钟
+  跑通完整学习闭环。系统全部开源，第五章给出本机复现路径。</p>
+  <p>本文是<strong>导读版</strong>：不要求读过 Voyager 论文或源码。行号级技术论证见
+  <a href="https://zxy876.github.io/voyager-vlml-mve/">完整版白皮书</a>。</p>
 </div>
 
 <!-- ============ 序言 ============ -->
 <h1 class="chapter" style="border-top:none; padding-top:0"><span class="no">序言</span></h1>
-<p>大语言模型很擅长「说」怎么做一件事，但不擅长<strong>证明自己真的做到过</strong>。问它一个数据库问题，
-它可能给出一段看起来正确的 SQL——也可能凭空编出一个根本不存在的表名。原版 Voyager 在游戏
-Minecraft 里给出了一种回答：让模型像学生一样<strong>反复练习、被批改、把成功的做法存成技能</strong>，
-越学越强。</p>
-<p>本系统要回答的问题是：<strong>这套「越用越强」的范式，能否在真实数据的世界里成立？</strong>真实世界
-没有游戏那样的即时得分，取数会失败、查询会串库、模型会幻觉——所以它比游戏难，也因此更有价值：
-它建立了一套「每一条被记住的知识，都附带着当时的真实证据」的纪律。</p>
-<p>这份白皮书面向所有想了解本系统的读者——不要求读过 Voyager 论文，也不要求读过源码。</p>
+<p>2023 年，NVIDIA 的 Voyager 项目展示了一种令人印象深刻的能力：一个 LLM Agent 在游戏
+Minecraft 里自主设定课程、执行任务、把成功经验写成技能存进代码库，能力随游玩时间单调增长。
+它不需要重新训练模型——模型权重不变，变的是模型身边那份<strong>自己挣来的技能库</strong>。</p>
+<p>这引出一个自然的问题：<strong>这套范式离开游戏还成立吗？</strong>游戏世界给了 Voyager 三样奢侈的
+东西：即时得分（系统知道任务成没成功）、可读的实现（技能就是源码，塞回提示词就能复用）、
+封闭世界（表名、物品、方块是有限的集合）。</p>
+<p>真实的数据世界一样都没有：没有标准答案、没有源码可看、表和字段开放且会变。本项目
+（Voyager-VLML-MVE）就是对这三个缺失的一一回应。这份白皮书讲清楚：问题是什么、现有方案
+缺什么、我们怎么解、证据在哪、以及<strong>你如何在自己电脑上复现它</strong>。</p>
 
 <!-- ============ 目录 ============ -->
 <nav class="toc">
   <h2>目录</h2>
   <ol>
-    <li><a href="#ch1">项目概述：它是什么，解决什么问题</a></li>
-    <li><a href="#ch2">核心理念：三条设计原则</a>
-      <div class="l2">2.1 双线架构 · 2.2 知识图谱是「看不见的教材」 · 2.3 证据优先</div>
+    <li><a href="#ch1">问题：为什么 LLM 在真实数据世界「越用越弱」</a>
+      <div class="l2">1.1 直接问大模型的四种失败 · 1.2 现有方案的不足 · 1.3 Voyager 的启示与迁移障碍</div>
+    </li>
+    <li><a href="#ch2">解决方案：Voyager-VLML-MVE</a>
+      <div class="l2">2.1 总体思路 · 2.2 双线架构 · 2.3 知识图谱 · 2.4 防幻觉三闸 · 2.5 掌握度与求助 · 2.6 场景系统</div>
     </li>
     <li><a href="#ch3">系统如何工作：一次学习的旅程，一次提问的旅程</a></li>
-    <li><a href="#ch4">可信设计：防幻觉三闸与判据分层</a></li>
-    <li><a href="#ch5">掌握度与求助：像老师一样记账</a></li>
-    <li><a href="#ch6">场景系统：1→n 可插拔</a></li>
-    <li><a href="#ch7">人机分工模型</a></li>
-    <li><a href="#ch8">验证与证据</a></li>
-    <li><a href="#ch9">能力边界与诚实声明</a></li>
-    <li><a href="#ch10">术语表与深入阅读</a></li>
+    <li><a href="#ch4">验证与证据</a></li>
+    <li><a href="#ch5">如何复现与参与</a></li>
+    <li><a href="#ch6">能力边界与诚实声明</a></li>
+    <li><a href="#ch7">术语表与深入阅读</a></li>
   </ol>
 </nav>
 
 <!-- ============ 一 ============ -->
-<h1 class="chapter" id="ch1"><span class="no">一、</span>项目概述</h1>
-<p class="chapter-sub">读完本章你应当能回答：这个系统是什么、和「直接问大模型」差在哪。</p>
+<h1 class="chapter" id="ch1"><span class="no">一、</span>问题：为什么 LLM 在真实数据世界「越用越弱」</h1>
+<p class="chapter-sub">先定义问题，再看现有方案为什么没解掉，最后说明可迁移的思想资产是什么。</p>
 
-<h2>1.1 它是什么</h2>
-<p>Voyager-VLML-MVE 是一个<strong>在线强化学习系统</strong>：它不重新训练模型，而是让模型在「做题—批
-改—沉淀」的循环里积累一份<strong>外挂的技能库</strong>。模型还是那个模型，但它身边多了一份自己写过、
-被验证过的解题配方集，以及一张记录「数据世界里什么值从哪张表来」的知识图谱。</p>
-
-<h2>1.2 它解决什么问题</h2>
+<h2>1.1 直接问大模型的四种失败</h2>
 <table>
-  <tr><th style="width:38%">直接问大模型</th><th>用本系统</th></tr>
-  <tr><td>答案无从核实，可能幻觉出表名、列名、数值</td><td>答案必须来自真实取到的数，字面量逐个可指认</td></tr>
-  <tr><td>每次都从零开始，问一百次答一百次</td><td>做对一次就沉淀为技能，下次直接复用</td></tr>
-  <tr><td>不知道「该值在哪张表哪个字段」时只能猜</td><td>知识图谱记录指标语义与列来源，写查询前先看「教材」</td></tr>
-  <tr><td>用没用提示、答得对不对，没有账本</td><td>掌握度按复用与求助情况逐笔记账</td></tr>
+  <tr><th style="width:34%">失败模式</th><th>具体表现</th></tr>
+  <tr><td><strong>幻觉</strong></td><td>编造不存在的表名、列名，甚至编出貌似合理的数值——且语气与真话无异</td></tr>
+  <tr><td><strong>无积累</strong></td><td>每次对话从零开始：第 100 次回答同样的查询，不会比第 1 次更快更好</td></tr>
+  <tr><td><strong>知其 tool 不知其值</strong></td><td>知道该「查询数据库」，不知道这个指标在哪张表哪个字段，只能猜</td></tr>
+  <tr><td><strong>不可核查</strong></td><td>回答无法追溯到「当时真实取到了什么数」，对了不知道为什么对，错了无法归因</td></tr>
 </table>
 
-<h2>1.3 核心成果一览</h2>
+<h2>1.2 现有方案的不足</h2>
 <table>
-  <tr><th style="width:30%">能力</th><th>一句话说明</th></tr>
-  <tr><td>双线架构</td><td>学习线刷题积累，消费线复用作答，共享一份技能库</td></tr>
-  <tr><td>防幻觉三闸</td><td>进库必真实、防膨胀、事实可溯源</td></tr>
-  <tr><td>知识图谱</td><td>回答「这个值从哪来」的教材层，A/B 实测覆盖率 0%→100%</td></tr>
-  <tr><td>掌握度记账</td><td>求助只给做法不给数值；用了提示打 0.85 折</td></tr>
-  <tr><td>1→n 可插拔场景</td><td>新场景一条命令接入，不重启、不清库、不改代码</td></tr>
-  <tr><td>九分区面板</td><td>学习曲线、技能库、因果时间线全链路可见</td></tr>
+  <tr><th style="width:22%">路线</th><th style="width:44%">做法</th><th>在数据场景的短板</th></tr>
+  <tr><td>微调 / RLHF</td><td>把领域能力训进模型权重</td><td>每换一个数据域都要重新训练；成本高、周期长，能力更新滞后于数据变化</td></tr>
+  <tr><td>RAG</td><td>检索文档片段拼进上下文</td><td>给的是「知识」不是「能力」：模型读到了 schema 文档，仍可能写出跑不通的查询，且没有对错反馈</td></tr>
+  <tr><td>纯 Agent 循环</td><td>ReAct 式边想边做</td><td>每轮的试错经验随会话丢弃——失败过的坑下一个问题接着踩</td></tr>
+  <tr><td>Text-to-SQL 微调</td><td>在 (问题, SQL) 对上训练</td><td>强依赖标注对；对 schema 演进和数据域切换脆弱，同样缺少在线改进回路</td></tr>
 </table>
+<p>共同缺口：都缺一个<strong>「从自己的成败中积累可复用经验」的在线闭环</strong>。</p>
+
+<h2>1.3 Voyager 的启示与迁移障碍</h2>
+<p>Voyager 证明了在线闭环可行，但它的三个前提在数据世界全部失效：</p>
+<table>
+  <tr><th style="width:34%">游戏世界的奢侈前提</th><th>数据世界的现实</th></tr>
+  <tr><td>即时得分：游戏API直接报成功/失败</td><td>查询跑通了 ≠ 取到了对的数 ≠ 回答了问题</td></tr>
+  <tr><td>技能即源码：成功代码直接塞回提示词复用</td><td>没有「源码」可看；要复用的是取数路径，不是代码文本</td></tr>
+  <tr><td>封闭世界：物品与方块有限可枚举</td><td>表、字段、指标开放且随业务演进</td></tr>
+</table>
+<p>所以问题可以精确表述为：<strong>把 Voyager 的「课程—执行—判卷—固化」闭环搬到数据世界，
+需要重建哪几块地基？</strong>这正是第二章的内容。</p>
 
 <!-- ============ 二 ============ -->
-<h1 class="chapter" id="ch2"><span class="no">二、</span>核心理念：三条设计原则</h1>
-<p class="chapter-sub">三条原则互为因果：双线决定「学到的给谁用」，图谱决定「凭什么写得对」，证据纪律决定「凭什么可信」。</p>
+<h1 class="chapter" id="ch2"><span class="no">二、</span>解决方案：Voyager-VLML-MVE</h1>
+<p class="chapter-sub">三个缺失 → 三块地基：判卷地基（双线+判据分层）、教材地基（知识图谱）、信任地基（三闸）。</p>
 
-<h2>2.1 双线架构：练习线和考试线分开</h2>
-<p>系统里有两条独立运转的线，共享同一份技能库与知识图谱：</p>
+<h2>2.1 总体思路</h2>
+<p>不训练模型，而是给模型两样外挂：</p>
+<ul>
+  <li><strong>一份技能库</strong>：每条技能 = 一次被验证成功的取数做法 + 当时的真实观测。模型做对过一次，就永远会做第二次；</li>
+  <li><strong>一张知识图谱</strong>：记录「什么指标、从哪张表哪个字段、用什么路径取」——回答「值从哪来」的教材。</li>
+</ul>
+<p>系统的全部设计纪律归结为一句话：<strong>凡是被机器复用的东西，必须附带真实证据。</strong></p>
+
+<h2>2.2 双线架构：练习线和考试线分开</h2>
 <div class="flow split">
   <div class="branch">
     <div class="step">学习线：出题 → 检索 → 动手执行 → 判卷 → 固化技能</div>
@@ -219,30 +236,51 @@ Minecraft 里给出了一种回答：让模型像学生一样<strong>反复练�
   </div>
   <div class="branch">
     <div class="step">消费线：人提问 → 检索技能 → 编排 → 叙述 → 裁判复核</div>
-    <div class="step ok">判据：裁判独立复核的覆盖率 —— 作为交付尺度</div>
+    <div class="step ok">判据：裁判独立复核 —— 作为交付尺度</div>
   </div>
 </div>
-<p>关键纪律是：<strong>消费只编排复用，不现做合成</strong>。回答人的问题时，系统组合已验证的技能，而不临场
-发明新做法——这保证了「考试考的都在练习范围内」，也让任何一条回答都能追溯到当初哪次练习验证过它。</p>
+<p>两条线共享同一份技能库与知识图谱，但判据语义不同。关键纪律：<strong>消费只编排复用，不现做
+合成</strong>——回答人的问题时组合已验证的技能，不临场发明。这让每条回答都能追溯到「当初哪次
+练习验证过它」。</p>
 
-<h2>2.2 知识图谱是「看不见的教材」</h2>
-<p>原版 Voyager 让模型写出能跑的游戏代码，靠的是把<strong>函数源码</strong>塞进提示词——模型看得见实现。
-但数据世界里没有「源码」可看：模型知道该调查询工具，却不知道<strong>值在哪张表哪个字段</strong>。</p>
-<p>本系统的答案是构建一张三层知识图谱（维度 → 工具 → 表），记录每个指标的语义、取数配方、各表
-字段与典型错误——相当于给模型一本<strong>看不见的教材</strong>，写查询前先翻书。</p>
-<div class="evidence"><div class="t">证据：这不是理念，是带对照组的实验</div>
-  同一道题（corrode_collapse）三种条件实测：<strong>无图谱 → 覆盖率 0%</strong>（连列都取错）；
-  <strong>图谱仅作提示 → 20% partial</strong>（骨架对但过滤位置错）；<strong>图谱 + 结构/参数硬断言 → 100%</strong>。
-  教训写在完整版里：提示打不过强先验，约束才行。
+<h2>2.3 知识图谱：给模型一本「看不见的教材」</h2>
+<p>原版 Voyager 复用技能靠把<strong>函数源码</strong>塞进提示词。数据世界没有源码可看，本系统用一张
+三层图谱（维度 → 工具 → 表）替代：记录每个指标的语义、取数配方、各表字段与典型错误。
+模型写查询前先翻书，而不是靠先验猜表名。</p>
+<div class="evidence"><div class="t">效果：同一道题，三种条件（第 1 轮、不求助）</div>
+  无图谱 → 覆盖率 <strong>0%</strong>（连列都取错）；图谱仅作提示 → <strong>20% partial</strong>（骨架对但过滤位置错）；
+  图谱 + 结构/参数硬断言 → <strong>100%</strong>。一条重要教训：提示打不过模型的强先验，<strong>约束</strong>才行。
 </div>
 
-<h2>2.3 证据优先：没有真实取数，就没有发言权</h2>
-<p>系统的判卷不是「模型说对就对」。任何一次判对，背后必须有真实执行过的取数动作与观测结果；
-任何一条进技能库的配方，都附带当时的真实观测。这条纪律贯穿第四章的「三闸」设计。</p>
+<h2>2.4 防幻觉三闸：进库的每一条都附带真实证据</h2>
+<table>
+  <tr><th style="width:22%">闸</th><th style="width:44%">拦什么</th><th>怎么拦</th></tr>
+  <tr><td><strong>闸一：防膨胀</strong></td><td>技能库被低质配方刷屏</td><td>入库三分支（added / rewritten / skipped）；少于 12 字或与已有技能相似度 ≥0.90 丢弃；检索每次最多 5 条</td></tr>
+  <tr><td><strong>闸二：回灌闸</strong></td><td>技能描述与真实执行脱节</td><td>判卷后的真实观测回灌进技能内容；解析失败重试，不靠想象补全</td></tr>
+  <tr><td><strong>闸三：事实溯源</strong></td><td>结论里的数值、表名是编的</td><td>叙述中的字面量必须全部能在真实取数结果中指认，指认不出就不许说</td></tr>
+</table>
+<p>判卷采用「<strong>LLM 判 + 确定性否决</strong>」：全程没调过数据源 → 直接判负（真空防线）；执行层报错 →
+直接判负；LLM 只在硬否决通过后裁决。判错<strong>不写技能库</strong>——错误做法不进库，因此不会经
+复用链传播。</p>
+
+<h2>2.5 掌握度与求助：像老师一样记账</h2>
+<p>学生卡住可以求助，但只讲思路、绝不报数值——给数值等于泄题。求助记录在案：</p>
+<table>
+  <tr><th style="width:44%">情形</th><th>记账结果</th></tr>
+  <tr><td>答对，且没用提示</td><td>半衰期拉长（记忆更牢）</td></tr>
+  <tr><td>答对，但用了提示</td><td>得分打 <code>0.85</code> 折，半衰期不动——不计全功，也不惩罚</td></tr>
+  <tr><td>答错</td><td>进失败账本，反哺出题——从哪里跌倒就从哪里再出题</td></tr>
+  <tr><td>消费侧复用技能</td><td>掌握度累计，重复提问可见增长</td></tr>
+</table>
+
+<h2>2.6 场景系统：1→n 可插拔</h2>
+<p>每个场景（数据域）有独立的技能库、图谱与数据工作区，<strong>非默认场景不继承默认库</strong>——这条
+隔离契约来自真实教训：曾有查询跨库取到了另一个数据域的数据。四种场景类型覆盖从「绑定数据
+库」到「数据源就是本机」的常见形态；插入新场景不重启、不清库、不改代码（实测见第四章）。</p>
 
 <!-- ============ 三 ============ -->
 <h1 class="chapter" id="ch3"><span class="no">三、</span>系统如何工作</h1>
-<p class="chapter-sub">用两次「旅程」讲清机制：一次学习，一次提问。</p>
+<p class="chapter-sub">两次「旅程」讲清机制。对照阅读：每个环节在完整版里都有 file:line 级论证。</p>
 
 <h2>3.1 一次学习的旅程（六阶段闭环）</h2>
 <div class="flow">
@@ -253,11 +291,9 @@ Minecraft 里给出了一种回答：让模型像学生一样<strong>反复练�
   <div class="step">⑤ 结晶</div><span class="arr">→</span>
   <div class="step">⑥ 里程碑</div>
 </div>
-<p><strong>① 出题</strong>：课程规划器依据知识图谱的缺口出题——哪里没覆盖，就练哪里；
-<strong>② 检索</strong>：从技能库召回相关配方作为参考（最多 5 条，见第四章防膨胀）；
-<strong>③ 执行</strong>：模型生成查询并真实执行，逐条记录工具调用与返回观测；
-<strong>④ 判卷</strong>：判据层裁决（详见 4.3），失败进「失败账本」并反馈给出题器；
-<strong>⑤ 结晶</strong>：成功的做法连同真实观测被固化成技能；
+<p><strong>① 出题</strong>：课程规划器依据图谱缺口出题，哪里没覆盖练哪里；<strong>② 检索</strong>：召回相关技能
+作参考（≤5 条）；<strong>③ 执行</strong>：生成查询并真实执行，逐条记录工具调用与返回；<strong>④ 判卷</strong>：
+判据分层裁决，失败进失败账本；<strong>⑤ 结晶</strong>：成功做法连同真实观测固化为技能（过三闸）；
 <strong>⑥ 里程碑</strong>：多个技能组合成复合技能，标记能力台阶。</p>
 
 <h2>3.2 一次提问的旅程（消费线）</h2>
@@ -269,130 +305,84 @@ Minecraft 里给出了一种回答：让模型像学生一样<strong>反复练�
   <div class="step">裁判复核</div><span class="arr">→</span>
   <div class="step">掌握度 +1</div>
 </div>
-<p>回答完成后由<strong>裁判</strong>独立取数复核（不是出题的那个角色自评），复核结果按掌握度规则记账
-（第五章）。复用发生时，回答会明确标注「本答案复用了哪条技能、来自哪次学习」。</p>
+<p>回答完成后由<strong>裁判</strong>独立取数复核（与出题、答题角色分离，避免自评）。回答明确标注复用了
+哪条技能、来自哪次学习。</p>
 
 <!-- ============ 四 ============ -->
-<h1 class="chapter" id="ch4"><span class="no">四、</span>可信设计：防幻觉三闸与判据分层</h1>
-<p class="chapter-sub">本章回答一个问题：凭什么相信技能库里的东西是真的。</p>
+<h1 class="chapter" id="ch4"><span class="no">四、</span>验证与证据</h1>
+<p class="chapter-sub">所有关键声明都附可复现的实测。</p>
 
-<h2>4.1 三道闸，各拦一类假</h2>
-<table>
-  <tr><th style="width:22%">闸</th><th style="width:44%">拦什么</th><th>怎么拦</th></tr>
-  <tr><td><strong>闸一：防膨胀</strong></td><td>技能库被低质配方刷屏，检索被垃圾淹没</td><td>入库三分支（added / rewritten / skipped）；少于 12 字或与已有技能相似度 ≥0.90 直接丢弃；检索每次最多进 5 条</td></tr>
-  <tr><td><strong>闸二：回灌闸</strong></td><td>技能描述与真实执行结果脱节</td><td>判卷后的真实观测回灌进技能内容；解析失败有重试，不靠想象补全</td></tr>
-  <tr><td><strong>闸三：事实溯源</strong></td><td>结论里的数值、表名是编的</td><td>叙述中的字面量必须全部能在真实取数结果中指认，指认不出就不许说</td></tr>
-</table>
-<div class="note"><div class="t">一条重要的分工纪律</div>
-  判错<strong>不写技能库</strong>——错误的做法不进库，因此不会通过复用链传播。三闸保护的对象是技能库
-  的纯净度：只要库是干净的，复用链上的一切（检索、编排、叙述）就建立在真证据上。
-</div>
-
-<h2>4.2 判据分层：LLM 判 + 确定性否决</h2>
-<p>判卷既不是纯 LLM 说了算，也不是死规则：</p>
-<ul>
-  <li><strong>确定性否决先行</strong>：全程没调过任何数据源 → 直接判负（「真空防线」）；执行层报错 → 直接判负，都不劳烦 LLM。</li>
-  <li><strong>LLM 只在硬否决通过后裁决</strong>：判断做法是否真正回答了问题。</li>
-  <li><strong>判据层与掌握度层分离</strong>：判据层只产出 success 布尔；掌握度是另一本账（第五章），两层互不驱动。</li>
-</ul>
-
-<!-- ============ 五 ============ -->
-<h1 class="chapter" id="ch5"><span class="no">五、</span>掌握度与求助：像老师一样记账</h1>
-<p class="chapter-sub">掌握度不是分数，是「带半衰期的记忆账本」。</p>
-
-<h2>5.1 求助闭环：只给做法，不给数值</h2>
-<p>学生卡住时可以求助，但老师<strong>只讲思路、绝不报答案</strong>——给数值等于泄题。求助被记录在案：
-本次答题用了提示。</p>
-
-<h2>5.2 记账规则</h2>
-<table>
-  <tr><th style="width:44%">情形</th><th>记账结果</th></tr>
-  <tr><td>答对，且没用提示</td><td>记忆增强：半衰期拉长</td></tr>
-  <tr><td>答对，但用了提示 / 求助解释</td><td>得分打 <code>0.85</code> 折，半衰期不动——不计全功，但也不惩罚</td></tr>
-  <tr><td>答错</td><td>进失败账本，反哺课程出题</td></tr>
-  <tr><td>消费侧复用技能作答</td><td>掌握度累计（例如首次复用记 1/30），重复导入同一问题可见增长</td></tr>
-</table>
-
-<!-- ============ 六 ============ -->
-<h1 class="chapter" id="ch6"><span class="no">六、</span>场景系统：1→n 可插拔</h1>
-<p class="chapter-sub">从一个游戏数据域，到任意数据库领域，扩展成本是一条命令。</p>
-
-<h2>6.1 场景是隔离的基本单位</h2>
-<p>每个场景有独立的技能库、知识图谱与数据工作区（<code>scene_data/&lt;id&gt;/</code>）。
-<strong>非默认场景不继承默认库</strong>——这是用真实教训换来的契约：曾有场景问了「世界模型」，
-却取到了另一个数据域的战队名。隔离不是配置建议，是系统强制。</p>
-
-<h2>6.2 四种场景类型</h2>
-<table>
-  <tr><th style="width:18%">kind</th><th>含义</th></tr>
-  <tr><td><code>vlml</code></td><td>默认场景：Voyager 学 VLML 数据域（本系统的母题）</td></tr>
-  <tr><td><code>scene</code></td><td>标准场景：绑定一个数据库数据源，独立学习</td></tr>
-  <tr><td><code>local</code></td><td>本机场景：数据源就是这台电脑，符合普通用户直觉</td></tr>
-  <tr><td><code>missing</code></td><td>配置失效：如实标注，不静默吞掉</td></tr>
-</table>
-
-<h2>6.3 插入新场景：不重启、不清库、不改代码</h2>
-<p>通过场景插入契约接入新数据域：既有场景与运行中的学习进程均不受影响。
-<em>实测记录见第八章。</em></p>
-
-<!-- ============ 七 ============ -->
-<h1 class="chapter" id="ch7"><span class="no">七、</span>人机分工模型</h1>
-<p class="chapter-sub">仿照云行业的「责任共担模型」：哪些由系统担保，哪些由人判断。</p>
-<table>
-  <tr><th style="width:50%">系统担保（架构强制）</th><th>人负责（人在环中）</th></tr>
-  <tr><td>技能库无污染：判错不进库，进库必附真实观测</td><td>提出有价值的问题、导入想验证的能力</td></tr>
-  <tr><td>消费侧回答可溯源：复用标注、裁判独立复核</td><td>阅读叙述层内容并作业务判断</td></tr>
-  <tr><td>场景隔离：跨场景数据拿不到，而非「不该拿」</td><td>为新场景准备数据源与图谱种子</td></tr>
-  <tr><td>能力边界如实标注（第九章），不虚报</td><td>对预期差立项拍板：修产品，或改文档</td></tr>
-</table>
-<p>这条分工解释了系统的一个设计取舍：<strong>面向人的叙事入口不做证据闸</strong>——因为它不写技能库、
-不进复用链，人导入属于「补知识面」的教育路径，人在环中自行判断内容；多加一道闸就多一层限制。
-系统把闸门全部投在「会被机器复用的东西」上。</p>
-
-<!-- ============ 八 ============ -->
-<h1 class="chapter" id="ch8"><span class="no">八、</span>验证与证据</h1>
-<p class="chapter-sub">所有关键声明都附可复现的实测，欢迎复检。</p>
-
-<h2>8.1 知识图谱 A/B 对照（同一道题，第 1 轮，不求助）</h2>
+<h2>4.1 知识图谱消融（同一道题，第 1 轮，不求助）</h2>
 <table>
   <tr><th>条件</th><th>覆盖率</th><th>表现</th></tr>
-  <tr><td>A：无图谱</td><td>0% wrong</td><td>连败 SQL 列都取错</td></tr>
-  <tr><td>B：图谱仅作提示</td><td>20% partial</td><td>骨架对，过滤位置错</td></tr>
-  <tr><td>D：图谱 + 结构/参数硬断言</td><td>100% correct</td><td>连败值与起点全部正确</td></tr>
+  <tr><td>无图谱</td><td>0% wrong</td><td>连败 SQL 列都取错</td></tr>
+  <tr><td>图谱仅作提示</td><td>20% partial</td><td>骨架对，过滤位置错</td></tr>
+  <tr><td>图谱 + 结构/参数硬断言</td><td>100% correct</td><td>连败值与起点全部正确</td></tr>
 </table>
 
-<h2>8.2 1→n 插拔与学习闭环实测（2026-11-01，本机）</h2>
+<h2>4.2 插拔与学习闭环实测（2026-11-01，一台普通 Mac）</h2>
 <div class="evidence"><div class="t">实测记录（全程无需云服务器）</div>
-  ① 运行时插入新场景（自建员工/部门/工资库）：一条命令、代码零改动，面板场景数 1→2，既有场景状态无污染；<br>
-  ② 在该场景发起学习：<code>status = learned</code>，3/3 维度闭合，4 条技能结晶入库；<br>
+  ① 运行时插入新场景（自建员工/部门/工资库）：一条命令、代码零改动，面板场景数 1→2，既有场景无污染；<br>
+  ② 在该场景发起学习：<code>status = learned</code>，3/3 个考察维度闭合，4 条技能结晶入库；<br>
   ③ 消费侧导入同一问题：<code>reused = True</code>，命中刚学的复合技能，掌握度 0 → 1/30，面板曲线出现数据点。
 </div>
 
-<h2>8.3 可达性边界实测</h2>
+<h2>4.3 能力边界是架构强制的</h2>
 <div class="evidence"><div class="t">系统会响亮地说「不」</div>
   向一个不含相关表的场景提问 → <code>unreachable</code>，在触达任何模型调用之前被可达性检查拒绝。
-  能力边界由架构强制，不靠提示词自觉。
+  能力边界不靠提示词自觉，靠架构拒绝。
 </div>
 
-<!-- ============ 九 ============ -->
-<h1 class="chapter" id="ch9"><span class="no">九、</span>能力边界与诚实声明</h1>
+<!-- ============ 五 ============ -->
+<h1 class="chapter" id="ch5"><span class="no">五、</span>如何复现与参与</h1>
+<p class="chapter-sub">一台普通电脑 + 一个大模型 API key，30 分钟内可跑通本白皮书第四章的全部实测。</p>
+
+<h2>5.1 本机复现（约 30 分钟）</h2>
+<pre><code># 1. 克隆仓库并准备环境（python ≥ 3.10）
+git clone https://github.com/Zxy876/voyager-vlml-mve.git
+cd voyager-vlml-mve
+python3 -m venv .venv && source .venv/bin/activate
+pip install duckdb httpx pypdf gymnasium
+
+# 2. 配置大模型 API（任选一家，默认智谱 glm-4-flash）
+cp .env.example mve/.env    # 填入你的 ZHIPU_API_KEY
+
+# 3. 启动面板（单文件 HTTP 服务，无其他依赖）
+MVE_PANEL_PORT=8877 python mve/dashboard.py
+# 浏览器打开 http://127.0.0.1:8877/mve/
+
+# 4. 跑全量单测（可选，验证环境完整）
+python mve/test_*.py</code></pre>
+<p>之后在面板里新建一个场景（指向你自己的 duckdb/CSV 数据），或在命令行里对任意场景发起学习，
+即可复现「学习 → 结晶 → 复用 → 掌握度上升」的完整闭环。</p>
+
+<h2>5.2 适合谁、怎么参与</h2>
+<table>
+  <tr><th style="width:34%">如果你是……</th><th>建议的切入点</th></tr>
+  <tr><td>LLM Agent 研究者</td><td>读完整版「与原版 Voyager 同构对照」——每条改动都给出 file:line，可直接引用或挑战</td></tr>
+  <tr><td>数据 / 后端工程师</td><td>把你手头的数据库接成一个新场景，验证 1→n 契约的边界（哪些数据域插不进去，对我们最有价值）</td></tr>
+  <tr><td> Agent 应用开发者</td><td>动作注册表支持五类来源（builtin / learned / plugin / mcp / local），技能与插件同一契约，可直接挂你自己的工具</td></tr>
+</table>
+<p>欢迎以 Issue / PR 形式参与。本项目的开发纪律是<strong>「文档声明与产品能力一致」</strong>：复现时若发现
+任何一条声明对不上实测，请提 Issue——预期差本身是我们最重要的一等公民。</p>
+
+<!-- ============ 六 ============ -->
+<h1 class="chapter" id="ch6"><span class="no">六、</span>能力边界与诚实声明</h1>
 <p class="chapter-sub">一份白皮书的可信度，取决于它说清楚了自己做不到什么。</p>
 <table>
   <tr><th style="width:44%">边界</th><th>含义</th></tr>
   <tr><td>掌握度挂在题（topic_id）上</td><td>是「带半衰期的记忆账本」，不是按能力项归档的评估体系</td></tr>
   <tr><td>技能绑死出处的题，不迁移</td><td>配方里写死了具体标识符，换个数据域要重学</td></tr>
   <tr><td>消费判分是软尺子</td><td>主尺子是「两边做法比对」（LLM 判），不是题库既有 rubric</td></tr>
-  <tr><td>图谱未消费 <code>ext_*</code> 表</td><td>表节点仅从种子题 rubric SQL 派生</td></tr>
-  <tr><td>公开源缺 <code>agg_*</code> 派生层</td><td>9 张派生表在公开源为 0 行，原料在 <code>ext_*</code> 表中</td></tr>
-  <tr><td><code>player_profile_report</code> 在公开源必然失败</td><td>其实现写死查询 0 行的派生表</td></tr>
+  <tr><td>图谱未消费全部底层表</td><td>表节点仅从种子题 rubric SQL 派生</td></tr>
+  <tr><td>部分派生数据层未随开源发布</td><td>若干派生表在公开源为 0 行，原料表在公开源中</td></tr>
+  <tr><td>个别报告类任务在公开源必然失败</td><td>其实现写死查询 0 行的派生表</td></tr>
 </table>
-<p>上述边界与主线纪律一致：<strong>文档声明和产品能力保持一致</strong>。发现预期差时，或修产品、或改文档，
-两条路都要经过评审拍板。</p>
 
-<!-- ============ 十 ============ -->
-<h1 class="chapter" id="ch10"><span class="no">十、</span>术语表与深入阅读</h1>
+<!-- ============ 七 ============ -->
+<h1 class="chapter" id="ch7"><span class="no">七、</span>术语表与深入阅读</h1>
 
-<h2>10.1 术语表</h2>
+<h2>7.1 术语表</h2>
 <dl class="terms">
   <dt>技能（Skill / 配方）</dt><dd>一次被验证成功的做法，存成可检索、可复用的条目，附带当时的真实观测。</dd>
   <dt>技能库</dt><dd>所有技能的集合，学习线写入、消费线读取，两线共享。</dd>
@@ -405,11 +395,11 @@ Minecraft 里给出了一种回答：让模型像学生一样<strong>反复练�
   <dt>抓手（Grab）</dt><dd>场景中可用的取证手段（查询、读文件、搜仓库等），注册制，学习侧与消费侧同一份菜单。</dd>
   <dt>掌握度</dt><dd>带半衰期的记忆账本：复用与无提示答对增强记忆，求助打折不加速遗忘。</dd>
   <dt>半衰期</dt><dd>掌握度衰减的时间常数；只有「答对且没用提示」才拉长它。</dd>
-  <dt>场景（Scene）</dt><dd>隔离的基本单位：独立技能库、图谱、数据工作区（四种 kind，见 6.2）。</dd>
+  <dt>场景（Scene）</dt><dd>隔离的基本单位：独立技能库、图谱、数据工作区。</dd>
   <dt>失败账本</dt><dd>判错题目的去向，反哺课程出题——从哪里跌倒，就从哪里再出题。</dd>
 </dl>
 
-<h2>10.2 深入阅读（完整版白皮书对应章节）</h2>
+<h2>7.2 深入阅读（完整版白皮书对应章节）</h2>
 <table>
   <tr><th style="width:34%">想深入了解</th><th>读完整版哪一节</th></tr>
   <tr><td>与原版 Voyager 的同构对照</td><td><a href="https://zxy876.github.io/voyager-vlml-mve/#sec-voyager-comparison">与原版 Voyager 同构对照</a>（全部给出 file:line）</td></tr>
@@ -421,9 +411,9 @@ Minecraft 里给出了一种回答：让模型像学生一样<strong>反复练�
 </table>
 
 <footer>
-  Voyager-VLML-MVE 技术白皮书 · 导读版 v1.0（2026-11-03）<br>
-  本导读版不含代码行号级论证；如需核对任何声明，请按 10.2 的链接进入完整版对应章节，
-  其中的 file:line 引用与 A/B 数据可逐条复现。完整版章节能力标题以完整版为准，本导读版不替代之。
+  Voyager-VLML-MVE 技术白皮书 · 导读版 v2.0（2026-11-03）<br>
+  本导读版面向外部读者，不含代码行号级论证与内部开发史；如需核对任何声明，请按 7.2 的链接进入
+  完整版对应章节。完整版章节能力标题以完整版为准，本导读版不替代之。
 </footer>
 
 </div>
