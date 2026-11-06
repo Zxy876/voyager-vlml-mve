@@ -103,16 +103,40 @@ def _parse(text: str) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _material_block(evidence: Any, limit: int = 3, per: int = 1200) -> str:
-    """材料清单（同构助产士的 gathered）：只列**取成功**的条目，带来源。"""
+def _material_block(evidence: Any, limit: int = 3, per: int = 6000) -> str:
+    """材料清单（同构助产士的 gathered）：只列**取成功**的条目，带来源。
+
+    ⚠️ 2026-11-06 生产实证（Scene R）：原来每条只给**前 1200 字**，而
+    sherlock.py 的 `class Sherlock…` 正好在第 1234 字节 —— 闸门每轮都判
+    「源码断在 class Sh、远未达到 34664 字节」，维度连败 10+ 轮。
+    长条目的完整性看不出来不是内容问题，是**视野问题**：给头 + 尾 + 总长，
+    尾部（如 `if __name__ == "__main__"`）才是「拿全了没有」的证据。
+    另外观测条目正文常在 `data` 里（没有 `text`），一并兜底。
+    """
     items = [e for e in (evidence or []) if isinstance(e, dict) and e.get("ok")]
     if not items:
         return "  （没有取到任何材料）"
     out = []
     for e in items[:limit]:
         src = e.get("source") or e.get("tool") or "?"
-        text = " ".join(str(e.get("text") or "").split())[:per]
-        out.append(f"  - 来源：{src}\n    内容：{text}")
+        raw = e.get("text")
+        if not raw:
+            _d = e.get("data")
+            if isinstance(_d, dict) and isinstance(_d.get("text"), str):
+                raw = _d["text"]
+            elif _d is not None:
+                try:
+                    raw = json.dumps(_d, ensure_ascii=False)
+                except Exception:
+                    raw = str(_d)
+        text = " ".join(str(raw or "").split())
+        n = len(text)
+        if n > per:
+            head = int(per * 0.6)
+            tail = per - head - 40
+            text = (text[:head] + f" …（中略 {n - head - tail} 字）… "
+                    + text[-tail:])
+        out.append(f"  - 来源：{src}（共 {n} 字）\n    内容：{text}")
     if len(items) > limit:
         out.append(f"  （另有 {len(items) - limit} 条材料未列出）")
     return "\n".join(out)
