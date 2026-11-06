@@ -1028,7 +1028,7 @@ def _make_mcp_callable(gw: Any, tool_id: str, loop: Any,
     return _sync
 
 
-_EVIDENCE_CHARS = 12000
+_EVIDENCE_CHARS = 40000
 # 证据正文的上限（2026-10-31 从 4000 提到 12000）。
 # 4000 是「一行日志看着舒服」的量级，不是「够答一道题」的量级：README 真实长度
 # 8~20KB，砍到 4000 只留下开头一段，于是语义层被要求在**残料**上下整体判断

@@ -69,7 +69,7 @@ MIN_QUOTE = 4
 # 材料预算：与 local_agent._EVIDENCE_CHARS（单条证据 12000）配套。
 # 一条证据刚好放得下；两条证据（如 gh_tree + gh_read）时按此预算依次放，
 # 放不下的部分**标注**出来，不静默丢。
-MATERIAL_LIMIT = 20000
+MATERIAL_LIMIT = 40000
 
 _TRUNC_MARK = "\n…（这里已到材料预算上限，后面还有内容没放进来，不许假设）"
 
