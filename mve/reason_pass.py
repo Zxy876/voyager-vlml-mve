@@ -275,7 +275,10 @@ def answer_over_material(task: str, material: str, *,
                 out = llm(msgs)
             else:
                 import llm_client
-                out = llm_client.chat_json(msgs, max_tokens=max_tokens, retries=2)
+                # 34k 字材料 + glm-4.6 思考 + 4000 tokens：默认 90s 必 ReadTimeout
+                # （2026-11-06 Scene R 实测）—— 语义层这一发要 240s。
+                out = llm_client.chat_json(msgs, max_tokens=max_tokens,
+                                           retries=2, timeout=240.0)
         except Exception as e:
             return {"ok": False, "why": f"语义层调用失败：{type(e).__name__}: {e}",
                     "answer": "", "verdict": "", "quotes": [], "gap": ""}
