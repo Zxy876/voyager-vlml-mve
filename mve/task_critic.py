@@ -92,7 +92,7 @@ reasoning / critique 一律用中文写。
 """
 
 
-def _evidence_text(result: dict[str, Any], limit: int = 2600) -> str:
+def _evidence_text(result: dict[str, Any], limit: int = 8000) -> str:
     """把一轮学习结果渲染成原版那种"观察"文本（含答案，知识型任务靠它判）。
 
     原版防幻觉的核心（voyager_original/voyager/agents/critic.py:30-80）：
@@ -117,7 +117,12 @@ def _evidence_text(result: dict[str, Any], limit: int = 2600) -> str:
         lines.append("执行内容（前 800 字）:\n" + sql[:800])
     ans = str(result.get("answer") or "").strip()
     if ans:
-        lines.append("最终答案（RESULT）:\n" + ans[:800])
+        # 只给头部会让判官把「长答案」误读成「被截断」（2026-11-06 Scene R：
+        # 模型把 34,664 字源码整份贴进 RESULT，判官只看前 800 字，正好断在
+        # class Sh 一带 → 判「源码被截断」。头 + 尾才看得出完整与否）。
+        _aview = ans[:600] if len(ans) <= 900 else (
+            ans[:600] + "\n…（中略 " + str(len(ans) - 850) + " 字）…\n" + ans[-250:])
+        lines.append("最终答案（RESULT，共 " + str(len(ans)) + " 字）:\n" + _aview)
     # 观察明细：每轮调了哪个数据源、返回的**真实行值**、报了什么错。
     # 知识型任务没有数据源，但也要让 critic 看见模型到底交了什么。
     obs = result.get("observations") or []
@@ -146,9 +151,17 @@ def _evidence_text(result: dict[str, Any], limit: int = 2600) -> str:
     if isinstance(mat, list) and mat:
         lines.append("材料账（数据源实际返回；答案里说的每一点都得在这里找得到）:")
         for it in [m for m in mat if isinstance(m, dict)][-6:]:
-            tail = str(it.get("text") or it.get("error") or "")[:400]
+            t = str(it.get("text") or it.get("error") or "")
             tag = "" if it.get("ok") else "（失败，不算材料）"
-            lines.append(f"- {it.get('tool') or '?'}{tag}: {tail}")
+            # 头 + 尾 + 长度：判官要判「拿全了没有」，只看头部必然误判截断
+            # （尾部是文件真正的收尾，如 if __name__ == "__main__"）。
+            if len(t) > 600:
+                view = (t[:200] + "\n…（中略 " + str(len(t) - 400) + " 字）…\n"
+                        + t[-200:])
+            else:
+                view = t
+            lines.append(f"- {it.get('tool') or '?'}{tag}"
+                         f"（共 {len(t)} 字）: {view}")
     ab = result.get("absorbed") or {}
     if ab:
         lines.append(f"入库: topic={ab.get('topic_id')} mastered={ab.get('mastered')}")
