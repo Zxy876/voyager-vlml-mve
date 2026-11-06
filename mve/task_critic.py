@@ -151,7 +151,21 @@ def _evidence_text(result: dict[str, Any], limit: int = 8000) -> str:
     if isinstance(mat, list) and mat:
         lines.append("材料账（数据源实际返回；答案里说的每一点都得在这里找得到）:")
         for it in [m for m in mat if isinstance(m, dict)][-6:]:
-            t = str(it.get("text") or it.get("error") or "")
+            # 观测条目（local_agent 的 obs）**没有 text 字段**，正文在 data 里：
+            # 只读 it["text"] → 材料账那行是空的，判官唯一看得到的正文是
+            # 上面 obs 的 json[:400] 头部 —— 于是任何长文件都被判「截断」
+            # （2026-11-06 Scene R：判官反复说「断在 class Sh」，材料其实全）。
+            t = str(it.get("text") or "")
+            if not t:
+                _d = it.get("data")
+                if isinstance(_d, dict) and isinstance(_d.get("text"), str):
+                    t = _d["text"]
+                elif _d is not None:
+                    try:
+                        t = json.dumps(_d, ensure_ascii=False)
+                    except Exception:
+                        t = str(_d)
+            t = t or str(it.get("error") or "")
             tag = "" if it.get("ok") else "（失败，不算材料）"
             # 头 + 尾 + 长度：判官要判「拿全了没有」，只看头部必然误判截断
             # （尾部是文件真正的收尾，如 if __name__ == "__main__"）。
