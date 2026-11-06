@@ -72,7 +72,16 @@ def chat(
             else:
                 r.raise_for_status()
                 data = r.json()
-                text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+                msg = ((data.get("choices") or [{}])[0]
+                       .get("message", {}) or {})
+                text = str(msg.get("content") or "").strip()
+                if not text:
+                    # glm-4.5/4.6 的思考模式：思考段可能把 max_tokens 吃光，
+                    # 正文落到 reasoning_content 而 content 为空
+                    # （2026-11-06 Scene R 生产实证：语义层 34,720 字材料 +
+                    # max_tokens=1800 → 连续「返回空内容」。同构
+                    # voyager_vlml/llm.py:103 的兜底 —— 它是模型真说的话）。
+                    text = str(msg.get("reasoning_content") or "").strip()
                 if text.strip():
                     return text
                 last = "返回空内容"

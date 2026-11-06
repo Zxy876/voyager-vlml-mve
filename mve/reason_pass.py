@@ -241,7 +241,7 @@ def verify_quotes(quotes: list[dict[str, Any]], material: str) -> tuple[bool, st
 
 def answer_over_material(task: str, material: str, *,
                          critique: str = "", llm: Any = None,
-                         max_tokens: int = 1800, demos_text: str = "") -> dict[str, Any]:
+                         max_tokens: int = 4000, demos_text: str = "") -> dict[str, Any]:
     """在材料上作答一次（工具已关，不重取数）。
 
     返回 {"ok", "answer", "verdict", "quotes", "gap", "why"}。
