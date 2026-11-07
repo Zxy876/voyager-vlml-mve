@@ -164,6 +164,31 @@ systemctl restart mve-panel
 - **搜索链**：智谱 → Bing(rss) → DDG，必须过相关性闸（`_split_relevant` 零交集整组丢）。
 - **安全**：可读根只剩场景目录（+`MVE_READ_ROOTS`）；`_is_sensitive` 挡 `.env`；DuckDB 禁外部访问。
 
+### 5.3b 取证落库回路（2026-11-07 补，学习侧那半原是断的）
+- **回路**（用户 2026-10-28 拍板）：联网取回的资料 → 落进本场景数据源 → 学习侧把
+  这张表当数据源学出技能 → 下次消费直接答。工具功劳算一次，学习功劳从第二次开始。
+- **消费侧那半早就在**（`consume.py` 调 `web_ingest.save_docs/save_evidence`），
+  **学习侧那半原是断的** → 已补 `mve/web_ingest_learning.py`：按**返回形状**
+  （per_site / results / 单篇正文）映射成 web_docs 资料行 + web_evidence 事实行，
+  挂 `local_agent._recorder` 的 `ingest` 开关（`origin=net/mcp` 才落，本机原语不落）。
+  认形状不认工具名 → 新原语族接进来**零改动**（MCP 是唯一正式接缝）。
+- ⚠️ **`web_docs` / `web_facts` 初始就是空的，这是设计**（用户 2026-11-07 明确）：
+  预置数据会让表里出现不实内容 → 幻觉防线（判官看材料账）就失效了。
+  **表空 ≠「不存在」**——那是**真空否定**（没查 ≠ 查了没有）。正确顺序是
+  **先调工具取证（结果自动落库）→ 再查表核对**；反过来（没取证就下结论）= 编。
+  守卫：`mve/test_web_ingest_learning.py`（19 项）扫「绕过 save_docs 直接 INSERT
+  web_docs」的路径必须为 0。
+- **`web_facts` 是按 `attribute` 摊平的宽表** → 同名属性多行并存时 PIVOT 用
+  `first(value)` 只留一个 → 多站点同属性必须**带站点名**（`GitHub http 状态码`）。
+- **观测必须汇入顶层**：代码路径分支（`obs1, code1 = await local_agent.solve`）
+  要 `observations.extend(obs1)`，否则顶层 `calls=0` → 真空防线判「一次数据源都没调」
+  → 维度层明明闭合了、里程碑 `achieved=true`，整轮仍被标 `no_data`（2026-11-07 实测）。
+  ⚠️ 只有这一处是真漏账；另 4 处 `_code_exec` 里 3 处是 `observations, sql = await ...`
+  （直写顶层）、1 处只选执行后端 —— 逐个查过，别盲加。
+- **中文用户名在 GitHub 上 → `verdict=ILLEGAL`**（http 空）—— 这是**原版**
+  `regexCheck` 的正确判定（站点规则不接受中文名），不是 bug；此时状态码列不出现
+  也是对的（http 空不落空事实）。**测 Sherlock 要用 ASCII 用户名**。
+
 ### 5.4 技能入库
 - **存算法不存数值**：入库前 `generalize` 成 `:slot`，消费侧 `_refill_sql` 回填。
 - 三通道一个口径（`_absorb` / `learn_milestone_skills` / `learn_milestone_composite`）**都过 generalize**；`code` 存模板、`blueprint.rollout_sql` 存判对原文；`_absorb` 返回的是 `skill_key`，**别按 code 字符串认**。
