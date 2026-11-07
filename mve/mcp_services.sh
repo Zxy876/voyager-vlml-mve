@@ -22,12 +22,15 @@ set -euo pipefail
 
 HOST="${MCP_HOST:-172.18.0.1}"
 ENV_DIR="${MCP_ENV:-/root/mcp-env}"
+# MVE 自己的 venv（有 requests；sherlock server 需要它，mcp-env 里没有）
+MVE_ENV="${MVE_VENV:-/root/mve/.venv}"
 MVE_DIR="${MVE_DIR:-/root/mve/mve}"
 UNIT_PREFIX="mve-mcp"
 
 # name|port|命令（空格分隔的参数用 :: 分隔，便于数组展开）
 SERVICES=(
   "neko|8791|${ENV_DIR}/bin/python::${MVE_DIR}/mcp_neko_server.py"
+  "sherlock|8797|${MVE_ENV}/bin/python::${MVE_DIR}/mcp_sherlock_server.py"
   "fetch|8792|${ENV_DIR}/bin/mcp-server-fetch"
   "time|8793|${ENV_DIR}/bin/mcp-server-time"
   "ddg|8794|${ENV_DIR}/bin/duckduckgo-mcp-server"
@@ -59,6 +62,9 @@ write_unit() {
   # neko 的 server 要 import net_tools（在 mve/ 下）
   local extra_env=""
   if [ "$name" = "neko" ]; then
+    extra_env="Environment=PYTHONPATH=${MVE_DIR}"
+  fi
+  if [ "$name" = "sherlock" ]; then
     extra_env="Environment=PYTHONPATH=${MVE_DIR}"
   fi
   cat > "$unit" <<UNIT

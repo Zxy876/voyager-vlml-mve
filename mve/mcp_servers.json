@@ -4,21 +4,29 @@
     "neko": {
       "url": "http://172.18.0.1:8791/mcp",
       "fallback_command": "auto",
-      "fallback_args": ["mcp_neko_server.py"],
+      "fallback_args": [
+        "mcp_neko_server.py"
+      ],
       "env": {},
       "enabled": true
     },
     "fetch": {
       "url": "http://172.18.0.1:8792/mcp",
       "fallback_command": "auto",
-      "fallback_args": ["-m", "mcp_server_fetch"],
+      "fallback_args": [
+        "-m",
+        "mcp_server_fetch"
+      ],
       "env": {},
       "enabled": true
     },
     "time": {
       "url": "http://172.18.0.1:8793/mcp",
       "fallback_command": "auto",
-      "fallback_args": ["-m", "mcp_server_time"],
+      "fallback_args": [
+        "-m",
+        "mcp_server_time"
+      ],
       "env": {},
       "enabled": true
     },
@@ -32,14 +40,29 @@
     "sequential-thinking": {
       "url": "http://172.18.0.1:8795/mcp",
       "fallback_command": "npx",
-      "fallback_args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
+      "fallback_args": [
+        "-y",
+        "@modelcontextprotocol/server-sequential-thinking"
+      ],
       "env": {},
       "enabled": true
     },
     "context7": {
       "url": "http://172.18.0.1:8796/mcp",
       "fallback_command": "npx",
-      "fallback_args": ["-y", "@upstash/context7-mcp"],
+      "fallback_args": [
+        "-y",
+        "@upstash/context7-mcp"
+      ],
+      "env": {},
+      "enabled": true
+    },
+    "sherlock": {
+      "url": "http://172.18.0.1:8797/mcp",
+      "fallback_command": "auto",
+      "fallback_args": [
+        "mcp_sherlock_server.py"
+      ],
       "env": {},
       "enabled": true
     }
