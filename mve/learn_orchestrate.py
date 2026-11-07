@@ -1374,6 +1374,17 @@ async def _start_learning_impl(
                                 # 「这张表里没有答案」→ 换 gh_read 去读仓库。
                                 # 这就是"见人说人话"，不是我们替它分类。
                                 context=((_env1 if exec_db else "") + _bind_tip))
+                            # ⚠️ 代码路径的观测**必须汇进顶层**（2026-11-07 修）：
+                            # 只有下面 else（VLML）分支有 `observations.extend(obs1)`，
+                            # 代码路径漏了 → 顶层汇总时 observations 为空 →
+                            # calls=0 / real_calls=0 → 真空防线判「一次数据源都没调」
+                            # → 明明维度层查到了真数（_ev1 有料、维度闭合、里程碑
+                            # achieved），整轮却被标 status=no_data。
+                            # 实测（场景 L）：维度两条全闭合、里程碑达成，
+                            # 顶层仍 no_data —— 就是这条漏账。
+                            # 口径：代码路径的观测自带 data_sources=list(tracer)
+                            # （local_agent.py:898），直接汇入即可，不用补。
+                            observations.extend(obs1)
                         else:
                             obs1, code1 = await agent.solve(
                                 _q1, skills=skills, grabs=grabs,
