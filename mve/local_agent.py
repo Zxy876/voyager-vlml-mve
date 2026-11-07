@@ -723,11 +723,13 @@ async def solve(question: str, scene_dir: str, *, llm=None,
             #
             # ⚠️ 2026-11-07 场景 L 实测：示例原来只看 "search" 关键字 → 题面里
             # 点名「sherlock 工具」时示例仍是 `web_search(query=…)`，模型照抄示例
-            # 就去搜「介绍 sherlock 的文章」，一次没调 MCP。现在：**题面点到的
-            # MCP 工具优先当示例**，并按它自己的 input_schema 生成调用（参数名
-            # 从 schema 取，别拿 query= 硬套 —— 那样模型照抄就 TypeError）。
+            # 就去搜「介绍 sherlock 的文章」，一次没调 MCP。
+            # 现在：**题面点到的 MCP 工具优先当示例**，并按它自己的 input_schema
+            # 生成调用（参数名从 schema 取，别拿 query= 硬套 —— 那样模型照抄就
+            # TypeError）。挑选是**结构化**的（字面点名 → server 自报顺序），
+            # 不打分（见 `_pick_mcp_tool`）。
             _mcp_specs = _mcp_tool_specs()
-            _rel = next((n for n in _ordered if n in _mcp_specs), "")
+            _rel = _pick_mcp_tool(question, _mcp_specs)
             if _rel:
                 _sch = _mcp_specs[_rel].get("schema") or {}
                 _props = _sch.get("properties") or {}
@@ -752,8 +754,8 @@ async def solve(question: str, scene_dir: str, *, llm=None,
             if _rel:
                 _code_ex = (
                     f"r = {_ex}({_ex_arg})\n"
-                    f"# 返回是结构化结果（counts / claimed / blocked …），"
-                    f"按字段取，别猜形状\n"
+                    f"# 返回是结构化结果，**先看它实际长什么样再取字段**"
+                    f"（别照抄别的工具的形状）\n"
                     f"RESULT = {{\"answer\": r, \"source\": \"{_ex}\"}}")
             elif _fx:
                 _code_ex = (
@@ -786,6 +788,11 @@ async def solve(question: str, scene_dir: str, *, llm=None,
                 "gh_tree/gh_read（原文，不是搜索摘要）；要公开网页上的事实就 "
                 "web_search 找种子再抓正文；本机/上传的文件用 list_files/"
                 "read_file；场景库里的数用 query_sql。\n"
+                "**清单是事实，不是路线**：每条都有它自己的说明书和参数签名，"
+                "**你按题面自己判断该调哪个** —— 名字里带 mcp_ 的是经 MCP 接入的"
+                "远端工具（如 mcp_sherlock_lookup_username：在 481 个公开站点上"
+                "并发探测某 username 是否被注册），它自己会按站点规格做确定性判定，"
+                "**不要自己拼 URL 去一个个抓**。\n"
                 "**工具报错就换工具，别拿同一句重试**：MCP 报错（validation "
                 "error）、TypeError/KeyError 都说明这个工具当前不可用或返回形状"
                 "与预期不同 —— 换一个同类工具（还有 web_search/gh_*/别的 mcp_*）"
@@ -1049,7 +1056,31 @@ def _make_mcp_callable(gw: Any, tool_id: str, loop: Any,
         try:
             ret = _unwrap_mcp(cfut.result(timeout=60))
         except Exception as e:
-            _note_mcp_fail(str(tool_id), f"{type(e).__name__}: {e}")
+            # ⚠️ 2026-11-07 用户定调「打断」：MVE 判定这个 MCP 任务已经不需要
+            # 了（或它太慢），要能**真的把它掐掉**，而不是干等 60 秒后留一个
+            # 僵尸协程在事件循环里继续跑（Sherlock 全量 481 站约 35-50 秒 ——
+            # 不掐掉就会占着主循环，下一轮规划拿不到干净的循环）。
+            # 两层：
+            # ① 本地取消协程（`run_coroutine_threadsafe` 的 future 超时**不会**
+            #    自动取消底层协程，必须显式 cancel）；
+            # ② 通知远端停（`notifications/cancelled`）—— 不通知的话，远端那边
+            #    仍在扫 481 站。HTTP 传输下这个通知是另一次 POST，与被打断的
+            #    那次请求并发发出，不会互相阻塞。
+            _cancelled = False
+            try:
+                _cancelled = cfut.cancel()
+            except Exception:
+                pass
+            _notified = False
+            try:
+                _notified = bool(asyncio.run_coroutine_threadsafe(
+                    gw.cancel_remote(tool_id), loop).result(timeout=5))
+            except Exception:
+                _notified = False
+            _note_mcp_fail(str(tool_id),
+                           f"{type(e).__name__}: {e}"
+                           + ("（已打断）" if _cancelled else "")
+                           + ("（已通知远端停止）" if _notified else ""))
             raise
         _MCP_FAILS.pop(str(tool_id), None)
         return ret
@@ -1082,7 +1113,8 @@ _TOOL_ERR_HINTS = (
 )
 
 
-def _render_lines(obj: Any, *, depth: int = 0, limit: int = 80) -> str:
+def _render_lines(obj: Any, *, depth: int = 0, limit: int = 80,
+                  chars: int = _EVIDENCE_CHARS) -> str:
     """把结构化成**一行一条**的可读文本（证据正文用）。
 
     为什么不能直接 `json.dumps`（2026-10-31 生产实测，两处真实失败都源于此）：
@@ -1093,22 +1125,50 @@ def _render_lines(obj: Any, *, depth: int = 0, limit: int = 80) -> str:
         —— 同样对不上，3 条真引文全判 miss。
     一行一条（`license: ` / `- A.md`）既让人能读，也让引文能抄对：材料长什么样，
     引文就该长什么样。这只是**呈现**，不改任何字段值。
+
+    ⚠️ 2026-11-07：**list 按字符预算裁剪，不按条数**。
+    原来 list 硬砍前 `limit`(=80) 项：MCP 的 Sherlock 返回带 `per_site`
+    （481 站逐站结论）→ 只剩前 80 站，307 个「确定没注册」的站**整段丢失**。
+    后果是判官看到「这个站不在清单里」却分不清它**确定没注册**还是**压根没问到**
+    —— MCP 里发生的交互没回来，等于白接。
+    改法：list 按**总字符预算**（`_EVIDENCE_CHARS`）裁，裁了就在末尾**如实说明**
+    裁了多少（与 `_clip_ev` 同一口径：不静默截断，否则「没看到=不存在」）。
+    dict 的 key 截断保持原样（那是防 dict 键爆炸的，不是正文预算）。
     """
     if isinstance(obj, dict):
         lines: list[str] = []
         for k, v in list(obj.items())[:limit]:
             if isinstance(v, (dict, list, tuple)):
-                sub = _render_lines(v, depth=depth + 1, limit=limit)
+                sub = _render_lines(v, depth=depth + 1, limit=limit, chars=chars)
                 lines.append(f"{k}:\n{sub}" if "\n" in sub else f"{k}: {sub}")
             else:
                 lines.append(f"{k}: {'' if v is None else v}")
         return "\n".join(lines)
     if isinstance(obj, (list, tuple)):
-        items = list(obj)[:limit]
+        items = list(obj)
         if all(not isinstance(x, (dict, list, tuple)) for x in items):
-            return "\n".join(f"- {x}" for x in items)
-        return "\n".join(_render_lines(x, depth=depth + 1, limit=limit)
-                         for x in items)
+            out: list[str] = []
+            used = 0
+            for i, x in enumerate(items):
+                one = f"- {x}"
+                if used + len(one) > chars:
+                    out.append(f"…（共 {len(items)} 项，这里只给前 {i} 项，"
+                               "未给出的部分不许假设、不许按常识补）")
+                    break
+                out.append(one)
+                used += len(one)
+            return "\n".join(out)
+        out2: list[str] = []
+        used2 = 0
+        for i, x in enumerate(items):
+            one = _render_lines(x, depth=depth + 1, limit=limit, chars=chars)
+            if used2 + len(one) > chars:
+                out2.append(f"…（共 {len(items)} 项，这里只给前 {i} 项，"
+                            "未给出的部分不许假设、不许按常识补）")
+                break
+            out2.append(one)
+            used2 += len(one)
+        return "\n".join(out2)
     return str("" if obj is None else obj)
 
 
@@ -1277,7 +1337,7 @@ def _env_receipt(evidence: list[dict[str, Any]] | None,
     if called:
         lines.append("调用过的数据源：" + "、".join(dict.fromkeys(called)))
     for it in items[-limit:]:
-        name = str(it.get("tool") or "?")
+        name = str(it.get("tool") or "")
         # 入参进回执 = 原版 events 里「bot 真做了什么」那一半（2026-10-31 补）：
         # 只说「gh_repo_info 取到 300 字」，模型判不出「我问错了对象」。
         q = str(it.get("args") or "").replace("\n", " ")[:100]
@@ -1293,7 +1353,49 @@ def _env_receipt(evidence: list[dict[str, Any]] | None,
         else:
             why = str(it.get("error") or "").replace("\n", " ")
             lines.append(f"· {name} → 失败：{why[:chars]}")
+    # ---- MCP 远端工具：把「MCP 里发生了什么」如实回灌 ----
+    # 2026-11-07 用户定调：「mve 在 mcp 里发生的交互也会带回给 voyager agent
+    # 和判官（不然他没法学习）」。判官那侧走材料账（`_evidence_item` → 
+    # `reason_pass.material_text`，实测已能读全 481 站逐站结论）；但 Voyager
+    # 这侧只拿到前 260 字摘要 —— 对「探测了 481 个站、148 个说被占用、
+    # 307 个确定没注册」这种**结论分布**，前 260 字只够看见前几条，
+    # 模型学不到「MCP 里发生了什么」，下一轮也就不知道怎么用。
+    # 这里补一段**结构化结论**（不判对错、不改字段值，只把分布说清楚）：
+    for it in items:
+        if not isinstance(it, dict) or not it.get("ok"):
+            continue
+        if not str(it.get("tool") or "").startswith("mcp_"):
+            continue
+        _s = _mcp_call_summary(it.get("text") or "")
+        if _s:
+            lines.append(f"· {it.get('tool')} → {_s}")
     return "\n".join(lines)
+
+
+def _mcp_call_summary(text: str) -> str:
+    """从 MCP 返回的成型文本里读出**结论分布**（回灌给 Voyager 用）。
+
+    只陈述事实：探测了多少站、各结论多少条、哪些是「可点开确认」的候选。
+    判对错不归这里管 —— 那是判官的事。
+    """
+    t = str(text or "")
+    if not t.strip():
+        return ""
+    counts: dict[str, int] = {}
+    site = ""
+    for raw in t.splitlines():
+        line = raw.strip()
+        if line.startswith("site: "):
+            site = line[6:].strip()
+        elif line.startswith("verdict: ") and site:
+            v = line[9:].strip()
+            counts[v] = counts.get(v, 0) + 1
+    if not counts:
+        return ""
+    order = ["CLAIMED", "AVAILABLE", "UNKNOWN", "WAF", "ILLEGAL"]
+    parts = [f"{k} {counts[k]} 条" for k in order if counts.get(k)]
+    parts += [f"{k} {v} 条" for k, v in counts.items() if k not in order]
+    return "探测结论分布：" + "、".join(parts)
 
 
 def _recorder(tracer: list[str] | None, name: str,
@@ -1493,6 +1595,11 @@ def _mcp_tool_specs() -> dict[str, dict]:
     「用 sherlock 工具查某用户名」，模型既不知道有 `mcp_sherlock_lookup_username`
     这个抓手（字母序截断把它砍掉了），菜单里也没有它的说明 → 转头去搜
     「介绍 sherlock 的文章」。
+
+    额外记下 **server 名**与 **tools/list 原始顺序**：MCP server 用
+    `tools/list` 的先后声明自己的主工具（Sherlock 把 `lookup_username` 排第一）。
+    MVE 侧据此**选工具**时不必自己发明「哪个更相关」——那是 server 的自述，
+    不是调用方的猜测（见 `_pick_mcp_tool`）。
     """
     out: dict[str, dict] = {}
     try:
@@ -1501,10 +1608,42 @@ def _mcp_tool_specs() -> dict[str, dict]:
             tid = str(t.get("tool_id") or "")
             if tid:
                 out[tid] = {"desc": str(t.get("description") or ""),
-                            "schema": t.get("input_schema") or {}}
+                            "schema": t.get("input_schema") or {},
+                            "server": str(t.get("server") or ""),
+                            "name": str(t.get("name") or "")}
     except Exception:
         pass
     return out
+
+
+def _pick_mcp_tool(question: str, specs: dict[str, dict]) -> str:
+    """挑一个 MCP 工具当示例 —— **结构化选择，不打分**。
+
+    2026-11-07 用户定调：「相关性打分制不要自己发明」。原版 Sherlock 压根没有
+    「哪个工具更相关」这种判断 —— 它只有一个入口 `sherlock <username>`，
+    站点选择靠 `--site` 显式指定。同一原则搬到工具层，MVE 的选择只有两级，
+    都是**确定性**的：
+      ① 题面**字面**出现某个工具名（完整 tool_id 或去掉 server 前缀的短名）
+         → 就是它；
+      ② 题面点名了某个 **server**（如「用 sherlock 工具」）→ 取该 server 在
+         `tools/list` 里**排第一**的工具 —— 顺序是 server 自己声明的
+         （MCP 规范里 tools/list 的先后即 server 的呈现次序），MVE 不猜。
+    两级都不命中 → 返回 ""（不硬塞一个工具进示例）。
+    """
+    q = str(question or "").lower()
+    if not q or not specs:
+        return ""
+    # ① 字面点名工具
+    for tid, spec in specs.items():
+        short = str(spec.get("name") or "")
+        if tid.lower() in q or (short and len(short) >= 4 and short.lower() in q):
+            return tid
+    # ② 点名 server → 取该 server tools/list 里第一个
+    for tid, spec in specs.items():
+        srv = str(spec.get("server") or "")
+        if srv and len(srv) >= 3 and srv.lower() in q:
+            return tid        # dict 保序 = tools/list 原始顺序
+    return ""
 
 
 # 组名别名：题面里说「GitHub」也算点到 gh_* 那组工具（组名，不是工具名单）。
@@ -1514,66 +1653,61 @@ _MENU_GROUP_ALIAS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("mcp_ddg_", ("duckduckgo",)),
 )
 
-# 说明书里「关键词：A、B、C」的显式声明（server 自报，权重最高）。
-_KEYWORDS_RE = re.compile(r"关键词[：:]\s*([^\n。;；]+)")
-
-
-def _desc_keywords(desc: str) -> list[str]:
-    """说明书里显式声明的关键词。
-
-    约定：description 里写「关键词：用户名、账号、主页链接」→ 这些词出现在题面
-    时，就认为题面点名了这个工具。**server 自己最清楚自己的语义**，比调用方
-    按名字猜准得多（2026-11-07 场景 L：lookup_username 与 list_sites 名字都含
-    sherlock，光看名字分不出「查账号」和「列站点」）。
-    """
-    out: list[str] = []
-    try:
-        for m in _KEYWORDS_RE.finditer(str(desc or "")):
-            for w in re.split(r"[、,，;；/|\s]+", m.group(1)):
-                w = w.strip()
-                if len(w) >= 2:
-                    out.append(w)
-    except Exception:
-        pass
-    return out
-
 
 def _order_menu(names: list[str], question: str = "",
                 descs: dict[str, str] | None = None) -> list[str]:
-    """按「题面点到哪个工具」排序：命中的排前面，其余按名字。
+    """把工具清单**原样摊开**给模型，只按「题面字面点到哪个」排前面。
 
-    为什么必须有（2026-11-07 场景 L 实证的根因）：
-    菜单原来按**字母序**截断（system 提示 [:14]、模型清单 [:16]），而 mcp_*
-    排在 gh_*/list_files 之后 —— 唯一能查账号的 `mcp_sherlock_lookup_username`
-    落在第 17 位被砍掉，模型**根本不知道它存在**，于是去 web_search 搜
-    「介绍 sherlock 的文章」。两头都上：① 相关性排序 ② 不再截断。
+    ⚠️ 2026-11-07 用户定调：**这里不做相关性打分**。
+    之前那版是自己发明的打分制（命中片段长度加总 + 关键词命中 ×30），
+    越权替模型判断「哪个工具更相关」。原版 Sherlock 压根没有这种机制 ——
+    它的站点选择只有一条路：`--site` **显式指定**，其余全量遍历，
+    判定全在代码里（`sherlock.py:410-456`）。同一原则搬到工具层：
+      · **MVE 负责把工具摊开、说清各自能干什么**（server 自报说明书）；
+      · **选哪个由模型自己判断**（它有题面、有说明书、有 schema）；
+      · **MVE 不替模型排序打分**，更不发明关键词权重。
+    剩下的原逻辑全在 MCP 里（Sherlock 的 481 站探测、确定性判定）。
 
-    命中判定**只认词面，不写死任何工具名单**：
-      · 工具名按非字母数字切出的片段（≥4 字符）
-      · 说明书里的英文词（≥4 字符）
-      · 说明书里「关键词：A、B、C」显式声明的词（权重最高）
-    打分 = 命中片段长度之和 + 30×关键词命中数（长片段/显式关键词更具体）。
+    排在前面的唯一依据：**题面里字面出现工具名**（确定性、可解释、不猜语义）。
+    例：题面写「用 sherlock 查」→ `mcp_sherlock_*` 排前面。
+    这不是相关性打分 —— 是字面命中，且**不改变清单内容**，只调顺序。
+
+    ⚠️ 组内**不按字母序**排（2026-11-07）：同一 server 的工具按它自己在
+    `tools/list` 里声明的顺序排 —— 那是 server 的自述（Sherlock 把主工具
+    `lookup_username` 排第一）。按字母序会把 `list_sites` 顶到
+    `lookup_username` 前面，模型照着第一个就调错 —— 上一版用打分权重去
+    纠正它，那是越权；正确做法是**信 server 的声明顺序**。
     """
     q = str(question or "").lower()
     if not q or not names:
         return list(names)
     descs = descs or {}
-    scored: list[tuple[int, str]] = []
+    specs = _mcp_tool_specs()
+    # server 自报顺序（tools/list 的原始次序）
+    mcp_order = {tid: i for i, tid in enumerate(specs)}
+
+    def _key(n: str):
+        if n in mcp_order:
+            return (1, mcp_order[n], n)      # MCP 组内按 server 声明序
+        return (0, 0, n)                     # 本机/联网组保持原样（字母序）
+
+    hit: list[str] = []
+    rest: list[str] = []
     for n in names:
         low = str(n).lower()
-        d = str(descs.get(n) or "")
-        terms = [f for f in re.split(r"[^a-z0-9]+", low) if len(f) >= 4]
-        terms += [f for f in re.split(r"[^a-z0-9]+", d.lower()) if len(f) >= 4]
-        score = 0
-        for t in terms:
-            if t and t in q:
-                score += len(t)
-        for k in _desc_keywords(d):
-            if k.lower() in q:
-                score += 30
-        scored.append((-score, n))
-    scored.sort()
-    return [n for _s, n in scored]
+        # 工具名按非字母数字切片段；任一片段在题面里字面出现 → 算题面点到它
+        terms = [f for f in re.split(r"[^a-z0-9]+", low) if len(f) >= 3]
+        # 组名别名（gh_* ↔ GitHub）也算字面命中：题面说的是**能力**不是工具名
+        for pref, aliases in _MENU_GROUP_ALIAS:
+            if low.startswith(pref):
+                terms += [a for a in aliases]
+        if any(t in q for t in terms):
+            hit.append(n)
+        else:
+            rest.append(n)
+    hit.sort(key=_key)
+    rest.sort(key=_key)
+    return hit + rest
 
 
 def tool_descriptions() -> dict[str, str]:

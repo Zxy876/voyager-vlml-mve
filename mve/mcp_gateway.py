@@ -372,6 +372,23 @@ class MCPClient:
         self.writer.write((json.dumps(frame) + "\n").encode())
         await self.writer.drain()
 
+    async def cancel_call(self, tool_name: str, request_id: Any = None) -> bool:
+        """发 `notifications/cancelled`（MCP 规范的取消通知）。
+
+        为什么需要（2026-11-07 用户定调「MVE 可以随时打断他」）：取消是
+        **通知**（无 id、不回响应），server 侧收到后应停止正在做的调用 ——
+        Sherlock 全量 481 站要 35-50 秒，不掐掉就等于占着执行域不放。
+        `request_id` 给了就带上（server 可据此只掐这一个请求）。
+        """
+        params: dict[str, Any] = {}
+        if request_id is not None:
+            params["requestId"] = request_id
+        try:
+            await self._notify("notifications/cancelled", params)
+            return True
+        except Exception:
+            return False
+
     async def _read_loop(self) -> None:
         proc = self.process
         if proc is None or proc.stdout is None:
@@ -522,6 +539,23 @@ class MCPHTTPClient:
                 timeout: float = 15.0) -> None:
         self._post({"jsonrpc": "2.0", "method": method, "params": params},
                    timeout)
+
+    async def cancel_call(self, tool_name: str, request_id: Any = None) -> bool:
+        """发 `notifications/cancelled`（MCP 规范的取消通知）。
+
+        2026-11-07 用户定调「MVE 可以随时打断他」：取消是**通知**（无 id、
+        不回响应）。streamable-http 传输下它同样是一次普通 POST（不带 id），
+        server 侧据此停止正在做的调用。
+        """
+        params: dict[str, Any] = {}
+        if request_id is not None:
+            params["requestId"] = request_id
+        try:
+            await asyncio.to_thread(self._notify, "notifications/cancelled",
+                                   params)
+            return True
+        except Exception:
+            return False
 
     # ---- 对外接口（与 MCPClient 一致）----
     async def connect(self, timeout: float = 30.0) -> bool:
@@ -783,6 +817,30 @@ class MCPGateway:
         prefix = f"mcp_{server}_"
         tool_name = str(tool_id)[len(prefix):]
         return await client.call_tool(tool_name, arguments)
+
+    async def cancel_remote(self, tool_id: str, request_id: Any = None) -> bool:
+        """**打断**远端正在进行的调用（2026-11-07 用户定调）。
+
+        「MVE 只是可以随时打断他」—— 打断不能只是本地不再等：远端还在跑
+        （Sherlock 全量 481 站 35-50 秒），不通知它就会一直占着资源。
+        这里发 MCP 规范的 `notifications/cancelled` 通知。
+
+        返回 True = 通知已发出（不代表远端一定停了）；False = 没发出去
+        （server 不支持/未连接）—— 调用方据此知道「只能本地放弃」。
+        """
+        idx = self.tool_index()
+        server = idx.get(str(tool_id))
+        if server is None:
+            return False
+        client = self._clients.get(server)
+        if client is None:
+            return False
+        prefix = f"mcp_{server}_"
+        tool_name = str(tool_id)[len(prefix):]
+        try:
+            return bool(await client.cancel_call(tool_name, request_id))
+        except Exception:
+            return False
 
     # ---- 暴露 / 撤回（同构「远端工具注入聊天」）----
     def tool_allowed(self, tool_id: str) -> tuple[bool, str]:

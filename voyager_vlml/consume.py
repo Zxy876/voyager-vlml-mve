@@ -3795,27 +3795,37 @@ def _web_reachable(scene_id: str) -> tuple[bool, str]:
     ③ 条目在 ≠ 可用：猫爪总开关 + 该组开关都开才可达（开关关掉不是删
        条目，是不暴露 + 拒调用，同 neko 插件语义）。
     不可达 → 计划如实修订，不假装查过、不编数。
+
+    ⚠️ 2026-11-07 用户定调「Sherlock 要和 web 注册在同一规划层面」：
+    此前判据只看 `origin == "net"`，而 MCP 原语（origin=mcp）被排除在外
+    —— 于是「规划排了 web 路（查某用户名在 GitHub 上有没有账号）」，
+    可达性检查却说「没有联网原语」，规划被无谓地修订掉。
+    口径改为：**web 路 = 能取场景外信息的原语**，即 origin=net
+    （联网原语、GitHub 原语）**或** origin=mcp 的远端工具 ——
+    后者本来就是在访问外部网站取实时数据（如 Sherlock 的 481 站探测），
+    语义上就是 web 路，只是承载形式不同。
     """
     try:
         import actions as _act
         bucket = getattr(_act, "_REGISTRY", {}).get(str(scene_id)) or {}
 
-        def _net_names(b: dict) -> list[str]:
+        def _web_names(b: dict) -> list[str]:
+            # web 路的原语：net（联网/GitHub）+ mcp（远端工具，如 Sherlock）
             return [str(a.name) for a in b.values()
-                    if str(getattr(a, "origin", "")) == "net"]
+                    if str(getattr(a, "origin", "")) in ("net", "mcp")]
 
-        names = _net_names(bucket)
+        names = _web_names(bucket)
         if not names:
             try:
                 _act.restore()
             except Exception:
                 pass
             bucket = getattr(_act, "_REGISTRY", {}).get(str(scene_id)) or {}
-            names = _net_names(bucket)
+            names = _web_names(bucket)
         if not names:
             return False, "动作注册表里没有联网原语"
         _gs = sorted({str(_act.group_of(a)) for a in bucket.values()
-                      if str(getattr(a, "origin", "")) == "net"})
+                      if str(getattr(a, "origin", "")) in ("net", "mcp")})
         if not any(_act.group_enabled(str(scene_id), g) for g in _gs):
             return False, f"联网能力开关没开（{'、'.join(_gs)}）"
         return True, "、".join(names[:4])
@@ -3857,7 +3867,9 @@ def _plan_routes(question: str, *, scene_id: str, has_file: bool,
                  f"- db：场景数据源/已学技能（"
                  f"{'有表：' + '、'.join((scene_tables or [])[:6]) if (scene_tables or []) else '当前没有表'}）\n"
                  f"- web：场景**外**的信息（外部对比基准/时变行情/公开数据，"
-                 f"GitHub 公开仓库可读：owner/repo）"
+                 f"GitHub 公开仓库可读：owner/repo，"
+                 f"**某用户名在跨平台网站上的账号存在性/主页链接/状态码"
+                 f"（Sherlock 站点规格探测，可读）**）"
                  f"—— 规划里允许有这一步，可达性执行时另核\n"
                  f"- file：用户上传的文件"
                  f"{'（本次检测到上传）' if has_file else '（本次没有上传）'}\n"
