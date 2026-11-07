@@ -61,10 +61,13 @@ TOOLS: list[dict] = [
         "name": "lookup_username",
         "description": (
             "在 481 个公开站点上并发探测某 username 是否被注册（Sherlock 站点规格驱动，"
-            "确定性判定，不回传网页正文）。返回五态统计、http=200 的候选主页 URL 列表、"
-            "以及被 WAF 挡住的可疑项。想找某个 username 在其他平台的身份主页时用它，"
-            "不要自己拼 URL 逐个抓。claimed 里 http=200 的才是可点开确认的候选；"
-            "blocked 表示「没问到」而非「不存在」。"
+            "确定性判定，不回传网页正文）。关键词：用户名、账号、账号存在、主页链接、"
+            "状态码、跨平台身份。返回五态统计、http=200 的候选主页 URL 列表、以及被 WAF "
+            "挡住的可疑项。想找某个 username 在其他平台的身份主页时用它，不要自己拼 URL "
+            "逐个抓。claimed 里 http=200 的才是可点开确认的候选；blocked 表示「没问到」"
+            "而非「不存在」。"
+            "⚠️ 当题目里出现「用 sherlock 查某用户名」时，**直接调用本工具**，不要用"
+            "搜索引擎去查「sherlock 这个工具的说明」——那是介绍文章，不是查询结果。"
         ),
         "inputSchema": {
             "type": "object",
@@ -89,6 +92,7 @@ TOOLS: list[dict] = [
         "name": "list_sites",
         "description": (
             "列出 Sherlock 支持的站点规格（站点名、主页、判定方式、是否需正则/headers）。"
+            "关键词：站点清单、站点列表、哪些站点、支持的站点。"
             "用于挑选要查哪些站点，或用 keyword 过滤（按站点名匹配）。"
         ),
         "inputSchema": {

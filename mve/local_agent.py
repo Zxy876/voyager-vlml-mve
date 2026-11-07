@@ -716,7 +716,8 @@ async def solve(question: str, scene_dir: str, *, llm=None,
                       if not n.startswith("__") and n != "ok_text"]
             # 相关优先：题面点到的工具排前面（原来只有字母序，见 _order_menu
             # 的注释——字母序会把 mcp_* 全推到 gh_*/list_files 之后）。
-            _ordered = _order_menu(_names, question)
+            _desc = tool_descriptions()
+            _ordered = _order_menu(_names, question, _desc)
             # 示例里的函数名必须**真的存在**：写 `web_search` 而本场景只有
             # mcp_*_search（本机联网没注册）时，模型照抄就 NameError。
             #
@@ -772,11 +773,6 @@ async def solve(question: str, scene_dir: str, *, llm=None,
                 _code_ex = (
                     f"r = {_ex}(query=\"<本题关键词>\")\n"
                     f"RESULT = {{\"answer\": r, \"source\": \"{_ex}\"}}")
-            _desc = tool_descriptions()
-            # ⚠️ 2026-11-07：**不再截断**。截断掉的工具对模型等于不存在 ——
-            # 唯一能查账号的 mcp_sherlock_lookup_username 按字母序排第 17 位，
-            # 落在旧的 [:16] 之外 → 模型根本不知道它存在，于是去搜介绍文章。
-            # 清单按**题面相关性**排序（题面点到的排前面）。
             _menu = "\n".join(
                 f"- {n} — {_desc.get(n) or '（没有说明，按名字判断）'}"
                 for n in _ordered)
@@ -1514,13 +1510,36 @@ def _mcp_tool_specs() -> dict[str, dict]:
 # 组名别名：题面里说「GitHub」也算点到 gh_* 那组工具（组名，不是工具名单）。
 _MENU_GROUP_ALIAS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("gh_", ("github",)),
-    ("mcp_sherlock_", ("sherlock",)),
     ("mcp_time_", ("time", "时间")),
     ("mcp_ddg_", ("duckduckgo",)),
 )
 
+# 说明书里「关键词：A、B、C」的显式声明（server 自报，权重最高）。
+_KEYWORDS_RE = re.compile(r"关键词[：:]\s*([^\n。;；]+)")
 
-def _order_menu(names: list[str], question: str = "") -> list[str]:
+
+def _desc_keywords(desc: str) -> list[str]:
+    """说明书里显式声明的关键词。
+
+    约定：description 里写「关键词：用户名、账号、主页链接」→ 这些词出现在题面
+    时，就认为题面点名了这个工具。**server 自己最清楚自己的语义**，比调用方
+    按名字猜准得多（2026-11-07 场景 L：lookup_username 与 list_sites 名字都含
+    sherlock，光看名字分不出「查账号」和「列站点」）。
+    """
+    out: list[str] = []
+    try:
+        for m in _KEYWORDS_RE.finditer(str(desc or "")):
+            for w in re.split(r"[、,，;；/|\s]+", m.group(1)):
+                w = w.strip()
+                if len(w) >= 2:
+                    out.append(w)
+    except Exception:
+        pass
+    return out
+
+
+def _order_menu(names: list[str], question: str = "",
+                descs: dict[str, str] | None = None) -> list[str]:
     """按「题面点到哪个工具」排序：命中的排前面，其余按名字。
 
     为什么必须有（2026-11-07 场景 L 实证的根因）：
@@ -1529,22 +1548,32 @@ def _order_menu(names: list[str], question: str = "") -> list[str]:
     落在第 17 位被砍掉，模型**根本不知道它存在**，于是去 web_search 搜
     「介绍 sherlock 的文章」。两头都上：① 相关性排序 ② 不再截断。
 
-    匹配用**词面**：工具名按非字母数字切出的片段（≥4 字符）出现在题面里即算
-    命中；另加少量组名别名（gh_* ↔ GitHub）。不写死任何工具名单。
+    命中判定**只认词面，不写死任何工具名单**：
+      · 工具名按非字母数字切出的片段（≥4 字符）
+      · 说明书里的英文词（≥4 字符）
+      · 说明书里「关键词：A、B、C」显式声明的词（权重最高）
+    打分 = 命中片段长度之和 + 30×关键词命中数（长片段/显式关键词更具体）。
     """
     q = str(question or "").lower()
     if not q or not names:
         return list(names)
-    hit: list[str] = []
-    rest: list[str] = []
+    descs = descs or {}
+    scored: list[tuple[int, str]] = []
     for n in names:
         low = str(n).lower()
-        frags = [f for f in re.split(r"[^a-z0-9]+", low) if len(f) >= 4]
-        for pref, aliases in _MENU_GROUP_ALIAS:
-            if low.startswith(pref):
-                frags += [a.lower() for a in aliases]
-        (hit if any(f in q for f in frags) else rest).append(n)
-    return sorted(hit) + sorted(rest)
+        d = str(descs.get(n) or "")
+        terms = [f for f in re.split(r"[^a-z0-9]+", low) if len(f) >= 4]
+        terms += [f for f in re.split(r"[^a-z0-9]+", d.lower()) if len(f) >= 4]
+        score = 0
+        for t in terms:
+            if t and t in q:
+                score += len(t)
+        for k in _desc_keywords(d):
+            if k.lower() in q:
+                score += 30
+        scored.append((-score, n))
+    scored.sort()
+    return [n for _s, n in scored]
 
 
 def tool_descriptions() -> dict[str, str]:
