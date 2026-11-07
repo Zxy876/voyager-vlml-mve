@@ -52,6 +52,16 @@ EVID = "web_evidence"
 FACTS = "web_facts"
 LEDGER = "web_ledger.duckdb"
 
+# value 的长度上限（2026-11-07 用户拍板：「把限制放开吧，让他多看到一些文本」）。
+# ⚠️ 原来这里是 200，害得一条合理的维度永远取不到值：
+#   GitHub API 返回体 1291 字，`created_at` 在第 1216 位 → 被切掉 →
+#   `web_facts.正文` 只剩前 200 字（JSON 截断）→ `JSON_EXTRACT` 报
+#   Malformed JSON → 维度「账号创建时间」反复失败，判词再准也执行不了。
+#   真答案其实**在** `web_docs.body`（完整），但维度问的是 web_facts 的正文列。
+# 为什么给 20000 而不是无限：`value` 是摊平宽表的一列，长文本进宽表会拖慢
+# PIVOT 刷新（每次写证据都重建整张表）；20000 与 `body` 的上限对齐，够用。
+VALUE_MAX = 20000
+
 
 def _scene_dir(scene_id: str) -> str:
     import scene_profile
@@ -240,7 +250,7 @@ def save_evidence(scene_id: str, rows: list[dict[str, Any]],
             con.execute(
                 f"INSERT INTO {EVID} VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [_eid(item, attr, val), str(question)[:400], item[:400], attr,
-                 val[:200], str(r.get("source_title") or "")[:200],
+                 val[:VALUE_MAX], str(r.get("source_title") or "")[:200],
                  str(r.get("source_url") or "")[:400], str(method),
                  float(r.get("confidence") or 0.0),
                  bool(r.get("confirmed") or False),

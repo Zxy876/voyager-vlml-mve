@@ -177,6 +177,27 @@ def main() -> int:
           f"共 {found} 处维度层 solve" + ("，缺: " + "、".join(missing)
                                         if missing else "，全部已汇入"))
 
+    # ---- 8. 设计不变量：正文落库**不许截断**（2026-11-07 用户拍板）----
+    print("== 8. 不变量：正文进库不被截断 ==")
+    # 背景：GitHub API 返回体 1291 字，`created_at` 在第 1216 位。
+    # 原来正文进 web_facts 只留 200 字 → JSON 截断 → JSON_EXTRACT 报
+    # Malformed JSON → 维度「账号创建时间」永远失败（判词再准也执行不了）。
+    # 用户原话：「把限制放开吧，就让他多看到一些文本」。
+    long_text = '{"login": "torvalds", "created_at": "2011-09-03T15:26:22Z", "pad": "' \
+                + "x" * 1500 + '"}'
+    rows4 = wil._rows_from_return({"url": "https://api.github.com/users/torvalds",
+                                    "text": long_text})
+    check("正文形状拆出 1 行", len(rows4) == 1)
+    val4 = str(rows4[0].get("value") or "") if rows4 else ""
+    check("正文列（web_facts 的 value）不被截到 200 字", len(val4) > 1000,
+          f"value 长度 {len(val4)}")
+    check("正文列保住 JSON 尾部（created_at 在第 1216 位）",
+          "created_at" in val4 and val4.rstrip().endswith("}"))
+    # 落库层也必须放行（否则上层给足、底层又切回去 = 白改）
+    import web_ingest
+    check("落库层 value 上限 >= 2000", int(getattr(web_ingest, "VALUE_MAX", 0)) >= 2000,
+          f"VALUE_MAX={getattr(web_ingest, 'VALUE_MAX', '未定义')}")
+
     print(f"\n通过 {PASS} / 失败 {FAIL}")
     return 0 if FAIL == 0 else 1
 

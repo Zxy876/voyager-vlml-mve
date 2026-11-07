@@ -162,7 +162,11 @@ def _rows_from_return(ret: Any) -> list[dict[str, Any]]:
                 "url": url, "title": _clip(body.get("title"), 200),
                 "snippet": _clip(text, 2000), "body": text,
                 "item": _clip(body.get("title") or url or "网页", 200),
-                "attribute": "正文", "value": _clip(text, 200),
+                # ⚠️ 正文进 web_facts 的「正文」列时**不能截到 200**
+                # （2026-11-07 用户拍板放开限制）：那会把 JSON 正文截成
+                # 非法片段，维度想 `JSON_EXTRACT` 直接报 Malformed JSON。
+                # 这里给足上限，落库那层还有 web_ingest.VALUE_MAX 兜底。
+                "attribute": "正文", "value": _clip(text, 20000),
                 "method": "web",
             })
     return out
