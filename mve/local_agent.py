@@ -444,7 +444,8 @@ def _skill_call_name(raw: str) -> str:
 def _make_skill_fn(skill: dict[str, Any], scene_dir: str, scene_id: str,
                    tracer: list[str] | None, timeout: float = 45.0,
                    loop: Any = None,
-                   evidence: list[dict[str, Any]] | None = None):
+                   evidence: list[dict[str, Any]] | None = None,
+                   question: str = ""):
     """一条已学技能 → 一个**可调用**的函数（同构原版 `programs`）。
 
     原版怎么合成（取证）：
@@ -481,7 +482,8 @@ def _make_skill_fn(skill: dict[str, Any], scene_dir: str, scene_id: str,
         if tracer is not None:
             tracer.append(f"skill:{label}")     # 先记后跑：真调用过才有据
         ns: dict[str, Any] = _ns_base(scene_dir, scene_id, tracer=tracer,
-                                      loop=loop, evidence=evidence)
+                                      loop=loop, evidence=evidence,
+                                      question=question)
         box = _run_restricted(code, ns, timeout=timeout)
         if not box.get("ok"):
             raise RuntimeError(
@@ -499,7 +501,8 @@ def _make_skill_fn(skill: dict[str, Any], scene_dir: str, scene_id: str,
 def _build_skill_fns(skills: list[dict[str, Any]] | None, scene_dir: str,
                      scene_id: str, tracer: list[str],
                      limit: int = 8, loop: Any = None,
-                     evidence: list[dict[str, Any]] | None = None
+                     evidence: list[dict[str, Any]] | None = None,
+                     question: str = ""
                      ) -> dict[str, Any]:
     """把检索到的技能编成一组可调用函数（同原版 `programs` 拼进同一作用域）。"""
     out: dict[str, Any] = {}
@@ -507,7 +510,7 @@ def _build_skill_fns(skills: list[dict[str, Any]] | None, scene_dir: str,
         if not str((s or {}).get("code") or "").strip():
             continue
         fn = _make_skill_fn(s, scene_dir, scene_id, tracer, loop=loop,
-                            evidence=evidence)
+                            evidence=evidence, question=question)
         if fn.__name__ and fn.__name__ not in out:
             out[fn.__name__] = fn
     return out
@@ -567,12 +570,14 @@ async def solve(question: str, scene_dir: str, *, llm=None,
         except RuntimeError:      # 测试等非协程环境：退回旧行为（如实降级）
             _loop = None
         ns = _ns_base(scene_dir, scene_id, tracer=tracer, loop=_loop,
-                      evidence=evidence, db_path=db_path)
+                      evidence=evidence, db_path=db_path,
+                      question=str(question or ""))
         # 已学技能进**执行域**（不是只进 prompt）—— 同构原版
         # index.js:256 的 `programs + code` 同作用域 eval：模型写的
         # `skill_def()` 才真的调得到。
         ns.update(_build_skill_fns(skills, scene_dir, scene_id, tracer,
-                                   loop=_loop, evidence=evidence))
+                                   loop=_loop, evidence=evidence,
+                                   question=str(question or "")))
         return ns
 
     # 场景目录里**现有**什么，直接告诉它（否则它会猜 *.txt 而真实文件是 .json）
@@ -1399,7 +1404,9 @@ def _mcp_call_summary(text: str) -> str:
 
 
 def _recorder(tracer: list[str] | None, name: str,
-              evidence: list[dict[str, Any]] | None = None):
+              evidence: list[dict[str, Any]] | None = None,
+              scene_id: str = "", question: str = "",
+              ingest: bool = False):
     """给一个可调用套一层：**被调用时**把 name 记进 tracer（先记后调，调用失败也留痕）。
 
     这是堵「真空成功」新形态的关键：代码跑通、RESULT 非空，但如果一次数据源都没
@@ -1408,6 +1415,13 @@ def _recorder(tracer: list[str] | None, name: str,
     `evidence`：给了就把每次调用的**实际返回**剪成证据条目（见 `_evidence_item`）。
     tracer 只回答「调没调」，evidence 才回答「取到了什么」—— 后者才是闸门判
     闭合时要看的东西（同构助产士的 gathered/report 两本账）。
+
+    `ingest`：True 时，这次调用的返回**顺手落进本场景数据源**
+    （web_ingest_learning → web_docs 资料行 + web_evidence 事实行）。
+    只给**联网/MCP 原语**开（`origin=net` / `origin=mcp`）—— 本机原语
+    （read_file / list_files）落库没意义，query_sql 是查库不是取资料。
+    落库是**副产物**：失败只吞掉，不影响这次调用本身（取证成功就是成功，
+    材料账照常记，判官照常看）。
     """
     def deco(fn: Any) -> Any:
         def _w(*a: Any, **k: Any) -> Any:
@@ -1425,6 +1439,13 @@ def _recorder(tracer: list[str] | None, name: str,
                 raise
             if evidence is not None:
                 evidence.append(_evidence_item(name, ret, args=_args))
+            if ingest and scene_id:
+                # 落库放在最后：取证/记证据已经完成，落库失败不影响它们。
+                try:
+                    import web_ingest_learning as _wil
+                    _wil.ingest(scene_id, question, name, ret)
+                except Exception:
+                    pass
             return ret
         _w.__name__ = str(name)
         return _w
@@ -1752,7 +1773,8 @@ def _ns_base(scene_dir: str, scene_id: str = "",
              tracer: list[str] | None = None,
              loop: Any = None,
              evidence: list[dict[str, Any]] | None = None,
-             db_path: str = "") -> dict[str, Any]:
+             db_path: str = "",
+             question: str = "") -> dict[str, Any]:
     """执行命名空间。
 
     给了 scene_id 就**按注册表里的启用条目**建（猫爪总开关关掉的组不注入 ——
@@ -1767,6 +1789,14 @@ def _ns_base(scene_dir: str, scene_id: str = "",
     循环（solve 在 loop 线程里调用，够用）；`run_saved_async` 把 exec 挪到 worker
     线程后必须**显式传**（worker 线程自己没有运行中的循环，`get_running_loop()`
     必抛 RuntimeError → mcp_* 一个都注入不进去 → 重放配方 NameError）。
+
+    `question`：本题题面。**联网/MCP 取证后落库要用**（web_ingest 的
+    `web_docs.query` / `web_evidence.question` 记的是「这次为哪件事取的」）。
+    给了 scene_id + question 时，取证原语的返回会经 `web_ingest_learning`
+    落进本场景数据源 —— 这补的是回路的学习侧那一半（消费侧那半在
+    consume.py）。不落库的后果实测过（场景 L）：维度派成「查 web_docs 表」
+    （落点是对的），但表 0 行 → 模型查空表 → 写出「不存在」的**真空否定**，
+    同时 tracer 空 → 整题判 no_data。
     """
     full: dict[str, Any] = {
         "list_files": lambda path="", pattern="*": list_files(
@@ -1776,10 +1806,15 @@ def _ns_base(scene_dir: str, scene_id: str = "",
         "read_json": lambda path: read_json(scene_dir, path),
         "query_sql": lambda sql: query_sql(scene_dir, sql, db_path),
     }
+    # 联网类原语（origin=net）：它们的返回是**从外面取回的资料**，该落进
+    # 数据源（web_ingest_learning）。本机原语（读文件/列目录/查库）不落 ——
+    # 那是读自己已有的东西，不是取证。
+    _net_names: set[str] = set()
     try:
         import net_tools
         full["web_search"] = net_tools.web_search
         full["web_fetch"] = net_tools.web_fetch
+        _net_names |= {"web_search", "web_fetch"}
     except Exception:
         pass
     # GitHub 原语**必须进 full**：下面 `names = 注册表启用条目 & set(full)`
@@ -1792,6 +1827,7 @@ def _ns_base(scene_dir: str, scene_id: str = "",
         import gh_tools
         for _gp in gh_tools.bind():
             full[str(_gp["name"])] = _gp["fn"]
+            _net_names.add(str(_gp["name"]))
     except Exception:
         pass
     # 套调用记录：每个原语被调用时往 tracer 记一笔（可读性让位于「真的取了数吗」）。
@@ -1802,7 +1838,10 @@ def _ns_base(scene_dir: str, scene_id: str = "",
     # 只看「每次调用的实际返回」，而只传 evidence 不传 tracer 时原先不套记录器
     # → 每次调用都不留痕 → 体检把所有技能判成「凭记忆写的」。
     if tracer is not None or evidence is not None:
-        full = {k: _recorder(tracer, k, evidence)(v) for k, v in full.items()}
+        full = {k: _recorder(tracer, k, evidence,
+                              scene_id=scene_id, question=question,
+                              ingest=(k in _net_names))(v)
+                for k, v in full.items()}
     allowed_origins = {"local", "net"}
     names = set(full)
     if scene_id:
@@ -1857,7 +1896,11 @@ def _ns_base(scene_dir: str, scene_id: str = "",
                     continue
                 _entry = _make_mcp_callable(gw, tid, _loop,
                                             e.get("input_schema") or {})
-                ns[tid] = (_recorder(tracer, tid, evidence)(_entry)
+                # MCP 远端工具的返回也是**从外面取回的资料** → 同样落库
+                # （origin=mcp 与 origin=net 同义：都在访问外部数据源）。
+                ns[tid] = (_recorder(tracer, tid, evidence,
+                                      scene_id=scene_id, question=question,
+                                      ingest=True)(_entry)
                            if (tracer is not None or evidence is not None)
                            else _entry)
         except RuntimeError:
