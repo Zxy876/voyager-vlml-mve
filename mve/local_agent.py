@@ -680,10 +680,14 @@ async def solve(question: str, scene_dir: str, *, llm=None,
         # web_search/web_fetch/mcp_*，GitHub 原语接进来后它一句都没提到 →
         # 模型看不见 gh_read，调研类题只能在 web_docs 上磨 SQL）。
         # 名单从真实注入的命名空间里取，注册什么就说什么（见人说人话）。
-        _menu = [n for n in sorted(_probe) if not n.startswith("__")
-                 and n != "ok_text"]
+        # ⚠️ 2026-11-07：这里原来还把名字截到 [:14]（system 里一份、user 消息里
+        # 另一份 [:16]，两份本身就不一致）。按**字母序**截断的代价：mcp_* 排在
+        # gh_*/list_files 之后，唯一能查账号的 `mcp_sherlock_lookup_username`
+        # 落在第 17 位被砍掉 → 模型**根本不知道它存在**，于是去 web_search 搜
+        # 「介绍 sherlock 的文章」。两份名单都砍 → 砍掉的能力等于不存在。
+        # 现在：system 不再重复列名字（完整清单在 user 消息里，只有一份）。
         system += ("\n\n【这是**学习环节**，不是答题】你的答案必须来自你**真正调用"
-                   "数据源取回的内容**（" + "、".join(_menu[:14]) + "）。"
+                   "数据源取回的内容**（可用函数清单在下面「可用函数」一节，逐个都可用）。"
                    "直接凭记忆写一段"
                    "「正确」答案 = 没有取证 = 这轮判不通过，也不会被记成能力。"
                    "先调工具取证，再据实组织答案；取不到就如实说取到了什么。")
@@ -710,11 +714,31 @@ async def solve(question: str, scene_dir: str, *, llm=None,
         if require_tools and _can_fetch:
             _names = [n for n in sorted(_probe)
                       if not n.startswith("__") and n != "ok_text"]
+            # 相关优先：题面点到的工具排前面（原来只有字母序，见 _order_menu
+            # 的注释——字母序会把 mcp_* 全推到 gh_*/list_files 之后）。
+            _ordered = _order_menu(_names, question)
             # 示例里的函数名必须**真的存在**：写 `web_search` 而本场景只有
             # mcp_*_search（本机联网没注册）时，模型照抄就 NameError。
-            _ex = ("web_search" if "web_search" in _names
-                   else next((n for n in _names if "search" in n),
-                             _names[0] if _names else "web_search"))
+            #
+            # ⚠️ 2026-11-07 场景 L 实测：示例原来只看 "search" 关键字 → 题面里
+            # 点名「sherlock 工具」时示例仍是 `web_search(query=…)`，模型照抄示例
+            # 就去搜「介绍 sherlock 的文章」，一次没调 MCP。现在：**题面点到的
+            # MCP 工具优先当示例**，并按它自己的 input_schema 生成调用（参数名
+            # 从 schema 取，别拿 query= 硬套 —— 那样模型照抄就 TypeError）。
+            _mcp_specs = _mcp_tool_specs()
+            _rel = next((n for n in _ordered if n in _mcp_specs), "")
+            if _rel:
+                _sch = _mcp_specs[_rel].get("schema") or {}
+                _props = _sch.get("properties") or {}
+                _req = [str(x) for x in (_sch.get("required") or [])]
+                _arg = _req[0] if _req else (next(iter(_props), "query"))
+                _ex = _rel
+                _ex_arg = f"{_arg}=\"<本题需要的实际值>\""
+            else:
+                _ex = ("web_search" if "web_search" in _names
+                       else next((n for n in _names if "search" in n),
+                                 _names[0] if _names else "web_search"))
+                _ex_arg = "query=\"<本题关键词>\""
             # 有 fetch 类工具就演示**两步链**（照 maieutic 管道：search 只是
             # 种子，正文才是证据）。2026-10-22 场景 B 实测根因：示例只有
             # `r = web_search(query)`，模型照抄 → 把空 snippet 当答案交上来
@@ -722,10 +746,17 @@ async def solve(question: str, scene_dir: str, *, llm=None,
             # 2026-10-22 场景 B 实测：fetch 工具多是 MCP 挂载（mcp_ddg_fetch_content、
             # mcp_fetch_fetch、mcp_neko_web_fetch），原先 startswith("web_") 的条件
             # 一个都匹配不到 → 两步链示例整段没渲染，模型又拿回单步示例。
-            _fx = next((n for n in _names if "fetch" in n), "")
-            if _fx:
+            # ⚠️ 题面点到 MCP 工具时**不演示两步链**（它不是 search→fetch 形状）。
+            _fx = "" if _rel else next((n for n in _names if "fetch" in n), "")
+            if _rel:
                 _code_ex = (
-                    f"r = {_ex}(query=\"<本题关键词>\")\n"
+                    f"r = {_ex}({_ex_arg})\n"
+                    f"# 返回是结构化结果（counts / claimed / blocked …），"
+                    f"按字段取，别猜形状\n"
+                    f"RESULT = {{\"answer\": r, \"source\": \"{_ex}\"}}")
+            elif _fx:
+                _code_ex = (
+                    f"r = {_ex}({_ex_arg})\n"
                     f"# 返回形状别猜：list 直接用；dict 外壳取 results/items/data\n"
                     f"hits = [x for x in (r if isinstance(r, list) else [])\n"
                     f"        if isinstance(x, dict)]\n"
@@ -742,9 +773,13 @@ async def solve(question: str, scene_dir: str, *, llm=None,
                     f"r = {_ex}(query=\"<本题关键词>\")\n"
                     f"RESULT = {{\"answer\": r, \"source\": \"{_ex}\"}}")
             _desc = tool_descriptions()
+            # ⚠️ 2026-11-07：**不再截断**。截断掉的工具对模型等于不存在 ——
+            # 唯一能查账号的 mcp_sherlock_lookup_username 按字母序排第 17 位，
+            # 落在旧的 [:16] 之外 → 模型根本不知道它存在，于是去搜介绍文章。
+            # 清单按**题面相关性**排序（题面点到的排前面）。
             _menu = "\n".join(
                 f"- {n} — {_desc.get(n) or '（没有说明，按名字判断）'}"
-                for n in _names[:16])
+                for n in _ordered)
             fetch_txt = (
                 "【取证要求（先做这个，再写答案）】这是**学习环节**：你的答案必须"
                 "来自你**真正调用**下列函数取回的内容，凭记忆直接写的答案判不通"
@@ -1454,6 +1489,64 @@ def primitive_names() -> list[str]:
     return [p["name"] for p in PRIMITIVES]
 
 
+def _mcp_tool_specs() -> dict[str, dict]:
+    """MCP 远端工具的**说明书与签名**（从网关取，server 自报）。
+
+    原来 MCP 工具在菜单里一律显示「（没有说明，按名字判断）」——模型既不知道
+    它能干什么、也不知道参数怎么传。2026-11-07 场景 L 实测：题面点名
+    「用 sherlock 工具查某用户名」，模型既不知道有 `mcp_sherlock_lookup_username`
+    这个抓手（字母序截断把它砍掉了），菜单里也没有它的说明 → 转头去搜
+    「介绍 sherlock 的文章」。
+    """
+    out: dict[str, dict] = {}
+    try:
+        import mcp_gateway
+        for t in (mcp_gateway.get_gateway().list_tools() or []):
+            tid = str(t.get("tool_id") or "")
+            if tid:
+                out[tid] = {"desc": str(t.get("description") or ""),
+                            "schema": t.get("input_schema") or {}}
+    except Exception:
+        pass
+    return out
+
+
+# 组名别名：题面里说「GitHub」也算点到 gh_* 那组工具（组名，不是工具名单）。
+_MENU_GROUP_ALIAS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("gh_", ("github",)),
+    ("mcp_sherlock_", ("sherlock",)),
+    ("mcp_time_", ("time", "时间")),
+    ("mcp_ddg_", ("duckduckgo",)),
+)
+
+
+def _order_menu(names: list[str], question: str = "") -> list[str]:
+    """按「题面点到哪个工具」排序：命中的排前面，其余按名字。
+
+    为什么必须有（2026-11-07 场景 L 实证的根因）：
+    菜单原来按**字母序**截断（system 提示 [:14]、模型清单 [:16]），而 mcp_*
+    排在 gh_*/list_files 之后 —— 唯一能查账号的 `mcp_sherlock_lookup_username`
+    落在第 17 位被砍掉，模型**根本不知道它存在**，于是去 web_search 搜
+    「介绍 sherlock 的文章」。两头都上：① 相关性排序 ② 不再截断。
+
+    匹配用**词面**：工具名按非字母数字切出的片段（≥4 字符）出现在题面里即算
+    命中；另加少量组名别名（gh_* ↔ GitHub）。不写死任何工具名单。
+    """
+    q = str(question or "").lower()
+    if not q or not names:
+        return list(names)
+    hit: list[str] = []
+    rest: list[str] = []
+    for n in names:
+        low = str(n).lower()
+        frags = [f for f in re.split(r"[^a-z0-9]+", low) if len(f) >= 4]
+        for pref, aliases in _MENU_GROUP_ALIAS:
+            if low.startswith(pref):
+                frags += [a.lower() for a in aliases]
+        (hit if any(f in q for f in frags) else rest).append(n)
+    return sorted(hit) + sorted(rest)
+
+
 def tool_descriptions() -> dict[str, str]:
     """名字 → 一句话说明（给学习侧的工具菜单用，不写死名单）。
 
@@ -1473,6 +1566,13 @@ def tool_descriptions() -> dict[str, str]:
                 out[str(p["name"])] = str(p.get("desc") or "")
         except Exception:
             continue
+    # MCP 远端工具：说明书由 **server 自己提供**（同 DeepSeek 的 function
+    # description）。原来完全没有这一路 → MCP 工具在菜单里一律「（没有说明，
+    # 按名字判断）」（2026-11-07 场景 L 实测）。
+    for tid, spec in _mcp_tool_specs().items():
+        d = " ".join(str(spec.get("desc") or "").split())
+        if d:
+            out[tid] = d[:200] + ("…" if len(d) > 200 else "")
     return out
 
 
