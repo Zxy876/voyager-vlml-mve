@@ -812,6 +812,25 @@ async def solve(question: str, scene_dir: str, *, llm=None,
                    if _fx else "")
                 + "代码长这样（先取证，再据实组织；参数照上面签名的名字传）：\n"
                 "```python\n" + _code_ex + "\n```\n")
+        # ---- 取证落点表（web_docs / web_facts）----
+        # 这几张表是**联网取证的落点**：只有真的调过联网/MCP 工具才会有行，
+        # 初始 0 行。模型若只查表不取证，看到 0 行就写「不存在」——那是
+        # **真空否定**（没查 ≠ 查了没有）。实测（场景 L 2026-11-07）：两条维度
+        # 查空表演出「否，不存在满足条件的记录」并被判闭合，其实是根本没查。
+        # 所以必须点明：**表空 = 还没取过料，先取证**。
+        _itabs = _ingest_tables(db_path)
+        if _itabs:
+            fetch_txt += (
+                "\n【数据源里的 " + "、".join(_itabs) + " 是**取证落点**，"
+                "不是现成答案】\n"
+                "  · 这几张表存的是**联网/远端工具取回来的东西**（搜索结果、"
+                "抓到的正文、站点探测结论）。**表里现在可能是空的** —— "
+                "因为还没取过料。\n"
+                "  · **空表不等于「不存在」**：你要回答的是「某用户名在某个"
+                "站点上有没有账号」这类问题，正确顺序是**先调工具取证**"
+                "（结果会自动落进这几张表），**再查表核对**；"
+                "直接查空表得到的空，只能说明「还没查」，不能当结论。\n"
+                "  · 反过来也一样：取证没跑过就写结论 = 编，判不通过。\n")
         user = (f"问题：{question}\n\n{inv_txt}\n"
                 # 用户上传的文件 = 这次请求的上下文（DeepSeek 客户端同构）：
                 # 文件内容就在这里，别去猜、也别假装查过库。
@@ -1401,6 +1420,33 @@ def _mcp_call_summary(text: str) -> str:
     parts = [f"{k} {counts[k]} 条" for k in order if counts.get(k)]
     parts += [f"{k} {v} 条" for k, v in counts.items() if k not in order]
     return "探测结论分布：" + "、".join(parts)
+
+
+def _ingest_tables(db_path: str) -> list[str]:
+    """这个库里有哪些「取证落点表」（联网资料落库的那几张）。
+
+    认的是**表名**（web_docs / web_facts / web_evidence）—— 这几张表是
+    `web_ingest` 的落点约定（全场景统一），不是某个场景的特例。
+
+    为什么模型需要知道：取证落点表**初始是空的**，只有真的调过联网/MCP
+    工具才会有行。模型若只查表不取证，看到 0 行就会写出「不存在」——
+    那是**真空否定**（没查 ≠ 查了没有），实测场景 L 两条维度就是这么
+    假闭合的。告诉它「表空 = 还没取过料，先取证」才是关键。
+    """
+    try:
+        p = str(db_path or "").strip()
+        if not p or not p.endswith(".duckdb"):
+            return []
+        import duckdb
+        con = duckdb.connect(p, read_only=True)
+        try:
+            names = {str(r[0]) for r in con.execute("show tables").fetchall()}
+        finally:
+            con.close()
+        return sorted(n for n in names
+                      if n in ("web_docs", "web_facts", "web_evidence"))
+    except Exception:
+        return []
 
 
 def _recorder(tracer: list[str] | None, name: str,
