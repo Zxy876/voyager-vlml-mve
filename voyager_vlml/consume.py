@@ -1424,13 +1424,17 @@ async def consume(
                 _act.register_local(_scene_id, _scene_dir)
             except Exception:
                 pass
-            # 远端 MCP 工具必须先挂上：复用配方时 `_ns_base` 只注入**注册表里已有**
-            # 的 mcp 条目，而它们在 learn 那边是 connect_all + expose 才注册的。
-            # consume 是新进程 —— 不接这一步，重放 `mcp_xxx` 就是 NameError
-            # （2026-10-20 实测：命中 3 条配方，3 条全 NameError → "用到 0 条技能"）。
-            mcp_ready = await _la.ensure_mcp_tools(_scene_id)
-        if _env is not None:
-            mcp_ready = {"skipped": "场景库形态（query_sql 只读本场景 duckdb），消费不接 MCP"}
+        # 远端 MCP 工具必须先挂上：复用配方时 `_ns_base` 只注入**注册表里已有**
+        # 的 mcp 条目，而它们在 learn 那边是 connect_all + expose 才注册的。
+        # consume 是新进程 —— 不接这一步，重放 `mcp_xxx` 就是 NameError
+        # （2026-10-20 实测：命中 3 条配方，3 条全 NameError → "用到 0 条技能"）。
+        #
+        # ⚠️ 2026-11-07：这行原来只在 kind=local 分支里，kind=scene 紧接着就被
+        # 「场景库形态消费不接 MCP」覆盖掉 —— 于是库形态场景里凡是要外部工具的题
+        # 永远不可答。**与 2026-10-29 联网原语、2026-11-03 read_file 同款**：
+        # 库形态 ≠ 不许用外部能力。神秘学场景（kind=scene）要靠 sherlock MCP
+        # 查 username 的跨平台身份，正栽在这里。
+        mcp_ready = await _la.ensure_mcp_tools(_scene_id)
         # ---- 联网原语：local + scene 两种非 VLML 形态**都要**注册 ----
         # 2026-10-29 用户实测：H 场景「今天天气如何」规划排了 web 路，却因
         # 注册表没有联网原语而不可达 —— 之前 register_net 只挂在 kind=local
