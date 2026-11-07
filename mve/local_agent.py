@@ -1697,6 +1697,12 @@ def _order_menu(names: list[str], question: str = "",
         low = str(n).lower()
         # 工具名按非字母数字切片段；任一片段在题面里字面出现 → 算题面点到它
         terms = [f for f in re.split(r"[^a-z0-9]+", low) if len(f) >= 3]
+        # ⚠️ **传输层前缀不算语义**：`mcp` 只是「MCP 接进来」的前缀，题面里
+        # 出现一次 `mcp_sherlock_lookup_username` 会让**所有** mcp_* 工具的
+        # `mcp` 片段都命中 → 全被拉进 hit 组，排序退化成「按 server 声明序」，
+        # 题面点名的那个反而排不到前面（实测：lookup 排到第 11 位）。
+        # 去掉它，命中才真的是「题面点了这个工具/这个 server」。
+        terms = [t for t in terms if t != "mcp"]
         # 组名别名（gh_* ↔ GitHub）也算字面命中：题面说的是**能力**不是工具名
         for pref, aliases in _MENU_GROUP_ALIAS:
             if low.startswith(pref):
