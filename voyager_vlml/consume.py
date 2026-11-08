@@ -369,39 +369,37 @@ def _expand_session_skills(skills: list[dict[str, Any]] | None,
                 _res.append(_ck)
         return _res
 
-    # 1) 命中的会话 + 2) 由「组成命中」反查到的会话 → 会话一律排最前
-    #    （下游材料清单按前 N 条截断：_compose_sql / _refill_sql 的 skills[:5]，
-    #     会话不前置，它带的组成技能会被挤掉 → 等于没带）
-    _s_first = [s for s in sk if _is_session_skill(s)]
-    _s_rev: list[dict[str, Any]] = []
+    # 1) 命中项里**第一个**会话（检索顺序 = 相关度顺序）→ 它的组成全部带出
+    #    只展开一个：用户语义是「一个目标 = 一个会话」，材料清单混多个里程碑
+    #    的会话会让 LLM 看到 4 个目标却看不到组成细节（实测闭包带出 4 个会话
+    #    + 6 条组成，而下游 _compose_sql/_refill_sql 按 skills[:5] 截断
+    #    → 4 个会话占满前 4 位，组成只剩 1 条）。
+    _s_first = next((s for s in sk if _is_session_skill(s)), None)
+    # 2) 命中组成反查到的会话（若命中项本身不是会话，会话可能排在更后面）
+    if _s_first is None:
+        for s in sk:
+            if _is_session_skill(s):
+                continue
+            _ck = f"{s.get('topic')}::{s.get('name')}"
+            for _skey in _rev.get(_ck, []):
+                _se = _sess.get(_skey)
+                if _se is not None and _usable(_se):
+                    _s_first = _se
+                    break
+            if _s_first is not None:
+                break
+    if _s_first is not None:
+        _push(_s_first)
+        # 3) 该会话的全部组成（闭包的关键一步）
+        for _comp in _session_comps(f"{_s_first.get('topic')}::{_s_first.get('name')}"):
+            _ce = all_sk.get(_comp)
+            if _ce is not None and _usable(_ce):
+                _push(_ce, frm=f"{_s_first.get('topic')}::{_s_first.get('name')}")
+    # 4) 其余命中项原样跟随（不含别的会话 —— 混目标反而干扰组合）
     for s in sk:
         if _is_session_skill(s):
             continue
-        _ck = f"{s.get('topic')}::{s.get('name')}"
-        for _skey in _rev.get(_ck, []):
-            _se = _sess.get(_skey)
-            if _se is None or not _usable(_se):
-                continue
-            if any(f"{x.get('topic')}::{x.get('name')}" == _skey for x in _s_first):
-                continue
-            _s_rev.append(_se)
-    for _s in _s_first:
-        _push(_s)
-    for _s in _s_rev:
-        _push(_s, frm=f"{_s.get('topic')}::{_s.get('name')}")
-    # 3) 其余命中项
-    for s in sk:
-        if not _is_session_skill(s):
-            _push(s)
-    # 4) 会话带出的全部组成（闭包的最后一步）
-    for _item in list(_out):
-        _ck = f"{_item.get('topic')}::{_item.get('name')}"
-        if _ck not in _sess:
-            continue
-        for _comp in _session_comps(_ck):
-            _ce = all_sk.get(_comp)
-            if _ce is not None and _usable(_ce):
-                _push(_ce, frm=_ck)
+        _push(s)
     return _out
 
 
