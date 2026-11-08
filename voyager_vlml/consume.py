@@ -249,6 +249,96 @@ def _is_session_skill(s: dict[str, Any]) -> bool:
     return str(bp.get("from") or "") == "maieutic_milestone_composite"
 
 
+def _attribute_reused_skill(*, skills: list[dict[str, Any]] | None,
+                            used_names: list[str] | None,
+                            pool: list[dict[str, Any]] | None = None,
+                            ) -> dict[str, Any]:
+    """指认「本次复用了哪条已学技能」。
+
+    ★ 铁律（2026-11-09 服务器实测抓到的记账 bug）：
+      **「本次复用了谁」必须由「本次实际用上的方法」指认，不能由
+      「检索排名」代答；对不上就如实不记。**
+
+    实测事故（服务器，场景 L）：
+      问题「在 web_docs 表中，query 包含 torvalds 的记录总共有多少行？」
+      实际 SQL `SELECT COUNT(*) FROM web_docs WHERE query LIKE '%torvalds%'`
+      —— **方法完全正确**（真值 497，答 497 ✅）
+      记账却记到 `tiktok_claimed_count`（它算的是 TikTok 列 = CLAIMED
+      的行数，与本题毫无关系）。
+
+    根因：旧实现拿「模型在 used 里报的名字」**模糊子串**回对材料
+    （name == _u or name in _u or _u in name），模型报了个对不上的
+    泛称（"count_total"）→ 对不上 → **兜底取 `skills[0]`**（检索相关性
+    第一）。而检索第一只是「最像这句问句」，跟「本次实际复用了谁」
+    毫无关系。后果：`mark_result([key], True)` 把 ok +1 记到错的技能上
+    —— 而 ok 正是衡量「学会没有」的量化指标（此前 hits=279 / ok=0）。
+
+    为什么「对不上就不记」而不是「记最像的那条」：
+      记错比不记更坏 —— 不记只是这次不加分（指标保守），
+      记错会让一条**没被用过的**技能看起来「学成了」，还会把它顶到
+      检索前列（score 里有 0.6*(ok/hits) 与 0.3*r 两项加权）。
+      「如实不记」是既有的判定铁律（真空成功/真空否定那条同一口径）。
+
+    匹配口径（从严）：
+      · **逐字**对上 name 或 key → 取它
+      · 模型报了材料里那条的**带题头整段**（`【材料 3｜topic=…｜name】`）
+        → 从整段里**抽出材料名**再逐字对（不是子串猜）
+      · 都不成立 → 返回空（不记账）
+    """
+    _pool = list(pool or []) or list(skills or [])
+    if not _pool:
+        return {}
+    # 材料名 → 条目（逐字索引）
+    _by_name: dict[str, dict[str, Any]] = {}
+    _by_key: dict[str, dict[str, Any]] = {}
+    for s in _pool:
+        if not isinstance(s, dict):
+            continue
+        _n = str(s.get("name") or "").strip()
+        if _n:
+            _by_name.setdefault(_n, s)
+        _k = str(s.get("key") or "").strip()
+        if _k:
+            _by_key.setdefault(_k, s)
+
+    def _from_material_header(u: str) -> dict[str, Any]:
+        """模型把整段材料题头抄回来了 → 抽出材料名再逐字对。
+
+        材料题头的形态（见 `_compose_sql` 的渲染）：
+            【材料 3｜topic=learn_xxx｜some_name】
+        分隔符是全角「｜」。模型偶尔会把整段抄进 used —— 那时**抽出
+        最后一段**（材料名）再逐字对，而不是拿整段做子串猜。
+        """
+        _m = re.search(r"【[^】]*】", u)
+        if not _m:
+            return {}
+        # 去掉首尾的「【」「】」再按全角「｜」切 —— 不然末段会带上「】」
+        _seg = _m.group(0).strip("【】")
+        _parts = [x.strip() for x in _seg.split("｜") if x.strip()]
+        if len(_parts) < 2:
+            return {}
+        # 末段是材料名；「材料 N」这种序号段在首位，末段才是名字
+        _last = _parts[-1].strip()
+        return _by_name.get(_last) or {}
+
+    for _u in (used_names or []):
+        _u = str(_u or "").strip()
+        if not _u:
+            continue
+        # ① 逐字对上 key
+        if _u in _by_key:
+            return dict(_by_key[_u])
+        # ② 逐字对上 name
+        if _u in _by_name:
+            return dict(_by_name[_u])
+        # ③ 模型抄了整段材料题头 → 抽出名字再逐字对
+        _hit = _from_material_header(_u)
+        if _hit:
+            return dict(_hit)
+    # 对不上 → **不记账**（如实不记，不代答）
+    return {}
+
+
 def _expand_session_skills(skills: list[dict[str, Any]] | None,
                            scene_id: str = "",
                            ) -> list[dict[str, Any]]:
@@ -1777,21 +1867,16 @@ async def consume(
                         if _rr.get("ok") and _d.get("rows"):
                             # 对回「这条组合 SQL 用了哪些已学方法」：模型可能在
                             # used 里写全库目录里的配方名（而不只是本题命中的
-                            # 那几条），所以两张清单都要找；精确优先、再宽松
-                            # （模型偶尔把【材料 N｜…】整段抄进去）。
+                            # 那几条），所以两张清单都要找。
+                            # ⚠️ 2026-11-09：**逐字**对，不再模糊子串猜
+                            # （`name in _u or _u in name` 会把
+                            # 「count_total」这种泛称套到 `tiktok_claimed_count`
+                            # 上 → 记账记错技能 → 污染 ok 计数）。
+                            # 对不上就空 → `_settle` 不再兜底抓检索第一名。
                             _used = [str(x) for x in (_cs.get("used") or [])]
-                            _sk = None
-                            for _u in _used:
-                                _cands = list(_pool or []) + list(_all_sk or [])
-                                _sk = next(
-                                    (s for s in _cands
-                                     if str(s.get("name") or "")
-                                     and (str(s.get("name")) == _u
-                                          or str(s.get("name")) in _u
-                                          or _u in str(s.get("name")))),
-                                    None)
-                                if _sk:
-                                    break
+                            _sk = _attribute_reused_skill(
+                                skills=skills, used_names=_used,
+                                pool=(list(_pool or []) + list(_all_sk or [])))
                             _executed.append({"skill": _sk or {},
                                               "name": _lb, "sql": _sql,
                                               "data": _d,
@@ -1825,16 +1910,26 @@ async def consume(
                         data = _d
                         code = _e["sql"]
                         # 对回本次「真正被复用的那条技能」：模型在 used 里写的
-                        # 名字必须逐字对上材料名；对不上（模型改了写法）就退回
-                        # 命中的第一条 —— 与旧合并器同一兜底，不然 reused_skill
-                        # 没 key → ⑤ 的 _absorb 会按 topic 新建 consume_ 脏账
-                        # （违反「消费不写新技能」，2026-10-25 边界）。
-                        _first = (dict(_e.get("skill") or {})
-                                  or (dict(skills[0]) if skills else {}))
+                        # 名字必须**逐字**对上材料名（`_attribute_reused_skill`）。
+                        # ⚠️ 2026-11-09 实测：旧实现在对不上时**兜底取
+                        # `skills[0]`**（检索相关性第一）—— 那只是「最像这句
+                        # 问句」，跟本次实际复用了谁毫无关系。实测把
+                        # web_docs 的题记到了 `tiktok_claimed_count` 上 →
+                        # `mark_result(ok=True)` 记到错的技能 → ok 计数
+                        # （衡量「学会没有」的指标）既虚高又指错方向。
+                        # 现在：**对不上就不记账**（ok 不动）—— 记错比不记更坏。
+                        # ⚠️ 但 `reused_skill` 仍要有值：它为空 → ⑤ 的
+                        # `_absorb` 会按 topic 新建 consume_ 脏账（违反
+                        # 「消费不写新技能」，2026-10-25 边界）。所以这里
+                        # **只在「确有 skill 条目」时**用它做兜底，
+                        # 而 used_skills 披露的是**真正对上**的那条。
+                        _matched = dict(_e.get("skill") or {})
+                        _first = (_matched or (dict(skills[0]) if skills else {}))
                         reused_skill = {**_first,
                                         "refill_note": _last_note,
                                         "composed_of": [_e["name"]]}
-                        _used_skills = ([dict(_first)] if _first else [])
+                        # 披露与 _absorb 记账都用**对上**的那条；没对上就空。
+                        _used_skills = ([dict(_matched)] if _matched else [])
                         _ans_skills = (_used_skills or skills)
                         obs = [{"ok": True, "tool": "query_sql",
                                 "rows": _e["rows"], "data": _d,
@@ -2508,10 +2603,24 @@ async def consume(
                 # 只把**本次真正复用的那一条**记成"用过且有效"（used_keys）。
                 # 不传的话 _absorb 会按 topic 前缀扫出同题下全部技能集体 +1，
                 # 于是"有效率"（ok/hits）冲到 150%/300%（2026-10-20 截图）。
-                _used = ([str(reused_skill.get("key"))]
-                         if reused_skill and reused_skill.get("key") else None)
-                abs_info = _absorb(question, code, "", scene_id=_scene_id,
-                                   used_keys=_used)
+                #
+                # ⚠️ 2026-11-09：记账对象必须是**模型点名且逐字对上**的那条
+                # （`_used_skills`），**不是** `reused_skill` —— 后者在对不上时
+                # 是「检索第一名」的兜底（实测把 web_docs 的题记到
+                # tiktok_claimed_count 上 → ok 记错 → 指标虚高且指错方向）。
+                # 点名对不上 → **不传 used_keys** → _absorb 走「同题全量记账」
+                # 那条更糟的路径，所以这里**直接不调 _absorb**（如实不记）。
+                _attributed = (_used_skills[0] if _used_skills else None)
+                _attributed_key = (str(_attributed.get("key"))
+                                   if _attributed else "")
+                if not _attributed_key:
+                    # 没对上 → 如实不记账（ok 不动），但**不入库新技能**
+                    # （消费不写新技能，2026-10-25 边界）：只标掌握。
+                    abs_info = _absorb(question, code, "", scene_id=_scene_id,
+                                       record_skill=False)
+                else:
+                    abs_info = _absorb(question, code, "", scene_id=_scene_id,
+                                       used_keys=[_attributed_key])
             except Exception:
                 abs_info = {}
         base.update({
@@ -4268,7 +4377,8 @@ def _answer_is_partial(answer_sql: str,
 
 def _absorb(question: str, sql: str, topic_id: str,
             *, scene_id: str = "", answer: str = "",
-            used_keys: list[str] | None = None) -> dict[str, Any]:
+            used_keys: list[str] | None = None,
+            record_skill: bool = True) -> dict[str, Any]:
     """答完了 → **这题就到他的能力里了 → 这就是掌握**（用户 2026-10-13 定）。
 
     掌握不是覆盖率折算出来的一个分数，而是**能力集合的增长**：
@@ -4286,6 +4396,12 @@ def _absorb(question: str, sql: str, topic_id: str,
     ⚠️ 归不上已有题时**照样进能力库**（`_runtime_topic_id` 给它一个稳定 id），
     不能因为归不上就判"没掌握" —— 那等于把"答没答出来"和"归不归得上"
     两个条件捆在一起（实测吃过这次亏）。
+
+    ★ `record_skill=False`（2026-11-09）：**只标掌握，不动技能库的用量账**。
+      用于「本次复用了谁指认不出来」的情况 —— 记错比不记更坏：
+      记错会让一条没被用过的技能看起来"学成了"，还会把它顶到检索前列
+      （score 里有 0.6*(ok/hits) 与 0.3*r 两项加权）。
+      同时**不写入新配方**（消费不写新技能，2026-10-25 边界）。
     """
     out: dict[str, Any] = {"mastered": False, "skill_action": "",
                            "mastered_total": 0, "ability_total": 0, "topic_id": "",
@@ -4355,6 +4471,14 @@ def _absorb(question: str, sql: str, topic_id: str,
 
     if not str(sql or "").strip():
         out["skill_action"] = "答案无取数配方（不写技能库；技能存的是可执行配方）"
+        return out
+    if not record_skill:
+        # ★ 2026-11-09：本次复用了谁**指认不出来** → 只标掌握，
+        #   **不动技能库的用量账**（ok 不动），也**不写入新配方**。
+        #   记错比不记更坏：记错会让一条没被用过的技能看起来"学成了"，
+        #   还会把它顶到检索前列（score 里有 0.6*(ok/hits) 与 0.3*r 两项加权）。
+        out["skill_action"] = ("本次复用的技能未能指认（如实不记：ok 计数不动，"
+                               "不写入新配方）")
         return out
     if not _looks_like_recipe(sql):
         # 原版技能 = 一次**成功 rollout 的 program_code**，那是真的调了
