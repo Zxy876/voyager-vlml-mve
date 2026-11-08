@@ -539,8 +539,21 @@ async def learn_milestone_composite(scene_id: str, topic_id: str, question: str,
         return out
     _d = (rr or {}).get("data") or {}
     rows = _d.get("rows") or []
-    real = bool(rows) and any(
-        v is not None for row in rows[:3] for v in (row if isinstance(row, (list, tuple)) else [row]))
+    # ★ 2026-11-09：改用项目**既有**的真空判据 `critic.is_vacuous`
+    # （复用，不重造 —— 同 `_has_real` 的做法）。
+    # 旧写法 `any(v is not None ...)` 把 `SELECT 0 AS record_count` 判成
+    # 「取到真数」→ 整体取数是**假值**也照样入库（实测：L 场景里程碑
+    # 「八月份工资记录数」的会话 rollout_sql = `SELECT 0 AS record_count`，
+    # 而表根本不在这个场景 → 该说答不了，却固化了一条假配方）。
+    # `is_vacuous` 里 `_is_zeroish(0)` → True → 全零/全空 = 真空 → 拦。
+    try:
+        from voyager_vlml.agents.critic import is_vacuous as _isvac
+        real = bool(rows) and not _isvac(_d)
+    except Exception:
+        # 判据取不到时退回最保守口径：任何非 None 的值都算真数
+        real = bool(rows) and any(
+            v is not None for row in rows[:3]
+            for v in (row if isinstance(row, (list, tuple)) else [row]))
     if not (rr or {}).get("ok") or not real:
         out["skipped"] = (f"组合 SQL 没取到真数（ok={bool((rr or {}).get('ok'))} "
                           f"rows={len(rows)}）—— 不入库")
@@ -604,18 +617,37 @@ async def learn_milestone_composite(scene_id: str, topic_id: str, question: str,
                 _ns[_fn.__name__] = _fn
         _box = _la._run_restricted(_prog, _ns, timeout=45.0)
         _res = _ns.get("RESULT")
+        # ★ 2026-11-09：整体取数（`overall`）必须**自己是真值**。
+        # 旧判据只看「RESULT 里有没有任何非空值」→ 兄弟维度取到真值就放行，
+        # 而 `overall` 是 `SELECT 0 AS record_count` 这种**占位假值**也照样
+        # 入库（实测：L 场景里程碑「八月份工资记录数」的会话，
+        # 表不在本场景 → overall 恒 0，兄弟却是真的表存在性检查结果）。
+        # 会话的「整体取数」是它区别于维度技能的那一半 —— 它假了，整条会话
+        # 就是一条假配方。判据复用 critic.is_vacuous（不重造）。
+        _overall_real = False
+        if isinstance(_res, dict):
+            _ov = _res.get("overall")
+            try:
+                from voyager_vlml.agents.critic import is_vacuous as _isvac2
+                _overall_real = (_ov is not None) and not _isvac2(_ov)
+            except Exception:
+                _overall_real = (_ov is not None and _ov != {}
+                                 and _ov != [] and _ov != "")
         _vals = []
         if isinstance(_res, dict):
             for _v in _res.values():
                 _vals.extend(list(_v) if isinstance(_v, (list, tuple)) else [_v])
         elif _res is not None:
             _vals.append(_res)
-        _ok_prog = bool(_box.get("ok")) and any(
+        _ok_prog = bool(_box.get("ok")) and _overall_real and any(
             v is not None and v != "" and v != [] and v != {}
             for v in _vals)
         if not _ok_prog:
-            out["skipped"] = (f"会话程序没跑出真值（ok={bool(_box.get('ok'))} "
-                              f"err={str(_box.get('error') or '')[:120]}）—— 不入库")
+            _why = ("整体取数不是真值（overall 真空/缺）"
+                    if (bool(_box.get("ok")) and not _overall_real)
+                    else f"ok={bool(_box.get('ok'))} "
+                         f"err={str(_box.get('error') or '')[:120]}")
+            out["skipped"] = f"会话程序没跑出真值（{_why}）—— 不入库"
             return out
     except Exception as e:
         out["skipped"] = (f"会话程序验收抛错：{type(e).__name__}: {e}")
