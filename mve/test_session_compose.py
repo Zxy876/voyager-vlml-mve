@@ -168,6 +168,21 @@ def main() -> int:
         check("同名维度不跨 topic 误取",
               all(str(s.get("topic") or "") == "T1" for s in out2),
               ", ".join("%s/%s" % (s.get("topic"), s.get("name")) for s in out2))
+        # ★ 反向闭包（2026-11-09 实测加的）：命中**组成技能**也要带出会话。
+        #   只做「会话命中→带组成」不够 —— 会话是长文本，向量语义被稀释，
+        #   sim 略低于「与问句逐字相同」的那条具体维度技能 → 会话进不了
+        #   top5 → 闭包起点根本不触发。实测同一问句下会话一条都进不了。
+        skill_store._load_raw = lambda: _raw
+        _hit2 = [{"key": "T1::dim_x", "topic": "T1", "name": "dim_x",
+                  "text": "维度X", "code": "RESULT = 1", "source_scene": "L"}]
+        out3 = _expand_session_skills(_hit2, "L")
+        names3 = [str(s.get("name") or "") for s in out3]
+        check("命中组成技能 → 反查带出所属会话", "milestone" in names3,
+              ", ".join(names3))
+        check("会话带出后 → 组成技能补齐（闭包）",
+              "dim_y" in names3, ", ".join(names3))
+        check("会话排最前", names3 and names3[0] == "milestone",
+              ", ".join(names3))
     finally:
         skill_store._load_raw = _orig_load
 

@@ -252,19 +252,32 @@ def _is_session_skill(s: dict[str, Any]) -> bool:
 def _expand_session_skills(skills: list[dict[str, Any]] | None,
                            scene_id: str = "",
                            ) -> list[dict[str, Any]]:
-    """会话命中 → 把**它组成的全部维度技能**一并带出。
+    """命中技能 → **闭包**出它所属会话与该会话的全部组成技能。
 
     为什么（这就是用户说的「按会话去检索它就可以整合这一段时间的所有
     技能（为回答这个问题所积累的）」）：
       消费侧只拿到「碎片维度配方」时，每个配方只闭合了目标的一部分，
       组合要现凑 —— 凑不全就是「消费不到」（痛点 1/2 同源）。
       会话（maieutic 的累积并集 / 原版 Voyager 的复合 program）记着
-      「这个目标是哪些方法攒出来的」→ 命中会话就该把这一组全带上。
+      「这个目标是哪些方法攒出来的」→ 命中就该把这一组全带上。
+
+    ★ 为什么是**双向闭包**，不是只「会话→组成」（2026-11-09 实测）：
+      只做「会话命中→带组成」不够 —— 会话自己是**长文本**（里程碑题目 +
+      各维度问题 + 说明），向量化的对象是 name+text（skill_store.
+      _entry_embed_text）→ 文本越长语义越被稀释，sim 略低于「与问句
+      逐字相同」的那条具体维度技能。实测同一问句：
+        github_claimed_count  score=1.045
+        tiktok_claimed_count  score=0.980
+        github_claimed_first_source_url score=0.957
+        …
+      → 会话一条都进不了 top5，闭包起点根本不会触发。
+      所以：**命中组成技能也反查会话**（闭包），再由会话带出全部组成。
+      这才是「以会话为检索单位」的真实含义，也不改动任何打分与门槛。
 
     怎么带（不发明打分与门槛）：
       会话的 blueprint.dims 是组成技能的**完整 key**（{topic}::{dim_id}）。
       直接按 key 取，取不到就跳过 —— 不猜、不跨 topic 找、不重新打分。
-      排序上**会话排最前、组成紧随**：下游的材料清单按前 N 条截断
+      排序上**会话排最前**：下游的材料清单按前 N 条截断
       （_compose_sql / _refill_sql 的 skills[:5]），不前置就会被挤掉。
 
     老条目兼容：dims 里存的是**裸 dim_id**（维度 id 不是全局唯一的 ——
@@ -273,9 +286,6 @@ def _expand_session_skills(skills: list[dict[str, Any]] | None,
     """
     sk = list(skills or [])
     if not sk:
-        return sk
-    sessions = [s for s in sk if _is_session_skill(s)]
-    if not sessions:
         return sk
     try:
         import skill_store as _ss
@@ -290,53 +300,108 @@ def _expand_session_skills(skills: list[dict[str, Any]] | None,
         return (not _sid
                 or str((e or {}).get("source_scene") or "default") in _allowed)
 
+    # ---- 会话表：key → 会话条目；组成 key → 会话 key 列表（反查用）----
+    _sess: dict[str, dict[str, Any]] = {}
+    _rev: dict[str, list[str]] = {}
+    for _k, _e in all_sk.items():
+        if not _is_session_skill(_e):
+            continue
+        _sess[_k] = _e
+        _topic = str(_e.get("topic") or "")
+        for _d in (_e.get("blueprint") or {}).get("dims") or []:
+            _ds = str(_d or "").strip()
+            if not _ds:
+                continue
+            if "::" in _ds:
+                _ck = _ds
+            else:
+                _ck = f"{_topic}::{_ds}"
+                if _ck not in all_sk:
+                    # 维度 id 不是全局唯一 —— 只在本会话的 topic 里找，
+                    # 跨 topic 猜 = 拿错技能（组合出来的数就是错的）。
+                    _cands = [v for kk, v in all_sk.items()
+                              if str((v or {}).get("name") or "") == _ds
+                              and _usable(v)]
+                    _cand = next((v for v in _cands
+                                  if str(v.get("topic") or "") == _topic), None)
+                    if _cand is None:
+                        continue
+                    _ck = f"{_cand.get('topic')}::{_cand.get('name')}"
+            _rev.setdefault(_ck, []).append(_k)
+
+    # ---- 闭包：命中 → 组成命中 → 它们的会话 → 会话的组成 ----
     _out: list[dict[str, Any]] = []
     _seen: set[str] = set()
 
-    def _push(e: dict[str, Any]) -> None:
+    def _push(e: dict[str, Any], frm: str = "") -> None:
         _k = f"{e.get('topic')}::{e.get('name')}"
         if _k in _seen:
             return
         _seen.add(_k)
-        _out.append(e)
+        _item = dict(e)
+        _item["key"] = _k
+        if frm:
+            _item["from_session"] = frm
+        _out.append(_item)
 
-    # 会话排**最前**：下游的材料清单按前 N 条截断（_compose_sql / _refill_sql
-    # 的 skills[:5]），会话不前置，它带的组成技能会被挤掉 → 等于没带。
-    for sess in sessions:
-        _push(sess)
+    def _session_comps(skey: str) -> list[str]:
+        _e = _sess.get(skey) or {}
+        _topic = str(_e.get("topic") or "")
+        _res: list[str] = []
+        for _d in (_e.get("blueprint") or {}).get("dims") or []:
+            _ds = str(_d or "").strip()
+            if not _ds:
+                continue
+            if "::" in _ds:
+                _ck = _ds
+            else:
+                _ck = f"{_topic}::{_ds}"
+                if _ck not in all_sk:
+                    _cands = [v for kk, v in all_sk.items()
+                              if str((v or {}).get("name") or "") == _ds
+                              and _usable(v)]
+                    _cand = next((v for v in _cands
+                                  if str(v.get("topic") or "") == _topic), None)
+                    if _cand is None:
+                        continue
+                    _ck = f"{_cand.get('topic')}::{_cand.get('name')}"
+            if _ck not in _res:
+                _res.append(_ck)
+        return _res
+
+    # 1) 命中的会话 + 2) 由「组成命中」反查到的会话 → 会话一律排最前
+    #    （下游材料清单按前 N 条截断：_compose_sql / _refill_sql 的 skills[:5]，
+    #     会话不前置，它带的组成技能会被挤掉 → 等于没带）
+    _s_first = [s for s in sk if _is_session_skill(s)]
+    _s_rev: list[dict[str, Any]] = []
+    for s in sk:
+        if _is_session_skill(s):
+            continue
+        _ck = f"{s.get('topic')}::{s.get('name')}"
+        for _skey in _rev.get(_ck, []):
+            _se = _sess.get(_skey)
+            if _se is None or not _usable(_se):
+                continue
+            if any(f"{x.get('topic')}::{x.get('name')}" == _skey for x in _s_first):
+                continue
+            _s_rev.append(_se)
+    for _s in _s_first:
+        _push(_s)
+    for _s in _s_rev:
+        _push(_s, frm=f"{_s.get('topic')}::{_s.get('name')}")
+    # 3) 其余命中项
     for s in sk:
         if not _is_session_skill(s):
             _push(s)
-    for sess in sessions:
-        bp = (sess or {}).get("blueprint") or {}
-        _topic = str((sess or {}).get("topic") or "")
-        for d in (bp.get("dims") or []):
-            _d = str(d or "").strip()
-            if not _d:
-                continue
-            _e = None
-            if "::" in _d:
-                _e = all_sk.get(_d)              # 完整 key（2026-11-09 起）
-            else:
-                _e = all_sk.get(f"{_topic}::{_d}")   # 老条目：裸 dim_id
-                if _e is None:
-                    # 同名维度散在多个 topic 下 —— 只在本会话的 topic 里找，
-                    # 跨 topic 猜 = 拿错技能（组合出来的数就是错的）。
-                    _cands = [v for kk, v in all_sk.items()
-                              if str((v or {}).get("name") or "") == _d
-                              and _usable(v)]
-                    _e = next((v for v in _cands
-                               if str(v.get("topic") or "") == _topic), None)
-            if not _e or not _usable(_e):
-                continue
-            _k = f"{_e.get('topic')}::{_e.get('name')}"
-            if _k in _seen:
-                continue
-            _seen.add(_k)
-            _item = dict(_e)
-            _item["key"] = _k
-            _item["from_session"] = str(sess.get("key") or "")
-            _out.append(_item)
+    # 4) 会话带出的全部组成（闭包的最后一步）
+    for _item in list(_out):
+        _ck = f"{_item.get('topic')}::{_item.get('name')}"
+        if _ck not in _sess:
+            continue
+        for _comp in _session_comps(_ck):
+            _ce = all_sk.get(_comp)
+            if _ce is not None and _usable(_ce):
+                _push(_ce, frm=_ck)
     return _out
 
 
