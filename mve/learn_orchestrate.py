@@ -417,6 +417,30 @@ def _session_program(dim_calls: list[tuple[str, str]], sql_text: str) -> str:
     return "\n".join(lines)
 
 
+def _session_text(question: str, milestone_name: str = "",
+                  dim_questions: list[str] | None = None) -> str:
+    """会话的**检索文本** = 里程碑题目 + 各维度的问题（maieutic 累积并集）。
+
+    为什么必须带维度问题（2026-11-09 实测）：
+      只写里程碑题目的话，会话只能被「里程碑原题」检索到 —— 用组成维度的
+      问句（「GitHub=CLAIMED 的记录总共有多少行」）检索，会话进不了 top5。
+      而用户要的恰恰是「同一目标的各种问法」都能检索到会话
+      （「都是要查某人在xx年xx月的social media… 按会话去检索它就可以整合
+      这一段时间的所有技能」）。向量化的对象是 name + text
+      （skill_store._entry_embed_text）→ text 覆盖整个目标 = 语义面覆盖。
+
+    单一事实源：学习侧合成与迁移脚本重建都调这里。
+    """
+    qs = [str(q or "").strip() for q in (dim_questions or [])]
+    qs = [q for q in qs if q]
+    out = (f"【里程碑{('：' + str(milestone_name)[:40]) if milestone_name else ''}】"
+           f"{str(question or '').strip()}：全维度闭合后组合出的整体取数做法"
+           f"（维度配方组合，非单维度）")
+    if qs:
+        out += "；涵盖的维度问题：" + "；".join(qs[:6])
+    return out
+
+
 async def learn_milestone_composite(scene_id: str, topic_id: str, question: str,
                                     dim_codes: list[dict[str, Any]], *,
                                     db_path: str = "",
@@ -596,9 +620,17 @@ async def learn_milestone_composite(scene_id: str, topic_id: str, question: str,
     except Exception as e:
         out["skipped"] = (f"会话程序验收抛错：{type(e).__name__}: {e}")
         return out
-    text = (f"【里程碑{('：' + milestone_name[:40]) if milestone_name else ''}】"
-            f"{question}：全维度闭合后组合出的整体取数做法"
-            f"（维度配方组合，非单维度）")
+    # 会话的**检索文本**要覆盖整个目标（maieutic 累积并集），不只是里程碑题目。
+    # ⚠️ 2026-11-09 实测：只写里程碑题目的话，会话只能被「里程碑原题」检索到 ——
+    # 用组成维度的问句（「GitHub=CLAIMED 的记录总共有多少行」）检索，
+    # 会话进不了 top5（score 1.045/0.98/0.957… 全是维度技能）。
+    # 而用户要的恰恰是「同一目标的各种问法」都能检索到会话
+    # （「都是要查某人在xx年xx月的social media… 按会话去检索它就可以整合
+    # 这一段时间的所有技能」）。向量化的对象是 name + text（_entry_embed_text），
+    # 所以把各维度的问题并进 text = 会话的语义面覆盖整个目标。
+    _dim_qs = [str((_by_id.get(_d) or {}).get("question") or "").strip()
+               for _d in _use_ids]
+    text = _session_text(question, milestone_name, _dim_qs)
     # 材料来源 + 文本侧守卫：组合技能的配方由维度代码合成，来源按合成后的
     # 代码实际调用的工具判（同一套口径，别让两条写入通道不同构）。
     _prov_c = _provenance_of([], _prog)

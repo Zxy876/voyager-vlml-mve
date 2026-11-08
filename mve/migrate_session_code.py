@@ -32,7 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def _is_old_form(code: str) -> bool:
-    """这条会话需不需要重建。
+    """这条会话的**形态**需不需要重建。
 
     两种要重建的形态：
       ① **裸 SQL**（老形态）：`SELECT ...` —— 不是可执行程序，一调就炸
@@ -68,14 +68,14 @@ def main() -> int:
                 == "maieutic_milestone_composite"]
     print(f"会话技能共 {len(sessions)} 条")
     todo = [(k, v) for k, v in sessions if _is_old_form((v or {}).get("code"))]
-    print(f"其中老形态（裸 SQL）{len(todo)} 条")
+    print(f"其中形态要重建（裸 SQL / 含槽位）{len(todo)} 条")
     if args.scene:
         todo = [(k, v) for k, v in todo
                 if str(((v or {}).get("blueprint") or {}).get("scene") or "")
                 == args.scene]
         print(f"限定场景 {args.scene} → 待处理 {len(todo)} 条")
-    if not todo:
-        print("没有要改的")
+    if not sessions:
+        print("库里没有会话技能")
         return 0
 
     # 组成维度：同 topic 下按名字找（维度 id 不是全局唯一的 ——
@@ -86,6 +86,7 @@ def main() -> int:
             str((v or {}).get("name") or "")] = v
 
     changed: list[tuple[str, str]] = []
+    changed_keys: set[str] = set()
     for key, entry in todo:
         bp = dict((entry or {}).get("blueprint") or {})
         topic = str((entry or {}).get("topic") or "")
@@ -159,7 +160,45 @@ def main() -> int:
         bp["rollout_sql_tpl"] = sql_tpl
         entry["blueprint"] = bp
         changed.append((key, f"{len(calls)} 条组成"))
+        changed_keys.add(key)
         print(f"  ✅ {key}：重建为组合程序（{len(calls)} 条组成）")
+
+    # ---- 阶段 2：检索文本更新（快，不用真执行）----
+    # ⚠️ 2026-11-09 实测：会话的检索文本只写里程碑题目的话，会话**只能**被
+    # 「里程碑原题」检索到 —— 用组成维度的问句检索，会话进不了 top5
+    # （实测 score 全被维度技能占满）。用户要的恰恰是「同一目标的各种问法」
+    # 都能检索到会话。所以把各维度的问题并进 text（maieutic 累积并集）。
+    # text 变了 → 向量要重算（向量化的对象是 name + text）→ 删掉该 key 的
+    # 向量，_ensure_embs 会懒补。
+    from learn_orchestrate import _session_text
+    reembed: set[str] = set()
+    for key, entry in sessions:
+        if args.scene and str(((entry or {}).get("blueprint") or {}).get("scene")
+                              or "") != args.scene:
+            continue
+        bp = entry.get("blueprint") or {}
+        topic = str(entry.get("topic") or "")
+        pool = by_topic.get(topic) or {}
+        dim_qs: list[str] = []
+        for d in [str(x) for x in (bp.get("dims") or [])][:8]:
+            dn = d.split("::")[-1] if "::" in d else d
+            e = pool.get(dn)
+            if not e:
+                continue
+            q = str((e.get("blueprint") or {}).get("question") or "").strip()
+            if q:
+                dim_qs.append(q)
+        if not dim_qs:
+            continue          # 没有组成维度 → 无从并入（反复处理没意义）
+        new_text = _session_text(str(bp.get("question") or ""),
+                                  str(bp.get("milestone") or ""), dim_qs)
+        if new_text == str(entry.get("text") or ""):
+            continue
+        entry["text"] = new_text
+        reembed.add(key)
+        changed.append((key, "检索文本覆盖维度问题"))
+        changed_keys.add(key)
+        print(f"  ✅ {key}：检索文本覆盖 {len(dim_qs)} 条维度问题")
 
     if args.dry_run:
         print(f"\n[dry-run] 会改 {len(changed)} 条，未落盘")
@@ -180,7 +219,17 @@ def main() -> int:
         skill_store._RAW_CACHE.clear()
     except Exception:
         pass
-    print(f"已写回 {sp}（改了 {len(changed)} 条）")
+    # text 变了的 → 向量失效（下次检索时 _ensure_embs 懒补重算）
+    if reembed:
+        try:
+            embs = skill_store._load_embs()
+            for k in reembed:
+                embs.pop(k, None)
+            skill_store._save_embs(embs)
+            print(f"已作废 {len(reembed)} 条会话向量（下次检索懒补重算）")
+        except Exception as e:
+            print(f"⚠️ 向量作废失败：{type(e).__name__}: {e}")
+    print(f"已写回 {sp}（改了 {len(changed_keys)} 条会话）")
     return 0
 
 

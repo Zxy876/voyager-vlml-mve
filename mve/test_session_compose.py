@@ -225,6 +225,25 @@ def main() -> int:
     check("非会话列表原样返回",
           _expand_session_skills(_plain, "L") == _plain)
 
+    # ---- 7. 会话的检索文本要覆盖**整个目标** ----
+    # ⚠️ 2026-11-09 实测：检索文本只写里程碑题目的话，会话**只能**被
+    # 「里程碑原题」检索到 —— 用组成维度的问句检索，会话进不了 top5
+    # （实测 score 1.045/0.98/0.957… 全被维度技能占满）。用户要的恰恰是
+    # 「同一目标的各种问法」都能检索到会话 → text 必须带各维度的问题。
+    print("== 7. 会话检索文本覆盖整个目标（maieutic 累积并集） ==")
+    from learn_orchestrate import _session_text
+    _t = _session_text(
+        "从 web_facts 表查出 GitHub 列值为 CLAIMED 的第 1 行的 item 列",
+        "筛选特定平台状态并提取用户标识",
+        ["在 web_facts 表中，GitHub 列值为 'CLAIMED' 的记录总共有多少行？",
+         "在 web_facts 表中，GitHub 列值为 'CLAIMED' 的第 1 行的 item 列是什么？"])
+    check("含里程碑题目", "第 1 行的 item 列" in _t)
+    check("含维度问题 1（记录总共有多少行）", "总共有多少行" in _t, _t[-90:])
+    check("含维度问题 2（第 1 行的 item 列是什么）",
+          "item 列是什么" in _t)
+    check("没有维度时不加空段",
+          "涵盖的维度问题" not in _session_text("题目", "里程碑", []))
+
     print(f"\n通过 {PASS} / 失败 {FAIL}")
     return 0 if FAIL == 0 else 1
 
