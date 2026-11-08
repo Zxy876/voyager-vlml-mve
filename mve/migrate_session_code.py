@@ -32,9 +32,22 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def _is_old_form(code: str) -> bool:
-    """老形态 = 裸 SQL（不是可执行程序）。"""
+    """这条会话需不需要重建。
+
+    两种要重建的形态：
+      ① **裸 SQL**（老形态）：`SELECT ...` —— 不是可执行程序，一调就炸
+        （`SyntaxError: Invalid star expression`）。
+      ② **组合程序但整体 SQL 是槽位模板**：原样重放报
+        `ParserException: syntax error at or near ":"` —— 槽位没实例化。
+        2026-11-09 实测发现：泛化模板**不该进 code**。MVE 的维度技能本来
+        就没被泛化（code 里写死 'CLAIMED'/'ZXY876'，靠消费侧回填层换实体）
+        —— 会话必须跟维度技能同一套形态：code 里放真值。
+    """
     c = str(code or "").strip()
-    return c.lower().startswith(("select", "with"))
+    if c.lower().startswith(("select", "with")):
+        return True
+    import re as _re
+    return bool(_re.search(r":[a-z_][a-z0-9_]*", c, _re.I))
 
 
 def main() -> int:
@@ -133,16 +146,17 @@ def main() -> int:
         if not ok:
             print(f"  ⏭ {key}：重建后没跑出真值（{err}）—— 不动")
             continue
-        # 入库形态用泛化后的 SQL（技能存算法不存数值）
+        # 入库形态用**真值**（原样重放跑得通）；泛化模板只进 blueprint 供回填层参考
         try:
             from voyager_vlml.consume import generalize_sql_recipe as _gen
             sql_tpl = _gen(sql_raw, str(bp.get("question") or ""))
         except Exception:
             sql_tpl = sql_raw
-        prog_tpl = _session_program(calls, sql_tpl)
-        entry["code"] = prog_tpl
+        prog = _session_program(calls, sql_raw)
+        entry["code"] = prog
         bp["dims"] = [f"{topic}::{dn}" for dn, _ in dim_codes]
-        bp["session_code"] = prog_tpl
+        bp["session_code"] = prog
+        bp["rollout_sql_tpl"] = sql_tpl
         entry["blueprint"] = bp
         changed.append((key, f"{len(calls)} 条组成"))
         print(f"  ✅ {key}：重建为组合程序（{len(calls)} 条组成）")

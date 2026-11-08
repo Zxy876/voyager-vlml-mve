@@ -171,8 +171,56 @@ def main() -> int:
     finally:
         skill_store._load_raw = _orig_load
 
-    # ---- 5. 没有会话时，行为不变（不凭空多带技能） ----
-    print("== 5. 没有会话 → 列表原样返回（不改变既有检索行为） ==")
+    # ---- 5. 会话 code 里放**真值**，原样重放跑得通 ----
+    # ⚠️ 2026-11-09 实测踩过的坑：会话 code 里放**泛化后的槽位模板**
+    # （`WHERE "GitHub" = :status`）→ 原样重放报
+    # `ParserException: syntax error at or near ":"`（槽位没实例化）。
+    # MVE 的维度技能本来就没被泛化（code 里写死 'CLAIMED'/'ZXY876'，
+    # 靠消费侧回填层按当前问句换实体）—— 会话必须跟维度技能同一套形态：
+    # code 里放真值，泛化模板另存 blueprint 供回填层参考。
+    print("== 5. 会话 code 用真值 → 原样重放跑得通 ==")
+    _orig_q2 = local_agent.query_sql
+    local_agent.query_sql = (lambda scene_dir, sql, db_path="": {
+        "rows": [["https://www.github.com/torvalds"]], "columns": ["source_url"]})
+    try:
+        _p2 = _session_program([("d_1", "skill_github_claimed_first_source_url")],
+                               "SELECT source_url FROM web_facts "
+                               "WHERE \"GitHub\" = 'CLAIMED' LIMIT 1")
+        _ns2 = local_agent._ns_base(tmp, "", db_path="/tmp/x.duckdb")
+        _fn2 = local_agent._make_skill_fn(
+            {"name": "github_claimed_first_source_url",
+             "code": "r = query_sql(sql=\"SELECT source_url FROM web_facts "
+                     "WHERE \\\"GitHub\\\" = 'CLAIMED' LIMIT 1\")\nRESULT = r"},
+            tmp, "", None, db_path="/tmp/x.duckdb")
+        _ns2[_fn2.__name__] = _fn2
+        _box2 = local_agent._run_restricted(_p2, _ns2, timeout=20)
+        check("会话程序原样执行成功（真值 SQL）", bool(_box2.get("ok")),
+              str(_box2.get("error") or "")[:140])
+        _r2 = _ns2.get("RESULT") or {}
+        check("拿到真实数据",
+              isinstance(_r2, dict)
+              and "torvalds" in str(_r2.get("overall") or ""),
+              str(_r2.get("overall"))[:120])
+        check("兄弟结果也进 RESULT",
+              isinstance(_r2, dict)
+              and "torvalds" in str(_r2.get(
+                  "github_claimed_first_source_url") or ""),
+              str(_r2)[:160])
+        # 设计决定：**槽位模板不许进 code**。code 里放真值 → 原样重放跑得通；
+        # 放模板 → 槽位没实例化 → DuckDB 报
+        # `ParserException: syntax error at or near ":"`（2026-11-09 实测）。
+        # 守住这条：迁移脚本必须能把「含槽位的会话」认出来并重建。
+        from migrate_session_code import _is_old_form
+        check("含槽位的会话被认出来（迁移脚本会重建它）",
+              _is_old_form('r = query_sql(sql="SELECT x WHERE y = :status")'))
+        check("真值会话不被误判（不会反复重建）",
+              not _is_old_form(_p2),
+              _p2.splitlines()[-2][:80] if _p2 else "")
+    finally:
+        local_agent.query_sql = _orig_q2
+
+    # ---- 6. 没有会话时，行为不变（不凭空多带技能） ----
+    print("== 6. 没有会话 → 列表原样返回（不改变既有检索行为） ==")
     _plain = [{"key": "T1::dim_x", "topic": "T1", "name": "dim_x"}]
     check("非会话列表原样返回",
           _expand_session_skills(_plain, "L") == _plain)

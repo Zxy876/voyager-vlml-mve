@@ -521,7 +521,12 @@ async def learn_milestone_composite(scene_id: str, topic_id: str, question: str,
         out["skipped"] = (f"组合 SQL 没取到真数（ok={bool((rr or {}).get('ok'))} "
                           f"rows={len(rows)}）—— 不入库")
         return out
-    # 技能存算法不存数值：组合 SQL 也先泛化成槽位模板再入库
+    # 技能存算法不存数值：组合 SQL 也先泛化成槽位模板 —— 但**模板不进 code**。
+    # ⚠️ 2026-11-09 实测修正：模板进 code 会让会话程序**原样重放就跑不通**
+    # （`ParserException: syntax error at or near ":"` —— 槽位 `:status` 没实例化）。
+    # 而 MVE 的维度技能本来就没被泛化（code 里写死 'CLAIMED'/'ZXY876'，
+    # 靠消费侧回填层按当前问句换实体）—— 会话必须跟维度技能**同一套形态**：
+    # code 里是真值（原样重放能跑），泛化模板另存 blueprint 供回填层参考。
     try:
         sql_tpl = _gen(body, question)
     except Exception:
@@ -553,9 +558,9 @@ async def learn_milestone_composite(scene_id: str, topic_id: str, question: str,
     _calls: list[tuple[str, str]] = []
     for _i, _did in enumerate(_use_ids[:8], start=1):
         _calls.append(("d_%d" % _i, _scn(_did)))
-    _prog_tpl = _session_program(_calls, sql_tpl)
-    _prog_raw = _session_program(_calls, _raw_comp)
-    out["session_code"] = _prog_tpl
+    # 入库与验收都用**真值版**（原样重放跑得通）；泛化模板只进 blueprint。
+    _prog = _session_program(_calls, _raw_comp)
+    out["session_code"] = _prog
     # ---- ③' 真执行验收（会话形态）：程序真跑得出 RESULT 才入库 ----
     # 上面 ③ 验的是「SQL 本身能取到数」；这里验的是「**会话程序**能跑」——
     # 兄弟调不通 / 程序语法错 / RESULT 空 → 一律不入库。
@@ -573,7 +578,7 @@ async def learn_milestone_composite(scene_id: str, topic_id: str, question: str,
                 db_path=str(db_path or ""))
             if _fn.__name__:
                 _ns[_fn.__name__] = _fn
-        _box = _la._run_restricted(_prog_raw, _ns, timeout=45.0)
+        _box = _la._run_restricted(_prog, _ns, timeout=45.0)
         _res = _ns.get("RESULT")
         _vals = []
         if isinstance(_res, dict):
@@ -596,15 +601,15 @@ async def learn_milestone_composite(scene_id: str, topic_id: str, question: str,
             f"（维度配方组合，非单维度）")
     # 材料来源 + 文本侧守卫：组合技能的配方由维度代码合成，来源按合成后的
     # 代码实际调用的工具判（同一套口径，别让两条写入通道不同构）。
-    _prov_c = _provenance_of([], _prog_tpl)
+    _prov_c = _provenance_of([], _prog)
     if _prov_c == "upload":
-        _qg_c = _upload_quote_guard(text, _prog_tpl, str(scene_id or ""))
+        _qg_c = _upload_quote_guard(text, _prog, str(scene_id or ""))
         if _qg_c:
             out["skipped"] = _qg_c
             return out
     try:
         _act, key = skill_store.add(
-            topic_id, "milestone", text, code=_prog_tpl, source="learn",
+            topic_id, "milestone", text, code=_prog, source="learn",
             provenance=_prov_c,
             exact_only=True,
             # 组合技能的 r = 组成维度 r 的均值（全部无 r 时 -1，不计入择优）
@@ -624,7 +629,11 @@ async def learn_milestone_composite(scene_id: str, topic_id: str, question: str,
                        # 「同 topic 下找」兜底（见 consume._expand_session_skills）。
                        "dims": [f"{topic_id}::{_did}" for _did in _use_ids],
                        # 会话程序（泛化后）也留一份，便于面板/人看清组合关系
-                       "session_code": _prog_tpl},
+                       "session_code": _prog,
+                       # 泛化后的槽位模板（**不进 code**：模板进 code 会让
+                       # 会话程序原样重放报 ParserException —— 槽位没实例化。
+                       # 模板只给消费侧回填层参考，与维度技能同一套机制。）
+                       "rollout_sql_tpl": sql_tpl},
             source_scene=str(scene_id or "A"))
         out["added"] = str(key or "")
         out["action"] = str(_act or "")
