@@ -236,6 +236,111 @@ def _retrieve_skills(question: str, topic_hint: str = "",
 
 
 # ---------------------------------------------------------------------------
+# 按语义检索**会话**（用户 2026-11-09：「把索引技能变成索引过程（会话）」）
+# ---------------------------------------------------------------------------
+
+def _is_session_skill(s: dict[str, Any]) -> bool:
+    """这条技能是不是一个「会话」（= 为同一个目标积累的一组维度技能）。
+
+    判定看**来源标记**（blueprint.from），不靠名字猜 —— 名字会变、
+    形态会演进，来源标记才是稳定的。
+    """
+    bp = (s or {}).get("blueprint") or {}
+    return str(bp.get("from") or "") == "maieutic_milestone_composite"
+
+
+def _expand_session_skills(skills: list[dict[str, Any]] | None,
+                           scene_id: str = "",
+                           ) -> list[dict[str, Any]]:
+    """会话命中 → 把**它组成的全部维度技能**一并带出。
+
+    为什么（这就是用户说的「按会话去检索它就可以整合这一段时间的所有
+    技能（为回答这个问题所积累的）」）：
+      消费侧只拿到「碎片维度配方」时，每个配方只闭合了目标的一部分，
+      组合要现凑 —— 凑不全就是「消费不到」（痛点 1/2 同源）。
+      会话（maieutic 的累积并集 / 原版 Voyager 的复合 program）记着
+      「这个目标是哪些方法攒出来的」→ 命中会话就该把这一组全带上。
+
+    怎么带（不发明打分与门槛）：
+      会话的 blueprint.dims 是组成技能的**完整 key**（{topic}::{dim_id}）。
+      直接按 key 取，取不到就跳过 —— 不猜、不跨 topic 找、不重新打分。
+      排序上**会话排最前、组成紧随**：下游的材料清单按前 N 条截断
+      （_compose_sql / _refill_sql 的 skills[:5]），不前置就会被挤掉。
+
+    老条目兼容：dims 里存的是**裸 dim_id**（维度 id 不是全局唯一的 ——
+    实测 `web_facts_github_status` 同名存在于 5 个 topic 下），按
+    「同会话 topic 下找」兜底。
+    """
+    sk = list(skills or [])
+    if not sk:
+        return sk
+    sessions = [s for s in sk if _is_session_skill(s)]
+    if not sessions:
+        return sk
+    try:
+        import skill_store as _ss
+        all_sk = (_ss._load_raw().get("skills") or {})
+    except Exception:
+        return sk
+    _sid = str(scene_id or "").strip()
+    _allowed = {_sid, "default", ""} if _sid else set()
+
+    def _usable(e: dict[str, Any]) -> bool:
+        # 场景隔离口径与 retrieve 一致：只带本场景 + 通用的。
+        return (not _sid
+                or str((e or {}).get("source_scene") or "default") in _allowed)
+
+    _out: list[dict[str, Any]] = []
+    _seen: set[str] = set()
+
+    def _push(e: dict[str, Any]) -> None:
+        _k = f"{e.get('topic')}::{e.get('name')}"
+        if _k in _seen:
+            return
+        _seen.add(_k)
+        _out.append(e)
+
+    # 会话排**最前**：下游的材料清单按前 N 条截断（_compose_sql / _refill_sql
+    # 的 skills[:5]），会话不前置，它带的组成技能会被挤掉 → 等于没带。
+    for sess in sessions:
+        _push(sess)
+    for s in sk:
+        if not _is_session_skill(s):
+            _push(s)
+    for sess in sessions:
+        bp = (sess or {}).get("blueprint") or {}
+        _topic = str((sess or {}).get("topic") or "")
+        for d in (bp.get("dims") or []):
+            _d = str(d or "").strip()
+            if not _d:
+                continue
+            _e = None
+            if "::" in _d:
+                _e = all_sk.get(_d)              # 完整 key（2026-11-09 起）
+            else:
+                _e = all_sk.get(f"{_topic}::{_d}")   # 老条目：裸 dim_id
+                if _e is None:
+                    # 同名维度散在多个 topic 下 —— 只在本会话的 topic 里找，
+                    # 跨 topic 猜 = 拿错技能（组合出来的数就是错的）。
+                    _cands = [v for kk, v in all_sk.items()
+                              if str((v or {}).get("name") or "") == _d
+                              and _usable(v)]
+                    _e = next((v for v in _cands
+                               if str(v.get("topic") or "") == _topic), None)
+            if not _e or not _usable(_e):
+                continue
+            _k = f"{_e.get('topic')}::{_e.get('name')}"
+            if _k in _seen:
+                continue
+            _seen.add(_k)
+            _item = dict(_e)
+            _item["key"] = _k
+            _item["from_session"] = str(sess.get("key") or "")
+            _out.append(_item)
+    return _out
+
+
+# ---------------------------------------------------------------------------
 # ③ 复用配方：把当前这句话的实体值回填进配方的**计算**
 # ---------------------------------------------------------------------------
 
@@ -1380,6 +1485,11 @@ async def consume(
     # 表现正是用户抱怨的「清库了还是现做/复用混乱」。
     skills = [s for s in _raw_skills
               if not str(s.get("topic") or "").startswith("consume_")]
+    # ---- 检索到**会话** → 把它组成的全部维度技能一并带出 ----
+    # （用户 2026-11-09：「把索引技能变成索引过程（会话）… 按会话去检索它
+    #   就可以整合这一段时间的所有技能」）。没这一步，消费侧拿到的永远是
+    #   碎片配方 —— 每个只闭合目标的一部分 → 组合不全 → 消费不到。
+    skills = _expand_session_skills(skills, _scene_id)
     reused_list = [{"topic": s.get("topic"), "name": s.get("name"),
                     "key": s.get("key")} for s in skills]
     # 维度覆盖守卫的标尺：本条答案实际**复用**的是哪些技能。默认取全部检回技能；

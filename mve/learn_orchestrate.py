@@ -382,10 +382,48 @@ _COMPOSITE_SYSTEM = """你是数据取数方法组合员。手里有为同一道
 只返回一个 JSON：{"sql": "组合后的 SQL", "note": "一句话说明组合方式与取舍"}"""
 
 
+def _session_program(dim_calls: list[tuple[str, str]], sql_text: str) -> str:
+    """会话程序 = 组合调用兄弟技能 + 整体取数 + RESULT 汇总。
+
+    形态依据（三处都指向同一件事，别自创第四种）：
+      · **原版 Voyager**：一条技能 = 一段**可执行程序**
+        （`voyager.py:225` `code = parsed_result["program_code"] + "\\n" +
+        parsed_result["exec_code"]`；`skill.py:89` 存的是 `program_code`）
+        —— 裸 SQL 不是技能形态，装进技能库里一调就
+        `SyntaxError: Invalid star expression`（`SELECT COUNT(*)` 的 `*`
+        被当 Python 星号表达式）。
+      · **原版 Voyager 的组合**：程序里直接调 skill_a() + skill_b()
+        （`index.js:256` `programs + code` 同一作用域 eval；
+        `skill_library/trial1` 51 条里 7 处真实合成）。
+      · **消费侧现成样板** `consume_7c45c9b6`：兄弟调用 + `RESULT = {...}`
+        —— MVE 已经在用这个形态产出消费会话，学习侧照它对齐即可。
+
+    `dim_calls` = [(变量名, 函数名)]；`sql_text` = 整体取数那条 SQL。
+    SQL 用 repr 落进源码字面量：引号/换行自动转义，解析后还原成原串。
+    """
+    lines = [
+        "# 里程碑会话：组合 %d 条维度技能" % len(dim_calls),
+        "# （兄弟技能互相可见 —— 同原版 programs + code 同一作用域）",
+    ]
+    for _var, _fn in dim_calls:
+        lines.append("%s = %s()" % (_var, _fn))
+    lines.append("# 整体取数（这一里程碑整体怎么算）")
+    lines.append("r = query_sql(sql=%s)" % repr(str(sql_text or "")))
+    lines.append("RESULT = {")
+    for _var, _fn in dim_calls:
+        lines.append('    "%s": %s,' % (_fn[len("skill_"):], _var))
+    lines.append('    "overall": r,')
+    lines.append("}")
+    return "\n".join(lines)
+
+
 async def learn_milestone_composite(scene_id: str, topic_id: str, question: str,
                                     dim_codes: list[dict[str, Any]], *,
                                     db_path: str = "",
-                                    milestone_name: str = "") -> dict[str, Any]:
+                                    milestone_name: str = "",
+                                    scene_dir: str = "",
+                                    in_dims: list[str] | None = None,
+                                    ) -> dict[str, Any]:
     """里程碑**全闭合**后把「里程碑本身」组合成**一条复合技能**入库。
 
     用户 2026-10-25 指令：「把里程碑在学习侧重试之后计入技能，不计的话消费
@@ -396,12 +434,19 @@ async def learn_milestone_composite(scene_id: str, topic_id: str, question: str,
     原子技能**组合成复合 program 按里程碑索引入库**（voyager.py:230 成功才
     add_new_skill）—— 这里补上这一步。
 
-    入库三道关（缺一不入，宁缺毋滥）：
+    入库四道关（缺一不入，宁缺毋滥）：
       ① 字面量守卫：组合 SQL 里的每个取值必须能在 db_observation 实查里指认；
       ② fan-out 闸：跨一对多 JOIN 乘爆的 SQL 不入；
       ③ 真执行取到真数：跑不通 / 0 行 / 整行 NULL（空表聚合 (NULL,0) 骗局）
-         都不入。
+         都不入；
+      ④ 会话程序真跑得出真值（2026-11-09 加）：入库的形态是**组合程序**
+         （兄弟调用 + RESULT 汇总），不是裸 SQL —— 光有 ③ 还不够，
+         程序本身跑不通（兄弟调不到 / 语法错 / RESULT 空）照样不入库。
     任何一步失败都不入库（复合技能缺失只是退回「消费单配方复用」，不会存坏技能）。
+
+    `in_dims`：**真入库**的维度 id 列表（来自 learn_milestone_skills 的
+    `added`）。库里没有的维度不能出现在会话程序里 —— 调了必然 NameError，
+    整条会话崩掉。没给就用本轮闭合的全部维度。
     """
     out: dict[str, Any] = {"added": "", "skipped": "", "sql": "", "note": ""}
     codes = [str(d.get("code") or "").strip() for d in (dim_codes or [])]
@@ -478,26 +523,88 @@ async def learn_milestone_composite(scene_id: str, topic_id: str, question: str,
         return out
     # 技能存算法不存数值：组合 SQL 也先泛化成槽位模板再入库
     try:
-        code = _gen(body, question)
+        sql_tpl = _gen(body, question)
     except Exception:
-        code = body
+        sql_tpl = body
     # body 是**真执行取到真数**的那条（上面 ③ 验过）—— 泛化前的原文留
     # blueprint.rollout_sql，结晶条目重放它（模板给检索+回填通道）。
     _raw_comp = body
+    # ---- 会话程序（2026-11-09）：形态从「孤立 SQL」改成「可执行的组合程序」----
+    # 为什么必须改：技能是**程序**不是 SQL（原版 skill.py:89 存 program_code；
+    # 消费侧现成样板 consume_7c45c9b6 也是组合调用 + RESULT）。
+    # 之前这里存的是裸 `SELECT COUNT(*) ...` → 一调就
+    # `SyntaxError: Invalid star expression`（`*` 被当 Python 星号表达式）
+    # → 召回有（hits 高）但一条都跑不起来 → ok 恒 0。
+    # 组合关系照 maieutic 的累积并集（会话 = 为这个目标积累的全部维度技能），
+    # 兄弟互相可见照原版 programs 同作用域。
+    _by_id = {str((d or {}).get("id") or ""): (d or {})
+              for d in (dim_codes or [])}
+    # 只为**真入库**的维度生成兄弟调用行：库里没有的维度调了必然 NameError，
+    # 会话整条崩掉（连带它带的整体取数一起废）。in_dims 空 → 用本轮闭合的全部。
+    _use_ids = [str(x) for x in (in_dims or []) if str(x) in _by_id] \
+        or list(_by_id.keys())
+    try:
+        from local_agent import _skill_call_name as _scn
+    except Exception:
+        def _scn(_raw: str) -> str:                      # noqa: N802
+            import re as _re
+            _s = _re.sub(r"[^0-9A-Za-z_]+", "_", str(_raw or "")).strip("_")
+            return ("skill_" + _s) if _s else ""
+    _calls: list[tuple[str, str]] = []
+    for _i, _did in enumerate(_use_ids[:8], start=1):
+        _calls.append(("d_%d" % _i, _scn(_did)))
+    _prog_tpl = _session_program(_calls, sql_tpl)
+    _prog_raw = _session_program(_calls, _raw_comp)
+    out["session_code"] = _prog_tpl
+    # ---- ③' 真执行验收（会话形态）：程序真跑得出 RESULT 才入库 ----
+    # 上面 ③ 验的是「SQL 本身能取到数」；这里验的是「**会话程序**能跑」——
+    # 兄弟调不通 / 程序语法错 / RESULT 空 → 一律不入库。
+    # 兄弟函数用**泛化前**的维度原文现场造（泛化模板带 :slot 跑不通）。
+    _ok_prog = False
+    try:
+        import local_agent as _la
+        _ns = _la._ns_base(str(scene_dir or ""), "", db_path=str(db_path or ""))
+        for _did in _use_ids[:8]:
+            _fn = _la._make_skill_fn(
+                {"code": str((_by_id.get(_did) or {}).get("code") or ""),
+                 "name": _did,
+                 "text": str((_by_id.get(_did) or {}).get("question") or "")},
+                str(scene_dir or ""), str(scene_id or ""), None,
+                db_path=str(db_path or ""))
+            if _fn.__name__:
+                _ns[_fn.__name__] = _fn
+        _box = _la._run_restricted(_prog_raw, _ns, timeout=45.0)
+        _res = _ns.get("RESULT")
+        _vals = []
+        if isinstance(_res, dict):
+            for _v in _res.values():
+                _vals.extend(list(_v) if isinstance(_v, (list, tuple)) else [_v])
+        elif _res is not None:
+            _vals.append(_res)
+        _ok_prog = bool(_box.get("ok")) and any(
+            v is not None and v != "" and v != [] and v != {}
+            for v in _vals)
+        if not _ok_prog:
+            out["skipped"] = (f"会话程序没跑出真值（ok={bool(_box.get('ok'))} "
+                              f"err={str(_box.get('error') or '')[:120]}）—— 不入库")
+            return out
+    except Exception as e:
+        out["skipped"] = (f"会话程序验收抛错：{type(e).__name__}: {e}")
+        return out
     text = (f"【里程碑{('：' + milestone_name[:40]) if milestone_name else ''}】"
             f"{question}：全维度闭合后组合出的整体取数做法"
             f"（维度配方组合，非单维度）")
     # 材料来源 + 文本侧守卫：组合技能的配方由维度代码合成，来源按合成后的
     # 代码实际调用的工具判（同一套口径，别让两条写入通道不同构）。
-    _prov_c = _provenance_of([], code)
+    _prov_c = _provenance_of([], _prog_tpl)
     if _prov_c == "upload":
-        _qg_c = _upload_quote_guard(text, code, str(scene_id or ""))
+        _qg_c = _upload_quote_guard(text, _prog_tpl, str(scene_id or ""))
         if _qg_c:
             out["skipped"] = _qg_c
             return out
     try:
         _act, key = skill_store.add(
-            topic_id, "milestone", text, code=code, source="learn",
+            topic_id, "milestone", text, code=_prog_tpl, source="learn",
             provenance=_prov_c,
             exact_only=True,
             # 组合技能的 r = 组成维度 r 的均值（全部无 r 时 -1，不计入择优）
@@ -510,7 +617,14 @@ async def learn_milestone_composite(scene_id: str, topic_id: str, question: str,
                        "scene": str(scene_id or ""),
                        # 真执行取到真数的组合 SQL 原文（泛化前）
                        "rollout_sql": _raw_comp,
-                       "dims": [str((d or {}).get("id") or "") for d in dim_codes]},
+                       # ★ 组成维度存**完整 key**（{topic}::{dim_id}）：
+                       # 维度 id 不是全局唯一的 —— 实测 `web_facts_github_status`
+                       # 这一条 id 同时存在于 5 个 topic 下（同名维度各存一条），
+                       # 只存 id 定位不到具体技能。只存 id 的老条目消费侧按
+                       # 「同 topic 下找」兜底（见 consume._expand_session_skills）。
+                       "dims": [f"{topic_id}::{_did}" for _did in _use_ids],
+                       # 会话程序（泛化后）也留一份，便于面板/人看清组合关系
+                       "session_code": _prog_tpl},
             source_scene=str(scene_id or "A"))
         out["added"] = str(key or "")
         out["action"] = str(_act or "")
@@ -1856,13 +1970,20 @@ async def _start_learning_impl(
                         # 没全闭合不组合（组合了也是漏维的片面 SQL）。
                         if bool((_mst or {}).get("achieved")) and dim_codes:
                             try:
+                                # 会话程序只调**真入库**的维度（库里没有的
+                                # 维度调了必然 NameError → 整条会话崩）。
+                                _in_dims = [str(x.get("dim") or "")
+                                            for x in ((out.get("skills") or {})
+                                                      .get("added") or [])]
                                 out["milestone_skill"] = (
                                     await learn_milestone_composite(
                                         scene, _tid, question, dim_codes,
                                         db_path=str(prof.get("db_path") or ""),
                                         milestone_name=str(
                                             ((_mst or {}).get("milestone")
-                                             or {}).get("name") or "")))
+                                             or {}).get("name") or ""),
+                                        scene_dir=str(local_dir or exec_dir or ""),
+                                        in_dims=_in_dims))
                                 _mcomp = out.get("milestone_skill") or {}
                                 if _mcomp.get("added"):
                                     print(f"  · 里程碑复合技能已入库："

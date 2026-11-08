@@ -445,7 +445,9 @@ def _make_skill_fn(skill: dict[str, Any], scene_dir: str, scene_id: str,
                    tracer: list[str] | None, timeout: float = 45.0,
                    loop: Any = None,
                    evidence: list[dict[str, Any]] | None = None,
-                   question: str = ""):
+                   question: str = "",
+                   siblings: dict[str, Any] | None = None,
+                   db_path: str = ""):
     """一条已学技能 → 一个**可调用**的函数（同构原版 `programs`）。
 
     原版怎么合成（取证）：
@@ -473,6 +475,23 @@ def _make_skill_fn(skill: dict[str, Any], scene_dir: str, scene_id: str,
     → mcp_* 一个都注入不进 → 技能代码里调 `mcp_neko_web_search` 直接
     NameError（2026-10-21 服务器实测：许嵩 4 次导入全部「技能重放失败」）。
     与 run_saved_async 忘传主循环是同一类坑，只是长在嵌套的技能函数路径上。
+
+    ★ `siblings`（2026-11-09 修，照原版 index.js:256 的**同一作用域**）：
+      原版 `programs + code` 拼成**一个**作用域 → 已学技能之间互相可见。
+      MVE 之前只做到「模型看得见技能函数」，**技能重放时**的 ns 是
+      `_ns_base`（只有原语）→ 组合调用直接 NameError：
+        实测 `consume_7c45c9b6` 调 `skill_web_docs_2026_activity()`
+        → NameError: name 'skill_web_docs_2026_activity' is not defined
+      ⇒ 组合型技能（= 会话）一条都跑不起来 → 召回有（hits 高）但 ok 恒 0。
+      修法：重放时把**同一批**已学技能的函数也放进 ns（兄弟技能互相可见），
+      与原版 programs 拼接同构。siblings 由 _build_skill_fns 传入。
+
+    ★ `db_path`（2026-11-09 补，同批修）：技能重放里的 `query_sql` 必须绑
+      **同一个库**。之前这条链没透传 db_path → `_ns_base` 拿空串 → 回退到
+      「找场景目录里的库」（query_sql:193-208 的口径）。场景库形态的 duckdb
+      常**不在**场景目录（actions.register_local:384 的注释明说这一点）
+      → 技能重放查的是另一个库（或没有库）→ 组合型技能必然取不到数。
+      组合技能是「会话」，会话的组成就是这些技能 → 这一条不通，会话永远跑不起来。
     """
     code = str(skill.get("code") or "").strip()
     label = str(skill.get("name") or skill.get("topic") or "?")
@@ -483,7 +502,18 @@ def _make_skill_fn(skill: dict[str, Any], scene_dir: str, scene_id: str,
             tracer.append(f"skill:{label}")     # 先记后跑：真调用过才有据
         ns: dict[str, Any] = _ns_base(scene_dir, scene_id, tracer=tracer,
                                       loop=loop, evidence=evidence,
-                                      question=question)
+                                      question=question, db_path=db_path)
+        # 兄弟技能进同一作用域（照原版 programs + code 同作用域 eval）。
+        # 不放自己（正在跑，注进去会自我递归）。
+        # ⚠️ 兄弟表是**运行时从 __skill_siblings__ 取**的，不是建函数时抓的
+        # 参数快照 —— _build_skill_fns 是「先造全部函数、再回填兄弟」两遍，
+        # 建函数那一刻兄弟还不存在，抓快照会永远是空。
+        _sib = siblings if siblings is not None else (
+            getattr(_fn, "__skill_siblings__", None) or {})
+        if _sib:
+            for _k, _v in _sib.items():
+                if _k and _k != fname and _k not in ns:
+                    ns[_k] = _v
         box = _run_restricted(code, ns, timeout=timeout)
         if not box.get("ok"):
             raise RuntimeError(
@@ -502,18 +532,46 @@ def _build_skill_fns(skills: list[dict[str, Any]] | None, scene_dir: str,
                      scene_id: str, tracer: list[str],
                      limit: int = 8, loop: Any = None,
                      evidence: list[dict[str, Any]] | None = None,
-                     question: str = ""
+                     question: str = "",
+                     db_path: str = "",
                      ) -> dict[str, Any]:
-    """把检索到的技能编成一组可调用函数（同原版 `programs` 拼进同一作用域）。"""
-    out: dict[str, Any] = {}
-    for s in list(skills or [])[:limit]:
+    """把检索到的技能编成一组可调用函数（同原版 `programs` 拼进同一作用域）。
+
+    ★ 兄弟技能互见（2026-11-09，照原版 index.js:256）：
+      原版 `programs` = **全部**已学技能 code + 原语，拼成**一个**作用域
+      → 技能之间互相可见、新代码能调已学技能。
+      MVE 之前只做到「模型看得见技能函数」，技能**重放时**的 ns 只有原语
+      → 组合调用 NameError（实测 consume_7c45c9b6 调
+      `skill_web_docs_2026_activity()` 报 name ... is not defined）。
+      修法：先造出全部函数，再把整批函数回填给每个技能 —— 兄弟技能互相可见。
+      回填而非前向引用：函数闭包在建好时拿不到还没建的兄弟。
+
+    ★ `db_path`（2026-11-09 补）：透传给每个技能的 ns —— 技能里的
+      `query_sql` 必须查**同一个库**（场景库形态的 duckdb 常不在场景目录）。
+    """
+    picked = list(skills or [])[:limit]
+    fns: dict[str, Any] = {}
+    # 第一遍：造出全部函数对象（此刻它们的 siblings 还是空的）
+    for s in picked:
         if not str((s or {}).get("code") or "").strip():
             continue
         fn = _make_skill_fn(s, scene_dir, scene_id, tracer, loop=loop,
-                            evidence=evidence, question=question)
-        if fn.__name__ and fn.__name__ not in out:
-            out[fn.__name__] = fn
-    return out
+                            evidence=evidence, question=question,
+                            db_path=db_path)
+        if fn.__name__ and fn.__name__ not in fns:
+            fns[fn.__name__] = fn
+    # 第二遍：兄弟互见 —— 整批函数回填进每个技能
+    for s in picked:
+        if not str((s or {}).get("code") or "").strip():
+            continue
+        fn = fns.get(_skill_call_name(str((s or {}).get("name")
+                                          or (s or {}).get("topic") or "")))
+        if fn is not None:
+            try:
+                fn.__skill_siblings__ = fns
+            except Exception:
+                pass
+    return fns
 
 
 async def solve(question: str, scene_dir: str, *, llm=None,
@@ -577,7 +635,8 @@ async def solve(question: str, scene_dir: str, *, llm=None,
         # `skill_def()` 才真的调得到。
         ns.update(_build_skill_fns(skills, scene_dir, scene_id, tracer,
                                    loop=_loop, evidence=evidence,
-                                   question=str(question or "")))
+                                   question=str(question or ""),
+                                   db_path=db_path))
         return ns
 
     # 场景目录里**现有**什么，直接告诉它（否则它会猜 *.txt 而真实文件是 .json）
