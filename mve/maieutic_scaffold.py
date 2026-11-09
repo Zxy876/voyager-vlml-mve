@@ -330,23 +330,92 @@ def _exhausted_dims(scene_id: str, question: str,
     return out
 
 
+def _skeleton_dims_from_file(p: Path) -> list[dict]:
+    """读一份骨架缓存里的维度清单。"""
+    try:
+        import json as _json
+        data = _json.loads(p.read_text(encoding="utf-8"))
+        return [d for d in (data.get("dimensions") or [])
+                if str(d.get("id") or "").strip()]
+    except Exception:
+        return []
+
+
+def _resolved_import_question(question: str, scene_id: str) -> str:
+    """把「当前这句问话」找回它对应的**人导入原句**（找骨架用）。
+
+    ★ 为什么需要这一步（2026-11-09 服务器实测，第四个根因）：
+      骨架缓存键 = md5(问句)[:12] + md5(db_path)[:8]，而**问句是「人导入
+      时的那句原话」**。消费时人往往换个问法再问（实测：
+        导入原句 = "username为ce的女生是2007年3，26的生日 她在哪些平台活跃？用Sherlock找"
+        消费问句 = "帮我查查用户名 ce 的这位女生（2007年3月26日出生）都活跃在哪些社交平台上"
+      两者 md5 不同 → 按当前问句找不到骨架 → 路由判「没有骨架 → 不猜题型」
+      → 不碰环境、不联网 → 只能做模型推断 → **这正是「换个问法就答不出来」
+      的直接原因**（不是模型不会答）。
+
+    ★ 怎么找回（**不发明新的打分/门槛机制**）：
+      MVE **已经有**一个归题机制 —— `routing.route(question, scene_id)`
+      （照 neko material_topic_mapper 的双阈值，见 mve/routing.py 模块头）。
+      它把消费问句对回已有图谱节点，返回 `node_label` = **人导入原句**
+      （实测 score=62 / MEDIUM_CONFIDENCE，exact_match=False 但
+      meaningful 命中 12 个 chunk）。拿到原句就能算出同一个 md5 → 命中
+      同一个骨架缓存。
+
+      这是**复用**既有归题能力，不是新增一层「像不像」的判断 ——
+      阈值、评分口径全在 routing 里，本函数只是把它的结论接到骨架键上。
+    """
+    try:
+        import routing as _rt
+    except Exception:
+        return ""
+    try:
+        ri = _rt.route(str(question or ""), str(scene_id or ""))
+    except Exception:
+        return ""
+    # 判 REJECTED = 没归上（如实不猜）→ 不拿别的题目的骨架来套
+    if str(ri.get("decision") or "") == "REJECTED":
+        return ""
+    lbl = str(ri.get("node_label") or "").strip()
+    if not lbl or lbl == str(question or "").strip():
+        return ""
+    return lbl
+
+
 def milestone_dimensions(scene_id: str, question: str) -> list[dict]:
     """读里程碑骨架的维度清单（只读，不调 LLM、不重新生成）。
 
     供消费侧「维度覆盖守卫」判定"这道题拆了几维"：导入式里程碑题（人导入的那句
     话被 scaffold 拆成多维度）的权威维度数就在这里。没骨架（自由提问、没建里程碑）
     返回空列表，守卫便回退到 _derive_dims 的维度判定，不会误伤原子题。
+
+    ★ 找骨架是**两级**（2026-11-09 修第四个根因）：
+      ① 按当前问句直接命中（同一句再问，最快）；
+      ② 换了个问法 → 用**已有的** routing 归题找回「人导入原句」再命中
+         （见 `_resolved_import_question` 的取证与理由）。
+      两级都空 → 真的没骨架 → 如实返回空（不拿别的题目的骨架来套）。
     """
+    sid = str(scene_id or "A")
+    q = str(question or "")
     try:
-        import json as _json
-        p = _cache_path(str(scene_id or "A"), str(question or ""))
-        if not p.exists():
-            return []
-        data = _json.loads(p.read_text(encoding="utf-8"))
-        return [d for d in (data.get("dimensions") or [])
-                if str(d.get("id") or "").strip()]
+        p = _cache_path(sid, q)
+        if p.exists():
+            dims = _skeleton_dims_from_file(p)
+            if dims:
+                return dims
     except Exception:
-        return []
+        pass
+    # ② 换个问法 → 归题找回导入原句
+    try:
+        _orig = _resolved_import_question(q, sid)
+        if _orig:
+            p2 = _cache_path(sid, _orig)
+            if p2.exists():
+                dims2 = _skeleton_dims_from_file(p2)
+                if dims2:
+                    return dims2
+    except Exception:
+        pass
+    return []
 
 
 def _parse(text: str) -> dict[str, Any]:

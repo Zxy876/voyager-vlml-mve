@@ -241,7 +241,7 @@ def ingest_state(scene_id: str) -> list[str]:
         import duckdb
         con = duckdb.connect(db, read_only=True)
         try:
-            cols = [str(r[0]) for r in con.execute(
+            cols = [str(r[1]) for r in con.execute(
                 f"PRAGMA table_info('{FACTS}')").fetchall()]
             n = con.execute(f"SELECT count(*) FROM {FACTS}").fetchone()[0]
             di = con.execute(
