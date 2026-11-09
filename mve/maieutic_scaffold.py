@@ -357,13 +357,23 @@ def _skeleton_dims_from_file(p: Path) -> list[dict]:
 def resplit_needed(scene_id: str, question: str) -> bool:
     """这份骨架**需要重拆**吗（教师端落点写错了）？
 
-    判据：骨架里存在一条维度，它的 `landing` 指向一个**本场景够不着的
+    判据：骨架里存在一条维度，它的落点指向一个**本场景够不着的
     落点**（实测场景 L：维度写的是账本表 `web_evidence`，它在另一个
     duckdb 文件里，SQL 连不到 → 这道题在消费侧什么都查不了）。
 
     这不是「维度没闭合」，是**教师端把落点约束漏了** —— 原版教师端
     （`scaffolding.ts:262`）会把「学生学过哪些工具」当环境约束一次性
     说清，运行时只读不重拆；MVE 这里的落点由出题器写，出错就要修。
+
+    两条判据（都只用**实况**，无关键词表）：
+      ① 维度带 `landing`（第二刀之后生成的骨架）→ 落点不在「可达表 ∪
+         远端抓手」里 ⇒ 够不着；
+      ② 维度**不带** `landing`（第二刀之前的旧骨架）→ 维度文本里字面
+         点名了一张**本场景存在但查不到**的表（账本表，实查得来，
+         `reachable.unreachable_in_text`）⇒ 够不着。
+         ★ 这条是补「现场唯一存在的坏骨架正好是旧的」这个缺口 ——
+           原来只看 `landing`，对旧骨架恒返回 False，人看不到
+           「该重拆」的信号，坏骨架就永远留在缓存里。
 
     重拆**必须由人显式触发**（不能自动重拆）：骨架「拆一次就固定」是
     铁律（按失败指纹重拆 → 维度 id 每轮变 → 闭合账全对不上）。
@@ -385,12 +395,20 @@ def resplit_needed(scene_id: str, question: str) -> bool:
             if not isinstance(d, dict):
                 continue
             ld = str(d.get("landing") or "").strip()
-            if not ld or ld.lower() == "none":
-                continue
-            if ld in reach or ld in remote:
-                continue
-            # 落点写的是一个「像表名的东西」但场景里没有 → 够不着
-            return True
+            if ld:
+                if ld.lower() == "none":
+                    continue
+                if ld in reach or ld in remote:
+                    continue
+                # 落点写的是一个「像表名的东西」但场景里没有 → 够不着
+                return True
+            # ---- 旧骨架（无 landing）：字面点名了**不可达的表** → 够不着 ----
+            try:
+                blob = f"{d.get('question') or ''} {d.get('why') or ''}"
+                if _reach.unreachable_in_text(str(scene_id or "A"), blob):
+                    return True
+            except Exception:
+                pass
     except Exception:
         return False
     return False

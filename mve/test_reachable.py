@@ -112,6 +112,55 @@ def main() -> int:
     except Exception:
         pass
 
+    print("== 5. unreachable_in_text：字面点名「存在但查不到」的表 ==")
+    # 这条判据补的是「旧骨架没有 landing 字段」的缺口（2026-11-09 实测）：
+    # 现场唯一存在的坏骨架是第二刀之前生成的，只有 landing 判据的话对它
+    # 恒返回 False → 人看不到「该重拆」的信号 → 坏骨架永远留着。
+    try:
+        import scene_profile as _sp
+        found_scene = None
+        for sid in ("L", "A", "B", "E"):
+            led = R.ledger_tables(sid) or []
+            if led:
+                found_scene = (sid, led)
+                break
+        if found_scene:
+            sid, led = found_scene
+            t0 = led[0]
+            # 点名账本表 → 命中
+            check(f"场景 {sid}：文本点名账本表 {t0} → 命中",
+                  R.unreachable_in_text(sid, f"在 {t0} 表中，item 为 'ce' 的记录")
+                  == [t0])
+            # 点名可达表 → 不命中（那张表查得到）
+            reach = R.reachable_tables(sid) or []
+            if reach:
+                check(f"场景 {sid}：文本点名可达表 {reach[0]} → 不命中",
+                      R.unreachable_in_text(sid, f"在 {reach[0]} 表中查") == [])
+            # 空文本 → 不命中
+            check("空文本 → 不命中", R.unreachable_in_text(sid, "") == [])
+            # 完全无关的文本 → 不命中
+            check("无关文本 → 不命中",
+                  R.unreachable_in_text(sid, "帮我查一下这个人注册了哪些平台") == [])
+        else:
+            check("（本机没有带账本的场景，跳过点名类断言）", True)
+    except Exception as e:
+        check("unreachable_in_text 可用", False, f"{type(e).__name__}: {e}")
+
+    print("== 6. unreachable_in_text 只认「真存在但不可达」的表 ==")
+    # 反向断言：不能把「场景里根本没有的表名」也算成不可达落点 ——
+    # 否则任何一句提到别的场景的表名都会被误判成「骨架写错了」。
+    try:
+        import scene_profile as _sp
+        for sid in ("L", "A", "B", "E"):
+            led = R.ledger_tables(sid) or []
+            if not led:
+                continue
+            check(f"场景 {sid}：不存在的表名不算不可达",
+                  R.unreachable_in_text(sid, "在 definitely_not_a_table_zzz 表中") == [])
+            break
+    except Exception as e:
+        check("只认真存在的表", False, f"{type(e).__name__}: {e}")
+
     print(f"\n通过 {PASS} / 挂 {FAIL}")
     return 1 if FAIL else 0
 

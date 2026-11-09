@@ -143,6 +143,34 @@ def is_reachable(scene_id: str, table: str) -> bool:
     return t in reachable_tables(scene_id)
 
 
+def unreachable_in_text(scene_id: str, text: str) -> list[str]:
+    """文本里点名了「**本场景看得见、但消费侧查不到**」的表（账本表）。
+
+    为什么需要这一条（2026-11-09 服务器实测，场景 L）：
+        `resplit_needed` 原本只看骨架维度里的 `landing` 字段（第二刀新加的）。
+        但**第二刀之前生成的旧骨架没有这个字段** —— 而现场唯一存在的
+        那份坏骨架正是旧的（维度写「在 web_evidence 表中查…」）。
+        于是 `resplit_needed` 对它返回 False → 人看不到「该重拆」的信号
+        → 坏骨架永远留在缓存里 → 那道题在消费侧永远落进 infer。
+
+    判据（**实况，无关键词表**）：
+        账本表名是**实查**出来的（`ledger_tables` = 另一个 duckdb 文件里
+        真实存在的表）；文本里**字面包含**其中一个表名 ⇒ 这条维度指向的
+        是那张查不到的表。与消费侧 `_mentions_scene_table` 同构（字面包含），
+        只是方向相反：那边问「有没有点到**可达**表」，这边问「有没有点到
+        **不可达**表」。
+
+    ⚠️ 为什么不能反过来用「不在可达表里就算不可达」：
+        那会把「这个场景根本没有的表名」（比如别的场景的表）也算成
+        不可达落点 —— 判据必须是「**这张表真的存在，只是不在数据源里**」，
+        账本表正好是这种情况（它确实存在，只是搬到了另一个库）。
+    """
+    blob = str(text or "")
+    if not blob:
+        return []
+    return [t for t in ledger_tables(scene_id) if t and t in blob]
+
+
 def describe(scene_id: str) -> dict[str, Any]:
     """给日志/人看的一句话摘要。"""
     reach = reachable_tables(scene_id)

@@ -4511,6 +4511,20 @@ def _plan_from_scaffold(question: str, *, scene_id: str, has_file: bool,
                 unreachable.append(f"{_landing}（{_q[:40]}）")
             continue
         # ---- 旧骨架（无 landing）：字面判据（可达表 / 远端抓手名）----
+        # ⚠️ 2026-11-09 实测补一条：旧骨架里有一条维度字面点名了**不可达
+        #   的表**（账本表 web_evidence，在另一个 duckdb 文件里）。原来这里
+        #   两条判据都不命中 → 整题静默落进 infer = 什么都不查，且**没有
+        #   任何交代**（人只看到「答不出来」，不知道是骨架指向了一条走不通
+        #   的路）。现在把它**如实记进 unreachable_landings** —— 与新骨架
+        #   的落点够不着走同一条交代路径。
+        try:
+            import reachable as _reach
+            _bad = list(_reach.unreachable_in_text(str(scene_id or ""), _blob) or [])
+        except Exception:
+            _bad = []
+        if _bad:
+            unreachable.append(f"{_bad[0]}（{_q[:40]}）")
+            continue
         if _mentions_scene_table(_blob, _reach_tables):
             db_hits.append(_q)
             continue
