@@ -535,10 +535,33 @@ def _resolved_import_question(question: str, scene_id: str) -> str:
     # 判 REJECTED = 没归上（如实不猜）→ 不拿别的题目的骨架来套
     if str(ri.get("decision") or "") == "REJECTED":
         return ""
+    _q = str(question or "").strip()
+    nid = str(ri.get("node_id") or "")
     lbl = str(ri.get("node_label") or "").strip()
-    if not lbl or lbl == str(question or "").strip():
+    if not lbl:
         return ""
-    return lbl
+    if nid.startswith("import:"):
+        return lbl                     # 命中的就是**人导入原句**
+    # ⚠️ 2026-11-09 服务器实测（场景 L）：命中的是**问句自己**那个
+    # 消费节点（id=consume:consume_<hash>，label=问句原样）—— 它拿
+    # exact_match 满分，永远是最佳 → 找回的「原句」等于问句自己 →
+    # md5 算到自己 → 骨架读不到 → 路由判「没有骨架」→ 整题落进 infer。
+    # 修法：**排除这个节点再取下一个候选**（那个才是人导入原句）。
+    # 只认 `import:` 前缀的节点 —— 骨架永远是学习侧按「人导入原句」
+    # 建的，消费节点（consume: 前缀）是会话级脏账，拿它算 md5 会算到
+    # 别的题目的骨架上去。
+    # 不改打分口径、不加门槛（候选本来就在 match 的循环里算过）。
+    try:
+        ri2 = _rt.match(_q, str(scene_id or ""), exclude_ids=(nid,))
+    except Exception:
+        return ""
+    if str(ri2.get("decision") or "") == "REJECTED":
+        return ""
+    nid2 = str(ri2.get("node_id") or "")
+    lbl2 = str(ri2.get("node_label") or "").strip()
+    if not lbl2 or not nid2.startswith("import:"):
+        return ""
+    return lbl2
 
 
 def milestone_dimensions(scene_id: str, question: str) -> list[dict]:

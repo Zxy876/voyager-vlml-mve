@@ -104,7 +104,8 @@ def _node_texts(node: Any) -> list[str]:
 
 
 def match(question: str, scene_id: str | None = None, *,
-        graph: Any = None) -> dict[str, Any]:
+        graph: Any = None,
+        exclude_ids: tuple[str, ...] = ()) -> dict[str, Any]:
     """消费侧问题 → 命中哪个已有图谱节点。
 
     返回：:
@@ -114,12 +115,26 @@ def match(question: str, scene_id: str | None = None, *,
           "chunk_hits": int, "node_id": str, "node_label": str,
           "matched_on": str,
         }
+
+    ★ exclude_ids（2026-11-09 修「换个问法读不到骨架」）：
+      排除指定节点后再取最佳命中。
+      为什么要它：消费问句跑一次就在图谱里留下一个「消费节点」
+      （id = `consume:consume_<hash>`，label = **问句自己**）。归题时
+      它拿 exact_match 满分 → 永远是最佳 → 「找回人导入原句」拿回来的
+      是问句自己 → md5 算到自己 → 骨架永远读不到（服务器实测场景 L：
+      消费问句「帮我查查…」找回的还是「帮我查查…」，而骨架是按
+      人导入原句「我查查…」建的）。排除那个节点再取下一个，那个才是
+      真原句。
+      ⚠️ **不改打分口径、不加门槛**：候选本来就在这个循环里算过了，
+      只是以前只暴露 top-1；这里是把它按需再往前取一位。默认空 →
+      行为与以前**完全一致**。
     """
     q = str(question or "").strip()
     if not q:
         return {"decision": REJECTED, "max_score": 0, "exact_match": False,
                 "meaningful_match": False, "chunk_hits": 0,
                 "node_id": "", "node_label": "", "matched_on": ""}
+    _ex = {str(x) for x in (exclude_ids or ()) if str(x).strip()}
 
     if scene_id is None:
         try:
@@ -151,6 +166,9 @@ def match(question: str, scene_id: str | None = None, *,
             continue
         # 根占位节点不参与（它不是可归的题）
         if str(getattr(node, "kind", "")) == "scene_root":
+            continue
+        # 调用方点名排除的节点（见 docstring：排除「问句自己」那个消费节点）
+        if str(nid) in _ex:
             continue
         score, exact, meaningful, chunk = _score_one(
             q_norm, q_tokens, _node_texts(node))
