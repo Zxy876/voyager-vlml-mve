@@ -194,11 +194,28 @@ _RETRY_HINT = ("上一次输出不是合法 JSON（很可能被截断）。只�
 def _default_llm(messages: list[dict[str, str]]) -> str:
     from llm_client import chat
     # 1200 → 2400：观察面进来后 why 写得更长，1200 会把 JSON 砍断（实测）。
-    return chat(messages, temperature=0.3, max_tokens=2400)
+    # ★ 2026-11-09 再加 `thinking=disabled`（服务器实测，场景 L 重拆失败）：
+    #   GLM-4.6 默认开着思维链，**思考段与正文共用 max_tokens**。出题器是
+    #   「把材料翻译成结构化维度」的活儿 —— 不需要深思，但模型的思考吃光了
+    #   2400 的预算 → finish_reason=length、content 一字没有 → 解析必然失败
+    #   （5 次重试全败，实测 reasoning_tokens=2400 / content=0）。
+    #   关掉思考后：reasoning_tokens=0、content=1781 → 4 条维度，解析成功，
+    #   且维度**全部落在可达表上**（web_facts / web_docs），material_note
+    #   里模型自己写明「web_evidence 是审计账本不在可用数据源中」。
+    #   ⚠️ 只关**出题器**的思考 —— 判官（reason_pass/task_critic）需要它。
+    return chat(messages, temperature=0.3, max_tokens=2400,
+                thinking={"type": "disabled"})
 
 
 def _call_llm(llm: Callable | None, messages: list[dict[str, str]]) -> tuple[dict, list, str]:
-    """调出题器并解析，失败按原版重试（返回 (data, dims, 最后一次失败原因)）。"""
+    """调出题器并解析，失败按原版重试（返回 (data, dims, 最后一次失败原因)）。
+
+    ⚠️ 失败原因要**说清是什么**（2026-11-09 服务器实测）：
+      模型开着思维链时，思考段会把 max_tokens 吃光 → 正文一字没有 →
+      `_parse` 找不到 JSON → 报「解析失败/空列表」。这句话会让人以为是
+      prompt 写坏了，其实根因在模型适配层（thinking 吃光预算）。
+      所以这里把「文本里像不像思考」也报出来，让人一眼看出方向。
+    """
     last = ""
     msgs = list(messages)
     for _ in range(SCAFFOLD_LLM_RETRIES):
@@ -211,7 +228,14 @@ def _call_llm(llm: Callable | None, messages: list[dict[str, str]]) -> tuple[dic
         dims = _clean_dims(data)
         if dims:
             return data, dims, ""
-        last = "LLM 输出里没有可用维度（解析失败/空列表）"
+        # 没解析出维度 —— 看看模型是不是只说了「思考」没给 JSON
+        _t = str(text or "")
+        _hint = ""
+        if len(_t) > 400 and not _t.lstrip().startswith("{"):
+            _hint = ("（模型没给 JSON，输出像散文/思考稿 —— "
+                     "多半是思考段吃光了 max_tokens；"
+                     "出题器应传 thinking={'type':'disabled'}）")
+        last = "LLM 输出里没有可用维度（解析失败/空列表）" + _hint
         msgs = list(messages) + [{"role": "user", "content": _RETRY_HINT}]
     return {}, [], last
 
