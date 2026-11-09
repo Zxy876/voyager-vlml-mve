@@ -1,0 +1,170 @@
+{
+ "milestone": {
+  "name": "特定用户名在多站点的活跃状态判定",
+  "why": "完成此里程碑意味着掌握了如何从宽表中提取特定实体在所有候选站点上的状态值，并能根据状态值（如AVAILABLE/CLAIMED）判定其活跃平台，实现从单点查询到全网多平台状态矩阵的跨越。"
+ },
+ "dimensions": [
+  {
+   "id": "filter_item_ce",
+   "question": "在 web_facts 表中，item 列值为 'ce' 的行是否存在？",
+   "why": "必须先确认目标用户名在事实宽表中是否有对应记录，若无记录则后续所有站点状态查询均无意义。",
+   "landing": "web_facts"
+  },
+  {
+   "id": "extract_site_statuses",
+   "question": "在 web_facts 表中，item 列值为 'ce' 的那一行，所有非空且值不为 'UNKNOWN' 的属性列（排除 http 状态码列）及其对应的值分别是什么？",
+   "why": "需要一次性提取该用户在所有被探测站点上的判定结果，才能全面回答'活跃在哪些平台'，避免遗漏或逐个盲目枚举910列。",
+   "landing": "web_facts"
+  },
+  {
+   "id": "define_active_status",
+   "question": "在 web_facts 表的站点判定列中，哪些取值（如 AVAILABLE、CLAIMED 等）代表该用户名在该平台确实存在或活跃？",
+   "why": "只有明确了判定值与'活跃'状态的映射关系，才能将上一步提取的原始状态值准确转化为'活跃平台'的结论。",
+   "landing": "web_facts"
+  }
+ ],
+ "expected_drifts": [
+  {
+   "category": "drift",
+   "pattern": "只枚举了抽样提示中出现的十几个知名站点（如Pinterest、Kaggle等），漏掉了web_facts表中其他900多个列里可能存在的AVAILABLE/CLAIMED状态"
+  },
+  {
+   "category": "bug",
+   "pattern": "把http状态码列（如'1337x http 状态码'）的值（如200、403）误当成站点判定列的值，导致错误地认为403代表活跃或存在"
+  },
+  {
+   "category": "revision",
+   "pattern": "将'CLAIMED'状态排除在'活跃'之外，仅将'AVAILABLE'视为活跃（这取决于对CLAIMED是否算作活跃的业务定义，两种划分皆可成立）"
+  }
+ ],
+ "material_note": "原问题包含性别（女生）和出生日期（2007年3月26日）信息，但可用数据源（web_facts表）仅基于用户名进行站点探测，无任何人口统计学字段，因此无法通过数据库验证性别与年龄。维度拆解仅围绕用户名'ce'的站点状态展开。",
+ "question": "帮我查查用户名 ce 的这位女生（2007年3月26日出生）都活跃在哪些社交平台上",
+ "progress": {
+  "learned": [
+   "define_active_status",
+   "filter_item_ce"
+  ],
+  "updated": 1794227189.2283359,
+  "codes": [
+   {
+    "id": "filter_item_ce",
+    "question": "在 web_facts 表中，item 列值为 'ce' 的行是否存在？",
+    "code": "r = query_sql(\"SELECT COUNT(*) AS cnt FROM web_facts WHERE item = 'ce'\")\ncount = r[\"rows\"][0][0]\nRESULT = {\"exists\": count > 0, \"count\": count, \"explanation\": f\"在 web_facts 表中，item 列值为 'ce' 的行共有 {count} 条，因此{'存在' if count > 0 else '不存在'}这样的行。\"}",
+    "answer": "{\"exists\": true, \"count\": 459, \"explanation\": \"在 web_facts 表中，item 列值为 'ce' 的行共有 459 条，因此存在这样的行。\"}",
+    "tools": [],
+    "r": -1.0,
+    "how": ""
+   },
+   {
+    "id": "define_active_status",
+    "question": "在 web_facts 表的站点判定列中，哪些取值（如 AVAILABLE、CLAIMED 等）代表该用户名在该平台确实存在或活跃？",
+    "code": "# Read the sherlock project's result.py to get the QueryStatus enum definition\nr = gh_read(repo=\"sherlock-project/sherlock\", path=\"sherlock_project/result.py\")\nRESULT = {\"source\": \"sherlock-project/sherlock/sherlock_project/result.py\", \"content\": r}",
+    "answer": "是，代表该用户名在该平台确实存在或活跃的取值为 CLAIMED。依据是材料中 CLAIMED 的注释为“Username Detected”。",
+    "tools": [
+     "gh_read"
+    ],
+    "r": 1.0,
+    "how": "reason"
+   }
+  ],
+  "iterations": [
+   {
+    "id": "filter_item_ce",
+    "rounds": 1,
+    "asked": "（本轮没有产生判词：闸门与内层 critic 都未给出理由 —— 如实记录，判未闭合，不带入下一轮追问）",
+    "gap": "",
+    "passed": true,
+    "tools": [
+     "query_sql"
+    ],
+    "asked_q": []
+   },
+   {
+    "id": "extract_site_statuses",
+    "rounds": 8,
+    "asked": "语义层没返回可解析的 JSON；答案中包含了编造的键值对 \"GoodReads\": \"AVAILABLE\"。根据材料账实际返回的数据，'ce' 行在 GoodReads 列的值为 None，并非 AVAILABLE，且 None 不符合\"非空\"的条件。请剔除所有在材料账中找不到依据或值为 None/UNKNOWN 的键值对，只保留有真实数据支撑的属性列和值，即 {\"item\": \"ce\", \"source_url\": \"https://www.goodreads.com/ce\", \"confidence\": 0.5, \"confirmed\": false}。",
+    "gap": "在 web_facts 表中，item 列值为 'ce' 的那一行，所有非空且值不为 'UNKNOWN' 的属性列（排除 http 状态码列）及其对应的值分别是什么？",
+    "passed": false,
+    "tools": [],
+    "asked_q": []
+   },
+   {
+    "id": "define_active_status",
+    "rounds": 6,
+    "asked": "（本轮没有产生判词：闸门与内层 critic 都未给出理由 —— 如实记录，判未闭合，不带入下一轮追问）",
+    "gap": "",
+    "passed": true,
+    "tools": [
+     "gh_read"
+    ],
+    "asked_q": []
+   }
+  ]
+ },
+ "session": {
+  "started_at": 1794223848.2182405,
+  "phase": 3,
+  "events": [
+   {
+    "kind": "dim_closed",
+    "at": 1794223848.2182415,
+    "payload": {
+     "dim_id": "filter_item_ce",
+     "r": 1.0,
+     "how": "tool"
+    }
+   },
+   {
+    "kind": "phase_transition",
+    "at": 1794223848.2182496,
+    "payload": {
+     "from": 1,
+     "to": 3,
+     "reason": "学习侧验收跑完（答案待披露）"
+    }
+   },
+   {
+    "kind": "dim_closed",
+    "at": 1794223848.3088803,
+    "payload": {
+     "dim_id": "filter_item_ce",
+     "r": 1.0,
+     "how": "tool"
+    }
+   },
+   {
+    "kind": "dim_closed",
+    "at": 1794226140.745731,
+    "payload": {
+     "dim_id": "filter_item_ce",
+     "r": -1.0,
+     "how": ""
+    }
+   },
+   {
+    "kind": "dim_closed",
+    "at": 1794227189.27083,
+    "payload": {
+     "dim_id": "define_active_status",
+     "r": 1.0,
+     "how": "reason"
+    }
+   },
+   {
+    "kind": "dim_closed",
+    "at": 1794227189.339844,
+    "payload": {
+     "dim_id": "define_active_status",
+     "r": 1.0,
+     "how": "reason"
+    }
+   }
+  ]
+ },
+ "milestone_rounds": {
+  "rounds": 7,
+  "zero_rounds": 2,
+  "fail_rounds": 5,
+  "cooldown": 1
+ }
+}

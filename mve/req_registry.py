@@ -176,6 +176,22 @@ def register(scene_id: str, question: str, *,
                         "question": str(rec.get("question") or q),
                         "created": False, "known_questions": list(known)}
 
+    # ①.5 归题找回（换个问法）：不是同一句，但 routing 认为它属于某个已有需求
+    # —— 与 `req_id_of` 的 ② 级同源（routing.match 双阈值，不发明新判据）。
+    # 不接这一级 = 每换一种说法就建一个新 req（2026-11-09 服务器实测：同一
+    # 需求的第二种问法被分配成 req_...193342968e，旧会话从此读不到）。
+    try:
+        _rid_k = req_id_of(sid, q)
+    except Exception:
+        _rid_k = ""
+    if _rid_k:
+        note_question(sid, q, _rid_k)
+        _rec_k = (_read_registry(sid).get(_rid_k) or {})
+        return {"req_id": _rid_k,
+                "question": str(_rec_k.get("question") or q),
+                "created": False,
+                "known_questions": list(_rec_k.get("known_questions") or [])}
+
     # ② 新需求 → 分配
     rid = str(req_id or "").strip() or new_req_id(sid, q)
     reg[rid] = {
@@ -277,6 +293,33 @@ def find_by_question(scene_id: str, question: str) -> str:
 # ---------------------------------------------------------------------------
 # 问句 → req id 的三级解析（刀 A 的核心入口）
 # ---------------------------------------------------------------------------
+def _req_id_from_import(scene_id: str, import_id: str) -> str:
+    """导入记录 → req id（人导入那一刻登记的身份，比问句文本稳定）。
+
+    为什么要这一步（2026-11-09 服务器实测）：
+      routing 命中的往往是 `import:<id>` 节点，而它的 label
+      **就是那句问话自己** —— 拿 label 反查登记表查不到它自己的
+      req（反查循环）。导入记录里的 req_id 是入口当刻写死的，
+      不受问句怎么说影响。
+    """
+    iid = str(import_id or "").strip()
+    if not iid:
+        return ""
+    try:
+        import coach as _coach
+        rows = _coach.recent_imports(2000)
+    except Exception:
+        return ""
+    for r in reversed(rows):
+        if not isinstance(r, dict):
+            continue
+        if str(r.get("import_id") or "") == iid:
+            rid = str(r.get("req_id") or "")
+            if rid and rid in _read_registry(str(scene_id or "A")):
+                return rid
+    return ""
+
+
 def req_id_of(scene_id: str, question: str, *,
               allow_alloc: bool = False) -> str:
     """这个问句属于哪个需求（req id）？找不到返回 ""。
@@ -342,6 +385,12 @@ def req_id_of(scene_id: str, question: str, *,
             if _rid:
                 note_question(sid, q, _rid)
                 return _rid
+        if nid.startswith("import:"):
+            # 命中的是人导入节点 → 用它的 import_id 去导入记录里取 req（不靠 label）
+            _rid_i = _req_id_from_import(sid, nid.split(":", 1)[1])
+            if _rid_i:
+                note_question(sid, q, _rid_i)
+                return _rid_i
         if lbl:
             # 命中的是人导入原句 → 用原句反查 req id
             _rid = find_by_question(sid, lbl)

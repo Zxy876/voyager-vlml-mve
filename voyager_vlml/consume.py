@@ -2979,6 +2979,58 @@ async def consume(
         # 未学）一律不调 `_absorb`，消费侧永不写新技能。否则兜底现做会落
         # `consume_<md5>` 脏账，下次又被检回「现做」，正是此前「清库了还是
         # 现做」的根因。学习侧（learn()）才写技能，消费只调答案出来编排。
+        # ---- 复用记账反转（2026-11-09 23:30 用户拍板「默认记账，黑名单排除」）----
+        # 证据源（强 → 弱）：
+        #   ① 动态 obs[].skills_called —— tracer 里 `skill:<name>`（先记后跑，
+        #      技能真被调到才有；local_agent.py:502/948）—— 最强证据；
+        #   ② 静态 _mve_traj（_tools_in_code 认出的 skill_*，进了程序但调用
+        #      可能没跑成）—— 只够记 attempt。
+        # 黑名单（不记 ok，至多记 attempt）：
+        #   ① 两源都空 → 只是检回了、没调用 → 不记；
+        #   ② 静态有、动态无 → 调用没跑成（技能内部 raise / 死代码）→ attempt；
+        #   ③ 整轮没答出来（data is None / critic_ok=False / 叙事自评没答）
+        #      → attempt。
+        # 成功 → 剥 `skill_` 前缀逐字对池子（前缀是本系统加的，剥离不是猜名字）
+        # → 填 reused_skill / _used_skills，交下面 ⑤ 区按 used_keys 记账。
+        # 「记错比不记更坏」的铁律由动态证据保住：tracer 是真调用，不存在猜。
+        _dyn_skill_names: list[str] = []
+        for _o in (obs or []):
+            for _t in (_o.get('skills_called') or []):
+                _ts = str(_t).strip()
+                if _ts and _ts not in _dyn_skill_names:
+                    _dyn_skill_names.append(_ts)
+        _code_skill_names: list[str] = []
+        for _n in (_mve_traj or []):
+            _ns2 = str(_n)
+            if _ns2.startswith('skill_') and _ns2[6:] not in _code_skill_names:
+                _code_skill_names.append(_ns2[6:])
+        _reused_attempt = bool(_dyn_skill_names or _code_skill_names)
+        _attempt_only = ((_reused_attempt and not _dyn_skill_names)
+                         or not (data is not None and critic_ok
+                                 and nar.get('answered', True)))
+        if _reused_attempt and not _attempt_only:
+            _pool_idx: dict[str, dict[str, Any]] = {}
+            for _s in (list(skills or [])
+                       + list(locals().get('_all_sk') or [])):
+                if isinstance(_s, dict):
+                    _nm = str(_s.get('name') or '').strip()
+                    if _nm and _nm not in _pool_idx:
+                        _pool_idx[_nm] = _s
+            _matched_dyn: list[dict[str, Any]] = []
+            for _n in (_dyn_skill_names or _code_skill_names):
+                _s2 = _pool_idx.get(str(_n).strip())
+                if _s2 and all(str(x.get('key')) != str(_s2.get('key'))
+                               for x in _matched_dyn):
+                    _matched_dyn.append(dict(_s2))
+            if _matched_dyn:
+                if not _used_skills:
+                    _used_skills = _matched_dyn
+                if not _ans_skills:
+                    _ans_skills = _matched_dyn
+                if reused_skill is None:
+                    reused_skill = {**_matched_dyn[0], 'refill_note': '',
+                                    'composed_of': [str(_matched_dyn[0].get('name'))]}
+
         abs_info: dict[str, Any] = {}
         # critic 判没答出来 / answered=false（叙事层自检）→ 不进能力库 ——
         # 有行 ≠ 答出来（2026-10-23 Scene P：fail 的 task 却录入了技能）。
@@ -3010,6 +3062,10 @@ async def consume(
             except Exception:
                 abs_info = {}
         base.update({
+            # 复用记账反转的披露（2026-11-09）：默认记账 + 黑名单，
+            # attempt = 有调用证据但这轮没答出来 / 调用没跑成。
+            "reuse_attempt": bool(_reused_attempt),
+            "attempt_only": bool(_attempt_only),
             # topic_id 用 `_absorb` **解析后**的那个（归不上已有题时它给了一个
             # 稳定的 consume_<md5>）：面板的进步曲线就是按这一列累计
             # 「答出来了 +1」，写空串的话 mastered 永远是 True 但曲线不涨。
@@ -3061,6 +3117,7 @@ async def consume(
                     f"第 {_cnt} 次导入同一问题（之前导入过 {_cnt - 1} 次）")
         except Exception:
             pass
+        base.setdefault("req_id", locals().get("_req_id", ""))
         _log(base)
         return base
 
@@ -3089,6 +3146,7 @@ async def consume(
             "graph_link": {}, "judgment_result": "failed",
             "skipped": _non_vlml_why,
         }
+        base.setdefault("req_id", locals().get("_req_id", ""))
         _log(base)
         return base
 
@@ -3551,6 +3609,7 @@ async def consume(
         base["skipped"] = ("没有取到真实数据（调用失败，或结果全是真空值："
                            "空表上的纯聚合返回 1 行 (NULL, 0)），事实无来源，"
                            "不计覆盖率（避免给编造打分）")
+        base.setdefault("req_id", locals().get("_req_id", ""))
         _log(base)
         return base
 
@@ -3629,6 +3688,8 @@ async def consume(
         except Exception as e:  # pragma: no cover
             base["referee_skipped"] = (
                 f"硬尺子未计算：{type(e).__name__}: {str(e)[:120]}")
+
+    base.setdefault("req_id", locals().get("_req_id", ""))
 
     _log(base)
     return base

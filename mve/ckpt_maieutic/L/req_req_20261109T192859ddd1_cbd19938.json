@@ -1,0 +1,91 @@
+{
+ "milestone": {
+  "name": "web_facts 宽表中特定站点特定判定值的行数统计",
+  "why": "掌握在宽表中对指定列（如特定站点名）筛选特定判定结果（如 WAF）并计数的 SQL 查询模式，是完成此类事实核查统计的基础能力单元。"
+ },
+ "dimensions": [
+  {
+   "id": "count_1337x_waf",
+   "question": "在 web_facts 表中，1337x 列值为 WAF 的行数是多少？",
+   "why": "这是原问题的直接转写，必须通过此查询获得最终数值答案。",
+   "landing": "web_facts"
+  }
+ ],
+ "expected_drifts": [
+  {
+   "category": "drift",
+   "pattern": "只查出 1337x 列有哪些取值（如 WAF、ILLEGAL），但漏掉了对这些取值计数，没有给出值为 WAF 的具体行数。"
+  },
+  {
+   "category": "bug",
+   "pattern": "把列名 1337x 当作字符串字面量而非列名处理（如未加双引号导致 SQL 语法错误），或者把 WAF 误当成其他站点的判定值来筛选。"
+  }
+ ],
+ "material_note": null,
+ "question": "统计web_facts表中1337x列值为WAF的行数",
+ "progress": {
+  "learned": [
+   "count_1337x_waf"
+  ],
+  "updated": 1794223777.611784,
+  "codes": [
+   {
+    "id": "count_1337x_waf",
+    "question": "在 web_facts 表中，1337x 列值为 WAF 的行数是多少？",
+    "code": "r = query_sql('SELECT COUNT(*) AS cnt FROM web_facts WHERE \"1337x\" = \\'WAF\\'')\nRESULT = {\"count\": r[\"rows\"][0][0], \"source\": \"scene.duckdb web_facts table\"}",
+    "answer": "{\"count\": 4, \"source\": \"scene.duckdb web_facts table\"}",
+    "tools": [
+     "query_sql"
+    ],
+    "r": 1.0,
+    "how": "tool"
+   }
+  ],
+  "iterations": [
+   {
+    "id": "count_1337x_waf",
+    "rounds": 1,
+    "asked": "（本轮没有产生判词：闸门与内层 critic 都未给出理由 —— 如实记录，判未闭合，不带入下一轮追问）",
+    "gap": "",
+    "passed": true,
+    "tools": [
+     "query_sql"
+    ],
+    "asked_q": []
+   }
+  ]
+ },
+ "session": {
+  "started_at": 1794223777.653593,
+  "phase": 3,
+  "events": [
+   {
+    "kind": "dim_closed",
+    "at": 1794223777.6535943,
+    "payload": {
+     "dim_id": "count_1337x_waf",
+     "r": 1.0,
+     "how": "tool"
+    }
+   },
+   {
+    "kind": "phase_transition",
+    "at": 1794223777.6536016,
+    "payload": {
+     "from": 1,
+     "to": 3,
+     "reason": "学习侧验收跑完（答案待披露）"
+    }
+   },
+   {
+    "kind": "dim_closed",
+    "at": 1794223777.7345603,
+    "payload": {
+     "dim_id": "count_1337x_waf",
+     "r": 1.0,
+     "how": "tool"
+    }
+   }
+  ]
+ }
+}

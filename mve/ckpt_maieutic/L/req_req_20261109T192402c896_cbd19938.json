@@ -1,0 +1,129 @@
+{
+ "milestone": {
+  "name": "web_facts 表中未确认事实的规模统计",
+  "why": "掌握对特定布尔/枚举类型列进行条件筛选与计数的SQL查询能力，是数据验证与质量评估的基础；达成此里程碑意味着能独立完成对数据集中特定状态记录的量化提取。"
+ },
+ "dimensions": [
+  {
+   "id": "count_unconfirmed_facts",
+   "question": "在 web_facts 表中，confirmed 列值为 False 的行数是多少？",
+   "why": "这是原问题的直接拆解，必须通过该查询获得最终所需的精确数值。",
+   "landing": "web_facts"
+  }
+ ],
+ "expected_drifts": [
+  {
+   "category": "drift",
+   "pattern": "只查出总行数3740，而漏加 confirmed = False 的条件过滤"
+  },
+  {
+   "category": "bug",
+   "pattern": "将布尔值 False 当作字符串 'False' 进行匹配，导致在某些数据库方言下查不到结果或报错"
+  }
+ ],
+ "material_note": null,
+ "question": "统计web_facts表中confirmed列值为False的行数",
+ "progress": {
+  "learned": [
+   "count_unconfirmed_facts"
+  ],
+  "updated": 1794223481.4508932,
+  "codes": [
+   {
+    "id": "count_unconfirmed_facts",
+    "question": "在 web_facts 表中，confirmed 列值为 False 的行数是多少？",
+    "code": "r = query_sql(\"SELECT COUNT(*) FROM web_facts WHERE confirmed = FALSE\")\ncount = r[\"rows\"][0][0]\nRESULT = {\"answer\": count, \"query\": \"SELECT COUNT(*) FROM web_facts WHERE confirmed = FALSE\"}",
+    "answer": "{\"answer\": 3740, \"query\": \"SELECT COUNT(*) FROM web_facts WHERE confirmed = FALSE\"}",
+    "tools": [],
+    "r": -1.0,
+    "how": ""
+   }
+  ],
+  "iterations": [
+   {
+    "id": "count_unconfirmed_facts",
+    "rounds": 1,
+    "asked": "（本轮没有产生判词：闸门与内层 critic 都未给出理由 —— 如实记录，判未闭合，不带入下一轮追问）",
+    "gap": "",
+    "passed": true,
+    "tools": [
+     "query_sql"
+    ],
+    "asked_q": []
+   }
+  ]
+ },
+ "session": {
+  "started_at": 1794223481.4916427,
+  "phase": 4,
+  "events": [
+   {
+    "kind": "dim_closed",
+    "at": 1794223481.4916441,
+    "payload": {
+     "dim_id": "count_unconfirmed_facts",
+     "r": 1.0,
+     "how": "tool"
+    }
+   },
+   {
+    "kind": "phase_transition",
+    "at": 1794223481.4916515,
+    "payload": {
+     "from": 1,
+     "to": 3,
+     "reason": "学习侧验收跑完（答案待披露）"
+    }
+   },
+   {
+    "kind": "dim_closed",
+    "at": 1794223481.5736766,
+    "payload": {
+     "dim_id": "count_unconfirmed_facts",
+     "r": 1.0,
+     "how": "tool"
+    }
+   },
+   {
+    "kind": "dim_closed",
+    "at": 1794223518.11426,
+    "payload": {
+     "dim_id": "count_unconfirmed_facts",
+     "r": -1.0,
+     "how": ""
+    }
+   },
+   {
+    "kind": "phase_transition",
+    "at": 1794223540.8192048,
+    "payload": {
+     "from": 3,
+     "to": 4,
+     "reason": "里程碑达成（维度全闭合）"
+    }
+   },
+   {
+    "kind": "dim_closed",
+    "at": 1794226351.2540476,
+    "payload": {
+     "dim_id": "count_unconfirmed_facts",
+     "r": -1.0,
+     "how": ""
+    }
+   },
+   {
+    "kind": "dim_closed",
+    "at": 1794226850.8052998,
+    "payload": {
+     "dim_id": "count_unconfirmed_facts",
+     "r": -1.0,
+     "how": ""
+    }
+   }
+  ],
+  "completed_at": 1794223540.8192031
+ },
+ "milestone_achieved": true,
+ "milestone_lit_at": 1794223540.8191936,
+ "milestone_verified_real": true
+}

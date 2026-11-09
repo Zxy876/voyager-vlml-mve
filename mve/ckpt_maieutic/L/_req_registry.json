@@ -1,0 +1,79 @@
+{
+ "req_20261109T192126f72b": {
+  "req_id": "req_20261109T192126f72b",
+  "question": "统计web_facts表中Chess列值为AVAILABLE的行数",
+  "known_questions": [
+   "统计web_facts表中Chess列值为AVAILABLE的行数"
+  ],
+  "scene": "L",
+  "created_at": 1794223286.9167836
+ },
+ "req_20261109T192402c896": {
+  "req_id": "req_20261109T192402c896",
+  "question": "统计web_facts表中confirmed列值为False的行数",
+  "known_questions": [
+   "统计web_facts表中confirmed列值为False的行数",
+   "统计web_facts表中Monkeytype http 状态码列值为404的行数",
+   "统计web_facts表中Fanpop http 状态码列值为403的行数"
+  ],
+  "scene": "L",
+  "created_at": 1794223442.2934434,
+  "last_seen_at": 1794226849.9627597
+ },
+ "req_20261109T192627a7be": {
+  "req_id": "req_20261109T192627a7be",
+  "question": "统计web_facts表中Archive.org列值为CLAIMED的行数",
+  "known_questions": [
+   "统计web_facts表中Archive.org列值为CLAIMED的行数"
+  ],
+  "scene": "L",
+  "created_at": 1794223587.990159
+ },
+ "req_20261109T192859ddd1": {
+  "req_id": "req_20261109T192859ddd1",
+  "question": "统计web_facts表中1337x列值为WAF的行数",
+  "known_questions": [
+   "统计web_facts表中1337x列值为WAF的行数"
+  ],
+  "scene": "L",
+  "created_at": 1794223739.582615
+ },
+ "req_20261109T19292065e9": {
+  "req_id": "req_20261109T19292065e9",
+  "question": "帮我查查用户名 ce 的这位女生（2007年3月26日出生）都活跃在哪些社交平台上",
+  "known_questions": [
+   "帮我查查用户名 ce 的这位女生（2007年3月26日出生）都活跃在哪些社交平台上",
+   "帮我查一下用户名 ce 的女生注册过哪些平台"
+  ],
+  "scene": "L",
+  "created_at": 1794223760.5337377,
+  "last_seen_at": 1794224472.9191322
+ },
+ "req_20261109T1939221eff": {
+  "req_id": "req_20261109T1939221eff",
+  "question": "ce这个用户在哪些社交站点上注册过账号",
+  "known_questions": [
+   "ce这个用户在哪些社交站点上注册过账号"
+  ],
+  "scene": "L",
+  "created_at": 1794224362.2956042
+ },
+ "req_20261109T200215680b": {
+  "req_id": "req_20261109T200215680b",
+  "question": "统计web_facts表中Pinterest列值为CLAIMED的行数",
+  "known_questions": [
+   "统计web_facts表中Pinterest列值为CLAIMED的行数"
+  ],
+  "scene": "L",
+  "created_at": 1794225735.9608915
+ },
+ "req_20261109T2032386af6": {
+  "req_id": "req_20261109T2032386af6",
+  "question": "统计web_facts表中1337x http 状态码列值为403的行数",
+  "known_questions": [
+   "统计web_facts表中1337x http 状态码列值为403的行数"
+  ],
+  "scene": "L",
+  "created_at": 1794227558.2576475
+ }
+}

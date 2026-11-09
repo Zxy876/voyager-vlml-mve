@@ -1,0 +1,91 @@
+{
+ "milestone": {
+  "name": "web_facts 宽表中特定站点 HTTP 状态码的筛选与计数",
+  "why": "掌握在宽表中对包含空格与特殊字符的列名进行精确条件筛选与聚合计数的能力，标志着从单值属性查询进阶到对 HTTP 状态码等数值型判定指标的熟练处理。"
+ },
+ "dimensions": [
+  {
+   "id": "count_1337x_http_403",
+   "question": "在 web_facts 表中，1337x http 状态码 列值为 403 的行数是多少？",
+   "why": "这是原问题的直接转写，必须通过此查询得到最终所需的计数值。",
+   "landing": "web_facts"
+  }
+ ],
+ "expected_drifts": [
+  {
+   "category": "bug",
+   "pattern": "因列名包含空格和中文字符，在 SQL 中未加双引号或反引号包裹，导致解析报错或查出了错误的结果。"
+  },
+  {
+   "category": "drift",
+   "pattern": "误将站点判定列 1337x 的行数当作 1337x http 状态码 列的行数进行统计，混淆了判定结果与状态码。"
+  }
+ ],
+ "material_note": null,
+ "question": "统计web_facts表中1337x http 状态码列值为403的行数",
+ "progress": {
+  "learned": [
+   "count_1337x_http_403"
+  ],
+  "updated": 1794227595.8727102,
+  "codes": [
+   {
+    "id": "count_1337x_http_403",
+    "question": "在 web_facts 表中，1337x http 状态码 列值为 403 的行数是多少？",
+    "code": "r = query_sql('SELECT COUNT(*) FROM web_facts WHERE \"1337x http 状态码\" = 403')\ncount = r[\"rows\"][0][0]\nRESULT = {\"answer\": count, \"explanation\": f\"在 web_facts 表中，'1337x http 状态码' 列值为 403 的行数为 {count}\"}",
+    "answer": "{\"answer\": 4, \"explanation\": \"在 web_facts 表中，'1337x http 状态码' 列值为 403 的行数为 4\"}",
+    "tools": [
+     "query_sql"
+    ],
+    "r": 1.0,
+    "how": "tool"
+   }
+  ],
+  "iterations": [
+   {
+    "id": "count_1337x_http_403",
+    "rounds": 1,
+    "asked": "（本轮没有产生判词：闸门与内层 critic 都未给出理由 —— 如实记录，判未闭合，不带入下一轮追问）",
+    "gap": "",
+    "passed": true,
+    "tools": [
+     "query_sql"
+    ],
+    "asked_q": []
+   }
+  ]
+ },
+ "session": {
+  "started_at": 1794227595.9003522,
+  "phase": 3,
+  "events": [
+   {
+    "kind": "dim_closed",
+    "at": 1794227595.9003534,
+    "payload": {
+     "dim_id": "count_1337x_http_403",
+     "r": 1.0,
+     "how": "tool"
+    }
+   },
+   {
+    "kind": "phase_transition",
+    "at": 1794227595.9003615,
+    "payload": {
+     "from": 1,
+     "to": 3,
+     "reason": "学习侧验收跑完（答案待披露）"
+    }
+   },
+   {
+    "kind": "dim_closed",
+    "at": 1794227595.9568121,
+    "payload": {
+     "dim_id": "count_1337x_http_403",
+     "r": 1.0,
+     "how": "tool"
+    }
+   }
+  ]
+ }
+}

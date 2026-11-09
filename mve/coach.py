@@ -257,6 +257,14 @@ def _log_import(result: dict[str, Any]) -> None:
         "learn_kick_note": str(result.get("learn_kick_note") or "")[:200],
         # 里程碑回灌（2026-10-25 拍板）：人导入每句都立为当前里程碑锚点，让
         # 驾驶舱启动后按本句拆维学、未闭合维度优先。必须进白名单——否则白立了。
+        # 需求身份（req id）：人导入那一刻分配、与问句解耦。
+        # ⚠️ 白名单惯犯第 9 次预防：不进白名单 = 归题时拿不到身份，
+        # 换问法又会重建会话（2026-11-09 服务器实测）。
+        "req_id": str(result.get("req_id") or ""),
+        # 复用记账反转披露（2026-11-09 白名单惯犯第 10 次预防）：
+        # 默认记账 + 黑名单；attempt = 有调用证据但这轮没答出来/没跑成。
+        "reuse_attempt": bool(result.get("reuse_attempt")),
+        "attempt_only": bool(result.get("attempt_only")),
         "milestone_target_set": bool(result.get("milestone_target_set")),
         # 跨域提示：路由双阈值未命中（max_score=0）的导入，可能不属于本场景，
         # 面板据此提示"可另建场景承接"。

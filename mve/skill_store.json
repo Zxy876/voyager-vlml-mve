@@ -1,0 +1,523 @@
+{
+  "version": 2,
+  "skills": {
+    "learn_a72ff40e::count_chess_available": {
+      "topic": "learn_a72ff40e",
+      "name": "count_chess_available",
+      "text": "【web_facts宽表中特定站点特定状态的行数统计】在 web_facts 表中，Chess 列值为 AVAILABLE 的行数是多少？：闭合这个维度时跑通的取数做法",
+      "hits": 22,
+      "ok": 1,
+      "created": 1794223324.6628718,
+      "updated": 1794223324.6628718,
+      "versions": 1,
+      "history": [],
+      "source": "learn",
+      "source_scene": "L",
+      "provenance": "db",
+      "blueprint": {
+        "from": "maieutic_milestone",
+        "milestone": "web_facts宽表中特定站点特定状态的行数统计",
+        "dimension": "count_chess_available",
+        "question": "在 web_facts 表中，Chess 列值为 AVAILABLE 的行数是多少？",
+        "scene": "L",
+        "rollout_sql": "r = query_sql(sql=\"SELECT COUNT(*) FROM web_facts WHERE Chess = 'AVAILABLE'\")\ncount = r[\"rows\"][0][0]\nRESULT = {\"answer\": count, \"explanation\": \"在 web_facts 表中，Chess 列值为 AVAILABLE 的行数\"}",
+        "import_id": "",
+        "req_id": "req_20261109T192126f72b",
+        "tools": [
+          "query_sql"
+        ]
+      },
+      "code": "r = query_sql(sql=\"SELECT COUNT(*) FROM web_facts WHERE Chess = 'AVAILABLE'\")\ncount = r[\"rows\"][0][0]\nRESULT = {\"answer\": count, \"explanation\": \"在 web_facts 表中，Chess 列值为 AVAILABLE 的行数\"}",
+      "r": 1.0
+    },
+    "learn_a72ff40e::milestone": {
+      "topic": "learn_a72ff40e",
+      "name": "milestone",
+      "text": "【里程碑】统计web_facts表中Chess列值为AVAILABLE的行数：全维度闭合后组合出的整体取数做法（维度配方组合，非单维度）；涵盖的维度问题：在 web_facts 表中，Chess 列值为 AVAILABLE 的行数是多少？",
+      "hits": 6,
+      "ok": 0,
+      "created": 1794223363.2986238,
+      "updated": 1794223363.2986238,
+      "versions": 1,
+      "history": [],
+      "source": "learn",
+      "source_scene": "L",
+      "provenance": "db",
+      "blueprint": {
+        "from": "maieutic_milestone_composite",
+        "milestone": "",
+        "question": "统计web_facts表中Chess列值为AVAILABLE的行数",
+        "scene": "L",
+        "req_id": "req_20261109T192126f72b",
+        "rollout_sql": "SELECT COUNT(*) FROM web_facts WHERE Chess = 'AVAILABLE'",
+        "dims": [
+          "learn_a72ff40e::count_chess_available"
+        ],
+        "session_code": "# 里程碑会话：组合 1 条维度技能\n# （兄弟技能互相可见 —— 同原版 programs + code 同一作用域）\nd_1 = skill_count_chess_available()\n# 整体取数（这一里程碑整体怎么算）\nr = query_sql(sql=\"SELECT COUNT(*) FROM web_facts WHERE Chess = 'AVAILABLE'\")\nRESULT = {\n    \"count_chess_available\": d_1,\n    \"overall\": r,\n}",
+        "rollout_sql_tpl": "-- slots: chess_status=Chess列的筛选值，取问句里指定的状态（如\"AVAILABLE\"）\nSELECT COUNT(*) FROM web_facts WHERE Chess = :chess_status"
+      },
+      "code": "# 里程碑会话：组合 1 条维度技能\n# （兄弟技能互相可见 —— 同原版 programs + code 同一作用域）\nd_1 = skill_count_chess_available()\n# 整体取数（这一里程碑整体怎么算）\nr = query_sql(sql=\"SELECT COUNT(*) FROM web_facts WHERE Chess = 'AVAILABLE'\")\nRESULT = {\n    \"count_chess_available\": d_1,\n    \"overall\": r,\n}",
+      "r": 1.0
+    },
+    "learn_f772d78a::count_unconfirmed_facts": {
+      "topic": "learn_f772d78a",
+      "name": "count_unconfirmed_facts",
+      "text": "【web_facts 表中未确认事实的规模统计】在 web_facts 表中，confirmed 列值为 False 的行数是多少？：闭合这个维度时跑通的取数做法",
+      "hits": 27,
+      "ok": 0,
+      "created": 1794223481.6927722,
+      "updated": 1794223481.6927722,
+      "versions": 1,
+      "history": [],
+      "source": "learn",
+      "source_scene": "L",
+      "provenance": "db",
+      "blueprint": {
+        "from": "maieutic_milestone",
+        "milestone": "web_facts 表中未确认事实的规模统计",
+        "dimension": "count_unconfirmed_facts",
+        "question": "在 web_facts 表中，confirmed 列值为 False 的行数是多少？",
+        "scene": "L",
+        "rollout_sql": "r = query_sql(\"SELECT COUNT(*) FROM web_facts WHERE confirmed = FALSE\")\ncount = r[\"rows\"][0][0]\nRESULT = {\"answer\": count, \"query\": \"SELECT COUNT(*) FROM web_facts WHERE confirmed = FALSE\"}",
+        "import_id": "",
+        "req_id": "req_20261109T192402c896",
+        "tools": [
+          "query_sql"
+        ]
+      },
+      "code": "r = query_sql(\"SELECT COUNT(*) FROM web_facts WHERE confirmed = FALSE\")\ncount = r[\"rows\"][0][0]\nRESULT = {\"answer\": count, \"query\": \"SELECT COUNT(*) FROM web_facts WHERE confirmed = FALSE\"}",
+      "r": 1.0
+    },
+    "learn_f772d78a::milestone": {
+      "topic": "learn_f772d78a",
+      "name": "milestone",
+      "text": "【里程碑】统计web_facts表中confirmed列值为False的行数：全维度闭合后组合出的整体取数做法（维度配方组合，非单维度）；涵盖的维度问题：在 web_facts 表中，confirmed 列值为 False 的行数是多少？",
+      "hits": 5,
+      "ok": 0,
+      "created": 1794223503.760685,
+      "updated": 1794223503.760685,
+      "versions": 1,
+      "history": [],
+      "source": "learn",
+      "source_scene": "L",
+      "provenance": "db",
+      "blueprint": {
+        "from": "maieutic_milestone_composite",
+        "milestone": "",
+        "question": "统计web_facts表中confirmed列值为False的行数",
+        "scene": "L",
+        "req_id": "req_20261109T192402c896",
+        "rollout_sql": "SELECT COUNT(*) FROM web_facts WHERE confirmed = FALSE",
+        "dims": [
+          "learn_f772d78a::count_unconfirmed_facts"
+        ],
+        "session_code": "# 里程碑会话：组合 1 条维度技能\n# （兄弟技能互相可见 —— 同原版 programs + code 同一作用域）\nd_1 = skill_count_unconfirmed_facts()\n# 整体取数（这一里程碑整体怎么算）\nr = query_sql(sql='SELECT COUNT(*) FROM web_facts WHERE confirmed = FALSE')\nRESULT = {\n    \"count_unconfirmed_facts\": d_1,\n    \"overall\": r,\n}",
+        "rollout_sql_tpl": "-- slots: confirmed_val=confirmed列的筛选值，取问句里指定的布尔值（如FALSE或TRUE）\nSELECT COUNT(*) FROM web_facts WHERE confirmed = :confirmed_val"
+      },
+      "code": "# 里程碑会话：组合 1 条维度技能\n# （兄弟技能互相可见 —— 同原版 programs + code 同一作用域）\nd_1 = skill_count_unconfirmed_facts()\n# 整体取数（这一里程碑整体怎么算）\nr = query_sql(sql='SELECT COUNT(*) FROM web_facts WHERE confirmed = FALSE')\nRESULT = {\n    \"count_unconfirmed_facts\": d_1,\n    \"overall\": r,\n}",
+      "r": 1.0
+    },
+    "learn_6f701e36::count_archive_org_claimed": {
+      "topic": "learn_6f701e36",
+      "name": "count_archive_org_claimed",
+      "text": "【web_facts 宽表特定站点判定状态行数统计】在 web_facts 表中，Archive.org 列值为 CLAIMED 的行数是多少？：闭合这个维度时跑通的取数做法",
+      "hits": 24,
+      "ok": 0,
+      "created": 1794223626.4960508,
+      "updated": 1794223626.4960508,
+      "versions": 1,
+      "history": [],
+      "source": "learn",
+      "source_scene": "L",
+      "provenance": "db",
+      "blueprint": {
+        "from": "maieutic_milestone",
+        "milestone": "web_facts 宽表特定站点判定状态行数统计",
+        "dimension": "count_archive_org_claimed",
+        "question": "在 web_facts 表中，Archive.org 列值为 CLAIMED 的行数是多少？",
+        "scene": "L",
+        "rollout_sql": "r = query_sql(sql='SELECT COUNT(*) AS cnt FROM web_facts WHERE \"Archive.org\" = \\'CLAIMED\\'')\nRESULT = {\"count\": r[\"rows\"][0][0], \"detail\": \"web_facts表中Archive.org列值为CLAIMED的行数\"}",
+        "import_id": "",
+        "req_id": "req_20261109T192627a7be",
+        "tools": [
+          "query_sql"
+        ]
+      },
+      "code": "r = query_sql(sql='SELECT COUNT(*) AS cnt FROM web_facts WHERE \"Archive.org\" = \\'CLAIMED\\'')\nRESULT = {\"count\": r[\"rows\"][0][0], \"detail\": \"web_facts表中Archive.org列值为CLAIMED的行数\"}",
+      "r": 1.0
+    },
+    "learn_6f701e36::milestone": {
+      "topic": "learn_6f701e36",
+      "name": "milestone",
+      "text": "【里程碑】统计web_facts表中Archive.org列值为CLAIMED的行数：全维度闭合后组合出的整体取数做法（维度配方组合，非单维度）；涵盖的维度问题：在 web_facts 表中，Archive.org 列值为 CLAIMED 的行数是多少？",
+      "hits": 2,
+      "ok": 0,
+      "created": 1794223650.8965445,
+      "updated": 1794223650.8965445,
+      "versions": 1,
+      "history": [],
+      "source": "learn",
+      "source_scene": "L",
+      "provenance": "db",
+      "blueprint": {
+        "from": "maieutic_milestone_composite",
+        "milestone": "",
+        "question": "统计web_facts表中Archive.org列值为CLAIMED的行数",
+        "scene": "L",
+        "req_id": "req_20261109T192627a7be",
+        "rollout_sql": "SELECT COUNT(*) AS cnt FROM web_facts WHERE \"Archive.org\" = 'CLAIMED'",
+        "dims": [
+          "learn_6f701e36::count_archive_org_claimed"
+        ],
+        "session_code": "# 里程碑会话：组合 1 条维度技能\n# （兄弟技能互相可见 —— 同原版 programs + code 同一作用域）\nd_1 = skill_count_archive_org_claimed()\n# 整体取数（这一里程碑整体怎么算）\nr = query_sql(sql='SELECT COUNT(*) AS cnt FROM web_facts WHERE \"Archive.org\" = \\'CLAIMED\\'')\nRESULT = {\n    \"count_archive_org_claimed\": d_1,\n    \"overall\": r,\n}",
+        "rollout_sql_tpl": "-- slots: archive_status=Archive.org列的筛选值，取问句里指定的状态（如\"CLAIMED\"）\nSELECT COUNT(*) AS cnt FROM web_facts WHERE \"Archive.org\" = :archive_status"
+      },
+      "code": "# 里程碑会话：组合 1 条维度技能\n# （兄弟技能互相可见 —— 同原版 programs + code 同一作用域）\nd_1 = skill_count_archive_org_claimed()\n# 整体取数（这一里程碑整体怎么算）\nr = query_sql(sql='SELECT COUNT(*) AS cnt FROM web_facts WHERE \"Archive.org\" = \\'CLAIMED\\'')\nRESULT = {\n    \"count_archive_org_claimed\": d_1,\n    \"overall\": r,\n}",
+      "r": 1.0
+    },
+    "learn_257c1d2e::count_1337x_waf": {
+      "topic": "learn_257c1d2e",
+      "name": "count_1337x_waf",
+      "text": "【web_facts 宽表中特定站点特定判定值的行数统计】在 web_facts 表中，1337x 列值为 WAF 的行数是多少？：闭合这个维度时跑通的取数做法",
+      "hits": 25,
+      "ok": 0,
+      "created": 1794223777.8582726,
+      "updated": 1794223777.8582726,
+      "versions": 1,
+      "history": [],
+      "source": "learn",
+      "source_scene": "L",
+      "provenance": "db",
+      "blueprint": {
+        "from": "maieutic_milestone",
+        "milestone": "web_facts 宽表中特定站点特定判定值的行数统计",
+        "dimension": "count_1337x_waf",
+        "question": "在 web_facts 表中，1337x 列值为 WAF 的行数是多少？",
+        "scene": "L",
+        "rollout_sql": "r = query_sql('SELECT COUNT(*) AS cnt FROM web_facts WHERE \"1337x\" = \\'WAF\\'')\nRESULT = {\"count\": r[\"rows\"][0][0], \"source\": \"scene.duckdb web_facts table\"}",
+        "import_id": "",
+        "req_id": "req_20261109T192859ddd1",
+        "tools": [
+          "query_sql"
+        ]
+      },
+      "code": "r = query_sql('SELECT COUNT(*) AS cnt FROM web_facts WHERE \"1337x\" = \\'WAF\\'')\nRESULT = {\"count\": r[\"rows\"][0][0], \"source\": \"scene.duckdb web_facts table\"}",
+      "r": 1.0
+    },
+    "learn_257c1d2e::milestone": {
+      "topic": "learn_257c1d2e",
+      "name": "milestone",
+      "text": "【里程碑】统计web_facts表中1337x列值为WAF的行数：全维度闭合后组合出的整体取数做法（维度配方组合，非单维度）；涵盖的维度问题：在 web_facts 表中，1337x 列值为 WAF 的行数是多少？",
+      "hits": 0,
+      "ok": 0,
+      "created": 1794223804.1517897,
+      "updated": 1794223804.1517897,
+      "versions": 1,
+      "history": [],
+      "source": "learn",
+      "source_scene": "L",
+      "provenance": "db",
+      "blueprint": {
+        "from": "maieutic_milestone_composite",
+        "milestone": "",
+        "question": "统计web_facts表中1337x列值为WAF的行数",
+        "scene": "L",
+        "req_id": "req_20261109T192859ddd1",
+        "rollout_sql": "SELECT COUNT(*) AS cnt FROM web_facts WHERE \"1337x\" = 'WAF'",
+        "dims": [
+          "learn_257c1d2e::count_1337x_waf"
+        ],
+        "session_code": "# 里程碑会话：组合 1 条维度技能\n# （兄弟技能互相可见 —— 同原版 programs + code 同一作用域）\nd_1 = skill_count_1337x_waf()\n# 整体取数（这一里程碑整体怎么算）\nr = query_sql(sql='SELECT COUNT(*) AS cnt FROM web_facts WHERE \"1337x\" = \\'WAF\\'')\nRESULT = {\n    \"count_1337x_waf\": d_1,\n    \"overall\": r,\n}",
+        "rollout_sql_tpl": "-- slots: val=列筛选值，取问句里指定的值（如\"WAF\"）\nSELECT COUNT(*) AS cnt FROM web_facts WHERE \"1337x\" = :val"
+      },
+      "code": "# 里程碑会话：组合 1 条维度技能\n# （兄弟技能互相可见 —— 同原版 programs + code 同一作用域）\nd_1 = skill_count_1337x_waf()\n# 整体取数（这一里程碑整体怎么算）\nr = query_sql(sql='SELECT COUNT(*) AS cnt FROM web_facts WHERE \"1337x\" = \\'WAF\\'')\nRESULT = {\n    \"count_1337x_waf\": d_1,\n    \"overall\": r,\n}",
+      "r": 1.0
+    },
+    "learn_2776f867::filter_item_ce": {
+      "topic": "learn_2776f867",
+      "name": "filter_item_ce",
+      "text": "【特定用户名在多站点的活跃状态判定】在 web_facts 表中，item 列值为 'ce' 的行是否存在？：闭合这个维度时跑通的取数做法",
+      "hits": 20,
+      "ok": 0,
+      "created": 1794223848.4406617,
+      "updated": 1794223848.4406617,
+      "versions": 1,
+      "history": [],
+      "source": "learn",
+      "source_scene": "L",
+      "provenance": "db",
+      "blueprint": {
+        "from": "maieutic_milestone",
+        "milestone": "特定用户名在多站点的活跃状态判定",
+        "dimension": "filter_item_ce",
+        "question": "在 web_facts 表中，item 列值为 'ce' 的行是否存在？",
+        "scene": "L",
+        "rollout_sql": "r = query_sql(\"SELECT COUNT(*) AS cnt FROM web_facts WHERE item = 'ce'\")\ncount = r[\"rows\"][0][0]\nRESULT = {\"exists\": count > 0, \"count\": count, \"explanation\": f\"在 web_facts 表中，item 列值为 'ce' 的行共有 {count} 条，因此{'存在' if count > 0 else '不存在'}这样的行。\"}",
+        "import_id": "imp_20261109T193011",
+        "req_id": "req_20261109T19292065e9",
+        "tools": [
+          "query_sql"
+        ]
+      },
+      "code": "r = query_sql(\"SELECT COUNT(*) AS cnt FROM web_facts WHERE item = 'ce'\")\ncount = r[\"rows\"][0][0]\nRESULT = {\"exists\": count > 0, \"count\": count, \"explanation\": f\"在 web_facts 表中，item 列值为 'ce' 的行共有 {count} 条，因此{'存在' if count > 0 else '不存在'}这样的行。\"}",
+      "r": 1.0
+    },
+    "learn_cf2dea81::pinterest_claimed_count": {
+      "topic": "learn_cf2dea81",
+      "name": "pinterest_claimed_count",
+      "text": "【web_facts宽表特定站点判定值行数统计】在 web_facts 表中，Pinterest 列值为 CLAIMED 的行数是多少？：闭合这个维度时跑通的取数做法",
+      "hits": 14,
+      "ok": 0,
+      "created": 1794225769.4886498,
+      "updated": 1794225769.4886498,
+      "versions": 1,
+      "history": [],
+      "source": "learn",
+      "source_scene": "L",
+      "provenance": "db",
+      "blueprint": {
+        "from": "maieutic_milestone",
+        "milestone": "web_facts宽表特定站点判定值行数统计",
+        "dimension": "pinterest_claimed_count",
+        "question": "在 web_facts 表中，Pinterest 列值为 CLAIMED 的行数是多少？",
+        "scene": "L",
+        "rollout_sql": "r = query_sql(\"SELECT COUNT(*) FROM web_facts WHERE Pinterest = 'CLAIMED'\")\ncount = r[\"rows\"][0][0]\nRESULT = {\"answer\": count, \"explanation\": f\"在 web_facts 表中，Pinterest 列值为 CLAIMED 的行数为 {count}\"}",
+        "import_id": "",
+        "req_id": "req_20261109T200215680b",
+        "tools": [
+          "query_sql"
+        ]
+      },
+      "code": "r = query_sql(\"SELECT COUNT(*) FROM web_facts WHERE Pinterest = 'CLAIMED'\")\ncount = r[\"rows\"][0][0]\nRESULT = {\"answer\": count, \"explanation\": f\"在 web_facts 表中，Pinterest 列值为 CLAIMED 的行数为 {count}\"}",
+      "r": 1.0
+    },
+    "learn_cf2dea81::milestone": {
+      "topic": "learn_cf2dea81",
+      "name": "milestone",
+      "text": "【里程碑】统计web_facts表中Pinterest列值为CLAIMED的行数：全维度闭合后组合出的整体取数做法（维度配方组合，非单维度）；涵盖的维度问题：在 web_facts 表中，Pinterest 列值为 CLAIMED 的行数是多少？",
+      "hits": 0,
+      "ok": 0,
+      "created": 1794225794.1715834,
+      "updated": 1794225794.1715834,
+      "versions": 1,
+      "history": [],
+      "source": "learn",
+      "source_scene": "L",
+      "provenance": "db",
+      "blueprint": {
+        "from": "maieutic_milestone_composite",
+        "milestone": "",
+        "question": "统计web_facts表中Pinterest列值为CLAIMED的行数",
+        "scene": "L",
+        "req_id": "req_20261109T200215680b",
+        "rollout_sql": "SELECT COUNT(*) FROM web_facts WHERE Pinterest = 'CLAIMED'",
+        "dims": [
+          "learn_cf2dea81::pinterest_claimed_count"
+        ],
+        "session_code": "# 里程碑会话：组合 1 条维度技能\n# （兄弟技能互相可见 —— 同原版 programs + code 同一作用域）\nd_1 = skill_pinterest_claimed_count()\n# 整体取数（这一里程碑整体怎么算）\nr = query_sql(sql=\"SELECT COUNT(*) FROM web_facts WHERE Pinterest = 'CLAIMED'\")\nRESULT = {\n    \"pinterest_claimed_count\": d_1,\n    \"overall\": r,\n}",
+        "rollout_sql_tpl": "-- slots: pinterest_status=Pinterest列的筛选值，取问句里指定的状态（如\"CLAIMED\"）\nSELECT COUNT(*) FROM web_facts WHERE Pinterest = :pinterest_status"
+      },
+      "code": "# 里程碑会话：组合 1 条维度技能\n# （兄弟技能互相可见 —— 同原版 programs + code 同一作用域）\nd_1 = skill_pinterest_claimed_count()\n# 整体取数（这一里程碑整体怎么算）\nr = query_sql(sql=\"SELECT COUNT(*) FROM web_facts WHERE Pinterest = 'CLAIMED'\")\nRESULT = {\n    \"pinterest_claimed_count\": d_1,\n    \"overall\": r,\n}",
+      "r": 1.0
+    },
+    "learn_e88c1f06::count_unconfirmed_facts": {
+      "topic": "learn_e88c1f06",
+      "name": "count_unconfirmed_facts",
+      "text": "【web_facts 表中未确认事实的规模统计】在 web_facts 表中，confirmed 列值为 False 的行数是多少？：闭合这个维度时跑通的取数做法",
+      "hits": 0,
+      "ok": 0,
+      "created": 1794226351.3101182,
+      "updated": 1794226351.3101182,
+      "versions": 1,
+      "history": [],
+      "source": "learn",
+      "source_scene": "L",
+      "provenance": "db",
+      "blueprint": {
+        "from": "maieutic_milestone",
+        "milestone": "web_facts 表中未确认事实的规模统计",
+        "dimension": "count_unconfirmed_facts",
+        "question": "在 web_facts 表中，confirmed 列值为 False 的行数是多少？",
+        "scene": "L",
+        "rollout_sql": "r = query_sql(\"SELECT COUNT(*) FROM web_facts WHERE confirmed = FALSE\")\ncount = r[\"rows\"][0][0]\nRESULT = {\"answer\": count, \"query\": \"SELECT COUNT(*) FROM web_facts WHERE confirmed = FALSE\"}",
+        "import_id": "",
+        "req_id": "req_20261109T192402c896",
+        "tools": []
+      },
+      "code": "r = query_sql(\"SELECT COUNT(*) FROM web_facts WHERE confirmed = FALSE\")\ncount = r[\"rows\"][0][0]\nRESULT = {\"answer\": count, \"query\": \"SELECT COUNT(*) FROM web_facts WHERE confirmed = FALSE\"}"
+    },
+    "learn_e88c1f06::milestone": {
+      "topic": "learn_e88c1f06",
+      "name": "milestone",
+      "text": "【里程碑】统计web_facts表中Monkeytype http 状态码列值为404的行数：全维度闭合后组合出的整体取数做法（维度配方组合，非单维度）；涵盖的维度问题：在 web_facts 表中，confirmed 列值为 False 的行数是多少？",
+      "hits": 0,
+      "ok": 0,
+      "created": 1794226385.2824368,
+      "updated": 1794226385.2824368,
+      "versions": 1,
+      "history": [],
+      "source": "learn",
+      "source_scene": "L",
+      "provenance": "db",
+      "blueprint": {
+        "from": "maieutic_milestone_composite",
+        "milestone": "",
+        "question": "统计web_facts表中Monkeytype http 状态码列值为404的行数",
+        "scene": "L",
+        "req_id": "req_20261109T192402c896",
+        "rollout_sql": "SELECT COUNT(*) FROM web_facts WHERE \"Monkeytype http 状态码\" = 404",
+        "dims": [
+          "learn_e88c1f06::count_unconfirmed_facts"
+        ],
+        "session_code": "# 里程碑会话：组合 1 条维度技能\n# （兄弟技能互相可见 —— 同原版 programs + code 同一作用域）\nd_1 = skill_count_unconfirmed_facts()\n# 整体取数（这一里程碑整体怎么算）\nr = query_sql(sql='SELECT COUNT(*) FROM web_facts WHERE \"Monkeytype http 状态码\" = 404')\nRESULT = {\n    \"count_unconfirmed_facts\": d_1,\n    \"overall\": r,\n}",
+        "rollout_sql_tpl": "-- slots: status_code=HTTP状态码，取问句里指定的状态码值（如\"404\"）\nSELECT COUNT(*) FROM web_facts WHERE \"Monkeytype http 状态码\" = :status_code"
+      },
+      "code": "# 里程碑会话：组合 1 条维度技能\n# （兄弟技能互相可见 —— 同原版 programs + code 同一作用域）\nd_1 = skill_count_unconfirmed_facts()\n# 整体取数（这一里程碑整体怎么算）\nr = query_sql(sql='SELECT COUNT(*) FROM web_facts WHERE \"Monkeytype http 状态码\" = 404')\nRESULT = {\n    \"count_unconfirmed_facts\": d_1,\n    \"overall\": r,\n}"
+    },
+    "learn_f4f5aaf7::count_unconfirmed_facts": {
+      "topic": "learn_f4f5aaf7",
+      "name": "count_unconfirmed_facts",
+      "text": "【web_facts 表中未确认事实的规模统计】在 web_facts 表中，confirmed 列值为 False 的行数是多少？：闭合这个维度时跑通的取数做法",
+      "hits": 0,
+      "ok": 0,
+      "created": 1794226850.8614032,
+      "updated": 1794226850.8614032,
+      "versions": 1,
+      "history": [],
+      "source": "learn",
+      "source_scene": "L",
+      "provenance": "db",
+      "blueprint": {
+        "from": "maieutic_milestone",
+        "milestone": "web_facts 表中未确认事实的规模统计",
+        "dimension": "count_unconfirmed_facts",
+        "question": "在 web_facts 表中，confirmed 列值为 False 的行数是多少？",
+        "scene": "L",
+        "rollout_sql": "r = query_sql(\"SELECT COUNT(*) FROM web_facts WHERE confirmed = FALSE\")\ncount = r[\"rows\"][0][0]\nRESULT = {\"answer\": count, \"query\": \"SELECT COUNT(*) FROM web_facts WHERE confirmed = FALSE\"}",
+        "import_id": "",
+        "req_id": "req_20261109T192402c896",
+        "tools": []
+      },
+      "code": "r = query_sql(\"SELECT COUNT(*) FROM web_facts WHERE confirmed = FALSE\")\ncount = r[\"rows\"][0][0]\nRESULT = {\"answer\": count, \"query\": \"SELECT COUNT(*) FROM web_facts WHERE confirmed = FALSE\"}"
+    },
+    "learn_f4f5aaf7::milestone": {
+      "topic": "learn_f4f5aaf7",
+      "name": "milestone",
+      "text": "【里程碑】统计web_facts表中Fanpop http 状态码列值为403的行数：全维度闭合后组合出的整体取数做法（维度配方组合，非单维度）；涵盖的维度问题：在 web_facts 表中，confirmed 列值为 False 的行数是多少？",
+      "hits": 0,
+      "ok": 0,
+      "created": 1794226890.7665517,
+      "updated": 1794226890.7665517,
+      "versions": 1,
+      "history": [],
+      "source": "learn",
+      "source_scene": "L",
+      "provenance": "db",
+      "blueprint": {
+        "from": "maieutic_milestone_composite",
+        "milestone": "",
+        "question": "统计web_facts表中Fanpop http 状态码列值为403的行数",
+        "scene": "L",
+        "req_id": "req_20261109T192402c896",
+        "rollout_sql": "SELECT COUNT(*) FROM web_facts WHERE \"Fanpop http 状态码\" = 403",
+        "dims": [
+          "learn_f4f5aaf7::count_unconfirmed_facts"
+        ],
+        "session_code": "# 里程碑会话：组合 1 条维度技能\n# （兄弟技能互相可见 —— 同原版 programs + code 同一作用域）\nd_1 = skill_count_unconfirmed_facts()\n# 整体取数（这一里程碑整体怎么算）\nr = query_sql(sql='SELECT COUNT(*) FROM web_facts WHERE \"Fanpop http 状态码\" = 403')\nRESULT = {\n    \"count_unconfirmed_facts\": d_1,\n    \"overall\": r,\n}",
+        "rollout_sql_tpl": "-- slots: status_code=HTTP状态码，取问句里指定的状态码值（如403）\nSELECT COUNT(*) FROM web_facts WHERE \"Fanpop http 状态码\" = :status_code"
+      },
+      "code": "# 里程碑会话：组合 1 条维度技能\n# （兄弟技能互相可见 —— 同原版 programs + code 同一作用域）\nd_1 = skill_count_unconfirmed_facts()\n# 整体取数（这一里程碑整体怎么算）\nr = query_sql(sql='SELECT COUNT(*) FROM web_facts WHERE \"Fanpop http 状态码\" = 403')\nRESULT = {\n    \"count_unconfirmed_facts\": d_1,\n    \"overall\": r,\n}"
+    },
+    "learn_2776f867::define_active_status": {
+      "topic": "learn_2776f867",
+      "name": "define_active_status",
+      "text": "【特定用户名在多站点的活跃状态判定】在 web_facts 表的站点判定列中，哪些取值（如 AVAILABLE、CLAIMED 等）代表该用户名在该平台确实存在或活跃？：闭合这个维度时跑通的取数做法",
+      "hits": 4,
+      "ok": 1,
+      "created": 1794227189.4253368,
+      "updated": 1794227189.4253368,
+      "versions": 1,
+      "history": [],
+      "source": "learn",
+      "source_scene": "L",
+      "provenance": "web",
+      "blueprint": {
+        "from": "maieutic_milestone",
+        "milestone": "特定用户名在多站点的活跃状态判定",
+        "dimension": "define_active_status",
+        "question": "在 web_facts 表的站点判定列中，哪些取值（如 AVAILABLE、CLAIMED 等）代表该用户名在该平台确实存在或活跃？",
+        "scene": "L",
+        "rollout_sql": "# Read the sherlock project's result.py to get the QueryStatus enum definition\nr = gh_read(repo=\"sherlock-project/sherlock\", path=\"sherlock_project/result.py\")\nRESULT = {\"source\": \"sherlock-project/sherlock/sherlock_project/result.py\", \"content\": r}",
+        "import_id": "imp_20261109T195008",
+        "req_id": "req_20261109T19292065e9",
+        "tools": [
+          "gh_read"
+        ]
+      },
+      "code": "# Read the sherlock project's result.py to get the QueryStatus enum definition\nr = gh_read(repo=\"sherlock-project/sherlock\", path=\"sherlock_project/result.py\")\nRESULT = {\"source\": \"sherlock-project/sherlock/sherlock_project/result.py\", \"content\": r}",
+      "r": 1.0
+    },
+    "learn_a9035760::count_1337x_http_403": {
+      "topic": "learn_a9035760",
+      "name": "count_1337x_http_403",
+      "text": "【web_facts 宽表中特定站点 HTTP 状态码的筛选与计数】在 web_facts 表中，1337x http 状态码 列值为 403 的行数是多少？：闭合这个维度时跑通的取数做法",
+      "hits": 3,
+      "ok": 0,
+      "created": 1794227596.0421643,
+      "updated": 1794227596.0421643,
+      "versions": 1,
+      "history": [],
+      "source": "learn",
+      "source_scene": "L",
+      "provenance": "db",
+      "blueprint": {
+        "from": "maieutic_milestone",
+        "milestone": "web_facts 宽表中特定站点 HTTP 状态码的筛选与计数",
+        "dimension": "count_1337x_http_403",
+        "question": "在 web_facts 表中，1337x http 状态码 列值为 403 的行数是多少？",
+        "scene": "L",
+        "rollout_sql": "r = query_sql('SELECT COUNT(*) FROM web_facts WHERE \"1337x http 状态码\" = 403')\ncount = r[\"rows\"][0][0]\nRESULT = {\"answer\": count, \"explanation\": f\"在 web_facts 表中，'1337x http 状态码' 列值为 403 的行数为 {count}\"}",
+        "import_id": "",
+        "req_id": "req_20261109T2032386af6",
+        "tools": [
+          "query_sql"
+        ]
+      },
+      "code": "r = query_sql('SELECT COUNT(*) FROM web_facts WHERE \"1337x http 状态码\" = 403')\ncount = r[\"rows\"][0][0]\nRESULT = {\"answer\": count, \"explanation\": f\"在 web_facts 表中，'1337x http 状态码' 列值为 403 的行数为 {count}\"}",
+      "r": 1.0
+    },
+    "learn_a9035760::milestone": {
+      "topic": "learn_a9035760",
+      "name": "milestone",
+      "text": "【里程碑】统计web_facts表中1337x http 状态码列值为403的行数：全维度闭合后组合出的整体取数做法（维度配方组合，非单维度）；涵盖的维度问题：在 web_facts 表中，1337x http 状态码 列值为 403 的行数是多少？",
+      "hits": 0,
+      "ok": 0,
+      "created": 1794227627.3730795,
+      "updated": 1794227627.3730795,
+      "versions": 1,
+      "history": [],
+      "source": "learn",
+      "source_scene": "L",
+      "provenance": "db",
+      "blueprint": {
+        "from": "maieutic_milestone_composite",
+        "milestone": "",
+        "question": "统计web_facts表中1337x http 状态码列值为403的行数",
+        "scene": "L",
+        "req_id": "req_20261109T2032386af6",
+        "rollout_sql": "SELECT COUNT(*) FROM web_facts WHERE \"1337x http 状态码\" = 403",
+        "dims": [
+          "learn_a9035760::count_1337x_http_403"
+        ],
+        "session_code": "# 里程碑会话：组合 1 条维度技能\n# （兄弟技能互相可见 —— 同原版 programs + code 同一作用域）\nd_1 = skill_count_1337x_http_403()\n# 整体取数（这一里程碑整体怎么算）\nr = query_sql(sql='SELECT COUNT(*) FROM web_facts WHERE \"1337x http 状态码\" = 403')\nRESULT = {\n    \"count_1337x_http_403\": d_1,\n    \"overall\": r,\n}",
+        "rollout_sql_tpl": "-- slots: status_code=HTTP状态码值，取问句里指定的状态码（如\"403\"）\nSELECT COUNT(*) FROM web_facts WHERE \"1337x http 状态码\" = :status_code"
+      },
+      "code": "# 里程碑会话：组合 1 条维度技能\n# （兄弟技能互相可见 —— 同原版 programs + code 同一作用域）\nd_1 = skill_count_1337x_http_403()\n# 整体取数（这一里程碑整体怎么算）\nr = query_sql(sql='SELECT COUNT(*) FROM web_facts WHERE \"1337x http 状态码\" = 403')\nRESULT = {\n    \"count_1337x_http_403\": d_1,\n    \"overall\": r,\n}",
+      "r": 1.0
+    }
+  },
+  "writes": 425,
+  "added": 183,
+  "rewrites": 16,
+  "skipped": 87
+}

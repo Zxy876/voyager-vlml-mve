@@ -1,0 +1,111 @@
+{
+ "milestone": {
+  "name": "web_facts 宽表特定站点判定状态行数统计",
+  "why": "掌握在宽表中按指定站点列及其枚举值（如 Archive.org 的 CLAIMED）进行筛选并统计行数的能力，是完成多维度事实核查数据聚合分析的基础单元。"
+ },
+ "dimensions": [
+  {
+   "id": "count_archive_org_claimed",
+   "question": "在 web_facts 表中，Archive.org 列值为 CLAIMED 的行数是多少？",
+   "why": "这是原问题的直接转写，必须通过此查询获得最终所需的统计数值。",
+   "landing": "web_facts"
+  }
+ ],
+ "expected_drifts": [
+  {
+   "category": "drift",
+   "pattern": "只查出 Archive.org 列存在 CLAIMED 取值，但未返回具体的行数统计结果"
+  },
+  {
+   "category": "bug",
+   "pattern": "将列名或枚举值拼写错误，例如写成 Archive_org 或 Claimed，导致查询报错或返回0"
+  }
+ ],
+ "material_note": null,
+ "question": "统计web_facts表中Archive.org列值为CLAIMED的行数",
+ "progress": {
+  "learned": [
+   "count_archive_org_claimed"
+  ],
+  "updated": 1794223626.2773848,
+  "codes": [
+   {
+    "id": "count_archive_org_claimed",
+    "question": "在 web_facts 表中，Archive.org 列值为 CLAIMED 的行数是多少？",
+    "code": "r = query_sql(sql='SELECT COUNT(*) AS cnt FROM web_facts WHERE \"Archive.org\" = \\'CLAIMED\\'')\nRESULT = {\"count\": r[\"rows\"][0][0], \"detail\": \"web_facts表中Archive.org列值为CLAIMED的行数\"}",
+    "answer": "{\"count\": 7, \"detail\": \"web_facts表中Archive.org列值为CLAIMED的行数\"}",
+    "tools": [],
+    "r": -1.0,
+    "how": ""
+   }
+  ],
+  "iterations": [
+   {
+    "id": "count_archive_org_claimed",
+    "rounds": 1,
+    "asked": "（本轮没有产生判词：闸门与内层 critic 都未给出理由 —— 如实记录，判未闭合，不带入下一轮追问）",
+    "gap": "",
+    "passed": true,
+    "tools": [
+     "query_sql"
+    ],
+    "asked_q": []
+   }
+  ]
+ },
+ "session": {
+  "started_at": 1794223626.3202782,
+  "phase": 4,
+  "events": [
+   {
+    "kind": "dim_closed",
+    "at": 1794223626.3202796,
+    "payload": {
+     "dim_id": "count_archive_org_claimed",
+     "r": 1.0,
+     "how": "tool"
+    }
+   },
+   {
+    "kind": "phase_transition",
+    "at": 1794223626.3202875,
+    "payload": {
+     "from": 1,
+     "to": 3,
+     "reason": "学习侧验收跑完（答案待披露）"
+    }
+   },
+   {
+    "kind": "dim_closed",
+    "at": 1794223626.3987827,
+    "payload": {
+     "dim_id": "count_archive_org_claimed",
+     "r": 1.0,
+     "how": "tool"
+    }
+   },
+   {
+    "kind": "dim_closed",
+    "at": 1794223663.2851727,
+    "payload": {
+     "dim_id": "count_archive_org_claimed",
+     "r": -1.0,
+     "how": ""
+    }
+   },
+   {
+    "kind": "phase_transition",
+    "at": 1794223690.0709543,
+    "payload": {
+     "from": 3,
+     "to": 4,
+     "reason": "里程碑达成（维度全闭合）"
+    }
+   }
+  ],
+  "completed_at": 1794223690.070952
+ },
+ "milestone_achieved": true,
+ "milestone_lit_at": 1794223690.0709426,
+ "milestone_verified_real": true
+}
