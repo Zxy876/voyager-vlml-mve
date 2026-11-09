@@ -122,6 +122,23 @@ def on_miss(question: str, scene_id: str = "", *,
     except Exception as e:
         out["reason"] = (out["reason"] + "；" if out["reason"] else "") + \
             f"建图谱节点失败：{type(e).__name__}: {e}"
+    # ③ **需求级 id 登记**（2026-11-09 第三刀 A）
+    #    人导入这一刻 = 原版 maieutic「教师发布 Exercise」的那一刻
+    #    （照抄 `prisma/schema.prisma:14` 的 `Exercise.id` = slug，
+    #      发布时定死、运行时不改、**不从题目文本算出来**）。
+    #    为什么在这一步：req id 是**这个需求**的身份，跨问法、跨批次恒定 ——
+    #    而 `consume:` 节点是「这道题的运行时记录」、`import:` 是「哪一次导入」，
+    #    两者都不承载需求身份。骨架/进度三本账/技能/会话归档全部挂 req id。
+    try:
+        import req_registry as _rr
+        _reg = _rr.register(scene, question)
+        out["req_id"] = str(_reg.get("req_id") or "")
+        out["req_created"] = bool(_reg.get("created"))
+        if out["req_id"]:
+            _rr.ensure_req_node(scene, question, out["req_id"])
+    except Exception as e:
+        out["reason"] = (out["reason"] + "；" if out["reason"] else "") + \
+            f"需求登记失败：{type(e).__name__}: {e}"
     return out
 
 

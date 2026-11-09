@@ -1646,6 +1646,28 @@ async def consume(
         _fail_block = _failures.recall_block(_scene_id, question)
     except Exception:
         _fail_block = ""
+    # ---- 需求级 id 登记（2026-11-09 第三刀 A）----
+    # ★ **位置是刻意的**：必须在下面「路由读骨架」**之前**。
+    #   骨架/进度账的键挂在 req id 上（`maieutic_scaffold._cache_path`），
+    #   读骨架之前身份必须先定下来，否则读到的是「还没登记」的空账。
+    # ★ 为什么消费侧就要登记（而不是只在学习侧）：
+    #   原版 maieutic 的需求身份 = `Exercise.id`（slug，教师**发布**时给的，
+    #   `prisma/schema.prisma:14`），**运行时不改、全仓无相似度检索**。
+    #   MVE 的对应物 = req id：人导入那一刻分配，跨问法、跨批次恒定。
+    #   消费侧是「人导入」的入口 → 在这里登记，学习侧与消费侧读到的是同一个 id
+    #   → 骨架/进度三本账/技能/会话归档全部挂它 → **换问法不重拆骨架**。
+    # ★ 覆盖命中与未命中两条路径（这一段在两条路径上都会经过）。
+    # ⚠️ 登记失败**不许拦消费**（同 on_miss 的口径：身份登记是增强，不是门槛）。
+    _req_id = ""
+    try:
+        import req_registry as _rr
+        _req_info = _rr.register(str(_scene_id or "A"), question)
+        _req_id = str(_req_info.get("req_id") or "")
+        if _req_id:
+            _rr.ensure_req_node(str(_scene_id or "A"), question, _req_id)
+    except Exception:
+        _req_id = ""
+
     # ---- 信息路由由**骨架**承担（2026-11-09，删规划员）----
     # 原版 maieutic 本来就没有规划员这一层：拆解即骨架（拆完逐条闭合）。
     # MVE 此前另设规划员判 db/web —— 与骨架构成第二套分解，实测互相打架
@@ -1742,6 +1764,8 @@ async def consume(
             miss_info["milestone_target_set"] = True
         except Exception:
             pass
+    # （需求级 id 的登记在上面「路由读骨架」之前就做完了 —— 见那段注释。
+    #  放这里会太晚：骨架键挂在 req id 上，读骨架之前身份必须先定下来。）
     # ---- ②.5 场景后端（数据源）----
     # 非 VLML 场景**不做 VLML 取数**：那条路连的是 rib/GRID，在别的场景里
     # 拿它回答就是上一次实测看到的「问世界模型，答出一串 Valorant 战队」。
@@ -3406,6 +3430,10 @@ async def consume(
         # 未命中时建的图谱节点（闭环第 2 步的可见证据）：node_id + 是否新建
         "miss_node": str(miss_info.get("node_id") or ""),
         "miss_node_created": bool(miss_info.get("node_created")),
+        # 需求级 id（2026-11-09 第三刀 A）—— 照抄原版 `Exercise.id`：
+        # 人导入那一刻分配，跨问法/跨批次恒定；骨架、进度三本账、技能、
+        # 会话归档全部挂它。面板据此能把「同一需求的第 N 种问法」认出来。
+        "req_id": str(_req_id or ""),
         # 判定结果枚举（设计《判定结果状态与写入证明规格》）：写入图谱的充分条件。
         #   written              —— 成功写入图谱（节点已存在/已验证，已提交终态）
         #   insufficient_evidence —— 冷启动单次证据（节点 cold_start_guess，待巩固）

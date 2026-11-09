@@ -241,9 +241,41 @@ def _call_llm(llm: Callable | None, messages: list[dict[str, str]]) -> tuple[dic
 
 
 def _cache_path(scene_id: str, question: str, db_path: str = "") -> Path:
-    h = hashlib.md5(str(question or "").strip().encode("utf-8")).hexdigest()[:12]
-    # db_path 进缓存键：场景换了库 / 首次加 schema 观察面，旧骨架（可能编了不存在
-    # 的参数）不能继续命中，必须重拆。知识型场景 db_path="" 不影响旧键。
+    """骨架 + 进度账的**统一钥匙**（2026-11-09 第三刀 A：键挂在需求 id 上）。
+
+    ★ 为什么键要换（用户 2026-11-09 判断 + 服务器取证）：
+      原键 = `md5(question)[:12] + "_" + md5(db_path)[:8]` → **身份挂在问句上**。
+      场景 L 实测：同一个需求三个问句 → 三套骨架并存，**维度 id 互不相同**
+      （`locate_target_item` vs `filter_target_item` vs `target_item_identification`）
+      → 闭合账互不认 → 学习侧验过的成果（`progress.codes` 里带 answer/r 的那条）
+      消费侧读不到 → 重复拆骨架、重复学。
+
+    ★ 照抄原版 maieutic 的 `Exercise.id`（已复核 `prisma/schema.prisma:14`）：
+      原版需求身份 = **slug，教师发布时给的**，不是从题目文本算出来的；
+      复用靠 `(exerciseId, studentId)` 精确二元组（`sessions.ts:159-170`）；
+      全仓**无** md5 / 相似度 / embedding 检索。
+      ⇒ MVE 对应物 = **req id**：人导入那一刻分配，**与问句文本完全无关**，
+      之后永不改变；换问法靠归题找回同一个 req（见 `req_registry`）。
+
+    ★ 为什么不改签名（16 处调用点零改动）：
+      `_cache_path` 是骨架与进度账的**唯一入口**（progress 三本账、
+      iterations、rounds、milestone_state 全走它）。改签名 = 改 16 处调用点
+      = 每处都要传 req id = 传错就写到别的需求的账上。改内部实现 = 一处改，
+      语义全局生效。
+
+    ★ 键的构成不变（照抄，不改口径）：
+      db_path 进键的理由与原版完全一致 —— 场景换了库 / 首次加 schema 观察面时，
+      旧骨架（可能编了不存在的参数）不能继续命中，必须重拆。
+
+    解析顺序：
+      ① 有 req id → 新键 `req_<req_id>_<dbhash>.json`
+      ② 新键不存在 → **按当前问句的 md5** 回退找旧键 → 命中则迁移（读时兼容）
+         ⚠️ 回退**只能用当前问句的 md5**，不许扫目录取最近
+            （那会拿到别的需求的骨架 = 串台，比读不到更坏）
+      ③ 都没有 → 返回新键路径（首次拆骨架时写它）
+    """
+    sid = str(scene_id or "A")
+    q = str(question or "")
     if not db_path:
         # 进度/追问历史的读写常省略 db_path；但它们必须与 scaffold 写出的缓存文件
         # 同把钥匙，否则数据场景（db_path 非空）的进度会被写到一个不存在的文件、
@@ -251,11 +283,28 @@ def _cache_path(scene_id: str, question: str, db_path: str = "") -> Path:
         # 解锁」对数据场景名存实亡。这里回退到场景规范 db_path，和 scaffold 对齐。
         try:
             import scene_profile as _sp
-            db_path = str((_sp.profile(str(scene_id or "A")) or {}).get("db_path") or "")
+            db_path = str((_sp.profile(sid) or {}).get("db_path") or "")
         except Exception:
             db_path = ""
+    try:
+        import req_registry as _rr
+    except Exception:
+        _rr = None
+    if _rr is not None:
+        try:
+            _rid = _rr.req_id_of(sid, q)
+            if _rid:
+                _new_p = _rr.skeleton_path(sid, _rid, db_path)
+                if not _new_p.exists():
+                    # 读时迁移：旧键（问句 md5）有账 → 迁到新键
+                    _rr.migrate_legacy(sid, q, _rid, db_path=db_path)
+                return _new_p
+        except Exception:
+            pass
+    # 没有 req 登记（自由提问 / 旧数据）→ 旧键（保持旧行为，零回归）
+    h = hashlib.md5(q.strip().encode("utf-8")).hexdigest()[:12]
     dh = hashlib.md5(str(db_path or "").encode("utf-8")).hexdigest()[:8]
-    return CKPT / str(scene_id or "A") / f"{h}_{dh}.json"
+    return CKPT / sid / f"{h}_{dh}.json"
 
 
 def _atomic_write(path: Path, data: dict) -> None:
