@@ -93,6 +93,13 @@ Context: <一句话说明：用哪个文件/表、算什么、完成标准是什
 _MAX_COLS_PER_TABLE = 40
 _MAX_VALUE_LINES = 24
 _MAX_OBS_CHARS = 12000
+# 2026-11-10：观察面升级「摘要 + 原始事实」（取值×计数 + 样本行），
+# 上限随之放宽；双拼 bug 已修（render_material 只拼一次），16k 安全。
+_MAX_OBS_CHARS = 16000
+# 样本行上限：每表倒几行**真实数据**（仅非空单元格），同构原版
+# render_observation 的「只倾倒」，一行代表什么由模型自己看出来。
+_MAX_SAMPLE_ROWS = 3
+_MAX_SAMPLE_CELLS = 14
 
 
 def db_observation(db_path: str) -> str:
@@ -137,7 +144,10 @@ def db_observation(db_path: str) -> str:
                 else:
                     lines.append(f"- 表 {t}（{cnt} 行）：" + ", ".join(cnames))
                     shown_cols = {str(c[0]): str(c[1]).upper() for c in cols}
-                # ---- 取值：只对抽到的列查，且每表限行数 ----
+                # ---- 取值：基数 + 取值×计数（2026-11-10）----
+                # 计数是原始事实（同构原版 iron_ore ×1），不是解读：
+                # 「item 2 个不同取值: ce(×1868)」让拆解器自己看出一键多行
+                # （分片宽表），「source_url 13+ 个不同取值」让它看出近似唯一。
                 _lines = 0
                 for cname, ctype in shown_cols.items():
                     if _lines >= _MAX_VALUE_LINES:
@@ -145,17 +155,58 @@ def db_observation(db_path: str) -> str:
                     if ctype not in ("VARCHAR", "TEXT", "STRING", "BOOLEAN"):
                         continue
                     try:
-                        vals = [r[0] for r in con.execute(
-                            f'select distinct "{cname}" from "{t}" '
-                            f'limit 13').fetchall()]
+                        _pairs = con.execute(
+                            f'select "{cname}", count(*) from "{t}" '
+                            f'where "{cname}" is not null '
+                            f'group by 1 order by 2 desc limit 13').fetchall()
                     except Exception:
                         continue
-                    vals = [v for v in vals if v is not None]
-                    if vals and len(vals) <= 12:
-                        lines.append(
-                            f"    · {t}.{cname} 真实取值: "
-                            + "、".join(str(v) for v in vals))
-                        _lines += 1
+                    if not _pairs:
+                        continue
+                    try:
+                        _nd = con.execute(
+                            f'select count(distinct "{cname}") from "{t}"'
+                        ).fetchone()[0]
+                    except Exception:
+                        _nd = len(_pairs)
+                    _parts = []
+                    for _v, _c in _pairs:
+                        _vs = str(_v)
+                        if len(_vs) > 60:
+                            _vs = _vs[:57] + "..."
+                        _parts.append(f"{_vs}(×{_c})")
+                    _head = f"    · {t}.{cname} {_nd} 个不同取值"
+                    if _nd <= 12:
+                        lines.append(_head + ": " + "、".join(_parts))
+                    else:
+                        # 高基数列也列**最多的几个**取值×计数（原始事实，让拆解器
+                        # 看见「ce 占 459 行」这类集中度；长尾不列）
+                        lines.append(_head + "（列最多的几个）: " + "、".join(_parts))
+                    _lines += 1
+                # ---- 样本行：原始末态倾倒（2026-11-10，同构原版 render_observation）----
+                # 原版不解读环境：只倒「背包 iron_ore ×1、附近 grass」。
+                # 这里只倒几行真实数据（仅非空单元格），一行代表什么、
+                # 要不要聚合，由拆解器自己看出来。
+                try:
+                    _rc = con.execute(f'select * from "{t}" limit {_MAX_SAMPLE_ROWS}')
+                    _all_cols = [str(d[0]) for d in _rc.description]
+                    _rows = _rc.fetchall()
+                    _prev_row = ""
+                    for _ri, _row in enumerate(_rows, 1):
+                        _cells = [f"{c}: {v}" for c, v in zip(_all_cols, _row)
+                                  if v is not None]
+                        if not _cells:
+                            continue
+                        _rtext = ", ".join(str(v) for v in _cells)
+                        if _rtext == _prev_row:
+                            continue
+                        _prev_row = _rtext
+                        if len(_cells) > _MAX_SAMPLE_CELLS:
+                            _rtext = (", ".join(str(v) for v in _cells[:_MAX_SAMPLE_CELLS])
+                                      + f" …（全行 {len(_cells)} 个非空列）")
+                        lines.append(f"    · {t} 样本行{_ri}/{len(_rows)}: {_rtext}")
+                except Exception:
+                    pass
             out = "\n".join(lines)
             if len(out) > _MAX_OBS_CHARS:
                 out = (out[:_MAX_OBS_CHARS]

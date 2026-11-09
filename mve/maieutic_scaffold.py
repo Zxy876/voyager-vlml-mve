@@ -203,8 +203,15 @@ def _default_llm(messages: list[dict[str, str]]) -> str:
     #   且维度**全部落在可达表上**（web_facts / web_docs），material_note
     #   里模型自己写明「web_evidence 是审计账本不在可用数据源中」。
     #   ⚠️ 只关**出题器**的思考 —— 判官（reason_pass/task_critic）需要它。
-    return chat(messages, temperature=0.3, max_tokens=2400,
-                thinking={"type": "disabled"})
+    # ★ 2026-11-10 恢复出题器思考（换回 enabled + 放大预算）：观察面升级
+    #   「基数+取值×计数+样本行」后，粒度判断需要整合这些事实
+    #   （「item: ce(×459)」⇒ 一键多行 ⇒ 聚合表述）—— 2400 预算下
+    #   思考吃光正文才截断，根因是**预算小**不是**思考有害**。
+    #   教师端拆一次就固定（低频），预算给足：thinking enabled + 8000。
+    #   实测（场景 L 同题对照）：disabled 拆出「item='ce' 的那行里…」
+    #   （无视 ce(×459) 的单行假设）；enabled 后待验证。
+    return chat(messages, temperature=0.3, max_tokens=8000,
+                thinking={"type": "enabled"})
 
 
 def _call_llm(llm: Callable | None, messages: list[dict[str, str]]) -> tuple[dict, list, str]:
