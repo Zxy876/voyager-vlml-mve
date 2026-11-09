@@ -38,6 +38,46 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 PASS = FAIL = 0
 
+# 假场景 id（临时骨架放这儿，不污染真实场景的缓存目录）
+FAKE = "_test_landing_gap"
+
+
+def _strip_docstrings(src: str) -> str:
+    """去掉 docstring 与注释，只留**代码**（判据是否写死表名只看代码）。
+
+    为什么要分清「代码」和「文档」：`reachable.py` 的文件头里写着
+    「实测场景 L 的 web_evidence 在另一个库里」—— 那是**取证记录**
+    （让人看懂为什么有这一层），不是判据。判据里写死表名才是硬编码。
+    """
+    import ast
+    import io
+    import tokenize
+    try:
+        # ① 记下所有 docstring 的行号范围
+        lines = set()
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Module, ast.FunctionDef,
+                                 ast.AsyncFunctionDef, ast.ClassDef)):
+                body = getattr(node, "body", None)
+                if body and isinstance(body[0], ast.Expr) and \
+                        isinstance(body[0].value, ast.Constant) and \
+                        isinstance(body[0].value.value, str):
+                    d = body[0]
+                    lines.update(range(d.lineno, (d.end_lineno or d.lineno) + 1))
+        # ② 逐行输出：注释整行丢；docstring 行换成空串
+        out: list[str] = []
+        for i, line in enumerate(src.splitlines(), start=1):
+            if i in lines:
+                out.append("")
+                continue
+            # 去掉行内注释（不处理字符串里的 #，简单够用）
+            code = line.split("#", 1)[0] if "#" in line else line
+            out.append(code)
+        return "\n".join(out)
+    except Exception:
+        return src
+
 
 def check(name: str, cond: bool, detail: str = "") -> None:
     global PASS, FAIL
@@ -93,10 +133,16 @@ def main() -> int:
 
     print("== 2. 旧骨架（无 landing）：点名不可达表 → 该重拆 ==")
     import maieutic_scaffold as ms
-    tmp = tempfile.mkdtemp(prefix="mve_landing_")
-    ck = Path(ms.CKPT) / "_test_landing_scene"
+    # ⚠️ 用**假场景 id** 做临时骨架（不污染真实场景的缓存目录）。
+    #   但判据按 scene_id 实查账本表 → 假场景查不到账本表 → 必然不命中。
+    #   所以这里把 `reachable.ledger_tables` **临时顶掉**成真场景的账本表
+    #   （表名来自实查，不是写死的字符串）—— 被测的仍是「判据接得对不对」。
+    _orig_ledger = R.ledger_tables
+    R.ledger_tables = lambda s: list(led) if str(s) == FAKE else _orig_ledger(s)
+    ck = Path(ms.CKPT) / FAKE
     ck.mkdir(parents=True, exist_ok=True)
     q = "测试用的问句（落点够不着）"
+    p = None
     try:
         # 造一份「旧骨架」：**故意不带 landing 字段**
         dims_bad = [{"id": "d1",
@@ -105,57 +151,76 @@ def main() -> int:
         dims_ok = [{"id": "d1",
                     "question": f"在 {t_reach} 表中，item 为 'ce' 的记录有哪些？",
                     "why": "查这个"}] if t_reach else []
-        # 用真实的 _cache_path 算键（保证 resplit_needed 能找到同一份文件）
-        p = ms._cache_path(ck.name, q)
+        p = ms._cache_path(FAKE, q)      # 写与读同一把钥匙
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps({"question": q, "dimensions": dims_bad},
                                 ensure_ascii=False), encoding="utf-8")
-        need = ms.resplit_needed(ck.name, q)
-        check("旧骨架点名不可达表 → resplit_needed = True", need is True)
+        check("旧骨架点名不可达表 → resplit_needed = True",
+              ms.resplit_needed(FAKE, q) is True)
 
-        # 换一份：点名可达表 → 不该判要重拆
         p.write_text(json.dumps({"question": q, "dimensions": dims_ok},
                                 ensure_ascii=False), encoding="utf-8")
-        need2 = ms.resplit_needed(ck.name, q)
         check("旧骨架点名可达表 → resplit_needed = False（不误伤）",
-              need2 is False)
+              ms.resplit_needed(FAKE, q) is False)
 
-        # 空维度 → 不判
         p.write_text(json.dumps({"question": q, "dimensions": []},
                                 ensure_ascii=False), encoding="utf-8")
         check("空维度 → resplit_needed = False",
-              ms.resplit_needed(ck.name, q) is False)
+              ms.resplit_needed(FAKE, q) is False)
+
+        # 新骨架（**带** landing，但落点够不着）→ 也要判该重拆
+        p.write_text(json.dumps(
+            {"question": q,
+             "dimensions": [{"id": "d1", "landing": "no_such_table_zzz",
+                             "question": "随便问", "why": ""}]},
+            ensure_ascii=False), encoding="utf-8")
+        check("新骨架落点够不着 → resplit_needed = True",
+              ms.resplit_needed(FAKE, q) is True)
+        # 新骨架落点 = 可达表 → 不判
+        p.write_text(json.dumps(
+            {"question": q,
+             "dimensions": [{"id": "d1", "landing": t_reach,
+                             "question": "随便问", "why": ""}]},
+            ensure_ascii=False), encoding="utf-8")
+        check("新骨架落点可达 → resplit_needed = False",
+              ms.resplit_needed(FAKE, q) is False)
     finally:
+        R.ledger_tables = _orig_ledger
         try:
-            p.unlink()
+            if p is not None and p.exists():
+                p.unlink()
             ck.rmdir()
         except Exception:
             pass
 
     print("== 3. 消费侧旧骨架路径：落进 unreachable_landings（如实交代）==")
-    # 造一份只有一条「点名不可达表」维度的骨架，让消费侧路由读它
-    import maieutic_scaffold as ms2
-    tmpdir = tempfile.mkdtemp(prefix="mve_landing2_")
+    _orig_ledger = R.ledger_tables
+    R.ledger_tables = lambda s: list(led) if str(s) == FAKE else _orig_ledger(s)
     q2 = "测试用的问句二（消费侧路由）"
-    p2 = ms2._cache_path(ck.name, q2)
-    p2.parent.mkdir(parents=True, exist_ok=True)
+    p2 = None
     try:
+        p2 = ms._cache_path(FAKE, q2)
+        p2.parent.mkdir(parents=True, exist_ok=True)
         p2.write_text(json.dumps(
             {"question": q2,
              "dimensions": [{"id": "d1",
                              "question": f"在 {t_led} 表中查 item='ce' 的记录",
                              "why": ""}]},
             ensure_ascii=False), encoding="utf-8")
-        plan = C._plan_from_scaffold(q2, scene_id=ck.name, has_file=False)
+        plan = C._plan_from_scaffold(q2, scene_id=FAKE, has_file=False)
         unreach = list(plan.get("unreachable_landings") or [])
         check("旧骨架点名不可达表 → 记进 unreachable_landings",
               len(unreach) >= 1, str(unreach)[:80])
         check("这条落点确实被点名了", t_led in str(unreach), str(unreach)[:80])
         check("不误判成 db 路（那张表 SQL 连不到）",
               plan.get("db") is False, f"db={plan.get('db')}")
+        check("不误判成 web 路（没有远端抓手命中）",
+              plan.get("web") is False, f"web={plan.get('web')}")
     finally:
+        R.ledger_tables = _orig_ledger
         try:
-            p2.unlink()
+            if p2 is not None and p2.exists():
+                p2.unlink()
             ck.rmdir()
         except Exception:
             pass
@@ -165,13 +230,22 @@ def main() -> int:
         encoding="utf-8")
     check("reachable.py 用 ledger_tables 实查 + 字面包含",
           "ledger_tables(scene_id)" in src and "t in blob" in src)
-    check("没写死任何具体表名（web_evidence/web_facts 不该出现）",
-          "web_evidence" not in src and "web_facts" not in src)
+    # 只查**代码**里有没有写死表名 —— 文档（docstring）里写「实测场景 L 的
+    # web_evidence」是取证记录，不是判据；判据写死了表名才是硬编码。
+    _code = _strip_docstrings(src)
+    check("**代码**里没写死任何具体表名（web_evidence/web_facts 不该出现）",
+          "web_evidence" not in _code and "web_facts" not in _code,
+          _code[max(0, _code.find("web_evidence") - 40):
+                _code.find("web_evidence") + 40] if "web_evidence" in _code else "")
     csrc = (Path(__file__).resolve().parent.parent / "voyager_vlml" /
             "consume.py").read_text(encoding="utf-8")
     check("消费侧用的是同一份实现（import reachable）",
           "import reachable as _reach" in csrc
           and "_reach.unreachable_in_text(" in csrc)
+    msrc = (Path(__file__).resolve().parent / "maieutic_scaffold.py").read_text(
+        encoding="utf-8")
+    check("教师端也用同一把尺子（resplit_needed → unreachable_in_text）",
+          "_reach.unreachable_in_text(" in msrc)
 
     print(f"== 结果：{PASS} 过 / {FAIL} 挂 ==")
     return 1 if FAIL else 0
