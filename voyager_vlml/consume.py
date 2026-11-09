@@ -1895,6 +1895,11 @@ async def consume(
         data = None
         code = ""
         obs: list[dict[str, Any]] = []
+        # ★ 2026-11-09 换血：**材料账**（maieutic 口径）—— 判定「取到真数
+        # 没有」看的是材料，不是结果对象的形状。由 `local_agent.solve` 就地
+        # 填充（见 `_recorder`：tracer 回答「调没调」，evidence 回答
+        # 「取到了什么」）。
+        evidence: list[dict[str, Any]] = []
         reused_skill: dict[str, Any] | None = None
         reuse_errors: list[str] = []
         # 组合执行账：**至多一条**（2026-10-29 起 ③b 是「一条组合 SQL」，
@@ -2249,6 +2254,13 @@ async def consume(
                     if _cs_win and data is not None:
                         _alt_disclosure = await _alt_line(_cs_win)
             else:
+                # ★ 2026-11-09 换血：把**材料账**带出来（maieutic 口径）——
+                # 判定要看的不是「结果长得像不像 SQL」，而是「材料里有没有
+                # 实质内容」。`local_agent.solve` 会把每次原语调用的实际返回
+                # 剪成证据条目**就地填进**这个 list（同 `_recorder` 的口径：
+                # tracer 回答「调没调」，evidence 回答「取到了什么」）。
+                # 没有它，判定层就只剩结果对象的形状可看 → 第五根因。
+                _ev_solve: list[dict[str, Any]] = []
                 obs, code = await _la.solve(
                     question, _scene_dir, scene_id=_scene_id, skills=skills,
                     # 命中（HIGH/MEDIUM_CONFIDENCE）且库里有已学技能 → **必须用**。
@@ -2264,10 +2276,12 @@ async def consume(
                     timeout=_consume_timeout(len(skills or [])),
                     # 上传的文件就是这次的上下文（DeepSeek 客户端同构）：
                     # 本机/场景 solve 也看得见它，不是只有 SQL 回填层看得见。
-                    context=_file_ctx)
+                    context=_file_ctx,
+                    evidence=_ev_solve)
                 real = [o for o in obs
                         if o.get("ok") and o.get("data") is not None]
                 data = (real[-1].get("data") if real else None)
+                evidence = _ev_solve
             # ---- 一个执行工具（2026-10-29 用户拍板「抄 DeepSeek 原理」）----
             # DeepSeek 只有一个执行工具（code interpreter），SQL 只是代码里的
             # 一行 —— 语言由上下文与报错决定，不靠标签分派。场景库形态的 SQL
@@ -2280,15 +2294,19 @@ async def consume(
                     _dbp2 = str((_prof or {}).get("db_path") or "")
                     print("  · SQL 通道没取到数 → 换执行工具再试"
                           "（写代码调 query_sql）", flush=True)
+                    _ev2: list[dict[str, Any]] = []
                     _obs2, _code2 = await _la.solve(
                         question, _scene_dir, scene_id=_scene_id, skills=skills,
                         timeout=_consume_timeout(len(skills or [])),
-                        context=_file_ctx, db_path=_dbp2)
+                        context=_file_ctx, db_path=_dbp2, evidence=_ev2)
                     _real2 = [o for o in _obs2
                               if o.get("ok") and o.get("data") is not None]
                     if _real2:
                         data, code, obs = (_real2[-1].get("data"),
                                            _code2, _obs2)
+                        # 材料账也换成本轮这份（两次 solve 的材料要分清，
+                        # 别拿上一轮的残留给这一轮判）。
+                        evidence = _ev2
                         reuse_errors.append(
                             "SQL 通道没成 → 改由 agent 写代码（query_sql）取到数")
                 except Exception as _e2:
@@ -2309,8 +2327,31 @@ async def consume(
                 # 0 行的查询也返回 {rows: []} —— 不挡的话「0 行 + 模型一段
                 # 文字」会判 written，还把 `WHERE 表达式='y=2x-1'` 这种把
                 # 答案字面量当查询条件的坏配方写进技能库（2026-10-22 K 实测）。
-                elif not (data.get("rows") if isinstance(data, dict) else data):
+                #
+                # ★ 2026-11-09 换血：这道闸原来写死 **SQL 形状**
+                #   （`data.get("rows")`）—— 那是 Voyager 血（原版产出必然是
+                #   「物品栏若干行」）。MVE 执行层已接 MCP 原语，返回**任意
+                #   dict**（无 rows 键）→ 真取到的数被当真空丢掉。
+                #   服务器实测（场景 L，Sherlock）：traj 有 mcp_sherlock 调用、
+                #   rows=1，但 ok_tool_calls=0 → 判 fetched_empty。
+                #   换成 maieutic 血：**材料账 + 形状无关**（`substance_gate`）
+                #   —— 判「有没有实质内容」，不判「长得像不像 SQL」。
+                #   口径同 maieutic `math-solution-gate.ts:54-57` 三档
+                #   （yes/partial/no）与 `isPlanOnly`（只有计划没结论 = 不算）。
+                #
+                # ⚠️ 这里**不能传 answer**：它在下面 :2441 才初始化（叙事层
+                # 才生成），此刻还不存在 → NameError。计划态判定改由守卫
+                # 内部看材料账/结果本身（substance_gate 两条路径都查）。
+                _sg = _grade_substance(data, evidence=evidence)
+                if not _sg["yes"]:
                     data = None
+                    reuse_errors.append(
+                        f"取数守卫判真空（{_sg['why']}）")
+                elif _sg.get("level") == "partial":
+                    # partial = 有真值但混着空值 → 如实披露，不当失败
+                    # （照 maieutic「清单外的发现不阻塞闭合」）。
+                    reuse_errors.append(
+                        f"取数部分为真（{_sg['why']}）—— 已如实披露")
                 if data is not None and not skills:
                     # 无已学技能 → 现场 solve 出的 SQL：同一把对题判官（看全貌判
                     # 主体/口径/完整性）。这里**不重填**：solve 已用掉内层 3 轮
@@ -4267,6 +4308,48 @@ def _web_reachable(scene_id: str) -> tuple[bool, str]:
         return True, "、".join(names[:4])
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
+
+
+def _grade_substance(data: Any, *, answer: str = "",
+                     evidence: Any = None) -> dict[str, Any]:
+    """判「这一轮取到真东西没有」—— 换血成 maieutic 口径（2026-11-09）。
+
+    ★ 为什么换（第五根因）：
+      消费侧原来判「取到真数」用的是**形状绑定** —— `data.get("rows")`，
+      也就是「结果必须是 `{rows: [...]}` 这种 SQL 形状才算数」。那是
+      **Voyager 血**：原版产出必然是「物品栏若干行」，形状判据成立。
+      但 MVE 执行层已接 MCP 原语，返回**任意 dict**（无 `rows` 键）→
+      真取到的数被当真空丢掉。
+
+      2026-11-09 服务器实测（场景 L，Sherlock 题）：
+          traj  = ['mcp_sherlock_lookup_username']  ← 工具真调了
+          rows  = 1                                   ← 真取到 1 行
+          ok_tool_calls = 0                            ← 但被闸门打掉了
+      模型那轮写的代码是 `RESULT = sherlock_result`，完全正确 ——
+      被丢掉的是**闸门**。
+
+    ★ maieutic 的同构：
+      maieutic **全仓没有任何形状绑定的判定**（搜 hasContent / nonEmpty /
+      emptyShell / isBlank / hasSubstance / mustContain 等 13 个关键词零命中）：
+      它的判定输入都是**文本**，判的是「有没有实质内容」。
+      区分「形式非空但没实质」和「真实但简短」用三档语义
+      （`math-solution-gate.ts:54-57`）+ `isPlanOnly`
+      （`math-runtime-evaluator.ts:77-80`：只有计划没结论 = 0 分）。
+
+    判据本体在 `mve/substance_gate.py`（与已有的 `mve/maieutic_gate.py`
+    同源同口径）。这里只做薄封装 + 异常兜底。
+    """
+    try:
+        import substance_gate as _sg
+        g = _sg.grade(data, answer=str(answer or ""), evidence=evidence)
+    except Exception as _e:
+        # 守卫本身不可用 → 如实退回最保守的旧口径（只认非 None），
+        # **不放宽**（守卫坏了不许变成「什么都算数」）。
+        return {"yes": data is not None, "level": "yes" if data is not None
+                else "no", "why": f"守卫不可用（{type(_e).__name__}），"
+                                 f"退回旧口径"}
+    return {"yes": _sg.took_real_number(g), "level": str(g.get("level") or ""),
+            "why": str(g.get("why") or "")}
 
 
 def _plan_from_scaffold(question: str, *, scene_id: str, has_file: bool,
