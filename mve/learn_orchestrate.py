@@ -271,6 +271,7 @@ def learn_milestone_skills(scene_id: str, topic_id: str, question: str,
                            milestone: dict[str, Any],
                            dim_codes: list[dict[str, Any]],
                            *, import_id: str = "",
+                           req_id: str = "",
                            ) -> dict[str, Any]:
     """里程碑**闭合**后把这一轮跑通的代码写进技能库 —— 同构原版
     `skill.py:64-99 add_new_skill`（原版只在 rollout **成功**后写：
@@ -368,6 +369,15 @@ def learn_milestone_skills(scene_id: str, topic_id: str, question: str,
                            # 「这条技能来自 imp_xxx（第 N 次导入）」，
                            # 第二次导入同一问题时掌握度涨的那一分能解释。
                            "import_id": str(import_id or ""),
+                           # ★ 需求级 id（2026-11-09 第三刀 A/E）：
+                           # 技能**属于哪个需求**的精确连接。
+                           # ⚠️ 为什么必须有它：`milestone` 字段是**标题字符串**
+                           #   （可重名），`topic_id` 是 `learn_<md5(question)>` —
+                          #   两者都还是**问句派生**，换问法就断。
+                           #   面板要按会话聚合技能时，靠的就是这个 req_id
+                           #   （照抄原版：技能挂在 Session 上，靠 sessionId 关联）。
+                           # 字段引入前的老技能没有这一项 → 面板如实标「未归属」。
+                           "req_id": str(req_id or ""),
                            "tools": list(item.get("tools") or [])},
                 source_scene=str(scene_id or "A"),
                 # ⭐ 组内择优（第 2 步 B）：维度闭合时 critic 沉淀的 r 随技能
@@ -464,6 +474,7 @@ async def learn_milestone_composite(scene_id: str, topic_id: str, question: str,
                                     milestone_name: str = "",
                                     scene_dir: str = "",
                                     in_dims: list[str] | None = None,
+                                    req_id: str = "",
                                     ) -> dict[str, Any]:
     """里程碑**全闭合**后把「里程碑本身」组合成**一条复合技能**入库。
 
@@ -701,6 +712,9 @@ async def learn_milestone_composite(scene_id: str, topic_id: str, question: str,
                        "milestone": str(milestone_name or ""),
                        "question": str(question or ""),
                        "scene": str(scene_id or ""),
+                       # ★ 需求级 id（2026-11-09 第三刀 E）：复合技能同样属于
+                       # 某个需求 —— 面板按会话聚合技能时靠它精确连接。
+                       "req_id": str(req_id or ""),
                        # 真执行取到真数的组合 SQL 原文（泛化前）
                        "rollout_sql": _raw_comp,
                        # ★ 组成维度存**完整 key**（{topic}::{dim_id}）：
@@ -909,6 +923,19 @@ async def _start_learning_impl(
     """
     question = str(question or "").strip()
     scene = _resolve_scene(scene_id)
+    # ---- 需求级 id（2026-11-09 第三刀 A/E）----
+    # 学习侧一开始就把身份定下来，后面**所有**产物都挂它：
+    # 骨架键、进度账、技能 blueprint 的 req_id。
+    # ⚠️ 必须在读进度账（_ms.load_progress，走 _cache_path → req_id_of）
+    #    **之前**登记 —— 骨架键挂在 req id 上，身份没定下来就读不到账。
+    # `register` 是幂等的：同一问句再学一次拿回同一个 req id，
+    # 换问法则由 req_id_of 的归题找回（②级）拿回同一个。
+    _req_id = ""
+    try:
+        import req_registry as _rr
+        _req_id = str(_rr.register(scene, question).get("req_id") or "")
+    except Exception:
+        _req_id = ""
     # ---- 导入批次（用户 2026-10-20）----
     # 「每次人导入-运行学习一批内容，这批图谱上长出来的内容就是那次人导入的
     #   子节点，技能归属也是如此」。调用方没给批次 id 时，按问句文本找**最近
@@ -934,6 +961,7 @@ async def _start_learning_impl(
         "plan": {}, "forged": {}, "exposed": {}, "stuck": [],
         "execution": {}, "absorbed": {}, "crystallized": {}, "milestone": {},
         "import_id": imp_id, "import_count": imp_n,
+        "req_id": _req_id,
         "started_at": round(time.time(), 1),
     }
     if not question:
@@ -2090,7 +2118,7 @@ async def _start_learning_impl(
                         # 成功 rollout，不该因为别的维度没闭合就被连坐丢掉。
                         out["skills"] = learn_milestone_skills(
                             scene, _tid, question, _mst, dim_codes,
-                            import_id=imp_id)
+                            import_id=imp_id, req_id=_req_id)
                         # 里程碑**全闭合** → 把里程碑本身组合成一条复合技能
                         # 入库（用户 2026-10-25：「把里程碑在学习侧重试之后
                         # 计入技能，不计的话消费检索不到」）。原版 learn()
@@ -2111,7 +2139,8 @@ async def _start_learning_impl(
                                             ((_mst or {}).get("milestone")
                                              or {}).get("name") or ""),
                                         scene_dir=str(local_dir or exec_dir or ""),
-                                        in_dims=_in_dims))
+                                        in_dims=_in_dims,
+                                        req_id=_req_id))
                                 _mcomp = out.get("milestone_skill") or {}
                                 if _mcomp.get("added"):
                                     print(f"  · 里程碑复合技能已入库："

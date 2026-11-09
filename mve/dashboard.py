@@ -1458,10 +1458,84 @@ function pSkill(s){
       ${cards||'<div class="empty">空。Voyager 还没积累任何经验。</div>'}
       ${mcBlock}
     </div>
+    ${pSessions(s)}
     <div class="panel">
       <div class="panel__head"><h2>行动因果时间线</h2>
         <span class="hint">control（人导入）与 attempt（Voyager 行动）在同一条单调序列上，只保序不评分</span></div>
       ${tl}
+    </div>`;
+}
+
+/* ---------------- 需求 · 会话（第三刀 E）----------------
+   会话视图**复用技能页**（用户 2026-11-09：「其实会话应该是可以复用技能页面的」）
+   —— 不新开页面、不新增后端接口（数据走既有 /api/state 的 s.sessions）。
+
+   照抄原版 maieutic：技能挂在 Session 上（靠 sessionId 关联），
+   这里靠 `blueprint.req_id` **精确**连接。
+   ⚠️ 老技能没有这一项 → **不按 milestone 标题猜**（标题可重名，猜=串台），
+     如实说「还没有关联技能」。 */
+function pSessions(s){
+  const ss=(s.sessions||[]);
+  const PH={0:['grey','未开始'],1:['grey','已拆骨架'],2:['warn','学习中'],
+            3:['warn','已验待披露'],4:['ok','已闭合归档']};
+  const ts=a=>{const n=Number(a||0);
+    return n>0?new Date(n*1000).toISOString().replace('T',' ').slice(5,19):'';};
+  if(!ss.length) return `<div class="panel">
+      <div class="panel__head"><h2>需求 · 会话</h2>
+        <span class="hint">照原版 maieutic：一个需求 = 一条会话，技能挂在会话上</span></div>
+      <div class="empty">本场景还没有登记过需求 —— 去「✍️ 人导入」问一句，这里就会长出会话。</div>
+    </div>`;
+  const cards=ss.map(x=>{
+    const ph=PH[x.phase]||['grey','未开始'];
+    const total=x.total||0, closed=x.closed||0;
+    const allClosed=total>0&&closed>=total;
+    const ver=x.verified||{};
+    const vkeys=Object.keys(ver);
+    const dims=(x.dims||[]).map(d=>{
+      const isC=(x.unclosed||[]).indexOf(d.id)<0;
+      const vv=ver[d.id]||null;
+      return `<li><span class="chip ${isC?'ok':'grey'}">${isC?'已闭合':'未闭合'}</span>
+        <b>${ESC(d.id)}</b>
+        ${d.landing?`<span class="chip grey">落点 ${ESC(d.landing)}</span>`:''}
+        ${vv&&vv.r>=0?`<span class="chip ok">r=${vv.r}</span>`:''}
+        <span class="hint">${ESC(d.question||'')}</span></li>`;
+    }).join('');
+    const evs=(x.events||[]).slice(-8).map(e=>{
+      const p=e.payload||{};
+      const what=e.kind==='phase_transition'?('阶段 '+p.from+' → '+p.to)
+        :(e.kind==='dim_closed'?('闭合 '+p.dim_id+(p.r>=0?'（r='+p.r+'）':''))
+        :(e.kind||''));
+      return `<div class="tl"><span class="seq">${ESC(ts(e.at))}</span>
+        <span>${ESC(what)}</span></div>`;
+    }).join('');
+    const sk=(x.skills||[]).map(z=>`<li><span class="mono" style="font-size:12px">${ESC(z.key)}</span>
+        ${z.dimension?`<span class="chip grey">${ESC(z.dimension)}</span>`:''}
+        <span class="chip grey">命中 ${z.hits}</span>
+        <span class="chip ${z.ok>0?'ok':'grey'}">有效 ${z.ok}</span></li>`).join('');
+    return `<details class="nocmp" style="margin-top:8px">
+      <summary class="th">${ESC(x.question||x.req_id)}</summary>
+      <div class="tm">
+        <span class="chip grey mono">${ESC(x.req_id)}</span>
+        <span class="chip ${ph[0]}">${ph[1]}</span>
+        ${total?`<span class="chip ${allClosed?'ok':'warn'}">维度 ${closed}/${total}</span>`:''}
+        ${vkeys.length?`<span class="chip ok">已验答案 ${vkeys.length} 条</span>`:''}
+        ${x.archived?'<span class="chip ok">已归档</span>':''}
+        ${(x.known_questions||[]).length>1?`<span class="chip grey">${x.known_questions.length} 种问法</span>`:''}
+      </div>
+      ${x.has_session?'':`<div class="hint" style="margin-top:6px">${ESC(x.why||'还没有会话记录')}</div>`}
+      ${dims?`<ul style="margin:6px 0 0 18px;padding:0">${dims}</ul>`:''}
+      ${sk?`<div class="hint" style="margin-top:6px">这个会话攒下的技能（${(x.skills||[]).length} 条）</div>
+        <ul style="margin:4px 0 0 18px;padding:0">${sk}</ul>`
+        :'<div class="hint" style="margin-top:6px">这个会话还没有关联技能（技能写入时还没有需求身份 → 不按标题猜）</div>'}
+      ${evs?`<div class="hint" style="margin-top:6px">会话事件流（append-only）</div><div class="timeline">${evs}</div>`:''}
+    </details>`;
+  }).join('');
+  return `<div class="panel">
+      <div class="panel__head"><h2>需求 · 会话</h2>
+        <span class="hint">照原版 maieutic：一个需求 = 一条会话，技能挂在会话上；换个问法回到同一条</span></div>
+      <div class="legend">会话阶段：<span class="chip grey">已拆骨架</span> → <span class="chip warn">学习中</span> → <span class="chip warn">已验待披露</span> → <span class="chip ok">已闭合归档</span>
+        <br>★ <b>已验待披露</b> = 学习侧验收已跑完、答案还没披露给消费侧 —— 这一档<b>不该再派任务</b>（重复派 = 重复拆骨架）。</div>
+      ${cards}
     </div>`;
 }
 

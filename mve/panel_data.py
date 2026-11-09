@@ -685,6 +685,109 @@ def _scene_cache_key() -> str:
         return "A"
 
 
+def _sessions_view(scene_id: str) -> list[dict[str, Any]]:
+    """需求 · 会话视图（2026-11-09 第三刀 E）。
+
+    用户指令：「其实会话应该是可以复用技能页面的」
+    —— 所以**不新开页面**，会话的视图挂在技能页里。
+
+    这个函数只做**聚合**，不做任何推断：
+    - 需求身份：`req_registry`（人导入那一刻分配，与问句文本无关）
+    - 会话内容：`session_recall.recall`（按 req id **精确**召回）
+    - 会话阶段与事件流：`session_state`（照抄原版 Session / SessionEvent）
+    - 会话包含哪些技能：按 `blueprint.req_id` **精确**反查技能库
+
+    ⚠️ **不猜**：
+      - 找不到会话文件 → 如实说「还没拆骨架」，不拿别的需求的会话顶替
+      - 老技能没有 `blueprint.req_id` → 不按 milestone 标题猜（可重名），
+        如实标「未归属」
+    """
+    try:
+        import req_registry as _rr
+        import session_recall as _sr
+    except Exception:
+        return []
+    try:
+        reqs = _rr.list_reqs(scene_id)
+    except Exception:
+        return []
+
+    # 技能库按 req_id 建索引（精确连接）。一次全表扫 + 建索引，
+    # 不为每个需求单独扫一遍技能库。
+    by_req: dict[str, list[dict[str, Any]]] = {}
+    unowned = 0
+    try:
+        for s in skill_store.all_skills():
+            rid = str((s.get("blueprint") or {}).get("req_id") or "")
+            if not rid:
+                unowned += 1
+                continue
+            by_req.setdefault(rid, []).append({
+                "key": str(s.get("key") or ""),
+                "name": str(s.get("name") or ""),
+                "dimension": str((s.get("blueprint") or {}).get("dimension") or ""),
+                "hits": int(s.get("hits") or 0),
+                "ok": int(s.get("ok") or 0),
+            })
+    except Exception:
+        by_req = {}
+
+    out: list[dict[str, Any]] = []
+    for rec in reqs:
+        rid = str(rec.get("req_id") or "")
+        if not rid:
+            continue
+        item: dict[str, Any] = {
+            "req_id": rid,
+            "question": str(rec.get("question") or ""),
+            "known_questions": [str(x) for x in (rec.get("known_questions") or [])],
+            "created_at": float(rec.get("created_at") or 0),
+            "has_session": False,
+            "phase": 0,
+            "phase_name": "未开始",
+            "archived": False,
+            "completed_at": 0.0,
+            "dims": [],
+            "closed": 0,
+            "total": 0,
+            "verified": {},
+            "unclosed": [],
+            "skills": by_req.get(rid, []),
+            "events": [],
+            "why": "",
+        }
+        try:
+            sess = _sr.recall(rid, scene_id)
+        except Exception as e:
+            item["why"] = f"会话读取失败：{type(e).__name__}: {e}"
+            out.append(item)
+            continue
+        if sess.get("found"):
+            item["has_session"] = True
+            sm = sess.get("session") or {}
+            item["phase"] = int(sm.get("phase") or 0)
+            item["phase_name"] = str(sm.get("phase_name") or "未开始")
+            item["archived"] = bool(sm.get("archived"))
+            item["completed_at"] = float(sm.get("completed_at") or 0)
+            item["events"] = [e for e in (sm.get("events") or [])
+                              if isinstance(e, dict)]
+            item["dims"] = sess.get("dims") or []
+            item["total"] = len(item["dims"])
+            item["closed"] = len(sess.get("learned") or [])
+            try:
+                item["verified"] = _sr.verified_answers(sess)
+            except Exception:
+                item["verified"] = {}
+            try:
+                item["unclosed"] = _sr.unclosed_dims(sess)
+            except Exception:
+                item["unclosed"] = []
+        else:
+            item["why"] = str(sess.get("why") or "还没有会话记录")
+        out.append(item)
+    return out
+
+
 def build_state() -> dict[str, Any]:
     """聚合面板全部视图（单飞 + 3s 缓存，为什么必须：见文件头的事故记录）。
 
@@ -831,6 +934,9 @@ def _build_state_uncached() -> dict[str, Any]:
             "skill_stats": skill_stats,
             "skill_detail": skill_detail,
             "mc_thinking": _mc_thinking_view(),
+            # 需求 · 会话（第三刀 E）：**不新开页面**，视图挂在技能页里。
+            # 这里只聚合，不推断 —— 见 _sessions_view 的注释。
+            "sessions": _sessions_view(scene_id=sid),
             # 摸底/考核走的是 exam_log.jsonl，**不写** run_log.jsonl（有意分开：
             # run_log 是带图谱的练习覆盖率，恒 100%，画出来是假平线）。
             # 所以"run_log 为空"≠"没有任何数据" —— 摸底跑完了一样要给看。
@@ -1032,6 +1138,8 @@ def _build_state_uncached() -> dict[str, Any]:
         "skill_stats": skill_stats,
         "skill_detail": skill_detail,
         "mc_thinking": _mc_thinking_view(),
+        # 需求 · 会话（第三刀 E）：技能页里的会话区块读它。
+        "sessions": _sessions_view(scene_id=sid),
         # 防幻觉：被溯源校验拦下的编造数字
         "hallucination_total": hallucination_total,
         # 注意：新后端（练习线）**不写 mastery**，所以这里通常是 None。
