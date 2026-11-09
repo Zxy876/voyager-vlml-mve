@@ -204,6 +204,30 @@ def main() -> int:
     check("没有骨架时不猜题型（planned=False + db=False）",
           "没有骨架（自由提问/还没建里程碑）→ 不猜题型" in _all_src
           and '"db": False, "web": False' in _all_src)
+    # ⚠️ 2026-11-09（用户实测发现）：删掉规划员后 `planned=False` 的语义
+    # 从「规划员挂了」变成了「**没有骨架**」。联网判据还停在旧语义
+    # （`planned and not web`）→ 没骨架时反而去联网，与路由层自相矛盾：
+    # `_plan_from_scaffold` 明说「不碰环境、不联网」，执行却联网了。
+    # 服务器实测（场景 L 清场后重问同一题）：白烧一次联网（三后端全灭），
+    # 还把「搜索失败」写成判词，把真正原因（这题没骨架落点 = 未学）埋掉。
+    # 现在判据**只看 web**：路由里没有 web 这一步 → 计划外的动作不执行。
+    check("联网判据只看 web（不再看 planned）",
+          '_plan.get("planned") and not _plan.get("web")' not in src_plan
+          and 'if not _plan.get("web"):' in src_plan)
+    check("没有骨架 → 路由里没有 web → 不执行计划外动作",
+          "路由里没有联网这一步（计划外的动作不执行）" in src_plan)
+    # 「规划员」这个名号不该再出现在任何**用户可见**的输出里
+    # （用户实测：「消费侧还是有规划员，不是删了吗」—— 看到的是这句文案）。
+    _cp_src2 = open(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "chat_page.py"),
+        encoding="utf-8").read()
+    check("用户可见文案里没有「规划员」",
+          "规划员不可用" not in _all_src
+          and "规划员不可用" not in _cp_src2
+          and "规划员不可用" not in _coach_src)
+    check("思考轨迹不再叫「这一问的规划」（改叫按骨架落点走哪条路）",
+          "这一问的规划" not in _cp_src2
+          and "这一问走哪条路（按骨架落点）" in _cp_src2)
     check("混合题两半由规划合成（_compose_halves）",
           "_compose_halves(" in src_plan and "库内半场" in src_plan)
     # 2026-10-29 服务器实测（腾讯校招起薪）：规划只排 web 路，却仍去技能库

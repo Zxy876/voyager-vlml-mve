@@ -785,7 +785,7 @@ def _scope_check(question: str, sql: str, schema: str,
 # ---------------------------------------------------------------------------
 # 对话记忆 → 指代消解（2026-10-29 用户实测指出的怪：
 #   上一轮答完「九月份一共支付 137,100」，下一轮问「相比于网上其他公司，
-#   这家公司的待遇好不好」—— 「这家公司」没人认识，规划员没认出库内有锚点，
+#   这家公司的待遇好不好」—— 「这家公司」没人认识，路由没认出库内有锚点，
 #   工具线联网搜回来一家不相干的公司还答「无法比较」。
 #   根因：对话页把完整历史发上来了，但 `_openai_chat` 只取**最后一条 user**
 #   就把历史扔了 —— consume 每次都是失忆的。修法不是把历史塞给每个环节，
@@ -1608,7 +1608,7 @@ async def consume(
         # 开头永远保留（文档的摘要/目录通常在前面）。
         _file_ctx = str(_upl.context_block(_scene_id, question=question) or "")
         # ⚠️ 2026-11-03：上下文有 30 分钟时效（DeepSeek 语义），但**文件本身
-        # 一直在场景目录里**。原来过期后 _file_ctx 变空 → 规划员判「本次没有
+        # 一直在场景目录里**。原来过期后 _file_ctx 变空 → 路由判「本次没有
         # 上传」→ file 路直接不规划 → 只能去查 web_docs 缓存（场景 J 实测）。
         # 现在把「可读文件清单」附上：read_file/list_files 已注册成本机原语，
         # 过期只代表"不再自动贴进上下文"，不代表"读不到"。
@@ -2631,11 +2631,20 @@ async def consume(
                     inference_used = True
             if not str(answer or "").strip():
                 # 斯坦福 Generative Agents 同构（2026-10-29 拍板）：计划里
-                # 有 web 这一步才联网 —— 计划外的动作不执行；规划员挂掉
-                # （planned=False）→ 退回旧行为，兜底不会比现状更差。
-                if _plan.get("planned") and not _plan.get("web"):
+                # 有 web 这一步才联网 —— 计划外的动作不执行。
+                # ⚠️ 2026-11-09：判据从 `_plan.planned and not web` 改成
+                # **只看 web**。原来 `planned=False` 走另一支（去联网），
+                # 那是**规划员时代**的兜底（规划员挂了就退回旧行为）；删掉
+                # 规划员后 `planned=False` 的语义变了 = **没有骨架**
+                # （这题还没被拆解过 = 未学）。若继续联网，就与路由层自相
+                # 矛盾：`_plan_from_scaffold` 明说「不碰环境、不联网」，
+                # 执行却联网 —— 服务器实测（场景 L 清场后重问）：
+                # 白烧一次联网（三后端全灭），还把「搜索失败」写成判词，
+                # 把真正的原因（这题没骨架落点）埋进 reuse_errors。
+                # 现在没骨架 = 不执行计划外动作 = 如实交代 + 交给学习线。
+                if not _plan.get("web"):
                     tool_line = {"used": False, "answer": "", "sources": [],
-                                 "note": "规划里没有联网这一步（计划外的动作不执行）"}
+                                 "note": "路由里没有联网这一步（计划外的动作不执行）"}
                 elif not _web_reachable(_scene_id)[0]:
                     _wn = _web_reachable(_scene_id)[1]
                     tool_line = {"used": False, "answer": "", "sources": [],
@@ -2743,13 +2752,14 @@ async def consume(
             "tool_line_used": bool(tool_line.get("used")),
             "tool_sources": (tool_line.get("sources") or [])[:5],
             "tool_line_note": str(tool_line.get("note") or "")[:200],
-            # 规划披露（2026-10-29）：这一问规划了哪几路 + 规划员的一句话
-            # 理由。规划≠可达，web 实际执行结果看 tool_line_note。
+            # 路由披露：这一问走哪几路（按骨架维度的落点；规划员已删）。
+            # 路由≠可达，web 实际执行结果看 tool_line_note。
             "plan_routes": {k: bool((_plan or {}).get(k))
                             for k in ("db", "web", "file", "infer")},
             "plan_why": (str((_plan or {}).get("why") or "")[:160]
                          + ("" if _plan.get("planned") is not False
-                            else "（规划员不可用：不碰环境、不联网，仅模型推断）"))[:200],
+                            else "（兜底：没有骨架落点 → 不碰环境、不联网，"
+                                 "仅模型推断）"))[:200],
             # inference 兜底（句句有回复）：模型推断层用没用 —— 与工具线
             # claim 同级的披露，面板/对话页据此挂「模型推断」标注。
             "inference_used": bool(inference_used),
@@ -2999,7 +3009,7 @@ async def consume(
             print(f"  （配方回填后没取到真数，降级为现场写 SQL：{note[:60]}）")
         reused, sql = False, ""
         if not _use_env:
-            # 规划没排 db 路（或规划员不可用+词表判知识题）→ 不走环境。
+            # 路由没排 db 路（或没有骨架落点）→ 不走环境。
             # act.solve 的 3 轮迭代实测要 80s+，对「什么是强化学习」纯属
             # 浪费；落到下面统一的 inference/工具线兜底，句子必有回复。
             observations, sql = [], ""
@@ -3258,11 +3268,11 @@ async def consume(
                             "不计入学习曲线）")
                 inference_used = True
         if not str(answer or "").strip():
-            # 与场景分支同款：计划里有 web 这一步才联网（斯坦福同构）；
-            # 规划员挂掉 → 退回旧行为。
-            if _plan.get("planned") and not _plan.get("web"):
+            # 与场景分支同款：**只看 web**（没有骨架 → 路由里没有 web 这一步
+            # → 计划外的动作不执行）。理由与 2026-11-09 那条同源注释。
+            if not _plan.get("web"):
                 tool_line = {"used": False, "answer": "", "sources": [],
-                             "note": "规划里没有联网这一步（计划外的动作不执行）"}
+                             "note": "路由里没有联网这一步（计划外的动作不执行）"}
             elif not _web_reachable(_scene_id)[0]:
                 _wn = _web_reachable(_scene_id)[1]
                 tool_line = {"used": False, "answer": "", "sources": [],
@@ -3371,12 +3381,13 @@ async def consume(
         "tool_line_used": bool(tool_line.get("used")),
         "tool_sources": (tool_line.get("sources") or [])[:5],
         "tool_line_note": str(tool_line.get("note") or "")[:200],
-        # 规划披露（2026-10-29）：与场景分支同口径。
+        # 路由披露：与场景分支同口径。
         "plan_routes": {k: bool((_plan or {}).get(k))
                         for k in ("db", "web", "file", "infer")},
         "plan_why": (str((_plan or {}).get("why") or "")[:160]
                      + ("" if _plan.get("planned") is not False
-                        else "（规划员不可用：不碰环境、不联网，仅模型推断）"))[:200],
+                        else "（兜底：没有骨架落点 → 不碰环境、不联网，"
+                             "仅模型推断）"))[:200],
         # inference 兜底（句句有回复）：与场景分支同口径的披露。
         "inference_used": bool(inference_used),
         "cold_start": bool(absorbed.get("cold_start")),

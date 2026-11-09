@@ -216,7 +216,7 @@ def _log_import(result: dict[str, Any]) -> None:
         "tool_line_used": bool(result.get("tool_line_used")),
         "tool_sources": (result.get("tool_sources") or [])[:5],
         "tool_line_note": str(result.get("tool_line_note") or "")[:200],
-        # 规划披露（2026-10-29）：规划了哪几路 + 规划员理由。
+        # 路由披露：这一问走哪几路（按骨架落点；规划员已删）。
         # ⚠️ 白名单惯犯第 8 次预防：consume 里写了不透传 = coach_log 永远空。
         "plan_routes": (result.get("plan_routes")
                         if isinstance(result.get("plan_routes"), dict) else {}),

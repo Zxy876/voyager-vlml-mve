@@ -344,8 +344,8 @@ def main() -> int:
                                 tool_line_used=False,
                                 tool_line_note="资料不足以回答（grounded=false，如实不答）"),
                                 scene_id="B", scene_label="工资")
-    check("规划写进思考轨迹（db + web 路）",
-          "这一问的规划" in r2 and "db + web" in r2)
+    check("路由写进思考轨迹（db + web 路）",
+          "这一问走哪条路" in r2 and "db + web" in r2)
     check("规划理由写进思考轨迹", "内部+外部对比题" in r2)
     check("联网没答成也如实转述（不读成没触发）",
           "联网这半场的执行结果" in r2 and "grounded=false" in r2)

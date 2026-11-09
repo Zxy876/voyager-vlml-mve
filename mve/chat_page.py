@@ -61,14 +61,16 @@ def reasoning_text(res: dict[str, Any] | None, *, scene_id: str = "",
         L.append(f"没有可指认的环境（{at}），"
                  "这条只能算 inference：模型推的，不写图。")
 
-    # 规划披露（2026-10-29）：先规划、再逐路执行。规划≠可达，web 实际
+    # 路由披露：先定走哪条路、再逐路执行。路由≠可达，web 实际
     # 执行结果看下面工具线那段 —— 这里只转述 consume 返回的字段。
+    # ⚠️ 2026-11-09：不再叫「规划」。规划员（LLM 规划）已删，路由由
+    # **骨架维度的落点**承担（照原版 maieutic：拆解即骨架，无独立规划层）。
     _pr = res.get("plan_routes")
     if isinstance(_pr, dict) and any(bool(v) for v in _pr.values()):
         _names = " + ".join(k for k in ("db", "web", "file", "infer")
                             if _pr.get(k))
         _pwhy = str(res.get("plan_why") or "").strip()
-        L.append(f"这一问的规划：走 {_names} 路"
+        L.append(f"这一问走哪条路（按骨架落点）：{_names} 路"
                  + (f"（{_pwhy[:120]}）" if _pwhy else "") + "。")
 
     used = res.get("used_skills") or []
