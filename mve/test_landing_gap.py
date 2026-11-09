@@ -38,9 +38,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 PASS = FAIL = 0
 
-# 假场景 id（临时骨架放这儿，不污染真实场景的缓存目录）
-FAKE = "_test_landing_gap"
-
 
 def _strip_docstrings(src: str) -> str:
     """去掉 docstring 与注释，只留**代码**（判据是否写死表名只看代码）。
@@ -133,16 +130,18 @@ def main() -> int:
 
     print("== 2. 旧骨架（无 landing）：点名不可达表 → 该重拆 ==")
     import maieutic_scaffold as ms
-    # ⚠️ 用**假场景 id** 做临时骨架（不污染真实场景的缓存目录）。
-    #   但判据按 scene_id 实查账本表 → 假场景查不到账本表 → 必然不命中。
-    #   所以这里把 `reachable.ledger_tables` **临时顶掉**成真场景的账本表
-    #   （表名来自实查，不是写死的字符串）—— 被测的仍是「判据接得对不对」。
-    _orig_ledger = R.ledger_tables
-    R.ledger_tables = lambda s: list(led) if str(s) == FAKE else _orig_ledger(s)
-    ck = Path(ms.CKPT) / FAKE
-    ck.mkdir(parents=True, exist_ok=True)
-    q = "测试用的问句（落点够不着）"
-    p = None
+    # ⚠️ 为什么用**真实场景** + 唯一测试问句，而不是造一个假场景 id：
+    #   `_cache_path` 的键里含 `md5(db_path)[:8]`，db_path 来自
+    #   `scene_profile.profile()` —— 对一个**还不存在**的场景，第一次调用时
+    #   场景目录里还没有 .duckdb（kind=local，db_path=""），随后
+    #   `ensure_source` 会**现场建**一个 scene.duckdb → 下一次调用 db_path
+    #   变了 → **键也变了** → 写文件与读文件指向不同路径
+    #   （2026-11-09 服务器实测踩到：`resplit_needed` 恒 False）。
+    #   真实场景的 db_path 稳定（实测 L 两次调用同路径），所以测试直接用
+    #   真实场景 + 唯一问句，测完把临时文件删掉。
+    q = "【测试】落点够不着（旧骨架，无 landing 字段）"
+    p = ms._cache_path(sid, q)
+    p.parent.mkdir(parents=True, exist_ok=True)
     try:
         # 造一份「旧骨架」：**故意不带 landing 字段**
         dims_bad = [{"id": "d1",
@@ -151,22 +150,20 @@ def main() -> int:
         dims_ok = [{"id": "d1",
                     "question": f"在 {t_reach} 表中，item 为 'ce' 的记录有哪些？",
                     "why": "查这个"}] if t_reach else []
-        p = ms._cache_path(FAKE, q)      # 写与读同一把钥匙
-        p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps({"question": q, "dimensions": dims_bad},
                                 ensure_ascii=False), encoding="utf-8")
         check("旧骨架点名不可达表 → resplit_needed = True",
-              ms.resplit_needed(FAKE, q) is True)
+              ms.resplit_needed(sid, q) is True)
 
         p.write_text(json.dumps({"question": q, "dimensions": dims_ok},
                                 ensure_ascii=False), encoding="utf-8")
         check("旧骨架点名可达表 → resplit_needed = False（不误伤）",
-              ms.resplit_needed(FAKE, q) is False)
+              ms.resplit_needed(sid, q) is False)
 
         p.write_text(json.dumps({"question": q, "dimensions": []},
                                 ensure_ascii=False), encoding="utf-8")
         check("空维度 → resplit_needed = False",
-              ms.resplit_needed(FAKE, q) is False)
+              ms.resplit_needed(sid, q) is False)
 
         # 新骨架（**带** landing，但落点够不着）→ 也要判该重拆
         p.write_text(json.dumps(
@@ -175,7 +172,7 @@ def main() -> int:
                              "question": "随便问", "why": ""}]},
             ensure_ascii=False), encoding="utf-8")
         check("新骨架落点够不着 → resplit_needed = True",
-              ms.resplit_needed(FAKE, q) is True)
+              ms.resplit_needed(sid, q) is True)
         # 新骨架落点 = 可达表 → 不判
         p.write_text(json.dumps(
             {"question": q,
@@ -183,31 +180,34 @@ def main() -> int:
                              "question": "随便问", "why": ""}]},
             ensure_ascii=False), encoding="utf-8")
         check("新骨架落点可达 → resplit_needed = False",
-              ms.resplit_needed(FAKE, q) is False)
+              ms.resplit_needed(sid, q) is False)
+        # 落点 = none（不需取数）→ 不判
+        p.write_text(json.dumps(
+            {"question": q,
+             "dimensions": [{"id": "d1", "landing": "none",
+                             "question": "随便问", "why": ""}]},
+            ensure_ascii=False), encoding="utf-8")
+        check("落点 = none（不需取数）→ resplit_needed = False",
+              ms.resplit_needed(sid, q) is False)
     finally:
-        R.ledger_tables = _orig_ledger
         try:
-            if p is not None and p.exists():
+            if p.exists():
                 p.unlink()
-            ck.rmdir()
         except Exception:
             pass
 
     print("== 3. 消费侧旧骨架路径：落进 unreachable_landings（如实交代）==")
-    _orig_ledger = R.ledger_tables
-    R.ledger_tables = lambda s: list(led) if str(s) == FAKE else _orig_ledger(s)
-    q2 = "测试用的问句二（消费侧路由）"
-    p2 = None
+    q2 = "【测试】消费侧路由（旧骨架，点名不可达表）"
+    p2 = ms._cache_path(sid, q2)
+    p2.parent.mkdir(parents=True, exist_ok=True)
     try:
-        p2 = ms._cache_path(FAKE, q2)
-        p2.parent.mkdir(parents=True, exist_ok=True)
         p2.write_text(json.dumps(
             {"question": q2,
              "dimensions": [{"id": "d1",
                              "question": f"在 {t_led} 表中查 item='ce' 的记录",
                              "why": ""}]},
             ensure_ascii=False), encoding="utf-8")
-        plan = C._plan_from_scaffold(q2, scene_id=FAKE, has_file=False)
+        plan = C._plan_from_scaffold(q2, scene_id=sid, has_file=False)
         unreach = list(plan.get("unreachable_landings") or [])
         check("旧骨架点名不可达表 → 记进 unreachable_landings",
               len(unreach) >= 1, str(unreach)[:80])
@@ -216,12 +216,13 @@ def main() -> int:
               plan.get("db") is False, f"db={plan.get('db')}")
         check("不误判成 web 路（没有远端抓手命中）",
               plan.get("web") is False, f"web={plan.get('web')}")
+        check("交代里说得清是「骨架落点够不着」",
+              "够不着" in str(plan.get("why") or ""),
+              str(plan.get("why") or "")[:80])
     finally:
-        R.ledger_tables = _orig_ledger
         try:
-            if p2 is not None and p2.exists():
+            if p2.exists():
                 p2.unlink()
-            ck.rmdir()
         except Exception:
             pass
 
@@ -246,6 +247,26 @@ def main() -> int:
         encoding="utf-8")
     check("教师端也用同一把尺子（resplit_needed → unreachable_in_text）",
           "_reach.unreachable_in_text(" in msrc)
+
+    print("== 5. 同一把钥匙（写与读必须指向同一份文件）==")
+    # 2026-11-09 服务器实测踩到的坑：`_cache_path` 的键含 md5(db_path)，
+    # 而 db_path 来自 `scene_profile.profile()` —— 对**还不存在**的场景，
+    # 第一次调用时目录里没有 .duckdb（db_path=""），随后 `ensure_source`
+    # 现场建一个 scene.duckdb → 下一次调用 db_path 变了 → **键变了**
+    # → 写文件的路径与读文件的路径不同 → 判据永远读到「文件不存在」。
+    # 这条断言守住「同一场景同一问句 → 同一个路径」。
+    import maieutic_scaffold as ms2
+    _q = "【测试】钥匙稳定性"
+    _p1 = ms2._cache_path(sid, _q)
+    _p2 = ms2._cache_path(sid, _q)
+    check("同一场景同一问句 → 同一个缓存路径", _p1 == _p2,
+          f"{_p1.name} vs {_p2.name}")
+    check("真实场景的 db_path 非空（键里带库指纹）",
+          len(_p1.stem.split("_")[-1]) == 8, _p1.stem)
+    # invalidate_skeleton / resplit_needed / scaffold 必须用**同一个**算路径函数
+    check("三个入口都用 _cache_path（同一把钥匙）",
+          "_cache_path(" in msrc
+          and msrc.count("_cache_path(") >= 2)
 
     print(f"== 结果：{PASS} 过 / {FAIL} 挂 ==")
     return 1 if FAIL else 0
