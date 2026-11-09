@@ -87,7 +87,8 @@ SCAFFOLD_SYSTEM = """你是一位擅长「产婆术」（Maieutic）的课程规
   "milestone": {"name": "<里程碑名，一句短语>", "why": "<为什么它是一个里程碑>"},
   "dimensions": [
     {"id": "<snake_case 短标识>", "question": "<具体问题，一句话>",
-     "why": "<为什么答清这句问题必须先回答它>"}
+     "why": "<为什么答清这句问题必须先回答它>",
+     "landing": "<落点：表名 / 远端工具名 / 文件名 / none>"}
   ],
   "expected_drifts": [
     {"category": "drift" | "revision" | "bug", "pattern": "<这道题上具体的偏差样子>"}
@@ -164,7 +165,19 @@ SCAFFOLD_SYSTEM_SOURCES = """
   「在 X 表中，Y 是多少」，跨站点的写成「该 username 在各站点上的判定
   结论分别是什么」；
 - **不要**把「去取某个外部来源」本身当成维度，除非那个来源已经取回并
-  落在下面的数据源里（这时写成「已取回的资料里，…」的对照形式）。"""
+  落在下面的数据源里（这时写成「已取回的资料里，…」的对照形式）。
+
+【每条维度必须带一个 landing 字段 —— 写清楚它落在哪个数据源上】
+「landing」= 这条维度的**落点**，取值只能从下面数据源清单里**逐字抄**：
+- 落点是表 → 写表名（如 "web_facts"）；
+- 落点是远端/联网工具 → 写那个工具的名字（如 "mcp_sherlock_lookup_username"）；
+- 落点是上传的文件 → 写文件名；
+- 这条维度不需要取数（概念/解释类）→ 写 "none"。
+⚠️ **为什么必须写**：运行时（消费侧）只读这个字段就知道该走哪条信息路，
+不会去猜、也不会自己加工一份「这题该查什么」（原版教师端同构：教师端
+把「这个学生学过哪些工具」一次性说清，运行时只读不重拆）。
+⚠️ **不许写清单里没有的名字** —— 写了运行时也查不到（实测：写了一个在
+另一个库里的表名，整道题因此走不通）。"""
 
 
 # 原版 curriculum.propose_next_ai_task(max_retries=5)：解析失败不是"这题拆不出来"，
@@ -341,6 +354,65 @@ def _skeleton_dims_from_file(p: Path) -> list[dict]:
         return []
 
 
+def resplit_needed(scene_id: str, question: str) -> bool:
+    """这份骨架**需要重拆**吗（教师端落点写错了）？
+
+    判据：骨架里存在一条维度，它的 `landing` 指向一个**本场景够不着的
+    落点**（实测场景 L：维度写的是账本表 `web_evidence`，它在另一个
+    duckdb 文件里，SQL 连不到 → 这道题在消费侧什么都查不了）。
+
+    这不是「维度没闭合」，是**教师端把落点约束漏了** —— 原版教师端
+    （`scaffolding.ts:262`）会把「学生学过哪些工具」当环境约束一次性
+    说清，运行时只读不重拆；MVE 这里的落点由出题器写，出错就要修。
+
+    重拆**必须由人显式触发**（不能自动重拆）：骨架「拆一次就固定」是
+    铁律（按失败指纹重拆 → 维度 id 每轮变 → 闭合账全对不上）。
+    """
+    try:
+        import reachable as _reach
+        reach = set(_reach.reachable_tables(str(scene_id or "A")) or [])
+        remote = set(_remote_primitive_names(str(scene_id or "A")))
+    except Exception:
+        return False
+    try:
+        p = _cache_path(str(scene_id or "A"), str(question or ""))
+        if not p.exists():
+            return False
+        data, st = _read_cache(p)
+        if st != "ok":
+            return False
+        for d in (data.get("dimensions") or []):
+            if not isinstance(d, dict):
+                continue
+            ld = str(d.get("landing") or "").strip()
+            if not ld or ld.lower() == "none":
+                continue
+            if ld in reach or ld in remote:
+                continue
+            # 落点写的是一个「像表名的东西」但场景里没有 → 够不着
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _remote_primitive_names(scene_id: str) -> list[str]:
+    """本场景的远端/联网抓手名字（origin=net | origin=mcp）。"""
+    try:
+        import actions as _act
+        bucket = getattr(_act, "_REGISTRY", {}).get(str(scene_id)) or {}
+        if not bucket:
+            try:
+                _act.restore()
+            except Exception:
+                pass
+            bucket = getattr(_act, "_REGISTRY", {}).get(str(scene_id)) or {}
+        return sorted({str(a.name) for a in bucket.values()
+                       if str(getattr(a, "origin", "")) in ("net", "mcp")})
+    except Exception:
+        return []
+
+
 def _resolved_import_question(question: str, scene_id: str) -> str:
     """把「当前这句问话」找回它对应的**人导入原句**（找骨架用）。
 
@@ -452,6 +524,24 @@ def _clean_milestone(data: dict[str, Any], question: str = "") -> dict[str, str]
 
 
 def _clean_dims(data: dict[str, Any]) -> list[dict[str, str]]:
+    """清洗维度。
+
+    ★ 2026-11-09（第二刀）保留 `landing`（落点）：
+      原版 maieutic 的 `SpecDimension` 只有 4 个字段（id/description/
+      rationale/source），其中 `source` 的语义是「**这条维度是谁写的**」
+      （opus / instructor_edited / instructor_added，见 schemas.ts:33），
+      **不是数据落点** —— 所以「落点」不能抄成 `source`，它是 MVE 特有的
+      扩展字段（原版教师端把「学生学过哪些工具」当**环境约束**告诉生成器，
+      落点因此隐含在维度问句里；MVE 的运行时需要显式读它才能不重拆）。
+
+      丢落点的代价（服务器实测，场景 L）：出题器拆出「在 web_evidence 表中
+      查…」这种维度，而那张表在另一个 duckdb 文件里 —— 运行时判不出 db 路
+      → 整道题落进 infer = 什么都不查。保留 `landing` 之后，运行时直接读
+      出题器写好的落点，不用再从问句里猜。
+
+    `landing` 缺失（旧缓存骨架 / 模型没给）→ 空串。空串 = **没有落点信息**
+    → 运行时按「认不出就不猜」处理，绝不猜一个。
+    """
     out: list[dict[str, str]] = []
     for i, d in enumerate(data.get("dimensions") or []):
         if not isinstance(d, dict):
@@ -461,7 +551,8 @@ def _clean_dims(data: dict[str, Any]) -> list[dict[str, str]]:
             continue
         out.append({"id": str(d.get("id") or f"dim_{i + 1}").strip(),
                     "question": q,
-                    "why": str(d.get("why") or "").strip()})
+                    "why": str(d.get("why") or "").strip(),
+                    "landing": str(d.get("landing") or "").strip()})
     return out
 
 
@@ -565,8 +656,27 @@ def scene_sources(question: str, scene_id: str) -> list[str]:
       · 取证落点表 → `local_agent._ingest_tables`（web_docs/web_facts/…）
       · 联网与远端抓手 → `actions` 注册表里 origin=net / origin=mcp 的条目
     每一项都是**实查**的；查不到就不列（清单里没有 = 本场景真没有）。
+
+    ★ 2026-11-09（第二刀，服务器实测场景 L）新增一段「可达表清单」：
+      实测场景 L 的骨架有一条维度「在 web_evidence 表中查…」—— 而
+      `web_evidence` 在**账本库** `web_ledger.duckdb` 里，不是数据源表。
+      消费侧只连数据源库 → 那条维度查不到 → 判不出 db 路 → 整道题落进
+      infer = 什么都不查。根因在教师端：**把不可达的表也展示给出题器了**。
+      现在单独列一段可达表（原版 `targetUnit` 的同构物）：出题器拆维度时
+      只能落在这些表上；账本表的价值（属性名与取值域最全）仍保留，
+      但标明它不是落点。
     """
     out: list[str] = []
+    # ⓪ 可达表清单（**原版 targetUnit 的同构物**：这个场景的「工具」= 表）
+    #    放在最前面 —— 教师端第一眼就该知道「哪些表能当落点」。
+    try:
+        import reachable as _reach
+        _reach_tbls = list(_reach.reachable_tables(str(scene_id or "A")) or [])
+        if _reach_tbls:
+            out.append("可查询的表（**维度只能落在这些表上**；别的表不在数据源里，"
+                       "查不到，不许当落点）：" + "、".join(_reach_tbls[:20]))
+    except Exception:
+        pass
     # ① 场景库（真查）
     try:
         import scene_profile as _sp

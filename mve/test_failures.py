@@ -115,25 +115,64 @@ def main() -> int:
 
         def _fake_dims(scene_id, question, *a, **kw):
             return [{"id": "d1", "question": "在 web_facts 表中查该用户名的判定",
-                     "why": "x"}]
+                     "why": "x", "landing": "web_facts"}]
 
         _ms.milestone_dimensions = _fake_dims
-        # 7a. 维度指向场景实有的表 → db 路
+        # 7a. 维度落在场景可达的表上 → db 路
         out = C._plan_from_scaffold("某用户名在 GitHub 有没有账号", scene_id="L",
                                     has_file=False, scene_tables=["web_facts"])
-        check("维度指向场景表 → 判 db 路",
+        check("维度落在场景表 → 判 db 路",
               out.get("db") is True and out.get("source") == "scaffold")
         check("db 路不带 web", out.get("web") is False)
 
-        # 7b. 维度指向外部 → web 路
+        # 7b（2026-11-09 第二刀改写）：信息路由由**教师端写好的 landing**
+        # 决定（落点 = 远端抓手名 → web 路），不再靠关键词表猜题型。
+        # ⚠️ 原来这里断言的是「维度问句含『各站点/跨平台』→ 判 web」——
+        # 那是两张针对特定场景的关键词表（_mentions_external），与本函数
+        # 文件头「不猜题型、不写关键词表」自相矛盾，且实测在真实骨架上
+        # 从未命中（真实维度全是「在 X 表中，Y 是多少」形式）。
         def _fake_web(scene_id, question, *a, **kw):
             return [{"id": "d1", "question": "该 username 在各站点的判定结论分别是什么",
-                     "why": "x"}]
+                     "why": "x", "landing": "mcp_sherlock_lookup_username"}]
 
         _ms.milestone_dimensions = _fake_web
-        out = C._plan_from_scaffold("某用户名在跨平台网站的账号存在性", scene_id="L",
+        _orig_remote = C._remote_primitive_names
+        C._remote_primitive_names = lambda sid: ["mcp_sherlock_lookup_username"]
+        try:
+            out = C._plan_from_scaffold("某用户名在跨平台网站的账号存在性",
+                                        scene_id="L", has_file=False,
+                                        scene_tables=["web_facts"])
+            check("落点 = 远端抓手 → 判 web 路", out.get("web") is True)
+            check("web 路不带 db", out.get("db") is False)
+        finally:
+            C._remote_primitive_names = _orig_remote
+
+        # 7b2（新增）：落点写了一个**够不着**的表名（实测场景 L 的
+        # web_evidence —— 它在另一个 duckdb 文件里，SQL 连不到）
+        # → 如实不猜：不判 db、不判 web（不假装这条路走得通）。
+        def _fake_ledger(scene_id, question, *a, **kw):
+            return [{"id": "d1",
+                     "question": "在 web_evidence 表中查 item 为 ce 的记录",
+                     "why": "x", "landing": "web_evidence"}]
+
+        _ms.milestone_dimensions = _fake_ledger
+        out = C._plan_from_scaffold("查 ce 的记录", scene_id="L", has_file=False,
+                                    scene_tables=["web_facts"])
+        check("落点够不着（账本表）→ 不猜（db=False / web=False）",
+              out.get("db") is False and out.get("web") is False)
+        check("落点够不着 → 只做模型推断", out.get("infer") is True)
+
+        # 7b3（新增）：落点 = none（概念/解释类）→ 不碰环境
+        def _fake_none(scene_id, question, *a, **kw):
+            return [{"id": "d1", "question": "正念和冥想的关系是什么",
+                     "why": "x", "landing": "none"}]
+
+        _ms.milestone_dimensions = _fake_none
+        out = C._plan_from_scaffold("正念和冥想的关系", scene_id="L",
                                     has_file=False, scene_tables=["web_facts"])
-        check("维度指向外部站点 → 判 web 路", out.get("web") is True)
+        check("落点 = none → 不碰环境（infer）",
+              out.get("db") is False and out.get("web") is False
+              and out.get("infer") is True)
 
         # 7c. 没有骨架 → 如实不猜（不碰环境、不联网）
         _ms.milestone_dimensions = lambda scene_id, question, *a, **kw: []

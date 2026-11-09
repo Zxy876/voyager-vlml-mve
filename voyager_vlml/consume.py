@@ -1664,6 +1664,12 @@ async def consume(
     # 走不走环境由**骨架**决定。骨架里没有维度落点 → 不碰环境、不联网，
     # 只做模型推断并如实标注（原版「没拆解就不执行计划外动作」同向）。
     _use_env = bool(_plan.get("db")) if _plan.get("planned") else False
+    # ⚠️ 2026-11-09（第二刀）：骨架里存在**够不着的落点**时（如实测场景 L
+    # 的维度写的是账本表 web_evidence —— 它在另一个 duckdb 文件里，SQL 连不到）
+    # → 这不是「消费侧答不出来」，是**教师端的骨架写错了落点**。
+    # 如实带出去（人看得见），并**不去自动重拆**（骨架「拆一次就固定」是
+    # 铁律：按失败指纹重拆 → 维度 id 每轮变 → 闭合账全对不上）。
+    _bad_landings = list(_plan.get("unreachable_landings") or [])
     # 对话页联网开关（DeepSeek 同构，2026-10-29）：开关关 = web 步不执行
     # （骨架照旧显示，执行层如实交代）；开关开 = 仍要过可达性检查。
     # None = 没带开关（旧客户端/CLI）→ 按骨架执行。
@@ -2352,6 +2358,32 @@ async def consume(
                     # （照 maieutic「清单外的发现不阻塞闭合」）。
                     reuse_errors.append(
                         f"取数部分为真（{_sg['why']}）—— 已如实披露")
+                # ---- 来源绑定判定（2026-11-09 第二刀，maieutic 血）----
+                # 抄的是**学习侧同一把尺子**（`learn_orchestrate.py:1716`
+                # 调 `source_binding.check`）—— 不发明新判据。
+                #
+                # 问的是「取到没有」，不问「取的是不是**这一份**」：
+                # 题面点名了 README.md，本轮却调 `gh_repo_info` 拿仓库元数据
+                # 来答 —— 材料是真的、来源是错的（生产实证：H 场景连着两次
+                # 假闭合，里程碑 3/5→4/5→5/5 全亮，问的却是 README 里的时间）。
+                # 判据看**入参**（args）不看返回文本：入参才是「我问了谁」的
+                # 原始凭据（`source_binding.py` 文件头原话）。
+                #
+                # ⚠️ 三条不拦（守卫只能判它看得见的东西）：
+                #   · 题面没点名任何来源 → 无从判起；
+                #   · 材料账里一条 args 都没有 → 无法归因；
+                #   · 消费侧完成判定保持**确定性**（`critic_ok = data is not
+                #     None`）—— 这道闸只把「取错了来源」标成未取到，不新增
+                #     LLM 调用、不新增门槛机制（守用户 2026-10-25 拍板）。
+                if data is not None:
+                    _bind_ok, _bind_why = _source_binding_gate(
+                        question, evidence,
+                        str((_prof or {}).get("db_path") or ""),
+                        dims=list(_plan.get("dims") or []))
+                    if not _bind_ok:
+                        data = None
+                        reuse_errors.append(
+                            f"来源未绑定（{_bind_why[:140]}）")
                 if data is not None and not skills:
                     # 无已学技能 → 现场 solve 出的 SQL：同一把对题判官（看全貌判
                     # 主体/口径/完整性）。这里**不重填**：solve 已用掉内层 3 轮
@@ -2635,6 +2667,16 @@ async def consume(
                       + (f"判官结论：{_lim[:220]} " if _lim.strip() else "")
                       + ("已自动拉起后台学习。" if learn_kick.get("kicked")
                          else "可到面板查看判定明细。"))
+            # ⚠️ 2026-11-09（第二刀）：骨架落点够不着 → **说清是谁的错**。
+            # 「没答出来」会被人理解成「系统不会」，但实测这里是**教师端的
+            # 骨架把落点写到了够不着的表上**（账本表在另一个 duckdb 文件里）。
+            # 如实点出来，人才知道该重拆骨架，而不是干等。
+            if _bad_landings:
+                answer += ("⚠️ 另外：这道题的**骨架落点够不着**（"
+                           + "、".join(str(x) for x in _bad_landings[:2])
+                           + "）—— 那不是本场景数据源里的表，查不到。"
+                             "需要重拆这份骨架（驾驶舱 ▶ 启动 Voyager 时会重拆，"
+                             "或删掉对应场景的骨架缓存后重新导入）。")
         # ---- 对比题的 web 半场（2026-10-29 拍板）----
         # db 半场答出了、规划里还有联网这一步 → 执行联网半场补「场景外」
         # 那一半（如「待遇好不好」= 库内 137100 + 外部行情对比）。可达才
@@ -4376,10 +4418,33 @@ def _plan_from_scaffold(question: str, *, scene_id: str, has_file: bool,
       数据源」（`maieutic_scaffold.scene_sources`），维度因此**自带落点**。
 
     ★ 判据是「维度落在哪个数据源上」，不是词表：
-      路由从骨架维度的**落点**推出来 —— 维度问句点名了本场景真有的
-      表/列 → db；指名要跨来源/跨站点核对 → web；落在上传材料上 →
-      file；全部维度都不需要取数 → infer。
+      路由从骨架维度的**落点**推出来 —— 落点在**可达表**里 → db；
+      落在**远端抓手**上 → web；落在**上传文件**上 → file；
+      落点 = none / 没有落点 → infer（不需要取数）。
       判据**只用骨架与场景实况**，不猜题型、不写关键词表。
+
+      ★ 落点从**教师端写好的 `landing` 字段**读（2026-11-09 第二刀）。
+        原版 maieutic 的 `SpecDimension` 只有 4 字段（id/description/
+        rationale/source），其中 `source` = 「这条维度是谁写的」，**不是
+        数据落点** —— 所以落点不能抄成 `source`，它是 MVE 特有扩展
+        （原版教师端把「学生学过哪些工具」当**环境约束**告诉生成器，
+        落点因此隐含在维度问句里；MVE 的运行时需要显式读它才不重拆）。
+
+      ⚠️ 删掉了原来那两张关键词表（`_mentions_upload` /
+        `_mentions_external`）。它们与本函数的文件头**自相矛盾**
+        （头里写「不猜题型、不写关键词表」，函数里就是两张针对特定场景的
+        词表：站点/平台/跨/外部/公开/主页/账号是否/注册/在哪/…）。
+        实测它们在真实数据上**从未命中**：服务器场景 L 的真实骨架里，
+        三条维度全是「在 X 表中，Y 是多少」的形式（落点自带）；
+        而它们**误伤**得厉害 —— 「在 web_evidence 表中查…」既不命中表名
+        （账本表不在可达清单）也不命中那些词 → 整道题落进 infer =
+        **什么都不查**（实测最严重的一次）。
+
+      旧骨架（没有 `landing` 字段）→ 回退到字面判据（可达表 / 远端抓手名
+      出现在问句里）—— 同样是实况判据，无词表。
+
+      账本表（`web_evidence`）**不在**可达清单里 —— 这正是它该被排除的
+      理由：它在另一个 duckdb 文件里，SQL 连不到（见 `mve/reachable.py`）。
 
     没有骨架（自由提问、没建里程碑）→ **如实不猜**：不碰环境、不联网，
     只做模型推断并如实标注（与原版「没规划就不执行计划外动作」同向）。
@@ -4399,53 +4464,185 @@ def _plan_from_scaffold(question: str, *, scene_id: str, has_file: bool,
                       "不碰环境、不联网，只做模型推断")
         return out
 
+    # ---- 可达表清单（实查；本场景真查得到的表）----
+    _reach_tables = list(scene_tables or [])
+    try:
+        import reachable as _reach
+        _r = list(_reach.reachable_tables(str(scene_id or "")) or [])
+        if _r:
+            _reach_tables = _r
+    except Exception:
+        pass
+
     # ---- 逐维度判落点 → 汇总成信息路 ----
+    # 落点从**教师端写好的 `landing` 字段**读（第二刀）；旧骨架没有这个字段
+    # → 回退到「问句里点名了可达表」的字面判据（同样是实况判据，无词表）。
     db_hits: list[str] = []
     web_hits: list[str] = []
     file_hits: list[str] = []
+    unreachable: list[str] = []
+    _remote_names = _remote_primitive_names(str(scene_id or ""))
+    _files = _file_names(scene_id) if has_file else []
     for d in dims:
         _q = str((d or {}).get("question") or "")
         _why = str((d or {}).get("why") or "")
         _blob = f"{_q} {_why}"
-        # db：维度点名了本场景真有的表/列（表名在场景实况里能对上）
-        if _mentions_scene_table(_blob, scene_tables):
+        _landing = str((d or {}).get("landing") or "").strip()
+        if _landing:
+            # ---- 落点字段（教师端固化，运行时只读）----
+            if _landing.lower() == "none":
+                continue                        # 不需要取数
+            if _landing in _reach_tables:
+                db_hits.append(_q)
+            elif _remote_names and _landing in _remote_names:
+                web_hits.append(_q)
+            elif has_file and _landing in _files:
+                file_hits.append(_q)
+            else:
+                # 落点写了但运行时够不着（如写了一个不在数据源里的表名）
+                # → 如实不猜：既不判 db 也不判 web，**并记下来**（让人看得见
+                #   「这题的骨架指向了一条走不通的路」，而不是静默降级成
+                #   「这题不需要取数」）。实测场景 L 的一条维度就写的是
+                #   账本表 web_evidence（另一个 duckdb 文件，SQL 连不到）。
+                unreachable.append(f"{_landing}（{_q[:40]}）")
+            continue
+        # ---- 旧骨架（无 landing）：字面判据（可达表 / 远端抓手名）----
+        if _mentions_scene_table(_blob, _reach_tables):
             db_hits.append(_q)
             continue
-        # file：维度指向用户上传的材料
-        if has_file and _mentions_upload(_blob):
-            file_hits.append(_q)
-            continue
-        # web：维度要跨来源/跨站点核对
-        if _mentions_external(_blob):
+        if _remote_names and any(n in _blob for n in _remote_names):
             web_hits.append(_q)
             continue
-        # 其余：概念/解释类（不需要取数）
     out["db"] = bool(db_hits)
     out["web"] = bool(web_hits)
     out["file"] = bool(file_hits or has_file)
     out["infer"] = not (db_hits or web_hits or file_hits)
     out["planned"] = True
     out["source"] = "scaffold"
+    if unreachable:
+        # 如实带出去：这不是「消费侧答不出来」，是**教师端的骨架指向了
+        # 够不着的落点**（原版教师端约束的漏洞）。学习侧重拆才能修。
+        out["unreachable_landings"] = unreachable
     _why_txt = []
     if db_hits:
-        _why_txt.append(f"库内 {len(db_hits)} 条（骨架维度落在场景库表/列上）")
+        _why_txt.append(f"库内 {len(db_hits)} 条（骨架维度落在场景可达的表上）")
     if web_hits:
-        _why_txt.append(f"场景外 {len(web_hits)} 条（骨架维度要跨来源核对）")
+        _why_txt.append(f"场景外 {len(web_hits)} 条（骨架维度落在远端抓手上）")
     if file_hits:
         _why_txt.append(f"上传材料 {len(file_hits)} 条")
+    if unreachable:
+        _why_txt.append(f"⚠️ {len(unreachable)} 条维度的落点够不着（"
+                        + "、".join(unreachable[:2]) + "）→ 这部分不查")
     if out["infer"]:
-        _why_txt.append("无需取数（概念/解释类）")
+        _why_txt.append("无需取数（没有维度落在可达数据源上）")
     out["why"] = ("骨架承担路由（照原版：拆解即骨架，无独立规划层）："
                   + "；".join(_why_txt))
     out["dims"] = dims
     return out
 
 
+def _remote_primitive_names(scene_id: str) -> list[str]:
+    """本场景的远端/联网抓手名字（origin=net | origin=mcp）。
+
+    这是「教师端环境约束」的另一半：MVE 的「工具」= 表 **+ 远端抓手**。
+    出题器把这两样一起看到，维度落点因此总落在够得着的东西上
+    （原版 `targetUnit` 的同构物）。
+    """
+    try:
+        import actions as _act
+        bucket = getattr(_act, "_REGISTRY", {}).get(str(scene_id)) or {}
+        if not bucket:
+            try:
+                _act.restore()
+            except Exception:
+                pass
+            bucket = getattr(_act, "_REGISTRY", {}).get(str(scene_id)) or {}
+        return sorted({str(a.name) for a in bucket.values()
+                       if str(getattr(a, "origin", "")) in ("net", "mcp")})
+    except Exception:
+        return []
+
+
+def _file_names(scene_id: str) -> list[str]:
+    """本场景上传过的文件名（供 landing 判 file 路）。"""
+    try:
+        import upload as _upl
+        mf = str(_upl.uploads_manifest(str(scene_id)) or "")
+        out: list[str] = []
+        for line in mf.splitlines():
+            for tok in str(line).replace("，", " ").replace("、", " ").split():
+                t = tok.strip("《》（）()[]【】:：,，。")
+                if t and "." in t:
+                    out.append(t)
+        return out
+    except Exception:
+        return []
+
+
+def _source_binding_gate(question: str, evidence: list[dict[str, Any]] | None,
+                         db_path: str, *,
+                         dims: list[dict[str, Any]] | None = None,
+                         ) -> tuple[bool, str]:
+    """来源绑定守卫（消费侧）—— 抄学习侧同一把尺子（2026-11-09 第二刀）。
+
+    问的是「取的是不是**这一份**」，不是「取到没有」：
+
+        题面/维度点名了 README.md → 本轮必须有一条 ok 的调用，其**入参**
+        点到 README.md；调 `gh_repo_info` 拿仓库元数据来答 → 不算数。
+
+    为什么消费侧也需要（生产实证，H 场景）：
+        旧判据只问「取到没有」（is_vacuous / real_calls），材料非空、
+        措辞对得上就闭合 —— 于是「调 gh_repo_info 把仓库 description 当
+        claim 交上去」也能让里程碑连着两次假闭合（3/5→4/5→5/5 全亮），
+        而问题要的是 README 里写的**最后更新时间**。
+
+    ★ 与学习侧**同一口径、同一份实现**（`mve/source_binding.py`）——
+      不发明新判据、不加新的词表：
+        · 点名的来源按「**最具体的目标**」取一类
+          （带扩展名的文件名 > URL > owner/repo > 本库真表名）；
+        · 这一类里至少一个 token，必须有一条 **ok 的调用**其入参点到它；
+        · 点不到 / 碰了失败 / 只用了别的工具 → 不闭合，判词指名道姓。
+
+    判谁（题面 + 维度问句都要判）：
+        题面是人问的那句；维度问句是**教师端拆出来的承诺**（更具体，
+        常带表名/文件名）。两者都点名了来源 → 都要被绑定。
+
+    不拦的三种情况（守卫只能判它看得见的东西）：
+        · 题面与维度都没点名任何来源 → 无从判起；
+        · 材料账里一条 `args` 都没有 → 无法归因；
+        · 守卫本身不可用 → 如实放行（不因为守卫坏了把正确答案拒掉）。
+    """
+    try:
+        import source_binding as _sb
+    except Exception:
+        return True, ""
+    texts: list[str] = [str(question or "")]
+    for d in (dims or []):
+        if isinstance(d, dict):
+            t = str(d.get("question") or "").strip()
+            if t:
+                texts.append(t)
+    for t in texts:
+        try:
+            ok, why = _sb.check(t, evidence, db_path)
+        except Exception:
+            return True, ""
+        if not ok:
+            return False, str(why or "来源未绑定")
+    return True, ""
+
+
 def _mentions_scene_table(blob: str, scene_tables: list[str] | None) -> bool:
-    """维度问句/理由里点名了本场景**真有的**表或列吗？
+    """维度问句/理由里点名了本场景**真查得到的**表或列吗？
 
     判据只用场景实况（实查到的表名）与维度文本的**字面包含** ——
     不猜题型、不写关键词表（项目铁律）。认不出就返回 False（如实不归 db）。
+
+    ⚠️ 2026-11-09（第二刀）：传入的必须是**可达**表清单
+    （`reachable.reachable_tables` = 数据源库实查的表），不是「本场景
+    看得见的全部表」。账本表（`web_evidence`）在另一个 duckdb 文件里，
+    SQL 连不到 → 它出现在清单里就会把题目路由到一条查不通的路上
+    （实测场景 L 的骨架就有一条这种维度，整道题因此落进 infer）。
     """
     _b = str(blob or "")
     if not _b:
@@ -4453,30 +4650,6 @@ def _mentions_scene_table(blob: str, scene_tables: list[str] | None) -> bool:
     for t in (scene_tables or []):
         _t = str(t or "").strip()
         if _t and _t in _b:
-            return True
-    return False
-
-
-def _mentions_upload(blob: str) -> bool:
-    """维度指向用户上传的材料吗（字面判据）。"""
-    _b = str(blob or "")
-    for _k in ("上传", "附件", "文件里", "文档中", "上传的文件"):
-        if _k in _b:
-            return True
-    return False
-
-
-def _mentions_external(blob: str) -> bool:
-    """维度要跨来源/跨站点核对吗（字面判据）？
-
-    这里判的是「这个维度需要场景外的信息」，不是「这题属于哪一类」。
-    认的是**取数形态**的词（哪些站点、在平台上、公开页面、账号是否注册…），
-    命中就归 web 路 —— 归错的后果是「多走一条路」，不是「编答案」。
-    """
-    _b = str(blob or "")
-    for _k in ("站点", "平台", "跨", "外部", "公开", "主页", "账号是否",
-               "注册", "在哪", "外网", "互联网", "跨平台"):
-        if _k in _b:
             return True
     return False
 
