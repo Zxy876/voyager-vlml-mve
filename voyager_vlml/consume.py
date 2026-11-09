@@ -1813,6 +1813,31 @@ async def consume(
     # + dims 口径在那边算 _nd；单配方捷径删除后这里不再需要预先分流。）
 
     # ---- ② 找已积累的能力（配方）----
+    # ★★★ 刀 C：先按**需求 id** 召回会话（照抄原版 maieutic 的方向）★★★
+    #
+    # 原版（已复核 `src/lib/sessions.ts:159-170`）：
+    #   `findOrCreateSession(exerciseId, studentId)` → **精确二元组匹配** →
+    #   `resolveSession()` 选出会话 → 带出全部组成。
+    #   检索键是**需求身份**（`Exercise.id`），不是问句文本。
+    # MVE 现状（`skill_store.retrieve(topic, question, top_k=5)`）：
+    #   检索键是**问句** → 换问法就检索不到 → 会话 key 又是问句派生的
+    #   （`learn_<md5(question)>::milestone`）→ 断。
+    #
+    # ⇒ 这里先按 req id（精确）召回会话；召回到了就走**披露**（刀 D），
+    #   召回不到再退回下面的语义检索（保底，不丢现有能力）。
+    _sess: dict[str, Any] = {}
+    _sess_verified: dict[str, dict[str, Any]] = {}
+    _sess_unclosed: list[str] = []
+    try:
+        import session_recall as _sr
+        _sess = _sr.recall_by_question(question, _scene_id,
+                                        db_path=str((_prof or {}).get("db_path")
+                                                   or ""))
+        if _sess.get("found"):
+            _sess_verified = _sr.verified_answers(_sess)
+            _sess_unclosed = _sr.unclosed_dims(_sess)
+    except Exception:
+        _sess = {}
     # ⚠️ 检索键必须是**本题归题结果**（2026-10-20 实测根因）：原来这里传的是
     # 函数入参 `topic_hint`（默认空），`_pick_ability_topic` 于是按词面**随便
     # 挑最像的** —— 问「正念是什么」时挑中了「正念练习的常见误区」那批技能
@@ -1942,7 +1967,58 @@ async def consume(
         _alt_disclosure = ""
         # ⚠️ 这里曾有 _money_kv / _total（把多条结果相加算合计）—— 已删：
         # 那正是 75120 / 330441 双计的产地。合计由组合 SQL 自己算。
-        if _scene_kind == "scene":
+        # ---- ★★★ 刀 D：披露学习侧**已验过**的答案（用户 2026-11-09）----
+        # 用户原话：「验收其实在学习侧就已经跑完，只是没有答案披露」。
+        # 事实（服务器取证）：学习侧跑通维度时把 code/answer/r/how 写进了
+        # `progress.codes`（maieutic_scaffold.save_progress_codes），
+        # 但消费侧**从不读它**（改动前 consume.py 里 load_progress_codes
+        # 命中数 = 0）→ 白跑一遍 SQL 再判一遍，而且判的还是同一件事。
+        #
+        # ★ 这里为什么可以短路（照抄原版）：
+        #   原版 maieutic 的会话内容**全在 Session 一行的 4 个 JSON 列里**
+        #   （`phase1Data`/`phase2Data`/`phase3Data`/`liveSummaries`），
+        #   运行时**只读**已发布内容（`api/session/**` 零命中 scaffolding）。
+        #   ⇒ 会话里已验过的结果就是**权威结果**，披露它不是「抄近路」，
+        #     是原版的正常读法。
+        # ⚠️ 边界（不许放宽）：
+        #   · 只披露**验过真值**的（有 answer 且 r >= 0）—— 判据见
+        #     `session_recall.verified_answers`，不新造
+        #   · **原样披露**，不改写、不摘要、不补全 —— 加工过就不是「已验过的」
+        #   · 会话**没闭合**的维度不走这里（那部分要继续学）
+        #   · 披露**不代替**对题判官：判官照跑（判的是「答得对不对题」，
+        #     不是「数是不是真的」—— 真不真在学习侧验过了）
+        _disclosed = False
+        if _sess_verified and _use_env:
+            try:
+                import session_recall as _sr
+                # 只在「这道题的全部维度都闭合」时整题披露；
+                # 部分闭合 → 缺的那部分还没验过，披露半截 = 答半截。
+                if _sr.is_learned(_sess):
+                    _ans_parts = []
+                    for _cid, _c in _sess_verified.items():
+                        _a = str(_c.get("answer") or "").strip()
+                        if not _a:
+                            continue
+                        _ans_parts.append({"dim_id": _cid, "answer": _a,
+                                            "r": float(_c.get("r", -1.0)),
+                                            "how": str(_c.get("how") or "")})
+                    if _ans_parts:
+                        data = {"disclosed_from_session": True,
+                                "req_id": str(_sess.get("req_id") or ""),
+                                "answers": _ans_parts}
+                        code = "\n".join(
+                            str(_c.get("code") or "") for _c in _sess_verified.values()
+                            if str(_c.get("code") or "").strip())
+                        obs = [{"ok": True, "data": data}]
+                        evidence = [{"dim_id": a["dim_id"], "source": "session",
+                                     "r": a["r"]} for a in _ans_parts]
+                        reused_skill = {"topic": "session",
+                                        "name": "session_disclose",
+                                        "key": f"session::{_sess.get('req_id') or ''}"}
+                        _disclosed = True
+            except Exception:
+                _disclosed = False
+        if _scene_kind == "scene" and not _disclosed:
             # ---- 场景库形态的配方复用：**回填**，不原样重放（2026-10-23 用户
             # 定「不要把数值写死，把算法积累成技能」）----
             # 原版同构：技能是带参数的函数，实体值是**调用时**传的（skill.py
@@ -2458,7 +2534,30 @@ async def consume(
         # 没取到 → 还是没学会。同样**不自动后台学**（2026-10-19 用户改设计）：
         # 这条问题已在场景学习账上（coach_log 判读 = 没答出来），人点驾驶舱
         # 「▶ 启动 Voyager」时 scene_learn.py 会排到它 —— 每轮落 run_log 可见。
-        if data is None and _use_env and not auto_learn:
+        #
+        # ★★★ 刀 C/D：派任务与验收**在数据源上分开**（用户 2026-11-09：
+        #   「消费侧分不清什么是派任务，什么是验收（但是验收其实在学习侧就
+        #     已经跑完，只是没有答案披露）」）★★★
+        # 原来的判据只有一个 `data is None`，它同时意味着两件不同的事：
+        #   ① 「这题没学过」→ 该派任务
+        #   ② 「这题学过、但这一答没取到数」→ **不该派任务**（学过了还学什么）
+        # 两者混在一起 → 学过的题被反复派任务 → 学习侧重复拆骨架。
+        # 现在改成看**会话**（刀 A/B/C）：
+        #   · 会话里已有验过的答案 → 学过了 → **不派任务**
+        #   · 会话存在但没闭合 → 学了一半 → 只对未闭合维度派任务
+        #   · 根本没有会话 → 没学过 → 照旧派任务
+        if data is None and _sess.get("found") and _sess_verified:
+            # ★ 学过了：这题的学习侧验收跑完过，有已验结果。
+            #   披露失败（如实交代，不静默降级成「没学过」）。
+            _unclosed = list(_sess_unclosed or [])
+            learn_kick = {"kicked": False, "manual": True,
+                          "why": (f"这题**学过**（会话 {str(_sess.get('req_id') or '')}"
+                                  f"已有验过的结果，{len(_sess_verified)} 条）—— "
+                                  "这一答没取到数是披露/执行层的问题，"
+                                  "**不重复派任务**（重复派 = 重复拆骨架）"
+                                  + (f"；未闭合维度：{', '.join(_unclosed[:4])}"
+                                     if _unclosed else ""))}
+        elif data is None and _use_env and not auto_learn:
             # 回访模式（2026-10-29）：重试排队问题时**不再**连环拉学习 ——
             # 否则回访失败又起一轮学习，回访↔学习互相触发转圈烧钱。
             learn_kick = {"kicked": False, "manual": True,
