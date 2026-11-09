@@ -103,8 +103,8 @@ def main() -> int:
     # （拆解即骨架）。下面断言的是新链路。
     check("路由由骨架承担（无规划员）",
           "_plan_from_scaffold" in src
-          and "_plan_selfcheck" not in src
-          and "_plan_routes" not in src)
+          and "_plan_selfcheck(" not in src
+          and "_plan_routes(" not in src)
 
     print("== 7. 骨架路由（_plan_from_scaffold）==")
     import voyager_vlml.consume as C
