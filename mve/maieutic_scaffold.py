@@ -1149,6 +1149,17 @@ def mark_milestone_achieved(scene_id: str, question: str, *,
     data["milestone_achieved"] = True
     data["milestone_lit_at"] = time.time()
     data["milestone_verified_real"] = bool(fetched)
+    # ---- 会话归档（2026-11-09 第三刀 B，照抄原版 advancePhase(sid, 4)）----
+    # 原版「结束」= `currentPhase = 4` + `completedAt` + 一条 phase_transition 事件
+    # （`src/lib/sessions.ts:222-249`）。**没有归档表、没有归档文件、没有快照拷贝** ——
+    # 全仓 `archive` / `归档` 零命中。
+    # MVE 同构：里程碑达成 = 这个需求的会话闭合 → 写 completed_at + phase=4。
+    try:
+        import session_state as _ss
+        _ss.ensure_session(data)
+        _ss.mark_archived(data, reason="里程碑达成（维度全闭合）")
+    except Exception:
+        pass
     try:
         _atomic_write(path, data)
     except Exception:
@@ -1281,6 +1292,27 @@ def save_progress_codes(scene_id: str, question: str,
                     "r": v["r"], "how": v["how"]}
                    for k, v in merged.items()]
     data["progress"] = pr
+    # ---- 会话事件（2026-11-09 第三刀 B，照抄原版 SessionEvent）----
+    # 这里是「维度闭合 + 验收跑完」的落点（code/answer/r 都已写进去），
+    # 所以正好是 phase 3「已验待披露」的触发点 —— 用户原话：
+    # 「验收其实在学习侧就已经跑完，只是没有答案披露」。
+    # ⚠️ 事件是 **append-only**（原版 `appendSessionEvent` 语义）：
+    #   只追加，从不覆盖旧事件 —— 事件流是证据链，改写历史 = 毁掉证据。
+    # ⚠️ 状态与过程分开：learned/codes 是**状态**（当前值，覆盖式），
+    #   session.events 是**过程**（历史，追加式）。
+    try:
+        import session_state as _ss
+        for c in codes:                       # 本轮闭合的维度各记一条
+            cid = str(c.get("id") or "").strip()
+            if cid and (str(c.get("code") or "").strip()
+                        or str(c.get("answer") or "").strip()):
+                _ss.note_dim_closed(data, cid,
+                                    r=float(c.get("r", -1.0)),
+                                    how=str(c.get("how") or ""))
+        _ss.ensure_session(data)
+        _ss.mark_verified(data, reason="学习侧验收跑完（答案待披露）")
+    except Exception:
+        pass
     try:
         _atomic_write(path, data)
     except Exception:
