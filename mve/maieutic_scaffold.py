@@ -396,6 +396,52 @@ def resplit_needed(scene_id: str, question: str) -> bool:
     return False
 
 
+def invalidate_skeleton(scene_id: str, question: str) -> dict[str, Any]:
+    """**作废**一份骨架（显式动作，人触发）—— 下次拆骨架会按当前实况重来。
+
+    为什么需要（2026-11-09 第二刀，服务器实测场景 L）：
+        骨架维度写的是「在 web_evidence 表中查…」—— 那张表在**另一个**
+        duckdb 文件（web_ledger.duckdb）里，SQL 连不到 → 整道题在消费侧
+        落进 infer = 什么都不查。教师端（出题器）当时把账本表也展示给了
+        它，拆出了走不通的维度。
+        现在出题器已经被约束好（可达表清单 + 账本表标注查不到），但
+        **旧骨架不会自己重拆**（「拆一次就固定」是铁律）—— 所以要有一条
+        显式的作废入口。
+
+    作废怎么做（不是删，是**改名留证**，与坏文件处理同一套）：
+        `xxx.json` → `xxx.invalidated<ts>.json`
+        · 留证：出问题能回溯（旧文件的进度账也一起留着，不丢历史）；
+        · 生效：下次 `scaffold()` 按当前问句**缓存未命中** → 重新拆 →
+          新的维度自带 `landing`（教师端约束已修好）。
+
+    ⚠️ **进度账不迁移**（这是有意的）：那批「已闭合」是对着**错落点**
+        做的（查的是够不着的表），本就不该算数；而且新拆出来的维度 id
+        几乎必然与旧的不同（id 是出题器给的），迁移过去只会造成
+        「已闭合的维度被当成未闭合重跑」—— 那正是「按指纹重拆」的老坑。
+
+    返回 {"ok": bool, "why": str, "path": str}
+    """
+    try:
+        p = _cache_path(str(scene_id or "A"), str(question or ""))
+    except Exception as e:
+        return {"ok": False, "why": f"算不出缓存路径：{type(e).__name__}: {e}",
+                "path": ""}
+    if not p.exists():
+        return {"ok": False, "why": "这份题没有骨架缓存（不用作废）",
+                "path": str(p)}
+    try:
+        bak = p.with_name(f"{p.stem}.invalidated{int(time.time())}{p.suffix}")
+        p.replace(bak)
+        return {"ok": True,
+                "why": (f"已作废（留证：{bak.name}）—— 下次拆骨架会按当前"
+                        "可达的数据源重来一遍；旧进度账留在留证文件里，"
+                        "不迁移（那批闭合是对着错落点做的）"),
+                "path": str(p)}
+    except Exception as e:
+        return {"ok": False, "why": f"作废失败：{type(e).__name__}: {e}",
+                "path": str(p)}
+
+
 def _remote_primitive_names(scene_id: str) -> list[str]:
     """本场景的远端/联网抓手名字（origin=net | origin=mcp）。"""
     try:

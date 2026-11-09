@@ -3656,6 +3656,38 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(500, {"ok": False, "error": f"{type(e).__name__}: {e}"[:200]})
             return
 
+        if path == "/api/milestone/invalidate":
+            # **作废**一份骨架（2026-11-09 第二刀）：骨架的落点指向了本场景
+            # 够不着的表（实测场景 L：维度写的是账本表 web_evidence —— 它在
+            # 另一个 duckdb 文件里，SQL 连不到 → 这道题在消费侧什么都查不到）。
+            #
+            # ⚠️ 为什么要**显式**作废（人点一下）：
+            #   骨架「拆一次就固定」是铁律（按失败指纹重拆 → 维度 id 每轮变
+            #   → 闭合账全对不上，2026-10-26 生产实测）。所以**不能自动重拆**。
+            #   但出题器那边已经修好了（可达表清单 + 账本表标注查不到），
+            #   作废后重拆出来的维度就自带正确落点。
+            # 作废 = 改名留证（不删）→ 下次拆骨架缓存未命中 → 按当前实况重来。
+            try:
+                import scenes as _sc
+                import maieutic_scaffold as _ms
+                sid = str(payload.get("scene_id") or "").strip() \
+                    or _sc.current_scene_id() or "A"
+                q = str(payload.get("question") or "").strip()
+                if not q:
+                    self._json(400, {"ok": False, "error": "缺少 question"})
+                    return
+                _r = _ms.invalidate_skeleton(sid, q)
+                _need = _ms.resplit_needed(sid, q)
+                self._json(200 if _r.get("ok") else 404,
+                           {"ok": bool(_r.get("ok")),
+                            "why": str(_r.get("why") or "")[:300],
+                            "scene_id": sid, "question": q[:120],
+                            "still_bad": bool(_need)})
+            except Exception as e:
+                self._json(500, {"ok": False,
+                                 "error": f"{type(e).__name__}: {e}"[:200]})
+            return
+
         if path == "/api/db/probe":
             try:
                 import db_switch
