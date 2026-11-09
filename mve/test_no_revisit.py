@@ -76,6 +76,18 @@ check("对话页不再读 pending 数", "d.pending" not in CHAT)
 check("对话页没有「🔁 自动回访」气泡",
       "'🔁 学习完成后自动回访：" not in CHAT)
 
+# ---- 产物级检查（比查源码更准：用户看的就是这份 HTML）----
+try:
+    import chat_page
+    _HTML = chat_page.CHAT_HTML
+    check("★ 页面产物里没有「排队」提示语", "排队问题" not in _HTML)
+    check("★ 页面产物里没有「不用你盯着」", "不用你盯着" not in _HTML)
+    check("★ 页面产物里没有「自动回访」气泡", "自动回访" not in _HTML)
+    check("★ 页面产物里没有回访拉取", "/api/revisit" not in _HTML)
+    check("★ 页面产物里没有 pullRevisit", "pullRevisit" not in _HTML)
+except Exception as e:
+    check("对话页产物可读", False, f"{type(e).__name__}: {e}")
+
 # ---------------------------------------------------------------------------
 print("\n== 2. 源码里没有残留调用 ==")
 # ---------------------------------------------------------------------------
