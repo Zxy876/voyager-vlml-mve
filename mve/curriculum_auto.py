@@ -80,6 +80,21 @@ Context: <一句话说明：用哪个文件/表、算什么、完成标准是什
 """
 
 
+# 观察面的**体量上限**（2026-11-09 服务器实测踩到的）：
+# 场景 L 的 web_facts 是宽表（3736 行 × 910 列），逐列打「真实取值」会产出
+# 909 行 / 57,254 字符 —— 骨架 prompt 直接被撑爆。更糟的是 render_material 里
+# 同一份 db_observation 出现**两次**（scene_sources 里一次 + 末尾又拼一次）
+# → 114k 字符，模型根本看不到人导入的那句话。
+# 所以这里按**体量**收敛（不是按内容删）：
+#   · 列名：超过阈值就**等距抽样**（保住头尾与中段；只列前 40 列会全落在
+#     前几个站点上，看不出这张表铺了多宽）；
+#   · 取值：每张表最多 _MAX_VALUE_LINES 行；
+#   · 整份：最多 _MAX_OBS_CHARS 字符（超出就明说截断了多少）。
+_MAX_COLS_PER_TABLE = 40
+_MAX_VALUE_LINES = 24
+_MAX_OBS_CHARS = 12000
+
+
 def db_observation(db_path: str) -> str:
     """实查场景库：表 → 行数 → 列 → 低基数字符串/布尔列的真实取值。
 
@@ -107,10 +122,26 @@ def db_observation(db_path: str) -> str:
                     cols = con.execute(f'describe "{t}"').fetchall()
                 except Exception:
                     continue
-                names = ", ".join(c[0] for c in cols)
-                lines.append(f"- 表 {t}（{cnt} 行）：{names}")
-                for c in cols:
-                    cname, ctype = str(c[0]), str(c[1]).upper()
+                cnames = [str(c[0]) for c in cols]
+                # ---- 列名：宽表等距抽样（保住头尾与中段）----
+                if len(cnames) > _MAX_COLS_PER_TABLE:
+                    head = cnames[:8]
+                    rest = cnames[8:]
+                    step = max(1, len(rest) // max(1, _MAX_COLS_PER_TABLE - len(head)))
+                    picked = list(head) + list(rest[::step])[: _MAX_COLS_PER_TABLE - len(head)]
+                    lines.append(
+                        f"- 表 {t}（{cnt} 行，{len(cnames)} 列；列名等距抽样 "
+                        f"{len(picked)} 个）：" + ", ".join(picked))
+                    shown_cols = {str(c[0]): str(c[1]).upper() for c in cols
+                                  if str(c[0]) in picked}
+                else:
+                    lines.append(f"- 表 {t}（{cnt} 行）：" + ", ".join(cnames))
+                    shown_cols = {str(c[0]): str(c[1]).upper() for c in cols}
+                # ---- 取值：只对抽到的列查，且每表限行数 ----
+                _lines = 0
+                for cname, ctype in shown_cols.items():
+                    if _lines >= _MAX_VALUE_LINES:
+                        break
                     if ctype not in ("VARCHAR", "TEXT", "STRING", "BOOLEAN"):
                         continue
                     try:
@@ -124,7 +155,11 @@ def db_observation(db_path: str) -> str:
                         lines.append(
                             f"    · {t}.{cname} 真实取值: "
                             + "、".join(str(v) for v in vals))
+                        _lines += 1
             out = "\n".join(lines)
+            if len(out) > _MAX_OBS_CHARS:
+                out = (out[:_MAX_OBS_CHARS]
+                       + f"\n…（观察面共 {len(out)} 字，只给前 {_MAX_OBS_CHARS} 字）")
         finally:
             con.close()
     except Exception:

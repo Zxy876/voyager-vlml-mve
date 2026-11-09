@@ -1562,6 +1562,20 @@ def _mcp_prompt_section(scene_id: str) -> str:
 
     只在真有 mcp 条目（server 连上、expose_as_actions 注册了）时才返回非空 ——
     server 没连上就不误导模型去调一个不存在的函数。
+
+    ★ 说明书不能截断（2026-11-09 实测）：原来 `description[:48]` 只留前 48 字，
+    而 server 自己写的**关键警告在末尾**（sherlock 的「⚠️ 题目里出现
+    『用 sherlock 查某用户名』时，**直接调用本工具**，不要用搜索引擎去查
+    『sherlock 这个工具的说明』」）→ 2026-11-07 加的警告**从未生效过**：
+    模型只看到「在 481 个公开站点上并发探测某 username 是否被注册（Sherlock
+    站点规格驱动」这句介绍，正好是「介绍文章」那层意思 → 就去搜文章了。
+
+    ★ 参数要带**语义**，不只带类型（同一批实测）：原来只印
+    `timeout: number=...`，模型不知道 timeout 是「单站点请求超时」，
+    当成「整体超时」传了 timeout=10（省时间）→ 462 站 × 每站最多 10s，
+    整体反而更慢（实测全量 30.15s），外层 30s 墙钟先爆 →
+    「执行超时（>30s）」。参数说明直接来自 server 的 inputSchema，
+    与实际行为同源（server 自己就是这么用的）。
     """
     if not scene_id:
         return ""
@@ -1582,11 +1596,19 @@ def _mcp_prompt_section(scene_id: str) -> str:
             required = set(schema.get("required") or [])
             parts = []
             for pname, pinfo in props.items():
-                ptype = (pinfo or {}).get("type", "str")
-                parts.append(f"{pname}: {ptype}" if pname in required
-                             else f"{pname}: {ptype}=...")
+                pinfo = pinfo or {}
+                ptype = pinfo.get("type", "str")
+                # 参数说明跟着参数走（不截断到只剩类型）：
+                # 模型不知道「timeout 是单站还是整体」就会猜错用法。
+                pdesc = " ".join(str(pinfo.get("description") or "").split())
+                seg = f"{pname}: {ptype}"
+                if pname in required:
+                    seg += "（必填）"
+                if pdesc:
+                    seg += f" —— {pdesc}"
+                parts.append(seg)
             sig = ", ".join(parts) if parts else ""
-            desc = str(e.get("description") or "")[:48].replace("\n", " ")
+            desc = " ".join(str(e.get("description") or "").split())
             items.append(f"  {name}({sig})  → {desc}")
         out = ""
         if items:

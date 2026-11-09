@@ -183,6 +183,121 @@ def _eid(item: str, attribute: str, value: str) -> str:
     return h[:16]
 
 
+# ---- 取证落点表的「当前状态」（2026-11-09）----
+# 为什么需要它：骨架（= 原版 maieutic 教师端）必须知道**学生够得着什么**，
+# 原版靠 `scaffolding.ts:262 buildScaffoldingUserMessage` 把 targetUnit /
+# targetLanguage 告诉骨架生成器。MVE 的同构物是「这个场景现在真的能取到
+# 什么」—— 里面就包括取证落点表**此刻装了什么**。
+#
+# ⚠️ 之前只给了「表名 + 一句『初始是空的』」，那是**过时**的：表早就装满了
+# （场景 L 实测 web_docs 3796 行 / web_facts 3736 行）。而且更危险的是：
+# 分不清 web_docs 里装的是**搜索引擎垃圾**（「怎么查找github用户名」这类
+# 介绍文章）还是**真探测结果** → 骨架会拆出「从 web_docs 查该用户名」的
+# 维度，而那些行根本不含该用户名的探测结论。
+#
+# 所以这里给的是**事实**：行数 / distinct 计数 / 值域 / **少量样本**。
+# 样本是关键 —— 「这是介绍文章还是真结果」得让模型自己看样本判断，
+# 我们不替它下结论（那是发明语义）。
+_STATE_SAMPLE = 5
+
+
+def ingest_state(scene_id: str) -> list[str]:
+    """取证落点表**此刻的真实状态**（实查；查不到就不列）。
+
+    返回给骨架的每一段都是事实：行数、distinct 计数、值域、样本值。
+    不替模型判断「这些数据好不好」—— 只让它看得见。
+    """
+    out: list[str] = []
+    db = _db(scene_id)
+    led = _ledger(scene_id)
+    # ① 资料行 web_docs（原始资料：搜索结果页 / 抓回来的正文）
+    try:
+        import duckdb
+        con = duckdb.connect(db, read_only=True)
+        try:
+            n = con.execute(f"SELECT count(*) FROM {DOCS}").fetchone()[0]
+            dq = con.execute(
+                f"SELECT count(DISTINCT query) FROM {DOCS}").fetchone()[0]
+            du = con.execute(
+                f"SELECT count(DISTINCT url) FROM {DOCS}").fetchone()[0]
+            nb = con.execute(
+                f"SELECT count(*) FROM {DOCS} "
+                f"WHERE body IS NOT NULL AND length(body) > 0").fetchone()[0]
+            samp = con.execute(
+                f"SELECT query, title FROM {DOCS} LIMIT {_STATE_SAMPLE}"
+            ).fetchall()
+            seg = (f"- {DOCS}（资料行）：{n} 行 / {du} 个不同 url / "
+                   f"{dq} 个不同 query / {nb} 行有正文")
+            if samp:
+                seg += "；样本（query → 标题）：" + "；".join(
+                    f"{str(a or '')[:40]} → {str(b or '')[:60]}" for a, b in samp)
+            out.append(seg)
+        finally:
+            con.close()
+    except Exception:
+        pass
+    # ② 事实宽表 web_facts（按 attribute 摊平；列名 = 属性名）
+    try:
+        import duckdb
+        con = duckdb.connect(db, read_only=True)
+        try:
+            cols = [str(r[0]) for r in con.execute(
+                f"PRAGMA table_info('{FACTS}')").fetchall()]
+            n = con.execute(f"SELECT count(*) FROM {FACTS}").fetchone()[0]
+            di = con.execute(
+                f"SELECT count(DISTINCT item) FROM {FACTS}").fetchone()[0]
+            base = {"item", "source_url", "confidence", "confirmed"}
+            site_cols = [c for c in cols if c not in base]
+            seg = (f"- {FACTS}（事实宽表）：{n} 行 / {di} 个不同 item / "
+                   f"{len(cols)} 列（其中 {len(site_cols)} 列是属性列）")
+            if site_cols:
+                seg += ("；属性列名（= 各站点的判定结果与 http 状态码）前 12 个："
+                        + "、".join(site_cols[:12]))
+            ci = con.execute(
+                f"SELECT confirmed, count(*) FROM {FACTS} "
+                f"GROUP BY confirmed").fetchall()
+            if ci:
+                seg += "；confirmed 分布：" + "、".join(
+                    f"{b}={c}" for b, c in ci)
+            samp = con.execute(
+                f"SELECT item FROM {FACTS} LIMIT {_STATE_SAMPLE}").fetchall()
+            if samp:
+                seg += "；item 样本：" + "、".join(str(a or '')[:40] for (a,) in samp)
+            out.append(seg)
+        finally:
+            con.close()
+    except Exception:
+        pass
+    # ③ 账本 web_evidence（EAV；属性名与取值域在这里最全 —— 宽表是 PIVOT 出来的）
+    try:
+        import duckdb
+        con = duckdb.connect(led, read_only=True)
+        try:
+            n = con.execute(f"SELECT count(*) FROM {EVID}").fetchone()[0]
+            da = con.execute(
+                f"SELECT count(DISTINCT attribute) FROM {EVID}").fetchone()[0]
+            vals = con.execute(
+                f"SELECT value, count(*) c FROM {EVID} "
+                f"WHERE value IS NOT NULL AND length(value) <= 30 "
+                f"GROUP BY value ORDER BY c DESC LIMIT 12").fetchall()
+            attrs = con.execute(
+                f"SELECT attribute, count(*) c FROM {EVID} "
+                f"GROUP BY attribute ORDER BY c DESC LIMIT 12").fetchall()
+            seg = (f"- {EVID}（审计账本 EAV）：{n} 行 / {da} 个不同属性")
+            if vals:
+                seg += "；取值域（按出现次数）：" + "、".join(
+                    f"{str(v)[:30]}×{c}" for v, c in vals)
+            if attrs:
+                seg += "；属性（按出现次数）：" + "、".join(
+                    f"{str(a)[:30]}×{c}" for a, c in attrs)
+            out.append(seg)
+        finally:
+            con.close()
+    except Exception:
+        pass
+    return out
+
+
 def save_docs(scene_id: str, query: str, results: list[dict[str, Any]],
               bodies: dict[str, str] | None = None) -> int:
     """原始资料入库（**按 url 去重**：同一个页面只留一行，query 记最后一次）。

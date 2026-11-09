@@ -172,9 +172,10 @@ def main() -> int:
     check("coach 落盘白名单带 tool_line_used",
           "tool_line_used" in _coach_src and "referee_compared" in _coach_src)
 
-    print("== 6. 信息路规划接线（2026-10-29 拍板：先规划、再可达性检查）==")
+    print("== 6. 信息路由接线（2026-11-09 删规划员：改由骨架承担）==")
     src_plan = inspect.getsource(C.consume)
-    check("consume 主流程调用 _plan_routes", "_plan_routes(" in src_plan)
+    check("consume 主流程调用 _plan_from_scaffold",
+          "_plan_from_scaffold(" in src_plan)
     check("对比题 db 半场目标被规划裁剪（「本轮只做 db 半场」）",
           "本轮只做 db 半场" in src_plan and "_solve_task" in src_plan)
     # 「所有问题都应由外部规划去完成」（2026-10-29 用户拍板）：
@@ -187,8 +188,20 @@ def main() -> int:
     _all_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  "..", "voyager_vlml", "consume.py"),
                     encoding="utf-8").read()
-    check("规划员不可用时不碰环境（兜底 planned=False + db=False）",
-          "规划员不可用 → 不碰环境" in _all_src
+    # 2026-11-09：规划员（_plan_routes / _plan_selfcheck）已整体删除 ——
+    # 原版 maieutic 本来就没有「规划员」这层（拆解即骨架），MVE 另设规划员
+    # 与骨架构成第二套分解，实测互相打架（Sherlock 那题规划员判 db:False，
+    # 骨架却写着「在 web_facts 表中查」）。路由改由骨架承担。
+    check("规划员已整体删除（函数不存在 + 源码零调用）",
+          not hasattr(C, "_plan_routes")
+          and not hasattr(C, "_plan_selfcheck")
+          and "_plan_routes(" not in _all_src
+          and "_plan_selfcheck(" not in _all_src)
+    check("路由由骨架承担（source=scaffold）",
+          '"source": "scaffold"' in _all_src
+          and "_plan_from_scaffold" in _all_src)
+    check("没有骨架时不猜题型（planned=False + db=False）",
+          "没有骨架（自由提问/还没建里程碑）→ 不猜题型" in _all_src
           and '"db": False, "web": False' in _all_src)
     check("混合题两半由规划合成（_compose_halves）",
           "_compose_halves(" in src_plan and "库内半场" in src_plan)

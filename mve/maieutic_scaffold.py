@@ -131,6 +131,42 @@ SCAFFOLD_SYSTEM_SOURCE = """
   不许出以它的内容为前提的判断维度。"""
 
 
+# 场景**可用数据源清单**专属约束（2026-11-09，删规划员的配套）。
+#
+# ★ 为什么要有这一段（照原版教师端同构）：
+#   原版 maieutic 的教师端骨架生成 `scaffolding.ts:262 buildScaffoldingUserMessage`
+#   会把 **targetUnit / targetLanguage** 一并告诉骨架生成器 —— 也就是
+#   「这个学生已经学过哪些工具」这条**环境约束**。维度因此**必然**落在
+#   学生够得着的工具上（原版原文：「Tools available: … NOT yet: …」，
+#   并明写「Do NOT include dimensions whose only defensible answer
+#   requires tools the student hasn't learned」）。
+#
+#   MVE 之前把这条**环境约束**漏在了骨架之外，另设了一个「规划员」
+#   （consume.py 的 _plan_routes）去判「这题走 db 还是 web」—— 两套分解，
+#   互相打架：实测 Sherlock 那道题，规划员判 db:False（于是不查库、
+#   只搜网页，搜回一堆应用宝介绍页），而骨架三条维度**明明写着**
+#   「在 web_facts 表中查」—— 骨架已经指认了落点，规划员却把它否掉了。
+#
+#   现在把环境约束**放回骨架生成里**（同原版）：告诉教师端「这个场景
+#   有哪些数据源可用」，维度因此自带落点；消费侧直接读骨架，不再另设
+#   规划员。原版的判据是「维度必须落在学生够得着的工具上」，这里是
+#   「维度必须落在本场景真有的数据源上」。
+SCAFFOLD_SYSTEM_SOURCES = """
+
+【本场景可用数据源清单 —— 维度必须落在下面真实存在的数据源上】
+下面列出这个场景**现在真的能取到**的数据源（每一条都是事实，不是建议）。
+你拆维度时：
+- 每条维度都必须在**至少一个**下列数据源里有落点；哪个数据源答不了它，
+  就**不要**出这条维度（或把维度改写成能被某个数据源直接回答的问法）；
+- 数据源清单里没有的东西，**不许假设它存在**（例如清单里没有
+  「小红书」，就不许出「她在小红书上是否活跃」这种只能靠假设的维度）；
+- 维度问句要写成**能被那个数据源直接回答**的形式：查表的写成
+  「在 X 表中，Y 是多少」，跨站点的写成「该 username 在各站点上的判定
+  结论分别是什么」；
+- **不要**把「去取某个外部来源」本身当成维度，除非那个来源已经取回并
+  落在下面的数据源里（这时写成「已取回的资料里，…」的对照形式）。"""
+
+
 # 原版 curriculum.propose_next_ai_task(max_retries=5)：解析失败不是"这题拆不出来"，
 # 是"这次没拆成"，重发再试。MVE 原先一次失败就降级自由出题 —— 2026-10-31 加了
 # 来源观察面之后（prompt 变长、why 字段变长）更容易撞上输出被截断，实测一次
@@ -443,6 +479,83 @@ def failed_dims(scene_id: str, question: str,
     return failed[:max(1, int(limit))]
 
 
+def scene_sources(question: str, scene_id: str) -> list[str]:
+    """这个场景**现在真的能取到**的数据源清单（事实，不是建议）。
+
+    ★ 这是原版教师端「targetUnit / targetLanguage」的同构物（2026-11-09）：
+      原版 `scaffolding.ts:262 buildScaffoldingUserMessage` 把「这个学生学过
+      哪些工具」告诉骨架生成器，维度因此必然落在够得着的工具上。
+      MVE 同构 = 把「这个场景有哪些数据源」告诉骨架生成器。
+
+    为什么必须有它（删规划员的配套）：此前 MVE 把这条环境约束漏在骨架之外，
+    另设「规划员」判 db/web 两套分解互相打架 —— 实测 Sherlock 那道题规划员
+    判 db:False，而骨架三条维度明明写着「在 web_facts 表中查」。
+
+    事实源全部复用**已有的**观察面（不另造）：
+      · 场景库 → `curriculum_auto.db_observation`（真查表/列/取值）
+      · 取证落点表 → `local_agent._ingest_tables`（web_docs/web_facts/…）
+      · 联网与远端抓手 → `actions` 注册表里 origin=net / origin=mcp 的条目
+    每一项都是**实查**的；查不到就不列（清单里没有 = 本场景真没有）。
+    """
+    out: list[str] = []
+    # ① 场景库（真查）
+    try:
+        import scene_profile as _sp
+        prof = _sp.profile(str(scene_id or "A")) or {}
+        _dp = str(prof.get("db_path") or "")
+        if _dp:
+            from curriculum_auto import db_observation
+            _obs = db_observation(_dp)
+            if _obs:
+                out.append("场景数据源（数据库，只读；下面的表/列是真有的）：\n"
+                           + str(_obs))
+    except Exception:
+        pass
+    # ② 取证落点表（联网资料落库的那几张）—— 给**当前状态**，不给一句过时的话
+    # 「初始是空的」在表早就装满后就是**假信息**（场景 L 实测 web_docs 3796 行
+    # / web_facts 3736 行）。而且必须带**样本**：web_docs 里装的是搜索引擎
+    # 垃圾还是真探测结果，只能让模型自己看样本判断，我们不替它下结论。
+    try:
+        import web_ingest as _wi
+        _stt = _wi.ingest_state(str(scene_id or "A"))
+        if _stt:
+            out.append("取证落点表（联网/远端工具取回的东西落在这里；下面是"
+                       "**此刻的真实状态**：行数 / 属性 / 取值域 / 样本）：\n"
+                       + "\n".join(_stt))
+            out.append("⚠️ 表里装的是**上一次取回**的东西，不等于「现在还成立」；"
+                       "表里没有的，不等于「不存在」（那是真空否定）；"
+                       "要确认现在的情况，得再调一次对应的工具。")
+    except Exception:
+        pass
+    # ③ 联网 / 远端抓手（origin=net / origin=mcp 的条目）
+    try:
+        import actions as _act
+        bucket = getattr(_act, "_REGISTRY", {}).get(str(scene_id or "")) or {}
+        if not bucket:
+            try:
+                _act.restore()
+            except Exception:
+                pass
+            bucket = getattr(_act, "_REGISTRY", {}).get(str(scene_id or "")) or {}
+        _nets = sorted({str(a.name) for a in bucket.values()
+                        if str(getattr(a, "origin", "")) in ("net", "mcp")})
+        if _nets:
+            out.append("联网 / 远端工具（能取到场景外的信息；调它们取回的结果"
+                       "会落进上面的取证落点表）：" + "、".join(_nets[:12]))
+    except Exception:
+        pass
+    # ④ 上传的文件（人给的一次性材料）
+    try:
+        import upload as _upl
+        _mf = str(_upl.uploads_manifest(str(scene_id or "")) or "")
+        if _mf.strip():
+            out.append("用户上传的文件（一次性材料，维度可以指向它）：\n"
+                       + _mf[:1200])
+    except Exception:
+        pass
+    return out
+
+
 def render_material(question: str, scene_id: str, *, extras: str = "",
                     state: dict[str, Any] | None = None) -> str:
     """把「材料」渲染给模型：人问的那句话 + 这个场景现在有什么（复用观测，不另造）。
@@ -516,22 +629,25 @@ def render_material(question: str, scene_id: str, *, extras: str = "",
                 state["snapshot"] = _ss.describe(_snap)
     except Exception:
         pass
-    if extras:
-        lines.append(str(extras))
-    _dp = ""
-    # 数据/SQL 场景：把**真实 DB 观察面**也喂进去，让骨架只拆出有落点的维度
-    # （避免编出库里不存在的业务参数）。场景没有库时 db_path 为空，这一段不触发。
+    # ---- 场景可用数据源清单（2026-11-09，删规划员的配套）----
+    # 原版教师端把「学生学过哪些工具」告诉骨架生成器（scaffolding.ts:262），
+    # 维度因此必然落在够得着的工具上。MVE 同构：告诉它「这个场景有哪些
+    # 数据源」，维度因此自带落点 → 消费侧直接读骨架，不再另设规划员。
     try:
-        import scene_profile as _sp
-        _dp = str((_sp.profile(scene_id) or {}).get("db_path") or "")
-        if _dp:
-            from curriculum_auto import db_observation
-            _obs = db_observation(_dp)
-            if _obs:
-                lines.append("数据库结构（实查，只列真实存在的表/列/取值，"
-                             "维度只能指向这里面的表/列）：\n" + _obs)
+        _srcs = scene_sources(question, scene_id)
+        if _srcs:
+            lines.append("本场景可用数据源（实查；维度只能落在这些上面）：\n"
+                         + "\n".join(_srcs))
+            if state is not None:
+                state["sources"] = len(_srcs)
     except Exception:
         pass
+    if extras:
+        lines.append(str(extras))
+    # ⚠️ 这里**不再**再拼一次 db_observation（2026-11-09 修）：
+    # 库结构已经由上面的 scene_sources ① 给过了。原来两处都拼 →
+    # 场景 L（web_facts 910 列）同一份观察面出现**两次** = 114k 字符，
+    # 骨架 prompt 直接被撑爆，模型看不到人导入的那句话。
     return "\n".join(lines)
 
 
@@ -580,9 +696,13 @@ def scaffold(question: str, scene_id: str = "A", *, llm: Callable | None = None,
     _st: dict[str, Any] = {}
     _material = render_material(q, scene_id, extras=extras, state=_st)
     system_content = SCAFFOLD_SYSTEM + (SCAFFOLD_SYSTEM_DB if db_path else "") \
-        + (SCAFFOLD_SYSTEM_SOURCE if _st.get("snapshot") else "")
+        + (SCAFFOLD_SYSTEM_SOURCE if _st.get("snapshot") else "") \
+        + (SCAFFOLD_SYSTEM_SOURCES if _st.get("sources") else "")
     if _st.get("snapshot"):
         print(f"  · 拆骨架前先看来源观察面：{_st['snapshot']}", flush=True)
+    if _st.get("sources"):
+        print(f"  · 拆骨架前先看场景可用数据源（{_st['sources']} 组）",
+              flush=True)
     if _st.get("failed"):
         print(f"  · 拆骨架前带上失败账：{_st['failed']} 条试过没做成的"
               "（原版 Failed tasks that are too hard）", flush=True)

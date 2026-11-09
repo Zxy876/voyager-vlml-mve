@@ -74,16 +74,34 @@ def _consume_timeout(n_skills: int) -> float:
     **真实的联网/MCP 取数**（一次 web_search 5~20s），命中的题一次要串行合成
     5 条技能 —— 30s 把整次重放判死：trace 里 5 条技能全进了、一条都没跑回来，
     面板显示「工具 0 次 · 0 行 / 取到真空」，掌握度（只认消费侧成功取数）
-    自然一次都不涨。预算 = 30s 基础 + 每条技能 25s，封顶 180s；
-    env `MVE_CONSUME_TIMEOUT` 可整体覆盖（下限仍 30s）。
+    自然一次都不涨。
+
+    ★ 下限必须是 **90s**（2026-11-09 服务器实测根因）：本地没有已学技能时
+    n_skills=0，旧公式给的是 30s —— 而**单次 MCP 调用本身就要 30s 以上**：
+      · MCP 客户端单次上限 60s（local_agent.py:1140 `cfut.result(timeout=60)`）；
+      · Sherlock 全量 481 站实测 **30.15s**（服务器 `sherlock_lookup('ce')`）；
+      · 工具自身 deadline 默认 50s（mcp_sherlock_server.py:304）。
+    于是「0 条技能 → 30s」这条**最穷的路径恰好是最需要 MCP 的路径**
+    （没学过才现场调工具），预算**倒挂**在外层墙钟上：外层 30s 先爆，
+    内层 MCP 还在等 → 报「执行超时（>30s）」，模型调对了工具也白调
+    （2026-11-09 实测：模型确实调了 `mcp_sherlock_lookup_username`，
+    trajectory 里有记录，就是等不到返回）。
+
+    这与学习侧 `EXEC_TIMEOUT = 90` 是同一条铁律：**外层墙钟必须 > MCP 单次
+    上限**（HANDOFF.md 已记：「外层墙钟 90s > MCP 60s」）。旧公式把下限
+    压在 30s，是消费侧与学习侧的口径不一致 —— 现在统一到 90s。
+
+    预算 = 90s 基础 + 每条技能 25s，封顶 180s；
+    env `MVE_CONSUME_TIMEOUT` 可整体覆盖（下限同样 90s，别让人把它调回
+    比 MCP 单次上限还小 —— 那正是本 bug 的形态）。
     """
     env = os.environ.get("MVE_CONSUME_TIMEOUT")
     if env:
         try:
-            return max(30.0, float(env))
+            return max(90.0, float(env))
         except ValueError:
             pass
-    return min(180.0, 30.0 + 25.0 * max(0, int(n_skills or 0)))
+    return min(180.0, 90.0 + 25.0 * max(0, int(n_skills or 0)))
 
 from voyager_vlml.agents.action import VLMLActionAgent  # noqa: E402
 from voyager_vlml.agents.critic import has_real_data  # noqa: E402
@@ -1212,6 +1230,154 @@ def _compose_halves(question: str, db_part: str, web_part: str) -> str:
         return ""
 
 
+async def _tool_line_mcp(question: str, scene_id: str = "") -> dict[str, Any]:
+    """工具线的 **MCP 抓手**：先问远端工具能不能直接答，答得了就别搜网页。
+
+    ★ 为什么必须有这一步（2026-11-09 服务器实测根因）：
+      规划层把「某用户名在跨平台网站上的账号存在性」明确判为 **web 路**
+      （`_plan_routes` 的菜单里就写着「Sherlock 站点规格探测，可读」），
+      可达性检查 `_web_reachable` 也认 origin=mcp 的远端工具。
+      但**执行层的工具线只有 net_tools.web_search/web_fetch**
+      —— MCP 抓手完全够不着 → 模型搜「Sherlock 工具」→ 搜回一堆
+      应用宝/介绍文章 → grounded=false → 如实不答（2026-11-09 实测：
+      工具线取回的唯一来源是「跑跑app-应用宝官网」，与题目毫无关系）。
+
+      这就是**规划层与执行层的接缝断了**：规划说「这条路能走」，
+      执行层却只有另一条路。修法不是加门槛，是把执行层缺的抓手补上。
+
+    口径与工具线一致（铁律不动）：
+      · 结果仍算 **claim**（时变数据，未经库内验证）→ 不入技能库、
+        不计学习曲线；
+      · 工具报错/取不到数 → **如实不答**，绝不退回编造；
+      · 「没问到」≠「不存在」：MCP 返回的 blocked（WAF 挡住）如实带出去。
+
+    认**返回形状**不认工具名（同 web_ingest_learning 的口径）：新增原语族
+    零改动 —— 只要返回的是 dict 且带站点/账号类字段，就当结构化探测结果。
+    """
+    out: dict[str, Any] = {"used": False, "answer": "", "sources": [],
+                           "note": "", "mcp_tool": ""}
+    if not scene_id:
+        return out
+    try:
+        import local_agent as _la
+        specs = _la._mcp_tool_specs()
+    except Exception:
+        return out
+    if not specs:
+        return out
+    # ★ 结构化挑选（同 _pick_mcp_tool，不打分）：题面字面点到哪个工具/
+    # 哪个 server 就是它；点不到就**不硬塞**一个工具进来。
+    try:
+        import local_agent as _la
+        tid = _la._pick_mcp_tool(question, specs)
+    except Exception:
+        tid = ""
+    if not tid:
+        # 题面没点名工具 → 但库里可能有**唯一**一个结构化探测类远端工具
+        # （如 sherlock）。这时用「能不能直接答这题」来判：工具自己的
+        # description 声明了适用场景，交给模型读（不自己发明打分）。
+        for _tid, _sp in specs.items():
+            _d = str(_sp.get("desc") or "")
+            if any(_k in _d for _k in ("账号", "用户名", "站点", "注册")):
+                tid = _tid
+                break
+    if not tid:
+        return out
+    spec = specs.get(tid) or {}
+    schema = spec.get("schema") or {}
+    props = schema.get("properties") or {}
+    required = set(schema.get("required") or [])
+    if not required:
+        return out
+    # 参数从题面里取：只认**明确出现在题面里的字面值**（不猜、不编）。
+    # 取不到 → 如实不调（宁可不答，也不传一个瞎猜的用户名）。
+    args: dict[str, Any] = {}
+    _q = str(question or "")
+    for _p in sorted(required):
+        _pi = (props.get(_p) or {})
+        if _pi.get("type") == "string":
+            _m = re.search(rf"[`\"'\u201c]([A-Za-z0-9_.\-]+)[`\"'\u201d]", _q)
+            if not _m:
+                _m = re.search(rf"(?:username|名称|账号|用户)\s*[=:：是为]\s*"
+                               rf"([A-Za-z0-9_.\-]+)", _q, re.I)
+            if not _m:
+                return out
+            args[_p] = _m.group(1)
+        elif _pi.get("type") == "number":
+            continue
+        else:
+            return out
+    if not args:
+        return out
+    try:
+        import mcp_gateway
+        gw = mcp_gateway.get_gateway()
+        payload = await gw.call(tid, scene_id, **args)
+    except Exception as e:
+        out["note"] = (f"MCP 抓手 {tid} 调用失败：{type(e).__name__}: "
+                       f"{str(e)[:140]}")
+        return out
+    try:
+        from local_agent import _unwrap_mcp as _uw
+        data = _uw(payload)
+    except Exception as e:
+        out["note"] = f"MCP 抓手 {tid} 返回无法解读：{type(e).__name__}: {str(e)[:140]}"
+        return out
+    if not isinstance(data, dict):
+        out["note"] = f"MCP 抓手 {tid} 没返回结构化结果"
+        return out
+    # 结构化探测结果 → 材料（模型据此组织答案）
+    try:
+        _txt = json.dumps(data, ensure_ascii=False, indent=1)
+    except Exception:
+        _txt = str(data)
+    if len(_txt) > 9000:
+        _txt = _txt[:9000] + " …（已截断）"
+    try:
+        cj = chat_json(
+            [{"role": "system",
+              "content": ("你根据远端工具取回的结构化结果回答问题。铁律："
+                          "**只依据取回的结果**；结果里没有的写「探测结果未提及」；"
+                          "绝不编造账号、链接或状态码。"
+                          "⚠️ blocked/WAF 挡住表示「没问到」，**不是**「不存在」。"
+                          "只返回 JSON："
+                          '{"answer": "基于探测结果的回答", '
+                          '"grounded": true/false}')},
+             {"role": "user",
+              "content": f"问题：{question}\n\n工具：{tid}\n"
+                         f"参数：{json.dumps(args, ensure_ascii=False)}\n\n"
+                         f"探测结果：\n{_txt}"}],
+            temperature=0.0)
+        ans = str((cj or {}).get("answer") or "").strip()
+    except Exception as e:
+        out["note"] = f"MCP 结果综合失败：{type(e).__name__}: {str(e)[:140]}"
+        return out
+    out["mcp_tool"] = tid
+    if not ans:
+        out["note"] = f"MCP 抓手 {tid} 的结果不足以回答"
+        return out
+    if not bool((cj or {}).get("grounded", True)):
+        out["note"] = "探测结果不足以回答（grounded=false，如实不答）"
+        out["sources"] = [{"title": f"{tid} 探测结果", "url": ""}]
+        return out
+    out["used"] = True
+    out["answer"] = ans
+    out["sources"] = [{"title": f"{tid} 探测结果", "url": ""}]
+    # 落库口径与工具线一致：claim（confirmed=False），时变数据不入能力账。
+    try:
+        if scene_id:
+            import web_ingest
+            web_ingest.save_evidence(
+                scene_id,
+                [{"item": question[:200], "attribute": "claim",
+                  "value": ans[:200], "source_title": tid,
+                  "source_url": "", "confidence": 0.5, "confirmed": False}],
+                question=question, method="web")
+    except Exception:
+        pass
+    return out
+
+
 async def _tool_line_fallback(question: str, context: str = "",
                               scene_id: str = "") -> dict[str, Any]:
     """工具线兜底（第 4 步，DeepSeek 消费同构）：库场景答不出 → 联网取公开
@@ -1219,6 +1385,10 @@ async def _tool_line_fallback(question: str, context: str = "",
 
     同构依据：DeepSeek 客户端消费架构 = 按需拉能力；MVE 库场景此前
     「消费不接 MCP」（consume.py 场景库形态注释）是联网唯一真缺口。
+
+    ★ 先问 MCP 抓手（2026-11-09 实测）：题面点名远端工具时，先调那个工具
+    —— 搜索引擎**答不了**「这个用户名在哪些平台上被注册」这种问题
+    （实测搜回来的全是工具介绍文章）。见 `_tool_line_mcp`。
 
     claim 口径铁律（2026-10-28 拍板）：
       · 联网取回的是 **claim**（有真值但未知）—— 答案必须带「工具线 claim」
@@ -1228,11 +1398,22 @@ async def _tool_line_fallback(question: str, context: str = "",
       · 联网失败**不是"答一个像样的"**：没取到内容就如实报 note，绝不编造
         （与 net_tools「取不到就如实抛错」同一条铁律）。
     """
-    out: dict[str, Any] = {"used": False, "answer": "", "sources": [], "note": ""}
+    out: dict[str, Any] = {"used": False, "answer": "", "sources": [],
+                            "note": ""}
+    # ① MCP 抓手优先（能直接答就别搜网页）
+    try:
+        _mcp = await _tool_line_mcp(question, scene_id=scene_id)
+    except Exception as e:
+        _mcp = {"used": False, "answer": "", "sources": [],
+                "note": f"MCP 抓手尝试失败：{type(e).__name__}: {str(e)[:140]}"}
+    if _mcp.get("used"):
+        return _mcp
     try:
         import net_tools
     except Exception as e:
         out["note"] = f"联网原语不可用：{type(e).__name__}: {e}"
+        if _mcp.get("note"):
+            out["note"] += f"（MCP 抓手也没成：{_mcp['note']}）"
         return out
     import asyncio as _aio
 
@@ -1465,40 +1646,27 @@ async def consume(
         _fail_block = _failures.recall_block(_scene_id, question)
     except Exception:
         _fail_block = ""
+    # ---- 信息路由由**骨架**承担（2026-11-09，删规划员）----
+    # 原版 maieutic 本来就没有规划员这一层：拆解即骨架（拆完逐条闭合）。
+    # MVE 此前另设规划员判 db/web —— 与骨架构成第二套分解，实测互相打架
+    # （Sherlock 那题规划员判 db:False，骨架却写着「在 web_facts 表中查」）。
+    # 现在只读骨架：维度落在哪个数据源上，就走哪条路。
     try:
-        _plan = _plan_routes(question, scene_id=_scene_id,
-                             has_file=bool(_file_ctx),
-                             scene_tables=_scene_tables,
-                             fail_block=_fail_block)
+        _plan = _plan_from_scaffold(question, scene_id=_scene_id,
+                                     has_file=bool(_file_ctx),
+                                     scene_tables=_scene_tables)
     except Exception:
-        _plan = {}
-    # ---- 理解层自检（2026-10-29 用户拍板「搬」②）：规划错了就地换路一次，
-    # 别把「路线分错」留给用户用眼睛发现。判错了也进失败账（下次规划直接看到）。
-    if _plan.get("planned"):
-        try:
-            _sc = _plan_selfcheck(question, _plan, scene_tables=_scene_tables)
-            if not _sc["ok"] and _sc["fix"]:
-                _old_why = str(_plan.get("why") or "")
-                _plan = {**_plan, **_sc["fix"],
-                         "why": (f"自检改路：{_sc['why']}"
-                                 f"（原规划：{_old_why}）")[:200]}
-                try:
-                    _failures.record(_scene_id, question,
-                                     f"路线规划错了（自检改路）：{_sc['why']}",
-                                     "plan")
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        _plan = {"db": False, "web": False, "file": bool(_file_ctx),
+                 "infer": True, "planned": False, "source": "none",
+                 "why": "骨架路由不可用 → 不猜题型，只做模型推断"}
 
-    # ---- 规划门控（2026-10-29 用户拍板「所有问题都应由外部规划去完成」）----
-    # 走不走环境**只**由规划决定。词表已删（它是硬编码路由：把「待遇好不好」
-    # 判成非数据题 → db 半场直接跳过、0 行收场，实测）。规划员不可用
-    # （planned=False）→ 兜底也不碰环境（不猜题型），只做模型推断并如实标注。
+    # ---- 路由门控（骨架承担后的口径）----
+    # 走不走环境由**骨架**决定。骨架里没有维度落点 → 不碰环境、不联网，
+    # 只做模型推断并如实标注（原版「没拆解就不执行计划外动作」同向）。
     _use_env = bool(_plan.get("db")) if _plan.get("planned") else False
-    # 对话页联网开关（DeepSeek 同构，2026-10-29）：开关关 = 规划里的 web 步
-    # 不执行（计划照旧显示，执行层如实交代）；开关开 = 仍要过可达性检查。
-    # None = 没带开关（旧客户端/CLI）→ 按规划执行。
+    # 对话页联网开关（DeepSeek 同构，2026-10-29）：开关关 = web 步不执行
+    # （骨架照旧显示，执行层如实交代）；开关开 = 仍要过可达性检查。
+    # None = 没带开关（旧客户端/CLI）→ 按骨架执行。
     if web_allowed is False and _plan.get("web"):
         _plan = dict(_plan)
         _plan["web"] = False
@@ -4052,20 +4220,6 @@ def _fits_judge(question: str, sql: str, data: Any,
 
 
 
-_PLAN_SYSTEM = (
-    "你是信息路规划员（斯坦福 Generative Agents 的「先规划、再可达性检查」"
-    "同构）。给你一道题和本场景的**信息路菜单**，规划这道题需要哪几路信息"
-    "（可多选）。判断口径：\n"
-    "- 题面的量能从场景数据源/已学技能算出来（口径能指认到真实表/列）→ db；\n"
-    "- 题面要**场景之外**的信息（外部对比基准、时变行情、公开数据）→ web；"
-    "内部与外部混合的对比题 → db 和 web 都选；\n"
-    "- 用户上传的文件能提供答案或部分答案 → file；\n"
-    "- 纯概念/方法/观点解释，不需要任何取数 → infer。\n"
-    "web 只是「规划里有这一步」，不代表可达 —— 可达性执行时另核。\n"
-    "只输出 JSON：{\"db\": bool, \"web\": bool, \"file\": bool, \"infer\": bool, "
-    "\"why\": \"一句话\"}")
-
-
 def _web_reachable(scene_id: str) -> tuple[bool, str]:
     """联网步骤的可达性检查（斯坦福 Generative Agents 同构：计划里的动作
     要对真实环境核 —— 世界上没有的东西，计划就得修订）。
@@ -4115,123 +4269,133 @@ def _web_reachable(scene_id: str) -> tuple[bool, str]:
         return False, f"{type(e).__name__}: {e}"
 
 
-def _plan_routes(question: str, *, scene_id: str, has_file: bool,
-                 scene_tables: list[str] | None = None,
-                 fail_block: str = "") -> dict[str, Any]:
-    """信息路规划：先让模型对着**能力菜单**规划这道题要哪几路，再逐路执行。
+def _plan_from_scaffold(question: str, *, scene_id: str, has_file: bool,
+                        scene_tables: list[str] | None = None,
+                        ) -> dict[str, Any]:
+    """信息路**由骨架承担**（2026-11-09，删规划员）。
 
-    斯坦福 Generative Agents 同构（用户 2026-10-29 拍板）：规划先行，执行
-    时逐步做可达性检查；DeepSeek V3.2 同构：工具菜单外挂给模型、模型自主
-    规划。菜单是事实（当前有什么），不是路由词表（词表是猜）。
-    规划 ≠ 可达：web 路执行时还要过 `_web_reachable`（工具开关核不核得上）
-    —— 两步分开，不可达就如实修订计划。
-    LLM 不可用 → 按旧词表兜底（安全方向：行为退回现状，不会更差）。
-    `fail_block`：失败经验账（failures.recall_block）—— 本场景类似问题
-    上次犯过的错，注入让规划员别再踩同一个坑（R1 判词回灌的落点）。
+    ★ 为什么删掉规划员（用户 2026-11-09 拍板）：
+      「既然我们人导入输入会拆骨架，其实没有必要安排规划员」——
+      原版 maieutic **本来就没有规划员这一层**：
+      `docs/maieutic-外包课程规划.md:49` 记的原版口径是
+      `inference(task=…)` → `decompose_task` 拆子目标 → 逐个闭合，
+      **拆解本身就是骨架**。MVE 此前在骨架之外另设了一个「规划员」
+      （`_plan_routes`）判 db/web/file/infer —— 那是**第二套分解**，
+      两套分解互相打架：实测 2026-11-09 场景 L 的 Sherlock 题，
+      规划员判 `db:False`（于是不检索技能、不查场景库，只搜网页），
+      而同一题的三条骨架维度**明明写着**「在 web_facts 表中查」。
+
+    ★ 骨架凭什么能承担路由（原版同构的依据）：
+      原版教师端 `scaffolding.ts:262 buildScaffoldingUserMessage` 把
+      **targetUnit / targetLanguage** 一并告诉骨架生成器 —— 也就是
+      「这个学生学过哪些工具」这条**环境约束**，维度因此必然落在
+      够得着的工具上。MVE 同构 = 骨架生成时看得见「本场景有哪些
+      数据源」（`maieutic_scaffold.scene_sources`），维度因此**自带落点**。
+
+    ★ 判据是「维度落在哪个数据源上」，不是词表：
+      路由从骨架维度的**落点**推出来 —— 维度问句点名了本场景真有的
+      表/列 → db；指名要跨来源/跨站点核对 → web；落在上传材料上 →
+      file；全部维度都不需要取数 → infer。
+      判据**只用骨架与场景实况**，不猜题型、不写关键词表。
+
+    没有骨架（自由提问、没建里程碑）→ **如实不猜**：不碰环境、不联网，
+    只做模型推断并如实标注（与原版「没规划就不执行计划外动作」同向）。
     """
+    out: dict[str, Any] = {"db": False, "web": False, "file": bool(has_file),
+                           "infer": True, "why": "", "planned": False,
+                           "source": "none"}
+    # ---- 读骨架（只读，不调 LLM；没有就是没有）----
+    dims: list[dict[str, Any]] = []
     try:
-        _cat = _scene_skill_catalog(scene_id)[0][:1200]
+        import maieutic_scaffold as _ms
+        dims = list(_ms.milestone_dimensions(scene_id, question) or [])
     except Exception:
-        _cat = ""
-    # 规划员不可用时的兜底（2026-10-29 用户拍板「不应该有词表」）：
-    # 不猜题型 —— 不碰环境、不联网，只走模型推断并如实标注。这是「没有
-    # 规划就不执行计划外动作」的安全方向；词表这条路由已删，不再复活。
-    _fallback = {"db": False, "web": False, "file": bool(has_file),
-                 "infer": True,
-                 "why": "规划员不可用 → 不碰环境、不联网，只做模型推断",
-                 "planned": False}
-    try:
-        cj = chat_json(
-            [{"role": "system", "content": _PLAN_SYSTEM},
-             {"role": "user", "content": (
-                 f"题面：{question}\n\n"
-                 f"信息路菜单：\n"
-                 f"- db：场景数据源/已学技能（"
-                 f"{'有表：' + '、'.join((scene_tables or [])[:6]) if (scene_tables or []) else '当前没有表'}）\n"
-                 f"- web：场景**外**的信息（外部对比基准/时变行情/公开数据，"
-                 f"GitHub 公开仓库可读：owner/repo，"
-                 f"**某用户名在跨平台网站上的账号存在性/主页链接/状态码"
-                 f"（Sherlock 站点规格探测，可读）**）"
-                 f"—— 规划里允许有这一步，可达性执行时另核\n"
-                 f"- file：用户上传的文件"
-                 f"{'（本次检测到上传）' if has_file else '（本次没有上传）'}\n"
-                 f"- infer：概念/方法解释，不需要任何取数\n\n"
-                 + (f"已学技能目录（库内已被验证可算的方法）：\n{_cat}\n\n"
-                    if _cat else "")
-                 + (fail_block + "\n\n" if fail_block else "")
-                 + "这道题需要哪几路？只输出 JSON。")}],
-            temperature=0.0)
-    except Exception:
-        return _fallback
-    if not isinstance(cj, dict):
-        return _fallback
-    out: dict[str, Any] = {}
-    for k in ("db", "web", "file", "infer"):
-        v = cj.get(k)
-        out[k] = (bool(v) if isinstance(v, bool)
-                  else str(v).strip().lower() in ("true", "1", "yes"))
-    if not any(out.values()):
-        return _fallback
-    out["why"] = str(cj.get("why") or "")[:160]
+        dims = []
+    if not dims:
+        out["why"] = ("没有骨架（自由提问/还没建里程碑）→ 不猜题型："
+                      "不碰环境、不联网，只做模型推断")
+        return out
+
+    # ---- 逐维度判落点 → 汇总成信息路 ----
+    db_hits: list[str] = []
+    web_hits: list[str] = []
+    file_hits: list[str] = []
+    for d in dims:
+        _q = str((d or {}).get("question") or "")
+        _why = str((d or {}).get("why") or "")
+        _blob = f"{_q} {_why}"
+        # db：维度点名了本场景真有的表/列（表名在场景实况里能对上）
+        if _mentions_scene_table(_blob, scene_tables):
+            db_hits.append(_q)
+            continue
+        # file：维度指向用户上传的材料
+        if has_file and _mentions_upload(_blob):
+            file_hits.append(_q)
+            continue
+        # web：维度要跨来源/跨站点核对
+        if _mentions_external(_blob):
+            web_hits.append(_q)
+            continue
+        # 其余：概念/解释类（不需要取数）
+    out["db"] = bool(db_hits)
+    out["web"] = bool(web_hits)
+    out["file"] = bool(file_hits or has_file)
+    out["infer"] = not (db_hits or web_hits or file_hits)
     out["planned"] = True
+    out["source"] = "scaffold"
+    _why_txt = []
+    if db_hits:
+        _why_txt.append(f"库内 {len(db_hits)} 条（骨架维度落在场景库表/列上）")
+    if web_hits:
+        _why_txt.append(f"场景外 {len(web_hits)} 条（骨架维度要跨来源核对）")
+    if file_hits:
+        _why_txt.append(f"上传材料 {len(file_hits)} 条")
+    if out["infer"]:
+        _why_txt.append("无需取数（概念/解释类）")
+    out["why"] = ("骨架承担路由（照原版：拆解即骨架，无独立规划层）："
+                  + "；".join(_why_txt))
+    out["dims"] = dims
     return out
 
 
-def _plan_selfcheck(question: str, plan: dict[str, Any],
-                    scene_tables: list[str] | None = None) -> dict[str, Any]:
-    """理解层自检（2026-10-29 用户拍板「搬」②：补 a 层失败不可见的缺口）。
+def _mentions_scene_table(blob: str, scene_tables: list[str] | None) -> bool:
+    """维度问句/理由里点名了本场景**真有的**表或列吗？
 
-    规划员把题路分错（该走 db 的走了 claim、评价题只给了 infer）在旧链路
-    上**没有任何判定** —— 只能靠用户用眼睛发现。这里在规划产出后加一次
-    **独立小问**（同 _scope_check 模式：独立小问才不会被主规划的脚步带走）：
-    只问「题面要的是什么、选的路对不对」，错了给出修正后的路。
-
-    返回 {"ok": bool, "fix": {db,web,file,infer}, "why": str}。
-    自检挂了/格式不对 → ok=True 照旧（自检是增强不是依赖，绝不挡路）。
+    判据只用场景实况（实查到的表名）与维度文本的**字面包含** ——
+    不猜题型、不写关键词表（项目铁律）。认不出就返回 False（如实不归 db）。
     """
-    try:
-        cj = chat_json(
-            [{"role": "system", "content": (
-                "你是复核员。给你一个用户问题和对它的执行路线规划"
-                "（db=查场景数据库/已学技能；web=联网取场景外的信息；"
-                "file=读用户上传的文件；infer=纯概念解释不取数）。"
-                "判断规划是否匹配问题的真实意图：\n"
-                "· 问数/算账/统计（「多少钱」「平均」「哪家高」）→ 至少要 db"
-                "（库里有表）或 file（有上传）或 web（库确实没有这类数据）；\n"
-                "· 主观评价（「好不好」「怎么样」）→ 常常要 db+web 两路"
-                "（库内事实 + 外部基准），**只给 infer 是错的**；\n"
-                "· 时变信息（天气/汇率/行情）→ web；\n"
-                "· 纯概念解释（「什么是 X」）→ infer 就够。\n"
-                '只返回 JSON：{"ok": true/false, '
-                '"fix": {"db": bool, "web": bool, "file": bool, "infer": bool}, '
-                '"why": "一句话理由"}。规划本来就对就 ok=true（fix 可空）。'
-                "不要因为问题措辞口语就降低标准。")},
-             {"role": "user", "content": (
-                 f"问题：{question}\n"
-                 f"场景数据源："
-                 f"{'有表：' + '、'.join((scene_tables or [])[:6]) if (scene_tables or []) else '当前没有表'}\n"
-                 f"规划：db={bool(plan.get('db'))}, web={bool(plan.get('web'))}, "
-                 f"file={bool(plan.get('file'))}, infer={bool(plan.get('infer'))}"
-                 f"（规划理由：{str(plan.get('why') or '')[:120]}）\n"
-                 "这份规划对吗？")}],
-            temperature=0.0)
-    except Exception as e:
-        return {"ok": True, "fix": {}, "why": f"自检不可用（{type(e).__name__}）—— 照旧"}
-    if not isinstance(cj, dict):
-        return {"ok": True, "fix": {}, "why": "自检返回异常 —— 照旧"}
-    ok = cj.get("ok")
-    ok = bool(ok) if isinstance(ok, bool) else str(ok).strip().lower() in ("true", "1", "yes")
-    fix: dict[str, Any] = {}
-    f = cj.get("fix")
-    if isinstance(f, dict):
-        for k in ("db", "web", "file", "infer"):
-            v = f.get(k)
-            fix[k] = (bool(v) if isinstance(v, bool)
-                      else str(v).strip().lower() in ("true", "1", "yes"))
-        if not any(fix.values()):
-            fix = {}          # 修出全 False 的路 = 修坏了，不采信
-    return {"ok": ok, "fix": fix,
-            "why": str(cj.get("why") or "")[:160]}
+    _b = str(blob or "")
+    if not _b:
+        return False
+    for t in (scene_tables or []):
+        _t = str(t or "").strip()
+        if _t and _t in _b:
+            return True
+    return False
+
+
+def _mentions_upload(blob: str) -> bool:
+    """维度指向用户上传的材料吗（字面判据）。"""
+    _b = str(blob or "")
+    for _k in ("上传", "附件", "文件里", "文档中", "上传的文件"):
+        if _k in _b:
+            return True
+    return False
+
+
+def _mentions_external(blob: str) -> bool:
+    """维度要跨来源/跨站点核对吗（字面判据）？
+
+    这里判的是「这个维度需要场景外的信息」，不是「这题属于哪一类」。
+    认的是**取数形态**的词（哪些站点、在平台上、公开页面、账号是否注册…），
+    命中就归 web 路 —— 归错的后果是「多走一条路」，不是「编答案」。
+    """
+    _b = str(blob or "")
+    for _k in ("站点", "平台", "跨", "外部", "公开", "主页", "账号是否",
+               "注册", "在哪", "外网", "互联网", "跨平台"):
+        if _k in _b:
+            return True
+    return False
 
 
 def _inference_answer(question: str, context: str = "") -> dict[str, Any]:
