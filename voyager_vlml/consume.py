@@ -1559,12 +1559,18 @@ async def consume(
     env: VLMLMCPEnv | None = None,
     web_allowed: bool | None = None,
     history: list[dict[str, str]] | None = None,
-    auto_learn: bool = True,
 ) -> dict[str, Any]:
     # ⚠️ 环境**延迟创建**：下面按场景后果判断要不要 VLML。非 VLML 场景
     # （用户 2026-10-19：「别的场景下，voyager 的学习和 VLML 没有关系」）
     # 连 `VLMLMCPEnv()` 都不该构造 —— 它的构造会引导 vlml_env（chdir + 打
     # duckdb 补丁 + 指向 rib），那已经是「碰 VLML」了。
+    #
+    # ⚠️ `auto_learn` 参数已删（2026-11-09 用户指令「不要回访了，也不要排队」）：
+    #   它唯一的用途是「回访重答时不许再拉学习」（防回访↔学习互相触发转圈）。
+    #   排队+回访整套拆掉后，这个门控没有意义 → 参数一并删掉，不留死参数。
+    #   现在「没答出来 → 拉起学习」是**单向**的：拉起就完了，学完**不**自动
+    #   回头重答；人再问同一句（或换个问法）时，由**会话召回 + 已验答案披露**
+    #   给出结果（第三刀）—— 披露是原样交出学习侧验过的答案，不必重跑一遍。
 
     # 当前场景：人导入的问题归属哪个命名空间（1→n 泛化）。
     # 取不到就按默认 A —— 但**必须取**，否则整条消费线没有场景归属，
@@ -2557,17 +2563,17 @@ async def consume(
                                   "**不重复派任务**（重复派 = 重复拆骨架）"
                                   + (f"；未闭合维度：{', '.join(_unclosed[:4])}"
                                      if _unclosed else ""))}
-        elif data is None and _use_env and not auto_learn:
-            # 回访模式（2026-10-29）：重试排队问题时**不再**连环拉学习 ——
-            # 否则回访失败又起一轮学习，回访↔学习互相触发转圈烧钱。
-            learn_kick = {"kicked": False, "manual": True,
-                          "why": "自动回访：本轮失败不拉学习（由学习侧收尾"
-                                 "统一回访，见 revisit.py）"}
         elif data is None and _use_env:
             # 自动拉起学习（2026-10-28 用户改设计，原 2026-10-19「只人工触发」
             # 作废）：「发送新的对话内容，就顺带拉取一个新的学习流程」—— 同构
             # R1「答不了就进入思考」：MVE 答不了数据题就**进入学习**，回复里
             # 明说「正在学」。kick_learning 自带同题去重，不怕连问。
+            #
+            # ⚠️ **不再排队**（2026-11-09 用户指令：「不要回访了，也不要排队，
+            #   会搞乱掉」）。原来这里会 mark_pending 把题塞进 revisit 队列，
+            #   等学习学完再自动重答一遍 —— 那套已整套删掉（见 revisit.py 移除）。
+            #   现在这条链是**单向**的：拉起学习 → 人自己再问；
+            #   再问时走**会话召回 + 披露**（第三刀），不重跑。
             try:
                 import learn_orchestrate as _lo2
                 _kk = _lo2.kick_learning(
@@ -2580,15 +2586,6 @@ async def consume(
                             if _kk.get("kicked") else
                             f"自动学习没拉起：{_kk.get('why') or '未知'}——"
                             "可在驾驶舱 ▶ 启动 Voyager 人工触发")}
-                if _kk.get("kicked"):
-                    # 排进回访队列（2026-10-29 用户拍板「学好了自动重答」）：
-                    # 学习轮真学出东西时，revisit 会自动重答这一句，人不用
-                    # 自己回来重问/调试。
-                    try:
-                        import revisit as _rv
-                        _rv.mark_pending(_scene_id, question)
-                    except Exception:
-                        pass
             except Exception as _ke:
                 learn_kick = {"kicked": False, "manual": True,
                               "why": f"自动学习拉起失败：{type(_ke).__name__}: {_ke}"}
@@ -3181,11 +3178,9 @@ async def consume(
     if not real_calls:
         # 自动拉起学习（2026-10-28 用户改设计，与场景分支同款）：答不了数据题
         # 就**进入学习**（同构 R1「答不了就进入思考」），回复里明说「正在学」。
-        if _use_env and not auto_learn:
-            learn_kick = {"kicked": False, "manual": True,
-                          "why": "自动回访：本轮失败不拉学习（由学习侧收尾"
-                                 "统一回访，见 revisit.py）"}
-        elif _use_env:
+        if _use_env:
+            # ⚠️ **不再排队**（2026-11-09 用户指令）—— 同上，这里原来会
+            #   mark_pending 塞进回访队列，等学习完自动重答。整套已删。
             try:
                 import learn_orchestrate as _lo3
                 _kk = _lo3.kick_learning(
@@ -3197,12 +3192,6 @@ async def consume(
                     "why": ("已自动拉起后台学习（学完再问同一句即可复用）"
                             if _kk.get("kicked") else
                             f"自动学习没拉起：{_kk.get('why') or '未知'}")}
-                if _kk.get("kicked"):
-                    try:
-                        import revisit as _rv2
-                        _rv2.mark_pending(_scene_id, question)
-                    except Exception:
-                        pass
             except Exception as _ke2:
                 learn_kick = {"kicked": False, "manual": True,
                               "why": f"自动学习拉起失败：{type(_ke2).__name__}: {_ke2}"}
