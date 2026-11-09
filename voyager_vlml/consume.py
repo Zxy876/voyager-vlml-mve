@@ -2379,7 +2379,8 @@ async def consume(
                     _bind_ok, _bind_why = _source_binding_gate(
                         question, evidence,
                         str((_prof or {}).get("db_path") or ""),
-                        dims=list(_plan.get("dims") or []))
+                        dims=list(_plan.get("dims") or []),
+                        scene_id=str(_scene_id or ""))
                     if not _bind_ok:
                         data = None
                         reuse_errors.append(
@@ -4600,6 +4601,7 @@ def _file_names(scene_id: str) -> list[str]:
 def _source_binding_gate(question: str, evidence: list[dict[str, Any]] | None,
                          db_path: str, *,
                          dims: list[dict[str, Any]] | None = None,
+                         scene_id: str = "",
                          ) -> tuple[bool, str]:
     """来源绑定守卫（消费侧）—— 抄学习侧同一把尺子（2026-11-09 第二刀）。
 
@@ -4621,6 +4623,17 @@ def _source_binding_gate(question: str, evidence: list[dict[str, Any]] | None,
         · 这一类里至少一个 token，必须有一条 **ok 的调用**其入参点到它；
         · 点不到 / 碰了失败 / 只用了别的工具 → 不闭合，判词指名道姓。
 
+    ★ 取证落点表的「上游等价」（2026-11-09 服务器实测加）：
+        维度问「在 web_facts 表中…平台判定列…」→ 判 kind=table，
+        要求调用的入参点到 web_facts。但模型做的是
+        `mcp_sherlock_lookup_username(username="ce")` —— **web_facts 恰恰
+        就是 Sherlock 结果落库后的摊平宽表**（同一份数据的源头）。
+        不放宽 → 守卫把最直接的取法判死 → 这道题永远答不出来
+        （实测 reuse_errors 里明写「来源未绑定…别处的真数据不能当它的
+        答案」，而那恰恰就是要的答案）。
+        两个清单都是**实况**：取证落点表 = `local_agent._ingest_tables`
+        实查；远端抓手 = `actions` 注册表 origin=net|mcp 的条目。
+
     判谁（题面 + 维度问句都要判）：
         题面是人问的那句；维度问句是**教师端拆出来的承诺**（更具体，
         常带表名/文件名）。两者都点名了来源 → 都要被绑定。
@@ -4640,9 +4653,19 @@ def _source_binding_gate(question: str, evidence: list[dict[str, Any]] | None,
             t = str(d.get("question") or "").strip()
             if t:
                 texts.append(t)
+    # 实况两个清单（拿不到就退化成「不放宽」，不猜）
+    _up_tables: list[str] = []
+    try:
+        import local_agent as _la
+        _up_tables = list(_la._ingest_tables(str(db_path or "")) or [])
+    except Exception:
+        _up_tables = []
+    _up_tools = _remote_primitive_names(str(scene_id or ""))
     for t in texts:
         try:
-            ok, why = _sb.check(t, evidence, db_path)
+            ok, why = _sb.check(t, evidence, db_path,
+                                upstream_tables=_up_tables,
+                                upstream_tools=_up_tools)
         except Exception:
             return True, ""
         if not ok:

@@ -141,7 +141,10 @@ def main() -> int:
     lo = (Path(__file__).resolve().parent / "learn_orchestrate.py").read_text(
         encoding="utf-8")
     check("维度闭合前跑来源绑定判定", "source_binding as _sb2" in lo
-          and "_sb2.check(_q1, _ev1, _bind_db)" in lo)
+          and "_sb2.check(" in lo
+          # 参数可能跨行折断（2026-11-09 加了 upstream_* 两个可选参数），
+          # 所以只查「三个基本实参都在」，不查字面连写。
+          and "_q1, _ev1, _bind_db" in " ".join(lo.split()))
     check("执行前注入绑定提示（不是事后才知道）", "bind_hint(_q1, _bind_db)" in lo)
     check("不绑定 → 本次维度判不闭合（ok1/_inner_ok 双清零）",
           "if not _bind_ok:\n                            ok1 = False\n"

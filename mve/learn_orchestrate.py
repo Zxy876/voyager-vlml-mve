@@ -1711,9 +1711,47 @@ async def _start_learning_impl(
                         # 措辞也对得上 → 闭合 → 里程碑假亮。这里补问一句
                         # 「取的是不是这一份」：题面点名的真实表，必须有一条成功
                         # 调用其**入参**点到它（判据见 source_binding.py）。
+                        #
+                        # ★ 取证落点表的「上游等价」放宽（2026-11-09 服务器实测）：
+                        #   维度问「web_facts 表中…平台判定列…」而执行层调的是
+                        #   `mcp_sherlock_lookup_username` —— web_facts 恰恰就是
+                        #   Sherlock 结果落库后的摊平宽表（同一份数据的源头）。
+                        #   不放宽 → 把最直接的取法判死 → 这条维度永远闭合不了
+                        #   （实测：维度卡在 web_evidence/web_facts 上，连着几轮
+                        #   都「维度闭合」但题答不出来）。
+                        #   两个清单都是**实况**：取证落点表 = `local_agent.
+                        #   _ingest_tables` 实查；远端抓手 = actions 注册表
+                        #   origin=net|mcp 的条目。与消费侧同一份实现、同一口径。
                         try:
                             import source_binding as _sb2
-                            _bind_ok, _bind_why = _sb2.check(_q1, _ev1, _bind_db)
+                            _up_tables: list[str] = []
+                            try:
+                                import local_agent as _la
+                                _up_tables = list(
+                                    _la._ingest_tables(str(_bind_db or "")) or [])
+                            except Exception:
+                                _up_tables = []
+                            _up_tools: list[str] = []
+                            try:
+                                import actions as _act
+                                _bucket = getattr(_act, "_REGISTRY", {}).get(
+                                    str(scene_id or "")) or {}
+                                if not _bucket:
+                                    try:
+                                        _act.restore()
+                                    except Exception:
+                                        pass
+                                    _bucket = getattr(_act, "_REGISTRY", {}).get(
+                                        str(scene_id or "")) or {}
+                                _up_tools = sorted({
+                                    str(a.name) for a in _bucket.values()
+                                    if str(getattr(a, "origin", "")) in ("net", "mcp")})
+                            except Exception:
+                                _up_tools = []
+                            _bind_ok, _bind_why = _sb2.check(
+                                _q1, _ev1, _bind_db,
+                                upstream_tables=_up_tables,
+                                upstream_tools=_up_tools)
                         except Exception:
                             _bind_ok, _bind_why = True, ""
                         if not _bind_ok:

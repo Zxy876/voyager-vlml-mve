@@ -143,7 +143,9 @@ def main() -> int:
           "import source_binding as _sb" in _all
           and "_sb.check(" in _all)
     check("判据看入参（args）不看返回文本",
-          "_sb.check(t, evidence, db_path)" in _all)
+          # 调用可能跨行折断、后面还跟可选参数（2026-11-09 加了
+          # upstream_tables / upstream_tools），所以只查前三个实参。
+          "_sb.check(t, evidence, db_path" in " ".join(_all.split()))
 
     print("== 5. 消费侧完成判定仍是确定性的（不新增 LLM critic）==")
     check("critic_ok = data is not None（确定性）",
