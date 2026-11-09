@@ -2533,7 +2533,9 @@ async def consume(
             # month_pay 合成列一表答全，却被 allowanc 表拉成 1/2 误杀）。
             # 组合模型下这道闸天然变弱（一条 SQL 就覆盖多维度），最终判据是
             # 看全貌的 _fits_judge；这里只保留它抓「明显只答了一部分」的能力。
-            _partial, _cwhy = _answer_is_partial(code, _ans_skills, _nd)
+            _partial, _cwhy = _answer_is_partial(
+                code, _ans_skills, _nd,
+                db_path=str((_prof or {}).get("db_path") or ""))
             if _partial:
                 _coverage_why = _cwhy
                 data = None
@@ -4978,6 +4980,11 @@ def _sql_tables(sql: str) -> set[str]:
         return set()
     s = re.sub(r"--[^\n]*", " ", str(sql))
     s = re.sub(r"'[^']*'", " ", s)
+    # 2026-11-10：技能 code 是 Python 程序（query_sql/gh_read 多步），
+    # 剥 Python 注释与双引号字符串，否则注释里的示例「FROM tbl」、
+    # URL 里的「http」会被当成表名（实测把守卫的维度源表污染成 4 张）。
+    s = re.sub(r"#[^\n]*", " ", s)
+    s = re.sub(r'"[^"]*"', " ", s)
     tabs: set[str] = set()
     # ⚠️ 表名必须允许中文（2026-10-29 实测）：旧正则 `[A-Za-z_]` 把
     # `up_工资明细` 截成 `up_` —— 于是覆盖守卫拿 `['up_'] / ['allowance','up_']`
@@ -4992,7 +4999,8 @@ def _sql_tables(sql: str) -> set[str]:
 
 def _answer_is_partial(answer_sql: str,
                        skills: list[dict[str, Any]],
-                       n_dims: int) -> tuple[bool, str]:
+                       n_dims: int,
+                       db_path: str = "") -> tuple[bool, str]:
     """维度覆盖守卫的判定核心（确定性，不赌 LLM）。
 
     合成题（n_dims>=2）的答案是**一条** SQL：若它只触及了「本题各维度技能所涉
@@ -5011,10 +5019,23 @@ def _answer_is_partial(answer_sql: str,
     dim_tabs: set[str] = set()
     for s in skills:
         dim_tabs |= _sql_tables(s.get("code") or s.get("recipe") or "")
+    # 2026-11-10：与**真实库表**对账 —— 提取出的名字不在库里 = 噪音
+    # （Python 注释/URL 残片）。地面真话取自 db_switch.list_tables。
+    _real: set[str] | None = None
+    if str(db_path or "").strip():
+        try:
+            import db_switch as _dsw_cg
+            _real = {str(t).lower() for t in (_dsw_cg.list_tables(db_path) or [])}
+        except Exception:
+            _real = None
+    if _real:
+        dim_tabs &= _real
     # 各维度本就同源单表（如只查员工表的"名+基薪"）→ 谈不上"组合漏维"，不拦。
     if len(dim_tabs) < 2:
         return (False, "")
     ans_tabs = _sql_tables(answer_sql)
+    if _real:
+        ans_tabs &= _real
     hit = dim_tabs & ans_tabs
     if len(hit) >= 1 and len(hit) < len(dim_tabs):
         return (True,

@@ -531,15 +531,28 @@ async def learn_milestone_composite(scene_id: str, topic_id: str, question: str,
         f"{c[:700]}"
         for i, c in enumerate(codes[:6]))
     user = (f"题目：{question}\n\n已学好的维度配方：\n{recipes}\n\n"
+            # ground 给全量（2026-11-10 实测）：[:4500] 在观察面升级（15.3k）后
+            # 恰好把 web_facts 段切掉 → 模型幻觉「表不存在」→ 产 SELECT 0 假兜底
+            # （被真数校验拦下，但合成作废）。合成是低频操作，给全量。
             f"当前库真实存在的表/列/真实取值（字面量只能从这里取）：\n"
-            f"{ground[:4500]}\n\n按规则产出组合 SQL。")
+            f"{ground[:16000]}\n\n按规则产出组合 SQL。")
     try:
+        # max_tokens 给足（2026-11-10 实测）：默认 1200 被 GLM-4.6 思维链
+        # 吃光 → content 空 → 兜底取 reasoning_content（散文）→ 解析 {} →
+        # 「组合产物不是 SELECT/WITH」。与教师端同病同修：预算小不是思考有害。
         resp = _cj([{"role": "system", "content": _COMPOSITE_SYSTEM},
-                    {"role": "user", "content": user}], temperature=0.2)
+                    {"role": "user", "content": user}],
+                   temperature=0.2, max_tokens=8000, timeout=240.0)
     except Exception as e:
         out["skipped"] = f"组合 LLM 失败：{type(e).__name__}: {e}"
         return out
     sql = str(resp.get("sql") or "").strip()
+    # 剥代码围栏（2026-11-10 实测）：模型常把 SQL 裹进 ```sql ... ```，
+    # 围栏残留会让下面的前缀检查误拒（「组合产物不是 SELECT/WITH」）。
+    import re as _re_c
+    _m = _re_c.search(r"```(?:sql|SQL)?\s*(.+?)```", sql, _re_c.S)
+    if _m:
+        sql = _m.group(1).strip()
     note = str(resp.get("note") or "")
     out["note"] = note
     body = sql
