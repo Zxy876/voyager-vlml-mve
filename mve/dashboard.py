@@ -1418,7 +1418,10 @@ function pSkill(s){
           ? `<span class="chip ${x.ok>0?'ok':'bad'}">有效率 ${Math.min(100,Math.round(100*x.ok/x.hits))}%</span>`
           : '<span class="chip dim">还没被用过</span>'}
         ${health(x)}
-        ${x.versions>1?`<span class="chip warn">已覆盖 ${x.versions} 版</span>`:''}</div>
+        ${x.versions>1?`<span class="chip warn">已覆盖 ${x.versions} 版</span>`:''}
+        <button class="btn btn-danger" style="padding:1px 8px;font-size:12px;margin-left:6px"
+          data-delkey="${ESC(x.key)}" data-delname="${ESC(x.name||'')}"
+          title="复核发现错账（假阳性/冗余）时单条清除：本体+向量+结晶一并，删动作记审计事件，不可恢复">清账</button></div>
     </div>`).join('');
   // 按场景分组（原溯源页的分组计数，并入本页 legend）
   const byScene={};
@@ -2164,6 +2167,25 @@ function oqReveal(){
 }
 
 const PANELS={overview:pOverview,practice:pPractice,import:pImport,trace:pTrace,skill:pSkill,graph:pGraph,voyager:pVoyager,adaptive:pAdaptive,console:pConsole};
+
+/* 单条清账：技能·因果页每张卡的「清账」按钮（事件委托，重渲染不丢绑定） */
+document.addEventListener('click', async ev=>{
+  const b=ev.target.closest('button[data-delkey]');
+  if(!b) return;
+  const key=b.getAttribute('data-delkey')||'';
+  const nm=b.getAttribute('data-delname')||'';
+  if(!confirm('清掉这条技能账？\n\n'+nm+'\n'+key+
+    '\n\n只删这一条；本体+向量+结晶文件（若无同名存活者）一并清理，\n删除动作本身会记审计事件。不可恢复。')) return;
+  try{
+    const r=await fetch('/api/skill/delete',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({key})});
+    const d=await r.json().catch(()=>({}));
+    if(d && d.ok) uiEvent('skill_delete',{key:key.slice(0,60)},
+      '已清：'+(nm||key.slice(0,40))+(d.plugin_removed?('（结晶 '+d.plugin_removed+' 一并清）'):''));
+    else alert('清账失败：'+((d&&d.error)||('HTTP '+r.status)));
+  }catch(e){ alert('清账失败：'+e); }
+  await load();
+});
 
 /* ---------------- 人导入（只在 import 分区里挂事件） ---------------- */
 function fillTopics(s){
@@ -4107,6 +4129,59 @@ class Handler(BaseHTTPRequestHandler):
                     result="已停止",
                 )
                 self._json(200, res)
+            except Exception as e:
+                self._json(500, {"ok": False,
+                                 "error": f"{type(e).__name__}: {e}"[:300]})
+            return
+
+        if path == "/api/skill/delete":
+            # 单条清账：人复核出假阳性/冗余条目后，在技能·因果页逐条清。
+            # 不发明新函数：本体走 skill_store.delete_skill（连向量一起清）；
+            # 结晶文件名用 plugin_forge._ident/PLUGIN_DIR 现成规则——
+            # 同名条目还有存活者就保留结晶（共享文件），没有才跟着清；
+            # 能力注册表同步摘除（同 crystal 注册时按 {源场景, 当前场景} 双挂）。
+            try:
+                import skill_store
+                import ui_events
+                key = str(payload.get("key") or "").strip()
+                if not key:
+                    self._json(400, {"ok": False, "error": "缺 key"})
+                    return
+                entry = next((one for one in skill_store.all_skills()
+                              if str(one.get("key") or "") == key), None)
+                if entry is None:
+                    self._json(404, {"ok": False, "error": "key 不存在（可能已删过）"})
+                    return
+                name = str(entry.get("name") or "")
+                scene = str(entry.get("source_scene") or "default")
+                ok = skill_store.delete_skill(key)
+                plugin_removed = ""
+                if ok and name:
+                    survivors = [one for one in skill_store.all_skills()
+                                 if str(one.get("name") or "") == name]
+                    if not survivors:
+                        try:
+                            import plugin_forge
+                            import actions
+                            mod = f"learned_{plugin_forge._ident(name)}"
+                            ppath = plugin_forge.PLUGIN_DIR / (mod + ".py")
+                            if ppath.exists():
+                                ppath.unlink()
+                                plugin_removed = ppath.name
+                            for sid2 in {scene, str(payload.get("scene") or "")} - {""}:
+                                bucket = actions._REGISTRY.get(sid2)
+                                if isinstance(bucket, dict):
+                                    bucket.pop(mod, None)
+                        except Exception:
+                            pass  # 结晶清理失败不拦删账本体（审计里如实记）
+                ui_events.append(
+                    ui_events.SKILL_DELETE,
+                    detail={"key": key[:80], "name": name[:60], "scene": scene,
+                            "结晶": plugin_removed or "无/保留"},
+                    result="已清" if ok else "失败",
+                )
+                self._json(200, {"ok": bool(ok), "key": key, "name": name,
+                                 "plugin_removed": plugin_removed})
             except Exception as e:
                 self._json(500, {"ok": False,
                                  "error": f"{type(e).__name__}: {e}"[:300]})
