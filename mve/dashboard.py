@@ -1424,7 +1424,7 @@ function pSkill(s){
         <button class="btn btn-danger" style="padding:1px 8px;font-size:12px;margin-left:6px"
           data-delkey="${ESC(x.key)}" data-delname="${ESC(x.name||'')}"
           title="复核发现错账（假阳性/冗余）时单条清除：本体+向量+结晶一并，删动作记审计事件，不可恢复">清账</button></div>
-      ${x.code?`<details style="margin-top:4px"><summary style="cursor:pointer;font-size:12px;opacity:.75">配方（code，原样入库的取数做法）</summary><pre style="white-space:pre-wrap;background:rgba(127,127,127,.08);padding:6px;border-radius:6px;font-size:12px;max-height:240px;overflow:auto">${ESC(x.code)}</pre></details>`:''}
+      ${x.code?`<details data-k="skill:${ESC(x.key)}:code" style="margin-top:4px"><summary style="cursor:pointer;font-size:12px;opacity:.75">配方（code，原样入库的取数做法）</summary><pre style="white-space:pre-wrap;background:rgba(127,127,127,.08);padding:6px;border-radius:6px;font-size:12px;max-height:240px;overflow:auto">${ESC(x.code)}</pre></details>`:''}
     </div>`).join('');
   // 按场景分组（原溯源页的分组计数，并入本页 legend）
   const byScene={};
@@ -1512,8 +1512,8 @@ function pSessions(s){
         ${dd.why?`<div class="hint" style="margin-top:2px;opacity:.8">为什么要有这一维：${ESC(dd.why)}</div>`:''}
         ${(!isC&&dd.asked)?`<div class="hint" style="margin-top:2px;color:#c98a00">上一次的判词：${ESC(dd.asked)}</div>`:''}
         ${(!isC&&dd.gap)?`<div class="hint" style="margin-top:2px">还缺：${ESC(dd.gap)}</div>`:''}
-        ${dd.answer?`<details style="margin-top:2px"><summary style="cursor:pointer;font-size:12px;opacity:.75">这一维验收交出的答案（原样）</summary><pre style="white-space:pre-wrap;background:rgba(127,127,127,.08);padding:6px;border-radius:6px;font-size:12px;max-height:220px;overflow:auto">${ESC(dd.answer)}</pre></details>`:''}
-        ${dd.code?`<details style="margin-top:2px"><summary style="cursor:pointer;font-size:12px;opacity:.75">取数配方（code，跑通的那次）</summary><pre style="white-space:pre-wrap;background:rgba(127,127,127,.08);padding:6px;border-radius:6px;font-size:12px;max-height:220px;overflow:auto">${ESC(dd.code)}</pre></details>`:''}
+        ${dd.answer?`<details data-k="sess:${ESC(x.req_id)}:${ESC(d.id)}:ans" style="margin-top:2px"><summary style="cursor:pointer;font-size:12px;opacity:.75">这一维验收交出的答案（原样）</summary><pre style="white-space:pre-wrap;background:rgba(127,127,127,.08);padding:6px;border-radius:6px;font-size:12px;max-height:220px;overflow:auto">${ESC(dd.answer)}</pre></details>`:''}
+        ${dd.code?`<details data-k="sess:${ESC(x.req_id)}:${ESC(d.id)}:code" style="margin-top:2px"><summary style="cursor:pointer;font-size:12px;opacity:.75">取数配方（code，跑通的那次）</summary><pre style="white-space:pre-wrap;background:rgba(127,127,127,.08);padding:6px;border-radius:6px;font-size:12px;max-height:220px;overflow:auto">${ESC(dd.code)}</pre></details>`:''}
       </li>`;
     }).join('');
     const evs=(x.events||[]).slice(-8).map(e=>{
@@ -1528,7 +1528,7 @@ function pSessions(s){
         ${z.dimension?`<span class="chip grey">${ESC(z.dimension)}</span>`:''}
         <span class="chip grey">命中 ${z.hits}</span>
         <span class="chip ${z.ok>0?'ok':'grey'}">有效 ${z.ok}</span></li>`).join('');
-    return `<details class="nocmp" style="margin-top:8px">
+    return `<details class="nocmp" data-k="sess:${ESC(x.req_id)}" style="margin-top:8px">
       <summary class="th">${ESC(x.question||x.req_id)}</summary>
       <div class="tm">
         <span class="chip grey mono">${ESC(x.req_id)}</span>
@@ -2834,6 +2834,12 @@ function render(s){
   const holdingForm = af && af.tagName && FORM.includes(af.tagName)
                       && stage.contains(af);
   if(!(TAB==='import' && busy) && !holdingForm){
+    // 展开态也要带过去（2026-11-10 用户：「展开一下就收回去了，应该是我再点它
+    // 它才关上」）。<details> 的 open 是 DOM 状态、不在 HTML 字符串里，轮询每 4 秒
+    // 重建 stage.innerHTML 就会把展开的折叠块全部打回默认 —— 不是超时收回。
+    // 这里按 data-k 稳定键（会话 req_id / 维度 id / 技能 key）快照，重建后补回。
+    const openKeys=new Set(Array.from(stage.querySelectorAll('details[data-k][open]'))
+                             .map(el=>el.getAttribute('data-k')));
     // 即便重建，也把用户改过的控件值带过去 —— 焦点在按钮上时轮询照常刷，
     // 不能因为刷新把人刚选的单元数/迁移间隔/草稿重置掉。
     const vals={}, afId=(af&&af.id&&stage.contains(af))?af.id:null;
@@ -2845,6 +2851,11 @@ function render(s){
       });
     window.__curveSceneReset=false;
     stage.innerHTML=(PANELS[TAB]||pOverview)(s);
+    if(openKeys.size){
+      stage.querySelectorAll('details[data-k]').forEach(el=>{
+        if(openKeys.has(el.getAttribute('data-k'))) el.open=true;
+      });
+    }
     Object.entries(vals).forEach(([id,v])=>{
       const n=document.getElementById(id);
       if(n && v) n.value=v;
