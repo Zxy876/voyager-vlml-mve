@@ -9,7 +9,7 @@ VLMLMCPEnv 的 `query_sql` 最终落到 VLML 的 `execute_custom_sql`，而它�
 里列出一串 Valorant 战队」。本模块给非 VLML 场景一个**最小等价物**：
 
     SceneDBEnv(db_path).run_sql(sql)      → 直连该场景的 duckdb（read_only）
-    SceneDBEnv(db_path).schema_block()    → 实查 information_schema 渲染 schema
+    SceneDBEnv(db_path).schema_block()    → 实查 SHOW TABLES/DESCRIBE 渲染 schema
 
 接口刻意与 VLMLMCPEnv 对齐（run_sql / schema_block 返回同一形状），这样
 `VLMLActionAgent(env=SceneDBEnv(...))` 就能直接复用它的写 SQL prompt 与
@@ -87,10 +87,11 @@ class SceneDBEnv:
         import duckdb
         con = duckdb.connect(self.db_path, read_only=True)
         try:
-            return con.execute(
-                "SELECT table_name, column_name, data_type "
-                "FROM information_schema.columns WHERE table_schema='main' "
-                "ORDER BY table_name, ordinal_position").fetchall()
+            _out = []
+            for (t,) in sorted(con.execute("show tables").fetchall()):
+                for r in con.execute(f'DESCRIBE "{t}"').fetchall():
+                    _out.append((t, r[0], r[1]))
+            return _out
         finally:
             try:
                 con.close()

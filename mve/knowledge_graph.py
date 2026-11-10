@@ -1438,7 +1438,7 @@ def build(*, observe: bool = False, with_schema: bool = True) -> KnowledgeGraph:
     observe=True 时会额外跑一遍裁判，用**实测**的编排顺序补 procedure_step
     边（慢，且要联网/连库），默认只用声明式信息。
     with_schema=True 时把 VLML 的 21 张表 / 46 个洞察 / 7 个工具一起进图
-    （实查 information_schema + 解析源码；连不上库时自动退回文件解析）。
+    （实查 SHOW TABLES/DESCRIBE + 解析源码；连不上库时自动退回文件解析）。
     """
     import vlml_env  # noqa: F401  引导环境
     from tasks import TASKS
@@ -1449,7 +1449,7 @@ def build(*, observe: bool = False, with_schema: bool = True) -> KnowledgeGraph:
     # ---- VLML 的真实结构：21 张表 + 46 个洞察 + 7 个工具 ----
     # 之前只从**我们自己的 rubric SQL** 反推，结果图谱里只有 2 张表 ——
     # 等于"出过题的才进图"，VLML 真正的建模一概没进。
-    # 实查 information_schema + 解析源码（表/派生/洞察/工具）补齐四层。
+    # 实查 SHOW TABLES/DESCRIBE + 解析源码（表/派生/洞察/工具）补齐四层。
     schema: dict[str, Any] = {}
     if with_schema:
         try:

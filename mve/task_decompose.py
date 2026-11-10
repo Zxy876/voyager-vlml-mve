@@ -41,7 +41,7 @@ MVE 同构映射（1→n 场景化）
 子目标状态（可达性）
 ------------------
     reachable   —— 注册表里有抓手条目，可以直接执行
-    gap         —— 没有条目，但当前库里有相关的**表**（实查 information_schema）
+    gap         —— 没有条目，但当前库里有相关的**表**（实查 SHOW TABLES）
                    → 可以写插件补上（plugin_forge.forge_plugin）
     unreachable —— 条目和表都没有 → 硬不可达，如实报给人（装插件/换数据源）
 """
@@ -228,7 +228,7 @@ def reachability(need: str, scene_id: str, *,
     （2026-10-19 实测：特斯拉问题判成 reachable，抓手却是 players 的条目）。
     滤掉 get/filter/by 这类空词后，撞的只能是实体与指标词。
 
-    「库里有相关表」的判据 = 表名与子目标词面有重合（实查 information_schema，
+    「库里有相关表」的判据 = 表名与子目标词面有重合（实查 SHOW TABLES，
     见 db_switch.list_tables）。不猜表内容，只看名字。
     """
     need = str(need or "").strip()

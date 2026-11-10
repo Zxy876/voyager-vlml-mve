@@ -210,10 +210,7 @@ class VLMLMCPEnv:
         hints 有没有指向空表也要用 —— 以前这段只在 schema_block 内部，
         算出来的行数只变成了字符串，别处拿不到结构化的。
         """
-        obs = await self.run_sql(
-            "SELECT table_name FROM information_schema.columns "
-            "WHERE table_schema='main' GROUP BY table_name ORDER BY table_name"
-        )
+        obs = await self.run_sql("SELECT * FROM (SHOW TABLES)")
         if not obs.get("ok"):
             return {}
         data = obs.get("data") or {}
@@ -243,10 +240,20 @@ class VLMLMCPEnv:
         照伴学 entity_catalog 的「实查不写死」原则：出题与写 SQL 都只能引用
         这里真实存在的表名/列名，避免模型编造。
         """
-        obs = await self.run_sql(
-            "SELECT table_name, column_name, data_type FROM information_schema.columns "
-            "WHERE table_schema='main' ORDER BY table_name, ordinal_position"
-        )
+        rows_all: list[tuple] = []
+        _tl = await self.run_sql("SELECT * FROM (SHOW TABLES)")
+        if _tl.get("ok"):
+            _d = _tl.get("data") or {}
+            _trows = _d.get("rows") if isinstance(_d, dict) else _d
+            for (t,) in sorted(_trows or []):
+                _ot = await self.run_sql(f'SELECT * FROM (DESCRIBE "{t}")')
+                if not _ot.get("ok"):
+                    continue
+                _d2 = _ot.get("data") or {}
+                _r2 = _d2.get("rows") if isinstance(_d2, dict) else _d2
+                for _r in _r2 or []:
+                    rows_all.append((t, _r[0], _r[1]))
+        obs = {"ok": True, "data": {"rows": rows_all}}
         if not obs.get("ok"):
             return ""
         data = obs.get("data") or {}

@@ -17,7 +17,7 @@
 
 两条硬自律（与全项目同一套，本模块每一行守它）
 --------------------------------------------
-1. **派生只从真实结构来**：表清单、列名全部实查 information_schema
+1. **派生只从真实结构来**：表清单、列名全部实查 SHOW TABLES/DESCRIBE
    （`db_switch.list_tables` / `db_switch.table_columns`），一个字段名都不手写。
    手写清单的实测后果见 `actions.py` 模块 docstring 的
    pattern_detection_report 签名事故（参数名对不上 → TypeError → 四个维度全 None）。
@@ -181,7 +181,7 @@ def forge_plugin(task: str, subtask: dict[str, Any], scene_id: str, *,
     参数：
         task     —— 原问题（进文件头 provenance，也进条目 description）
         subtask  —— task_decompose.plan() 输出的一个子目标（status=="gap"），
-                    取它的 need 与 gap_hint（相关表，实查 information_schema 得来）
+                    取它的 need 与 gap_hint（相关表，实查 SHOW TABLES/DESCRIBE 得来）
         scene_id —— 注册进哪个场景的动作命名空间
         db_path  —— 数据源路径（空 = 当前默认库，照 db_switch 口径）
 
@@ -271,7 +271,7 @@ def _render_forge_source(scene_id: str, task: str, need: str,
         f'来源：场景 {_safe(scene_id)} · 任务「{_safe(task)}」· '
         f'缺口子目标「{_safe(need)}」\n'
         f'生成时间：{time.strftime("%Y-%m-%d %H:%M:%S")}\n'
-        '派生依据（information_schema 实查，不手写）：\n'
+        '派生依据（SHOW TABLES/DESCRIBE 实查，不手写）：\n'
         + "".join(f'  - {_safe(t)}: {len(c)} 列\n'
                   for t, c in cols_by_table.items())
         + 'schema 变更后重跑 plugin_forge.forge_gaps 会覆盖本文件。\n'

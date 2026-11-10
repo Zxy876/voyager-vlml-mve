@@ -758,9 +758,7 @@ def ext_tables_present(db_path: str | None = None) -> bool:
             return False
         con = duckdb.connect(str(p), read_only=True)
         try:
-            tabs = [r[0] for r in con.execute(
-                "SELECT table_name FROM information_schema.tables "
-                "WHERE table_schema='main'").fetchall()]
+            tabs = [str(r[0]) for r in con.execute("show tables").fetchall()]
             return any(str(t).startswith("ext_") for t in tabs)
         finally:
             con.close()

@@ -499,8 +499,7 @@ def _table_fingerprint(con: Any, table: str) -> str:
     """
     _t = str(table).replace("'", "''")
     cols_phys = [str(r[0]) for r in con.execute(
-        "SELECT column_name FROM information_schema.columns "
-        f"WHERE table_name = '{_t}' ORDER BY ordinal_position").fetchall()]
+        f'DESCRIBE "{_t}"').fetchall()]
     rows = con.execute(f"SELECT * FROM {_q(table)}").fetchall()
     # 列序归一：按列名排序后的顺序取值（同一份数据换列序指纹不变）
     idx = sorted(range(len(cols_phys)), key=lambda i: cols_phys[i])
@@ -602,9 +601,7 @@ def ingest(scene_id: str, filename: str, blob: bytes) -> dict[str, Any]:
         try:
             _fp_new = _table_fingerprint(con, table)
             _dup = ""
-            _tables = [str(r[0]) for r in con.execute(
-                "SELECT table_name FROM information_schema.tables "
-                "WHERE table_schema = 'main'").fetchall()]
+            _tables = sorted(str(r[0]) for r in con.execute("show tables").fetchall())
             for _t in _tables:
                 if _t == table:
                     continue
@@ -747,12 +744,10 @@ def describe(scene_id: str) -> dict[str, Any]:
         import duckdb
         con = duckdb.connect(db_path, read_only=True)
         try:
-            rows = con.execute(
-                "SELECT table_name FROM information_schema.tables "
-                # ⚠️ 别用 LIKE 'up\_%'：duckdb 的 LIKE 不认反斜杠转义（实测
-                # 会一个都匹配不到，2026-10-28 服务器踩到）。用 starts_with。
-                "WHERE table_schema='main' AND starts_with(table_name, 'up_') "
-                "ORDER BY table_name").fetchall()
+            # ⚠️ 别用 LIKE 'up\_%' 过滤：duckdb 的 LIKE 不认反斜杠转义（实测
+            # 会一个都匹配不到，2026-10-28 服务器踩到）。Python 侧 startswith。
+            rows = [r for r in con.execute("show tables").fetchall()
+                    if str(r[0]).startswith("up_")]
         finally:
             con.close()
         out["tables"] = [str(r[0]) for r in rows]

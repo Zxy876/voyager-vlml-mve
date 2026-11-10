@@ -3,34 +3,27 @@ import duckdb
 
 c = duckdb.connect("vlml/data/vlml_rib.duckdb", read_only=True)
 print("== 表与行数 ==")
-tabs = c.execute(
-    "select table_name from information_schema.tables where table_schema = 'main' order by 1"
-).fetchall()
+tabs = c.execute("show tables").fetchall()
 for (t,) in tabs:
     n = c.execute(f'select count(*) from "{t}"').fetchone()[0]
     print(f"{t:34s} {n}")
 
 print("\n== 含 first / kill / fb 的列 ==")
-rows = c.execute(
-    "select table_name, column_name from information_schema.columns "
-    "where table_schema = 'main' and (lower(column_name) like '%first%' "
-    "or lower(column_name) like '%kill%' or lower(column_name) like '%fb%') "
-    "order by 1,2"
-).fetchall()
+rows = []
+for (t,) in c.execute("show tables").fetchall():
+    for r in c.execute(f'describe "{t}"').fetchall():
+        cl = str(r[0]).lower()
+        if "first" in cl or "kill" in cl or "fb" in cl:
+            rows.append((t, r[0]))
+rows.sort()
 for r in rows:
     print(f"{r[0]:34s} {r[1]}")
 
 print("\n== ext_player_round_stats 列 ==")
-print([r[0] for r in c.execute(
-    "select column_name from information_schema.columns "
-    "where table_name = 'ext_player_round_stats' order by ordinal_position"
-).fetchall()])
+print([r[0] for r in c.execute("describe ext_player_round_stats").fetchall()])
 
 print("\n== ext_player_round_stats 样例 1 行 ==")
-cols = [r[0] for r in c.execute(
-    "select column_name from information_schema.columns "
-    "where table_name = 'ext_player_round_stats' order by ordinal_position"
-).fetchall()]
+cols = [r[0] for r in c.execute("describe ext_player_round_stats").fetchall()]
 row = c.execute("select * from ext_player_round_stats limit 1").fetchone()
 for k, v in zip(cols, row):
     print(f"  {k:28s} = {v}")

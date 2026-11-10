@@ -267,9 +267,7 @@ def _report_db() -> None:
         print(f"  ⚠️ 连不上当前库：{type(e).__name__}: {e}")
         return
     try:
-        tabs = [r[0] for r in con.execute(
-            "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema='main'").fetchall()]
+        tabs = [str(r[0]) for r in con.execute("show tables").fetchall()]
         print(f"  表               : {len(tabs)} 张")
         for tbl, col, tag in (("games", "map_name", "地图"),
                               ("agg_team_series_stats", "team_name", "队伍")):

@@ -14590,6 +14590,85 @@
    "root_scene": "L",
    "status": "verified",
    "evidence": 1
+  },
+  {
+   "id": "consume:consume_ddb56147",
+   "kind": "dimension",
+   "label": "用户名叫ce的女生在多少个社交平台上注册过",
+   "detail": {},
+   "root_scene": "L",
+   "status": "verified",
+   "evidence": 2
+  },
+  {
+   "id": "import:imp_20261110T011153",
+   "kind": "import",
+   "label": "用户名叫ce的女生在多少个社交平台上注册过",
+   "detail": {
+    "import_id": "imp_20261110T011153",
+    "topic": "learn_ddb56147",
+    "source": "human_import"
+   },
+   "root_scene": "L",
+   "status": "verified",
+   "evidence": 1
+  },
+  {
+   "id": "dim:learn_ddb56147:unpivot_web_facts_for_ce",
+   "kind": "dimension",
+   "label": "在 DuckDB 中，如何将 web_facts 表中 item 为 'ce' 的行进行 UNPIVOT 操作，把除 item, source_url, confidence, c",
+   "detail": {
+    "why": "宽表无法直接对列名进行 WHERE 过滤和 COUNT 聚合，必须先通过列转行将站点判定结果统一到一列中，才能进行后续的条件筛选与计数。",
+    "from": "maieutic_spec_gate",
+    "topic": "learn_ddb56147"
+   },
+   "root_scene": "L",
+   "status": "verified",
+   "evidence": 1
+  },
+  {
+   "id": "tool:mcp_ddg_fetch_content",
+   "kind": "tool",
+   "label": "mcp_ddg_fetch_content",
+   "detail": {
+    "origin": "learn_loop"
+   },
+   "root_scene": "L",
+   "status": "verified",
+   "evidence": 1
+  },
+  {
+   "id": "tool:mcp_ddg_search",
+   "kind": "tool",
+   "label": "mcp_ddg_search",
+   "detail": {
+    "origin": "learn_loop"
+   },
+   "root_scene": "L",
+   "status": "verified",
+   "evidence": 1
+  },
+  {
+   "id": "dim:learn_ddb56147:count_active_platforms_for_ce",
+   "kind": "dimension",
+   "label": "在上述 UNPIVOT 生成的长表中，verdict 取值为 AVAILABLE 或 CLAIMED 的行数是多少？",
+   "detail": {
+    "why": "这是最终问题的直接答案：通过统计满足'已注册/活跃'判定条件的行数，得出用户 ce 注册的社交平台数量。",
+    "from": "maieutic_spec_gate",
+    "topic": "learn_ddb56147"
+   },
+   "root_scene": "L",
+   "status": "verified",
+   "evidence": 1
+  },
+  {
+   "id": "consume:consume_67f0768c",
+   "kind": "dimension",
+   "label": "ce这个女生注册了多少个社交平台",
+   "detail": {},
+   "root_scene": "L",
+   "status": "cold_start_guess",
+   "evidence": 1
   }
  ],
  "edges": [
@@ -20976,13 +21055,77 @@
    "origin": "observed",
    "reason": "实测：闭合「在 web_facts 表中，1337x http 状态码 列值为 40」时真的调用过",
    "confidence": 0.95
+  },
+  {
+   "from": "scene:L",
+   "to": "dim:learn_ddb56147:unpivot_web_facts_for_ce",
+   "relation": "has_dimension",
+   "origin": "observed",
+   "reason": "Maieutic 追问骨架",
+   "confidence": 1.0
+  },
+  {
+   "from": "import:imp_20261110T011153",
+   "to": "dim:learn_ddb56147:unpivot_web_facts_for_ce",
+   "relation": "has_dimension",
+   "origin": "observed",
+   "reason": "导入批次 imp_20261110T011153 长出/复用的维度",
+   "confidence": 1.0
+  },
+  {
+   "from": "tool:mcp_ddg_fetch_content",
+   "to": "dim:learn_ddb56147:unpivot_web_facts_for_ce",
+   "relation": "produced_by",
+   "origin": "observed",
+   "reason": "实测：闭合「在 DuckDB 中，如何将 web_facts 表中 item 为 '」时真的调用过",
+   "confidence": 0.95
+  },
+  {
+   "from": "tool:mcp_ddg_search",
+   "to": "dim:learn_ddb56147:unpivot_web_facts_for_ce",
+   "relation": "produced_by",
+   "origin": "observed",
+   "reason": "实测：闭合「在 DuckDB 中，如何将 web_facts 表中 item 为 '」时真的调用过",
+   "confidence": 0.95
+  },
+  {
+   "from": "tool:query_sql",
+   "to": "dim:learn_ddb56147:unpivot_web_facts_for_ce",
+   "relation": "produced_by",
+   "origin": "observed",
+   "reason": "实测：闭合「在 DuckDB 中，如何将 web_facts 表中 item 为 '」时真的调用过",
+   "confidence": 0.95
+  },
+  {
+   "from": "scene:L",
+   "to": "dim:learn_ddb56147:count_active_platforms_for_ce",
+   "relation": "has_dimension",
+   "origin": "observed",
+   "reason": "Maieutic 追问骨架",
+   "confidence": 1.0
+  },
+  {
+   "from": "import:imp_20261110T011153",
+   "to": "dim:learn_ddb56147:count_active_platforms_for_ce",
+   "relation": "has_dimension",
+   "origin": "observed",
+   "reason": "导入批次 imp_20261110T011153 长出/复用的维度",
+   "confidence": 1.0
+  },
+  {
+   "from": "tool:query_sql",
+   "to": "dim:learn_ddb56147:count_active_platforms_for_ce",
+   "relation": "produced_by",
+   "origin": "observed",
+   "reason": "实测：闭合「在上述 UNPIVOT 生成的长表中，verdict 取值为 AVAIL」时真的调用过",
+   "confidence": 0.95
   }
  ],
  "summary": {
-  "dimensions": 36,
-  "tools": 11,
+  "dimensions": 40,
+  "tools": 13,
   "tables": 27,
-  "edges": 798,
+  "edges": 806,
   "task_fingerprint": "e57c3c90dbc7a7c0",
   "model_fingerprint": "488d9376b167dd76"
  }

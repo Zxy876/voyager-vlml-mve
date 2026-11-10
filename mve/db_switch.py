@@ -64,7 +64,7 @@ def current_path() -> str:
 
 
 def list_tables(path: str = "") -> list[str]:
-    """实查某个库里的表名（information_schema，不手写清单）。
+    """实查某个库里的表名（SHOW TABLES 实查，不手写清单）。
 
     为什么要这个函数：`orchestrate.init_scene` 早就调 `db_switch.list_tables`
     —— 但这个函数**之前不存在**，调用点包在 try/except 里，表发现一直静默
@@ -83,9 +83,7 @@ def list_tables(path: str = "") -> list[str]:
     except Exception:
         return []
     try:
-        return [r[0] for r in con.execute(
-            "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema='main' ORDER BY table_name").fetchall()]
+        return sorted(r[0] for r in con.execute("show tables").fetchall())
     except Exception:
         return []
     finally:
@@ -96,7 +94,7 @@ def list_tables(path: str = "") -> list[str]:
 
 
 def table_columns(path: str, table: str) -> list[str]:
-    """实查某张表的列名（information_schema.columns）。"""
+    """实查某张表的列名（DESCRIBE 实查，不手写清单）。"""
     f = Path(str(path or "").strip() or current_path())
     if not f.exists() or f.suffix.lower() not in (".duckdb", ".db", ".ddb"):
         return []
@@ -107,8 +105,7 @@ def table_columns(path: str, table: str) -> list[str]:
         return []
     try:
         return [r[0] for r in con.execute(
-            "SELECT column_name FROM information_schema.columns "
-            f"WHERE table_name='{str(table)}' ORDER BY ordinal_position").fetchall()]
+            f'DESCRIBE "{str(table)}"').fetchall()]
     except Exception:
         return []
     finally:
@@ -214,9 +211,7 @@ def probe(path: str) -> dict[str, Any]:
         return out
 
     try:
-        tables = [r[0] for r in con.execute(
-            "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema='main' ORDER BY table_name").fetchall()]
+        tables = sorted(r[0] for r in con.execute("show tables").fetchall())
         out["tables"] = tables
         # 事件量：不同 schema 下表名不同，两个都试
         events = None
@@ -239,8 +234,7 @@ def probe(path: str) -> dict[str, Any]:
         for t in tables:
             try:
                 cols = [r[0] for r in con.execute(
-                    f"SELECT column_name FROM information_schema.columns "
-                    f"WHERE table_name='{t}'").fetchall()]
+                    f'DESCRIBE "{t}"').fetchall()]
                 if "series_id" not in cols:
                     continue
                 rows = con.execute(
@@ -313,9 +307,7 @@ def anchor_status() -> dict[str, Any]:
         return out
 
     try:
-        tables = [r[0] for r in con.execute(
-            "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema='main'").fetchall()]
+        tables = sorted(r[0] for r in con.execute("show tables").fetchall())
     except Exception as e:
         con.close()
         out["hint"] = f"读表清单失败：{type(e).__name__}"
@@ -329,8 +321,7 @@ def anchor_status() -> dict[str, Any]:
         for t in tables:
             try:
                 cols = [r[0] for r in con.execute(
-                    "SELECT column_name FROM information_schema.columns "
-                    f"WHERE table_name='{t}'").fetchall()]
+                    f'DESCRIBE "{t}"').fetchall()]
             except Exception:
                 continue
             for c in cols_needed:

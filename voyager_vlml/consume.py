@@ -4290,11 +4290,10 @@ def _numeric_columns(db_path: str, limit: int = 80) -> list[str]:
         import duckdb
         con = duckdb.connect(str(db_path), read_only=True)
         try:
-            rows = con.execute(
-                "SELECT table_name, column_name, data_type "
-                "FROM information_schema.columns "
-                "WHERE table_schema = 'main' "
-                "ORDER BY table_name, ordinal_position").fetchall()
+            rows = []
+            for (t,) in sorted(con.execute("show tables").fetchall()):
+                for r in con.execute(f'DESCRIBE "{t}"').fetchall():
+                    rows.append((t, r[0], r[1]))
         finally:
             con.close()
     except Exception:
