@@ -755,6 +755,12 @@ def _sessions_view(scene_id: str) -> list[dict[str, Any]]:
             "skills": by_req.get(rid, []),
             "events": [],
             "why": "",
+            # 维度级学习账（2026-11-10）：学习侧闭合过程的只读投影。
+            # 面板据此展示「每维试了几轮 / 判官说什么 / 验出什么」，
+            # 不必再靠消费侧问一句来窥视学习结果。
+            "dim_detail": [],
+            "rounds": {},
+            "is_target": False,
         }
         try:
             sess = _sr.recall(rid, scene_id)
@@ -782,9 +788,50 @@ def _sessions_view(scene_id: str) -> list[dict[str, Any]]:
                 item["unclosed"] = _sr.unclosed_dims(sess)
             except Exception:
                 item["unclosed"] = []
+            # 维度级明细：骨架维度 × 闭合状态 × 过程账 × 已验结果。
+            # 四份数据都已在 sess 里（dims / learned / iterations / codes），
+            # 这里只做对齐拼接，不推断、不补默认值假象（没试过的就是 rounds=0）。
+            _codes = sess.get("codes") or {}
+            _iters = sess.get("iterations") or {}
+            _learned = {str(x) for x in (sess.get("learned") or [])}
+            _dd: list[dict[str, Any]] = []
+            for _d in item["dims"]:
+                _did = str(_d.get("id") or "")
+                _c = _codes.get(_did) or {}
+                _it = _iters.get(_did) or {}
+                _dd.append({
+                    "id": _did,
+                    "question": str(_d.get("question") or ""),
+                    "why": str(_d.get("why") or ""),
+                    "landing": str(_d.get("landing") or ""),
+                    "closed": _did in _learned,
+                    "rounds": int(_it.get("rounds") or 0),
+                    "asked": str(_it.get("asked") or ""),
+                    "gap": str(_it.get("gap") or ""),
+                    "passed": bool(_it.get("passed")),
+                    "r": (float(_c.get("r", -1.0)) if _c else None),
+                    "how": str(_c.get("how") or ""),
+                    "answer": str(_c.get("answer") or ""),
+                    "code": str(_c.get("code") or ""),
+                    "tools": list(_c.get("tools") or []),
+                })
+            item["dim_detail"] = _dd
+            item["rounds"] = dict(sess.get("rounds") or {})
         else:
             item["why"] = str(sess.get("why") or "还没有会话记录")
         out.append(item)
+    # 当前学习锚点（maieutic_scaffold 的 current_target）—— 消费侧每问一句
+    # 都会立锚点，学习侧下一轮优先攻它。面板标出来，人才知道「它现在在学哪句」。
+    _tgt_q = ""
+    try:
+        import maieutic_scaffold as _msc
+        _tgt_q = str(_msc.current_target(scene_id) or "")
+    except Exception:
+        _tgt_q = ""
+    if _tgt_q:
+        for _it in out:
+            if str(_it.get("question") or "") == _tgt_q:
+                _it["is_target"] = True
     return out
 
 

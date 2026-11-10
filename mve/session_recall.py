@@ -83,6 +83,10 @@ def recall(req_id: str, scene_id: str, *,
     out: dict[str, Any] = {
         "found": False, "req_id": rid, "question": "", "dims": [],
         "learned": [], "codes": {}, "session": {}, "path": "", "why": "",
+        # 过程账（2026-11-10 面板可观测）：每维试了几轮、判官说什么、
+        # 缺口是什么；再加整题轮次账。原来只带 codes 的终值，
+        # 人想知道「这条维度为什么关不上」只能靠猜。
+        "iterations": {}, "rounds": {},
     }
     if not rid:
         out["why"] = "没有需求 id"
@@ -136,6 +140,24 @@ def recall(req_id: str, scene_id: str, *,
                       "r": float(c.get("r", -1.0)),
                       "how": str(c.get("how") or "")}
     out["codes"] = codes
+
+    # 每维过程账：rounds（试了几轮）、asked（判官/闸门原话）、
+    # gap（还缺什么）、passed（这一维过没过）。原样带出，不改写、不归纳 ——
+    # 面板要给人看的是**证据**，不是转述。
+    iters: dict[str, dict[str, Any]] = {}
+    for it in (pr.get("iterations") or []):
+        if not isinstance(it, dict):
+            continue
+        iid = str(it.get("id") or "").strip()
+        if not iid:
+            continue
+        iters[iid] = {"rounds": int(it.get("rounds") or 0),
+                      "asked": str(it.get("asked") or ""),
+                      "gap": str(it.get("gap") or ""),
+                      "passed": bool(it.get("passed")),
+                      "tools": list(it.get("tools") or [])}
+    out["iterations"] = iters
+    out["rounds"] = dict(data.get("milestone_rounds") or {})
 
     try:
         import session_state as _ss

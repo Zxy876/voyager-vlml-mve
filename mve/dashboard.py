@@ -1500,11 +1500,21 @@ function pSessions(s){
     const dims=(x.dims||[]).map(d=>{
       const isC=(x.unclosed||[]).indexOf(d.id)<0;
       const vv=ver[d.id]||null;
+      const dd=(x.dim_detail||[]).filter(z=>z.id===d.id)[0]||{};
+      const rr=(dd.r!=null&&dd.r>=0)?dd.r:((vv&&vv.r>=0)?vv.r:null);
       return `<li><span class="chip ${isC?'ok':'grey'}">${isC?'已闭合':'未闭合'}</span>
         <b>${ESC(d.id)}</b>
         ${d.landing?`<span class="chip grey">落点 ${ESC(d.landing)}</span>`:''}
-        ${vv&&vv.r>=0?`<span class="chip ok">r=${vv.r}</span>`:''}
-        <span class="hint">${ESC(d.question||'')}</span></li>`;
+        ${dd.rounds?`<span class="chip ${dd.rounds>=3?'bad':'grey'}" title="这一维在闭环里被试过几轮">试了 ${dd.rounds} 轮</span>`:'<span class="chip dim">还没试</span>'}
+        ${rr!=null?`<span class="chip ok">r=${rr}</span>`:''}
+        ${dd.how?`<span class="chip grey">判定 ${ESC(dd.how)}</span>`:''}
+        <span class="hint">${ESC(d.question||'')}</span>
+        ${dd.why?`<div class="hint" style="margin-top:2px;opacity:.8">为什么要有这一维：${ESC(dd.why)}</div>`:''}
+        ${(!isC&&dd.asked)?`<div class="hint" style="margin-top:2px;color:#c98a00">上一次的判词：${ESC(dd.asked)}</div>`:''}
+        ${(!isC&&dd.gap)?`<div class="hint" style="margin-top:2px">还缺：${ESC(dd.gap)}</div>`:''}
+        ${dd.answer?`<details style="margin-top:2px"><summary style="cursor:pointer;font-size:12px;opacity:.75">这一维验收交出的答案（原样）</summary><pre style="white-space:pre-wrap;background:rgba(127,127,127,.08);padding:6px;border-radius:6px;font-size:12px;max-height:220px;overflow:auto">${ESC(dd.answer)}</pre></details>`:''}
+        ${dd.code?`<details style="margin-top:2px"><summary style="cursor:pointer;font-size:12px;opacity:.75">取数配方（code，跑通的那次）</summary><pre style="white-space:pre-wrap;background:rgba(127,127,127,.08);padding:6px;border-radius:6px;font-size:12px;max-height:220px;overflow:auto">${ESC(dd.code)}</pre></details>`:''}
+      </li>`;
     }).join('');
     const evs=(x.events||[]).slice(-8).map(e=>{
       const p=e.payload||{};
@@ -1525,6 +1535,8 @@ function pSessions(s){
         <span class="chip ${ph[0]}">${ph[1]}</span>
         ${total?`<span class="chip ${allClosed?'ok':'warn'}">维度 ${closed}/${total}</span>`:''}
         ${vkeys.length?`<span class="chip ok">已验答案 ${vkeys.length} 条</span>`:''}
+        ${(x.rounds&&x.rounds.rounds)?`<span class="chip ${((x.rounds.zero_rounds||0)>=x.rounds.rounds)?'bad':'grey'}" title="整题层重试账：零闭合轮 = 这一轮一条维度都没关掉">里程碑 ${x.rounds.rounds} 轮（零闭合 ${x.rounds.zero_rounds||0} · 失败 ${x.rounds.fail_rounds||0}）</span>`:''}
+        ${x.is_target?'<span class="chip warn" title="消费侧立的学习锚点：学习侧下一轮优先攻这句">当前锚点</span>':''}
         ${x.archived?'<span class="chip ok">已归档</span>':''}
         ${(x.known_questions||[]).length>1?`<span class="chip grey">${x.known_questions.length} 种问法</span>`:''}
       </div>
@@ -1541,6 +1553,9 @@ function pSessions(s){
         <span class="hint">照原版 maieutic：一个需求 = 一条会话，技能挂在会话上；换个问法回到同一条</span></div>
       <div class="legend">会话阶段：<span class="chip grey">已拆骨架</span> → <span class="chip warn">学习中</span> → <span class="chip warn">已验待披露</span> → <span class="chip ok">已闭合归档</span>
         <br>★ <b>已验待披露</b> = 学习侧验收已跑完、答案还没披露给消费侧 —— 这一档<b>不该再派任务</b>（重复派 = 重复拆骨架）。</div>
+      <div class="legend">📖 <b>这是学习侧的账，纯读</b>：展开任一需求即可看到每一维<b>试了几轮、判官原话、还缺什么、验收交出的答案、跑通的取数配方</b>。
+        看它不会派任务、不会改账 —— 要它学一句，去「✍️ 人导入」或消费侧问一句。
+        <span class="hint">「试了 N 轮」标红 = 同一维反复关不上（判官每次给的理由若都一样，多半是维度落点选错了表/关键词，不是能力不够）。</span></div>
       ${cards}
     </div>`;
 }
