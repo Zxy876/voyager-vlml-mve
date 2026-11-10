@@ -303,12 +303,29 @@ def narrate_answer(question: str, data: Any, *, note: str = "") -> dict[str, Any
     msgs = [{"role": "system", "content": ANSWER_SYSTEM},
             {"role": "user", "content": prompt}]
     try:
-        raw = chat(msgs, temperature=0.3, max_tokens=800)
+        raw = chat(msgs, temperature=0.3, max_tokens=1500)
     except Exception as e:
         out["why"] = f"叙事模型调用失败：{type(e).__name__}: {e}"
         return out
 
     payload = _extract_json(str(raw or ""))
+    if not payload:
+        # 反馈重试一次（2026-11-10 实测：素材与问题有张力时 glm-4-flash 会把
+        # 铁律思辨写成推理长文，一个 JSON 都不给，800 token 截断在半路 ——
+        # 消费侧随即降级成原始 JSON 平铺，人不可读）。同构下方 critic→重试：
+        # 只重试一次，失败照旧降级，不拖长导入时间。
+        try:
+            raw_j = chat(
+                msgs + [
+                    {"role": "assistant", "content": str(raw)[:600]},
+                    {"role": "user",
+                     "content": ("你上一条没有按约定输出 JSON 对象。现在只输出"
+                                 "一个 JSON 对象（answer 字段是单行纯文本，"
+                                 "不含换行），不要写任何推理过程。")},
+                ], temperature=0.2, max_tokens=1500)
+            payload = _extract_json(str(raw_j or ""))
+        except Exception:
+            payload = {}
     answer = str(payload.get("answer") or "").strip()
     if not answer:
         out["why"] = f"叙事模型没给出可用的 JSON（原文前 80 字：{str(raw)[:80]}）"

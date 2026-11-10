@@ -1082,6 +1082,47 @@ def _method_compare(question: str, v_sql: str, v_obs: list[dict[str, Any]],
     }
 
 
+def _flat_readable(data: Any) -> str:
+    """原始数据平铺，但给人眼可读的排版（内容逐字保留，不改写）。
+
+    `json.dumps` 是机器口径（2026-11-10 用户："回答出来的内容人不可读"）。
+    叙事层挂掉时的降级/兜底展示，人也要能读 —— 降级只降修辞，不降可读性。
+    数字的逐字可核性不变：所有值都原样来自 data，不走模型。
+    """
+    try:
+        if isinstance(data, dict):
+            if data.get("disclosed_from_session"):
+                lines = ["（以下为本需求学习会话中已验证的结论，原样披露）"]
+                for a in (data.get("answers") or []):
+                    if isinstance(a, dict):
+                        lines.append(
+                            f"· {str(a.get('dim_id') or '维度')}："
+                            f"{str(a.get('answer') or '').strip()}")
+                if len(lines) > 1:
+                    return "\n".join(lines)
+            lines = []
+            for k, v in data.items():
+                if isinstance(v, (dict, list)):
+                    v = json.dumps(v, ensure_ascii=False)
+                lines.append(f"· {k}：{v}")
+            if lines:
+                return "\n".join(lines)
+        if isinstance(data, list):
+            lines = []
+            for x in data:
+                if isinstance(x, (dict, list)):
+                    x = json.dumps(x, ensure_ascii=False)
+                lines.append(f"· {x}")
+            if lines:
+                return "\n".join(lines)
+    except Exception:
+        pass
+    try:
+        return json.dumps(data, ensure_ascii=False, indent=1)
+    except Exception:
+        return str(data)
+
+
 def _narrate(question: str, obs: list[dict[str, Any]],
              compare: dict[str, Any] | None = None) -> str:
     """基于**取到的数**产出叙事洞察（答案是一张表也照样能说清楚）。"""
@@ -2606,7 +2647,7 @@ async def consume(
         nar: dict[str, Any] = {}
         if data is not None:
             try:
-                answer = json.dumps(data, ensure_ascii=False, indent=1)[:4000]
+                answer = _flat_readable(data)[:4000]
             except Exception:
                 answer = str(data)[:4000]
             try:
@@ -2661,8 +2702,7 @@ async def consume(
                         # 叙述作废并留痕 —— 展示层只给可验证的结论（R1：
                         # think 隐藏、只展示 answer 的同构）。
                         try:
-                            answer = json.dumps(data, ensure_ascii=False,
-                                                indent=1)[:4000]
+                            answer = _flat_readable(data)[:4000]
                         except Exception:
                             answer = str(data)[:4000]
                         try:
