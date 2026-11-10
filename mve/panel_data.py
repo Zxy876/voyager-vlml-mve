@@ -865,6 +865,9 @@ def _build_state_uncached() -> dict[str, Any]:
             "topic": s.get("topic", ""),
             "name": s.get("name", ""),
             "text": s.get("text", ""),
+            # 配方本体（2026-11-10 用户定：零碎技能人直接看，不走召回不占消费侧
+            # 额度 —— 卡片展开即可读 code，不用去翻库）。
+            "code": str(s.get("code") or ""),
             "hits": int(s.get("hits") or 0),
             "ok": int(s.get("ok") or 0),
             # 1→n 场景归属：技能卡上直接标「来自 Scene X」（溯源并入技能页，

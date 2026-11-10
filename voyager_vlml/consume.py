@@ -253,6 +253,39 @@ def _retrieve_skills(question: str, topic_hint: str = "",
     return out
 
 
+def _retrieve_skills_by_name(topic: str, scene_id: str = "") -> list[dict[str, Any]]:
+    """按名直取（零加工）—— routing 命中 `dim:<topic>:<name>` 节点时的专属通道。
+
+    用户 2026-11-10 定口径：「先前的召回其实就是让 agent 在已经学过的历史里
+    把那部分取出来。其实召回不需要任何加工。」—— 命中 dim: 节点时，节点 ID
+    自带会话 topic（learn_<md5>）与技能名，这就是**精确索引键**：按 topic 把
+    该会话的全部技能碎片（维度配方 + 里程碑复合）原样取出，不打分、不排序、
+    不截断、不改写。与 `_retrieve_skills`（相似度打分 + top_k 截断）是两条路：
+    那条是「不知道学没学过 → 语义猜」，这条是「名字已经指到了 → 直接拿」。
+    """
+    if not str(topic or "").strip():
+        return []
+    try:
+        import skill_store
+        out: list[dict[str, Any]] = []
+        _sid = str(scene_id or "").strip()
+        for s in skill_store.all_skills():
+            if str(s.get("topic") or "") != str(topic):
+                continue
+            if _sid and str(s.get("source_scene") or "default") not in (_sid, "default", ""):
+                continue
+            out.append(dict(s))
+        if out:
+            try:
+                skill_store.mark_used([str(s.get("key") or "") for s in out])
+            except Exception:
+                pass
+        return out
+    except Exception as e:  # pragma: no cover
+        print(f"  （按名直取不可用：{type(e).__name__}: {e}）")
+        return []
+
+
 # ---------------------------------------------------------------------------
 # 按语义检索**会话**（用户 2026-11-09：「把索引技能变成索引过程（会话）」）
 # ---------------------------------------------------------------------------
@@ -1764,6 +1797,28 @@ async def consume(
     except Exception:
         route_info = {"decision": "REJECTED", "max_score": 0,
                       "matched_on": "路由层不可用"}
+    # ---- 按名命中检测（2026-11-10）：归题命中 `dim:<topic>:<name>` 节点
+    # = 这句话的名字已经指到了**具体会话的具体技能**。节点 ID 本身就是索引键
+    # （上一轮实测：纯维度问句命中 dim: 节点 72 分，下游却没人接 → 消费 0 技能）。
+    # 此时 db 路直接放行（技能碎片的落点都是真实表），技能走 `_retrieve_skills_by_name`
+    # 原样直取 —— 「召回不需要任何加工」（用户 2026-11-10）。
+    _dim_topic = ""
+    try:
+        _nid = str((route_info or {}).get("node_id") or "")
+        if _nid.startswith("dim:"):
+            _parts = _nid.split(":")
+            if len(_parts) >= 3 and _parts[1]:
+                _dim_topic = _parts[1]
+                if not _plan.get("db"):
+                    _plan = dict(_plan)
+                    _plan["db"] = True
+                    _plan["planned"] = True
+                    _plan["source"] = "skill_name"
+                    _plan["why"] = (f"按名命中技能（{_parts[1]}::{_parts[2][:40]}）"
+                                    "→ 会话技能碎片原样直取，db 路放行")
+                    _use_env = True
+    except Exception:
+        _dim_topic = ""
     # 未命中 → **先落待审区**（设计案 §3.1，同构 neko candidate_knowledge_items）：
     # 不挂活图谱、不丢弃，冷启动解题成功才升活节点；被拒项留审计、不删。
     # ⚠️ 之前这条没接线 —— 面板场景卡的「待审 N」徽章因此恒为 0，人导入了
@@ -1898,8 +1953,12 @@ async def consume(
     # 白烧一轮 + 判词写成 fetched_empty。根因：检索不看规划。
     # 规划里没有 db 路 = 这题不该用库内配方 → 不检索、不 mark_used。
     # 有 db 路（含 db+web 混合题）照旧检索。
-    _raw_skills = (_retrieve_skills(question, topic_id or topic_hint, _scene_id)
-                   if _use_env else [])
+    if _dim_topic:
+        # 按名直取：节点 ID 已给出会话 topic → 该会话全部碎片原样取出。
+        _raw_skills = _retrieve_skills_by_name(_dim_topic, _scene_id)
+    else:
+        _raw_skills = (_retrieve_skills(question, topic_id or topic_hint, _scene_id)
+                       if _use_env else [])
     # ⚠️ 消费会话级技能（`consume_<md5>` topic）不是「学习跑过的里程碑」技能，
     # 只是上次消费兜底现做经 `_absorb` 落库的产物。按用户边界（2026-10-25：
     # 消费只编排、不复用消费会话产物、未学不答只标记）—— 必须排除出「已学

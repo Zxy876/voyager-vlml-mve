@@ -1408,7 +1408,9 @@ function pSkill(s){
   const cards=(s.skill_detail||[]).map(x=>`
     <div class="taskcard" style="margin-top:8px">
       <div class="th">${ESC(x.text)}</div>
-      <div class="tm"><span class="chip grey">${ESC(x.topic||'—')}</span>
+      <div class="tm"><span class="chip grey" title="技能名（消费索引键的一部分）">${ESC(x.name||'—')}</span>
+        <span class="chip grey" title="精确索引键：会话 topic::技能名 —— 消费按它直取">${ESC(x.key||'')}</span>
+        <span class="chip grey">${ESC(x.topic||'—')}</span>
         <span class="chip grey">Scene ${ESC(x.source_scene||'default')}</span>
         ${x.import_id?`<span class="chip grey" title="这次人导入长的技能">来自批次 ${ESC(x.import_id)}</span>`:''}
         ${x.milestone?`<span class="chip grey">里程碑 ${ESC(x.milestone)}${x.dimension?' · '+ESC(x.dimension):''}</span>`:''}
@@ -1422,6 +1424,7 @@ function pSkill(s){
         <button class="btn btn-danger" style="padding:1px 8px;font-size:12px;margin-left:6px"
           data-delkey="${ESC(x.key)}" data-delname="${ESC(x.name||'')}"
           title="复核发现错账（假阳性/冗余）时单条清除：本体+向量+结晶一并，删动作记审计事件，不可恢复">清账</button></div>
+      ${x.code?`<details style="margin-top:4px"><summary style="cursor:pointer;font-size:12px;opacity:.75">配方（code，原样入库的取数做法）</summary><pre style="white-space:pre-wrap;background:rgba(127,127,127,.08);padding:6px;border-radius:6px;font-size:12px;max-height:240px;overflow:auto">${ESC(x.code)}</pre></details>`:''}
     </div>`).join('');
   // 按场景分组（原溯源页的分组计数，并入本页 legend）
   const byScene={};
