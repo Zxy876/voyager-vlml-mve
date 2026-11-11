@@ -247,7 +247,8 @@ def _call_llm(llm: Callable | None, messages: list[dict[str, str]]) -> tuple[dic
     return {}, [], last
 
 
-def _cache_path(scene_id: str, question: str, db_path: str = "") -> Path:
+def _cache_path(scene_id: str, question: str,
+                db_path: str = "", req_id: str = "") -> Path:
     """骨架 + 进度账的**统一钥匙**（2026-11-09 第三刀 A：键挂在需求 id 上）。
 
     ★ 为什么键要换（用户 2026-11-09 判断 + 服务器取证）：
@@ -297,6 +298,14 @@ def _cache_path(scene_id: str, question: str, db_path: str = "") -> Path:
         import req_registry as _rr
     except Exception:
         _rr = None
+    # ★ 2026-11-11（拆骨架不做归一）：**发布方给的身份优先**。
+    #   同一句第二次发布时，按问句反查虽然也能取到最新，但两个派发并行时会
+    #   互相踩；显式身份是不可争辩的那一把钥匙。（未给时才回退到问句反查）
+    if _rr is not None and str(req_id or "").strip():
+        try:
+            return _rr.skeleton_path(sid, str(req_id).strip(), db_path)
+        except Exception:
+            pass
     if _rr is not None:
         try:
             _rid = _rr.req_id_of(sid, q)
@@ -998,7 +1007,8 @@ def render_material(question: str, scene_id: str, *, extras: str = "",
 
 
 def scaffold(question: str, scene_id: str = "A", *, llm: Callable | None = None,
-             use_cache: bool = True, extras: str = "", db_path: str = "") -> dict[str, Any]:
+             use_cache: bool = True, extras: str = "", db_path: str = "",
+             req_id: str = "") -> dict[str, Any]:
     """生成一份追问骨架。
 
     返回：
@@ -1023,7 +1033,7 @@ def scaffold(question: str, scene_id: str = "A", *, llm: Callable | None = None,
             db_path = str((_sp.profile(scene_id) or {}).get("db_path") or "")
         except Exception:
             db_path = ""
-    path = _cache_path(scene_id, q, db_path)
+    path = _cache_path(scene_id, q, db_path, req_id=str(req_id or ""))
     # ⚠️ 骨架**拆一次就固定**（原版 voyager.py 同构：sub_goals 拆一次，失败的维度
     # 原地重试 / 试满 N 轮就跳过，不重拆）。曾经按「失败账指纹变化」重拆过一版，
     # 生产实测维度 id 每轮都变、闭合账全对不上（详见 GIVE_UP_AFTER_ROUNDS 的注释），

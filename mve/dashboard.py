@@ -3725,7 +3725,23 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     import asyncio
                     import learn_orchestrate as _lo
-                    r = asyncio.run(_lo.start_learning(q))
+                    # ★ 2026-11-11（拆骨架不做归一，用户拍板）：
+                    #   人点「启动学习」= 再派一次 = 原版 maieutic 的一次
+                    #   **发布**（Exercise）。同一句点第二次必须拆**另一份**
+                    #   骨架：每次发布一份骨架 + 一本账，旧的原样保留
+                    #   （面板按 req_id 各自成卡片，能逐份盯它的闭环）。
+                    _pub_req = ""
+                    try:
+                        import scenes as _sc0
+                        import req_registry as _rr0
+                        _sid0 = str(_sc0.current_scene_id() or "A")
+                        _pub_req = str(_rr0.register(
+                            _sid0, q, force_new=True).get("req_id") or "")
+                        if _pub_req:
+                            _rr0.ensure_req_node(_sid0, q, _pub_req)
+                    except Exception:
+                        _pub_req = ""
+                    r = asyncio.run(_lo.start_learning(q, req_id=_pub_req))
                     LEARN_JOB["last_status"] = str(r.get("status") or "")
                     if r.get("status") in ("failed",):
                         LEARN_JOB["error"] = str(r.get("why") or "")[:300]

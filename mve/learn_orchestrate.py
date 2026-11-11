@@ -883,6 +883,7 @@ async def start_learning(
     import_id: str = "",
     preset_dimension: dict | None = None,
     milestone_retry: bool = False,
+    req_id: str = "",
 ) -> dict[str, Any]:
     """启动一轮学习（同构 learn() 单圈）。返回全量过程记录，失败如实带 why。
 
@@ -897,7 +898,7 @@ async def start_learning(
             execute=execute, use_mcp=use_mcp, critique=critique,
             judge=judge, context=context, import_id=import_id,
             preset_dimension=preset_dimension,
-            milestone_retry=milestone_retry)
+            milestone_retry=milestone_retry, req_id=req_id)
     finally:
         if use_mcp:
             try:
@@ -921,6 +922,7 @@ async def _start_learning_impl(
     import_id: str = "",
     preset_dimension: dict | None = None,
     milestone_retry: bool = False,
+    req_id: str = "",
 ) -> dict[str, Any]:
     """启动一轮学习（同构 learn() 单圈）的实现体（断开逻辑见外层 start_learning）。
 
@@ -946,7 +948,15 @@ async def _start_learning_impl(
     _req_id = ""
     try:
         import req_registry as _rr
-        _req_id = str(_rr.register(scene, question).get("req_id") or "")
+        # ★ 2026-11-11（拆骨架不做归一）：**发布方给的身份优先**。
+        #   kick_learning 派发时已 force_new 登记好新 req，这里必须原样用它 ——
+        #   若再走 register（按问句解析）会被 find_by_question 拽回旧账，
+        #   重拆等于没发生。没给 req_id（断点续学 / 课内逐维续跑）才走幂等登记。
+        if str(req_id or "").strip():
+            _req_id = str(req_id).strip()
+            _rr.ensure_req_node(scene, question, _req_id)
+        else:
+            _req_id = str(_rr.register(scene, question).get("req_id") or "")
     except Exception:
         _req_id = ""
     # ---- 导入批次（用户 2026-10-20）----
@@ -1087,7 +1097,8 @@ async def _start_learning_impl(
     except Exception:
         _upl_manifest = ""
     plan = task_decompose.plan(question, scene, llm=llm, db_path=db_path,
-                               scaffold=_use_scaffold, extras=_upl_manifest)
+                               scaffold=_use_scaffold, extras=_upl_manifest,
+                               req_id=_req_id)
     out["plan"] = plan
     out["plan_origin"] = str(plan.get("origin") or "")
     # 预设维度（驾驶舱逐维度闭合里程碑）：这条维度已知可达、已知有 DB 落点，
@@ -2509,9 +2520,26 @@ def kick_learning(question: str, scene_id: str = "", *,
     if old is not None and getattr(old, "is_alive", lambda: False)():
         return {"kicked": False, "why": "同一问题的学习已在后台跑"}
 
+    # ★ 2026-11-11（拆骨架不做归一，用户拍板）：
+    #   **派发即发布** —— 真派一次任务 = 原版 maieutic 的「教师发布一次
+    #   Exercise」。同一句再派一次，必须拿到新 req id，学习侧才会重拆骨架；
+    #   旧的那份骨架与那本账原样保留（面板按 req_id 各自成卡片）。
+    #   同构依据：`Exercise.id` 由发布方给、不从题面文本算，全仓无相似度检索
+    #   （req_registry 模块头已复核 prisma/schema.prisma:14）。
+    #   这里**只**跳过归并闸门，学习侧的拆维判据一律不动。
+    _new_req = ""
+    try:
+        import req_registry as _rr_pub
+        _reg_pub = _rr_pub.register(scene_id, question, force_new=True)
+        _new_req = str(_reg_pub.get("req_id") or "")
+        if _new_req:
+            _rr_pub.ensure_req_node(scene_id, question, _new_req)
+    except Exception:
+        _new_req = ""
+
     def _run() -> None:
         try:
-            asyncio.run(start_learning(question, scene_id))
+            asyncio.run(start_learning(question, scene_id, req_id=_new_req))
         except Exception as e:  # 后台任务自己兜住，绝不无声死掉
             _record({"question": question, "scene_id": scene_id,
                      "status": "failed", "why": f"{type(e).__name__}: {e}"})
@@ -2523,6 +2551,7 @@ def kick_learning(question: str, scene_id: str = "", *,
     _BG[question] = t
     t.start()
     return {"kicked": True, "question": question[:60], "mode": "thread",
+            "req_id": _new_req, "new_dispatch": True,
             "reason": str(reason or "")}
 
 

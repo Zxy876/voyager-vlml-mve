@@ -143,12 +143,24 @@ def new_req_id(scene_id: str = "", question: str = "") -> str:
 
 
 def register(scene_id: str, question: str, *,
-             req_id: str = "") -> dict[str, Any]:
-    """登记一个需求（人导入那一刻调用）。
+             req_id: str = "", force_new: bool = False) -> dict[str, Any]:
+    """登记一个需求（人导入/派发那一刻调用）。
 
-    - 已登记过同一问句 → 复用原 req id（**幂等**：同一句导入两次
-      不该产生两个需求）
+    - 已登记过同一问句 → 复用**最近一次发布**的 req id（幂等）
     - 没登记过 → 分配新 req id
+
+    ★ `force_new=True`（2026-11-11，拆骨架不做归一）：
+      **派发即发布**。同一句第二次派发 = 一次新的发布，必须拿新 req id ——
+      同构原版 maieutic 的 `Exercise`（教师可以对同一题面发布两次 exercise，
+      各自一份 `specGateDimensions`）。
+      跳过的只是「逐字幂等」与「归题找回」两道闸门，**不跳过任何判据**：
+      骨架怎么拆、账怎么记，仍然全在 maieutic_scaffold 的既有账上。
+      旧 req 原样保留（它是另一份骨架 + 另一本账，不是被覆盖的旧版本）。
+
+    ★ 幂等分支取**最新**那次发布（2026-11-11 实测修正）：
+      以前的 `for ...: return` 命中**最旧**那条 —— force_new 刚发布完，
+      学习侧续跑一调 register 就被拽回旧账，重拆等于没发生。
+      口径与 `find_by_question` 完全一致：created_at 最大者胜（并列取后插入）。
 
     返回 `{"req_id", "question", "created", "known_questions": [...]}`。
     """
@@ -160,37 +172,50 @@ def register(scene_id: str, question: str, *,
     reg = _read_registry(sid)
     nq = normalize_question(q)
 
-    # ① 已有登记 → 复用（幂等）
-    for rid, rec in reg.items():
-        if not isinstance(rec, dict):
-            continue
-        known = rec.get("known_questions") or []
-        if rec.get("question") and normalize_question(
-                str(rec.get("question"))) == nq:
-            _add_known(sid, rid, q)
-            return {"req_id": str(rid), "question": str(rec.get("question") or q),
-                    "created": False, "known_questions": list(known)}
-        for k in known:
-            if normalize_question(str(k)) == nq:
-                return {"req_id": str(rid),
-                        "question": str(rec.get("question") or q),
-                        "created": False, "known_questions": list(known)}
+    if not force_new:
+        # ① 已有登记 → 复用**最新**那次发布（幂等）
+        best_rid, best_at, best_known, best_q = "", float("-inf"), [], ""
+        for rid, rec in reg.items():
+            if not isinstance(rec, dict):
+                continue
+            known = list(rec.get("known_questions") or [])
+            hit = False
+            if rec.get("question") and normalize_question(
+                    str(rec.get("question"))) == nq:
+                hit = True
+            else:
+                for k in known:
+                    if normalize_question(str(k)) == nq:
+                        hit = True
+                        break
+            if not hit:
+                continue
+            at = float(rec.get("created_at") or 0)
+            if at >= best_at:
+                best_at = at
+                best_rid = str(rid)
+                best_known = known
+                best_q = str(rec.get("question") or q)
+        if best_rid:
+            _add_known(sid, best_rid, q)
+            return {"req_id": best_rid, "question": best_q,
+                    "created": False, "known_questions": best_known}
 
-    # ①.5 归题找回（换个问法）：不是同一句，但 routing 认为它属于某个已有需求
-    # —— 与 `req_id_of` 的 ② 级同源（routing.match 双阈值，不发明新判据）。
-    # 不接这一级 = 每换一种说法就建一个新 req（2026-11-09 服务器实测：同一
-    # 需求的第二种问法被分配成 req_...193342968e，旧会话从此读不到）。
-    try:
-        _rid_k = req_id_of(sid, q)
-    except Exception:
-        _rid_k = ""
-    if _rid_k:
-        note_question(sid, q, _rid_k)
-        _rec_k = (_read_registry(sid).get(_rid_k) or {})
-        return {"req_id": _rid_k,
-                "question": str(_rec_k.get("question") or q),
-                "created": False,
-                "known_questions": list(_rec_k.get("known_questions") or [])}
+        # ①.5 归题找回（换个问法）：不是同一句，但 routing 认为它属于某个已有需求
+        # —— 与 `req_id_of` 的 ② 级同源（routing.match 双阈值，不发明新判据）。
+        # 不接这一级 = 每换一种说法就建一个新 req（2026-11-09 服务器实测：同一
+        # 需求的第二种问法被分配成 req_...193342968e，旧会话从此读不到）。
+        try:
+            _rid_k = req_id_of(sid, q)
+        except Exception:
+            _rid_k = ""
+        if _rid_k:
+            note_question(sid, q, _rid_k)
+            _rec_k = (_read_registry(sid).get(_rid_k) or {})
+            return {"req_id": _rid_k,
+                    "question": str(_rec_k.get("question") or q),
+                    "created": False,
+                    "known_questions": list(_rec_k.get("known_questions") or [])}
 
     # ② 新需求 → 分配
     rid = str(req_id or "").strip() or new_req_id(sid, q)
@@ -200,6 +225,9 @@ def register(scene_id: str, question: str, *,
         "known_questions": [q],      # 后来归位到它的各种问法
         "scene": sid,
         "created_at": time.time(),
+        "publish_seq": sum(1 for r in reg.values()
+                           if isinstance(r, dict)
+                           and normalize_question(str(r.get("question") or "")) == nq),
     }
     _atomic_write(_registry_path(sid), reg)
     return {"req_id": rid, "question": q, "created": True,
@@ -274,25 +302,42 @@ def list_reqs(scene_id: str = "") -> list[dict[str, Any]]:
 
 
 def find_by_question(scene_id: str, question: str) -> str:
-    """按问句精确找 req id（规范化后比）。找不到返回 ""。"""
+    """按问句精确找 req id（规范化后比）。找不到返回 ""。
+
+    ★ 2026-11-11（拆骨架不做归一）：同一问句可能**发布过多次**（人再派一次
+    就是又一次发布，同构 maieutic 里教师可对同一题面发两次 Exercise）。
+    命中多个时取 **created_at 最大** 的那个 —— 最近一次发布才是「当前
+    exercise」，骨架/进度/技能都该挂它。旧的那份原样保留（它是**另一份**
+    骨架 + 另一本账，面板按 req_id 各自成卡片，互不覆盖）。
+
+    为什么不是「返回第一个」：dict 插入序 = 时间序，第一条是**最旧**的
+    那次发布。force_new 刚发布完，所有按问句取路径的调用点（save_progress
+    等 16 处）都会落回旧骨架文件 —— 重拆等于没发生。
+    """
     nq = normalize_question(question)
     if not nq:
         return ""
+    best_rid, best_at = "", float("-inf")
     for rid, rec in _read_registry(str(scene_id or "A")).items():
         if not isinstance(rec, dict):
             continue
+        hit = False
         if rec.get("question") and normalize_question(
                 str(rec.get("question"))) == nq:
-            return str(rid)
-        for k in (rec.get("known_questions") or []):
-            if normalize_question(str(k)) == nq:
-                return str(rid)
-    return ""
+            hit = True
+        else:
+            for k in (rec.get("known_questions") or []):
+                if normalize_question(str(k)) == nq:
+                    hit = True
+                    break
+        if not hit:
+            continue
+        at = float(rec.get("created_at") or 0)
+        if at >= best_at:                  # 并列时取后插入的（dict 序 = 时间序）
+            best_at, best_rid = at, str(rid)
+    return best_rid
 
 
-# ---------------------------------------------------------------------------
-# 问句 → req id 的三级解析（刀 A 的核心入口）
-# ---------------------------------------------------------------------------
 def _req_id_from_import(scene_id: str, import_id: str) -> str:
     """导入记录 → req id（人导入那一刻登记的身份，比问句文本稳定）。
 

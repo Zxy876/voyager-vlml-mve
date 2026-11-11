@@ -346,7 +346,7 @@ def _content_query(need: str) -> str:
 # ---------------------------------------------------------------------------
 def plan(task: str, scene_id: str, *, llm: Callable | None = None,
          db_path: str = "", scaffold: bool = False,
-         extras: str = "") -> dict[str, Any]:
+         extras: str = "", req_id: str = "") -> dict[str, Any]:
     """拆分一次任务并给每个子目标标注抓手状态。
 
     `scaffold=True`（本机/知识型场景用）：**先**走 Maieutic 的追问骨架
@@ -382,7 +382,9 @@ def plan(task: str, scene_id: str, *, llm: Callable | None = None,
             # 中查…」这种维度，把真正的材料（uploads/ 里的文集）挡在门外
             # （2026-11-03 场景 J 实测）。
             sc = maieutic_scaffold.scaffold(task, scene_id, llm=llm,
-                                            extras=str(extras or ""))
+                                            extras=str(extras or ""),
+                                            db_path=str(db_path or ""),
+                                            req_id=str(req_id or ""))
             dims = sc.get("dimensions") or []
             if dims:
                 dec = {"task": task, "scene_id": str(scene_id),
