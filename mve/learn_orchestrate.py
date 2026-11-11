@@ -1310,6 +1310,19 @@ async def _start_learning_impl(
                          for x in (str(context or ""), str(critique or ""),
                                    _upl_hint)
                          if str(x or "").strip()]
+            # 整篇作答（同构 maieutic：学生每轮交的是**整篇 spec**）：
+            # 上一轮提交的全文进 context 槽，这一轮在它上面补缺口，不是从零重答。
+            try:
+                import maieutic_scaffold as _ms0
+                _prev_spec = _ms0.load_spec_text(scene, question)
+            except Exception:
+                _prev_spec = ""
+            if str(_prev_spec or "").strip():
+                _hint_ctx.append(
+                    "你上一轮提交的**整篇作答**（这轮在它基础上补缺口，"
+                    "不要从零重答）：\n" + str(_prev_spec)[:3000])
+                print("  · 上一轮整篇作答已带入（" + str(len(_prev_spec))
+                      + " 字）", flush=True)
             if _use_scaffold:
                 import local_agent
                 # 本机原语先注册成条目（origin=local / group=本机能力），
@@ -1385,6 +1398,11 @@ async def _start_learning_impl(
                     # 旧账整包传回去会被**再加一遍**（预设维度路径每轮只跑一条，
                     # 其余 4 条的轮次会翻倍 → 轮次账虚高，面板就会误报「很顽固」）。
                     _iters_round: dict[str, dict] = {}
+                    # 整篇作答的段落账（维度 id → 这一维的结论），轮末拼成
+                    # 全文提交（同构 maieutic studentSpecText：交整篇，不交片段）。
+                    _ledger: dict[str, str] = {}
+                    # 本轮全部**取成功**的材料（整篇判定的材料面，失败项不进）
+                    _ev_all: list[dict[str, Any]] = []
                     _timed_out_dims = 0
                     if milestone_retry:
                         # ---- 里程碑重试轮：原版 rollout 同构（用户 2026-10-26：
@@ -1444,654 +1462,823 @@ async def _start_learning_impl(
                                    .get("answer") or "").strip()]
                     # milestone_retry 时维度循环零次（已闭合维度不重学，原版
                     # progress 语义），上面的本体 rollout 产物直接进判定段。
-                    for _d in ([] if milestone_retry else _dims):
-                        _did = str(_d.get("id") or "")
-                        _q1 = str(_d.get("question") or "").strip()
-                        if not _q1:
-                            continue
-                        # 外部工具已经连续超时两条 → 剩下的维度大概率同样卡住，
-                        # 继续跑只是堆僵尸线程（原版也不会在环境不可用时硬撑：
-                        # 它靠 critic 的 onError 短路 + 跳到下一个任务）。
-                        if _timed_out_dims >= 2:
-                            print("  · 外部工具连续超时 2 条 —— 本轮到此为止"
-                                  "（已闭合的已落盘，剩下的下一轮续学），不硬撑",
-                                  flush=True)
-                            break
-                        if _did and _did in _prog:
-                            learned_dims.append(_d)     # 断点续学：答到过的不重跑
-                            # 但仍要**保证节点在**（闭合过就该有那一枚技能单位）：
-                            # 旧代码里 ⑤' 判 partial 会提前 return，出现过"答到
-                            # 8 条却颗粒无收"。补挂不重跑、不加证据（bump=False）。
-                            closed_nodes.extend(
-                                close_one_dimension(
-                                    scene, _tid, question, _d, bump=False,
-                                    import_id=imp_id,
-                                    tools=list(_old_codes.get(_did, {}).get(
-                                        "tools") or [])
-                                    or _called_tools(
-                                        _old_codes.get(_did, {}).get("code"))))
-                            if _did:
-                                closed_ids.add(_did)
-                            # Obsidian 式反链：这条维度**被哪几次导入学过**。
-                            # 第二次导入同一问题时，这里会数出 2 条 —— 复用不是
-                            # 口头保证，是图上的入边（maieutic_scaffold.imports_of）。
-                            try:
-                                _imps = _ms.imports_of(scene, _tid, _did)
-                            except Exception:
-                                _imps = []
-                            if len(_imps) >= 1:
-                                print(f"  · 维重复用：{_q1[:22]}｜已有 "
-                                      f"{len(_imps)} 次导入学过它"
-                                      f"（{', '.join(i['import_id'] for i in _imps[-3:])}）",
+                    # ══════ Phase 1 轮循环（同构 maieutic spec/route.ts:83-106）══════
+                    # 原版一次次提交：整篇 spec → examiner 判每条维度答到没有 →
+                    # gaps_still_open 非空就问（≤3 条）→ 改整篇再交 → 直到为空 →
+                    # 进 Phase 2。MVE 原来的循环只跑一遍，判官说"还开着 5 维"也
+                    # 没人接（2026-11-11 实测 passed=False 却直接收工）。
+                    # 这里补的就是那一圈：闭合 = gaps_still_open 为空，闭合即停，
+                    # 等下次派任务（无人值守不加硬上限会烧穿余额）。
+                    _p1_round = 0
+                    _p1_open: list[str] = []
+                    _p1_qs: list[str] = []
+                    _p1_passed = False
+                    _P1_MAX = max(1, int(os.environ.get("MVE_PHASE1_ROUNDS") or 3))
+                    while True:
+                        _p1_round += 1
+                        # 第一轮做全集；之后只做上一轮判官说还开着的那些
+                        # （原版"改整篇"的 MVE 等价：已有作答留在 _ledger，
+                        #  只重做没答到的，不把已闭合的重跑一遍烧 token）。
+                        if _p1_round == 1:
+                            _round_dims = list(_dims)
+                        else:
+                            _round_dims = [d for d in _dims
+                                           if str(d.get("id") or "") in set(_p1_open)]
+                        if _p1_round > 1:
+                            print(f"  · Phase1 第 {_p1_round} 轮：上轮仍开着 "
+                                  f"{len(_round_dims)} 维，带追问答"
+                                  f"（{len(_p1_qs)} 条）", flush=True)
+                        for _d in ([] if milestone_retry else _round_dims):
+                            _did = str(_d.get("id") or "")
+                            _q1 = str(_d.get("question") or "").strip()
+                            if not _q1:
+                                continue
+                            # 外部工具已经连续超时两条 → 剩下的维度大概率同样卡住，
+                            # 继续跑只是堆僵尸线程（原版也不会在环境不可用时硬撑：
+                            # 它靠 critic 的 onError 短路 + 跳到下一个任务）。
+                            if _timed_out_dims >= 2:
+                                print("  · 外部工具连续超时 2 条 —— 本轮到此为止"
+                                      "（已闭合的已落盘，剩下的下一轮续学），不硬撑",
                                       flush=True)
-                            # 这一轮没重跑，但**上次跑通的代码**还在 —— 那次
-                            # rollout 的成果不该因为续学被丢掉（原版 program_code）
-                            _c0 = _old_codes.get(_did) or {}
-                            if str(_c0.get("code") or "").strip():
-                                dim_codes.append({"id": _did,
-                                                  "question": _c0.get("question")
-                                                  or _q1,
-                                                  "code": _c0.get("code"),
-                                                  "answer": _c0.get("answer")})
-                            _a0 = str(_c0.get("answer") or "").strip()
-                            if _a0:
-                                answers.append(f"【{_q1}】{_a0[:500]}")
-                            # 上次跑通的代码里解析调用过的动作 —— 续学不重跑，
-                            # produced_by 的实测证据只能从代码里来
-                            _t0 = (list(_c0.get("tools") or [])
-                                   or _called_tools(_c0.get("code")))
-                            if _t0:
-                                tools_map[_did] = _t0
-                            continue
-                        # 维度的一次 attempt（原版一个 task 的 rollout）：
-                        # 步数上限 4 在 solve 内（见下方的原版同构说明），
-                        # 步与步之间的 critique 回灌也在 solve 内 —— 原版
-                        # voyager.py:262-268 的迭代提示同款，不另起外层重试。
-                        ok1, crit1, obs1, r1 = False, "", [], {}
-                        # 内层判定（真伪）末态：闸门（覆盖）与内层 critic（真伪）
-                        # 两个都过才闭合这条维度，见下方的合并判定
-                        _inner_ok = False
-                        # 追问历史回灌：这条维度上次（上一轮/上一次学这句话）
-                        # 被问过什么、还差什么 —— 直接作为第一轮的输入，别让
-                        # 它从零开始撞同一堵墙（maieutic priorIterations 同款）。
-                        _h = _iters.get(_did) or {}
-                        if _h and not _h.get("passed"):
-                            crit1 = str(_h.get("asked") or _h.get("gap") or "")
-                            if crit1:
-                                print(f"  · 追问历史：{_q1[:24]}｜上次问过："
-                                      f"{crit1[:70]}", flush=True)
-                        # 证据账（同构助产士的 gathered）：每次工具调用成功取回的
-                        # 内容 —— 失败项 ok=False，**不进材料**。闸门判的是「材料
-                        # 有没有答到维度」，不是「模型写的文本像不像答案」。
-                        _ev1: list[dict[str, Any]] = []
-                        # ===== 原版同构：一个维度 = 一次 rollout，4 步封顶 =====
-                        # （voyager.py:277-279 `done = rollout_num_iter >=
-                        #   action_agent_task_max_retries(4) or success`；
-                        #  curriculum.py:342 失败即 "Skipping to next task"）
-                        # 2026-10-26 用户验收日志拍板「和原版做一样」：曾经的
-                        # SUBTASK_MAX_RETRIES=4 外层循环，每一轮是一次**完整
-                        # solve()**（自带 4 步 + 步内 critique 回灌——那本来就是
-                        # 原版 step 的机制，voyager.py:262-268），外层再套一层
-                        # 重试 = 单维度 16 步、双重重试，是原版 4 倍（实测交通
-                        # 补贴维度 3+ 个 solve 块连跑 4 分钟）。
-                        # 现在：一次 solve（4 步）封顶 → 4 步**之内**双判定
-                        # （步级闸门，见下方 _gate_stepwise）→ 不闭合进
-                        # failed_dims、跳过下一维度；闸门追问写进 _iters，下一轮
-                        # 带着它再来（原版 failed_tasks 的软重试语义，
-                        # curriculum.py:184 把 failed 列表给出题器看）。
-                        # 步级闸门（候选A，2026-10-26 用户拍板「子维度追问闭合
-                        # 由 voyager 根据自己的状况规划、一直实时注入」）：
-                        # 原版 Maieutic 的 examiner 就是**一步一判**
-                        # （spec/route.ts:82-100：passed = gaps_still_open 为空，
-                        #  判词当轮进下一轮输入）；原版 Voyager 的 critique 回灌
-                        # 也在 rollout 内（action.py:197-200）。MVE 曾把闸门放在
-                        # rollout **之后**判一次 → 4 步全用在没人告诉它清单缺口的
-                        # 事上，追问要等下一轮重跑才注入。现在闸门进 step()：
-                        # 内层 critic 每步判「真取到数 + 口径对」之后，闸门核
-                        # 「这条维度清单答到了没有」，questions（≤3 条）当步并进
-                        # critique 槽；双过 = 本步成功（done 提前），任一方不过
-                        # 就带着合并判词进下一步；4 步封顶仍不双过 → 跳过。
-                        # 闸门自己看**本 rollout 已问 + 跨轮 _iters.asked_q**
-                        # （同构 priorIterations，spec-examiner.ts:224-235），
-                        # 不重复问同一句。
-                        # ⚠️ 第二个返回值是**这一轮跑通的代码**（原版的
-                        # `program_code`）。以前写成 `obs1, _ =`，代码直接丢
-                        # 掉 → 知识型场景永远学不到技能（2026-10-20 定位）。
-                        # 场景数据题（db_path）走 VLMLActionAgent + SceneDBEnv
-                        # 写 SQL；本机题走 local_agent 写代码跑本机原语 ——
-                        # **两种后端都逐维度 solv，每维度闭合写一条技能**
-                        # （原版对每任务都拆，不区分知识/数据）。
-                        # ---- 步级闸门回调（候选A）：内层 critic 每步判过之后
-                        # 由 step() 调用（见 action.py 的 gate_check 契约）。
-                        # 闸门读的三样都从 agent 上取（实时，不是快照）：
-                        # ① 本 rollout 实取的观察（材料账，失败项已由 ok 过滤）
-                        # ② 交上来的答案（取到的数据 / 内层判官结论句）
-                        # ③ 已问清单：本 rollout 已问 + 跨轮 _iters.asked_q
-                        #    （同构 priorIterations）—— 不重复问同一句。
-                        # 异常/不可用 → origin=failed 且 passed=True（不阻塞，
-                        # 退化成内层 critic 单独判；它自带 env_obs 口径判据）。
-                        # env_obs 块一次 attempt 算一次（库只读，rollout 内
-                        # 不会变；db_observation 无缓存，每步打库是浪费）。
-                        _env1 = _env_obs_block(db_path)
+                                break
+                            if _did and _did in _prog:
+                                learned_dims.append(_d)     # 断点续学：答到过的不重跑
+                                # 但仍要**保证节点在**（闭合过就该有那一枚技能单位）：
+                                # 旧代码里 ⑤' 判 partial 会提前 return，出现过"答到
+                                # 8 条却颗粒无收"。补挂不重跑、不加证据（bump=False）。
+                                closed_nodes.extend(
+                                    close_one_dimension(
+                                        scene, _tid, question, _d, bump=False,
+                                        import_id=imp_id,
+                                        tools=list(_old_codes.get(_did, {}).get(
+                                            "tools") or [])
+                                        or _called_tools(
+                                            _old_codes.get(_did, {}).get("code"))))
+                                if _did:
+                                    closed_ids.add(_did)
+                                # Obsidian 式反链：这条维度**被哪几次导入学过**。
+                                # 第二次导入同一问题时，这里会数出 2 条 —— 复用不是
+                                # 口头保证，是图上的入边（maieutic_scaffold.imports_of）。
+                                try:
+                                    _imps = _ms.imports_of(scene, _tid, _did)
+                                except Exception:
+                                    _imps = []
+                                if len(_imps) >= 1:
+                                    print(f"  · 维重复用：{_q1[:22]}｜已有 "
+                                          f"{len(_imps)} 次导入学过它"
+                                          f"（{', '.join(i['import_id'] for i in _imps[-3:])}）",
+                                          flush=True)
+                                # 这一轮没重跑，但**上次跑通的代码**还在 —— 那次
+                                # rollout 的成果不该因为续学被丢掉（原版 program_code）
+                                _c0 = _old_codes.get(_did) or {}
+                                if str(_c0.get("code") or "").strip():
+                                    dim_codes.append({"id": _did,
+                                                      "question": _c0.get("question")
+                                                      or _q1,
+                                                      "code": _c0.get("code"),
+                                                      "answer": _c0.get("answer")})
+                                _a0 = str(_c0.get("answer") or "").strip()
+                                if _a0:
+                                    answers.append(f"【{_q1}】{_a0[:500]}")
+                                # 上次跑通的代码里解析调用过的动作 —— 续学不重跑，
+                                # produced_by 的实测证据只能从代码里来
+                                _t0 = (list(_c0.get("tools") or [])
+                                       or _called_tools(_c0.get("code")))
+                                if _t0:
+                                    tools_map[_did] = _t0
+                                continue
+                            # 维度的一次 attempt（原版一个 task 的 rollout）：
+                            # 步数上限 4 在 solve 内（见下方的原版同构说明），
+                            # 步与步之间的 critique 回灌也在 solve 内 —— 原版
+                            # voyager.py:262-268 的迭代提示同款，不另起外层重试。
+                            ok1, crit1, obs1, r1 = False, "", [], {}
+                            # 内层判定（真伪）末态：闸门（覆盖）与内层 critic（真伪）
+                            # 两个都过才闭合这条维度，见下方的合并判定
+                            _inner_ok = False
+                            # 追问历史回灌：这条维度上次（上一轮/上一次学这句话）
+                            # 被问过什么、还差什么 —— 直接作为第一轮的输入，别让
+                            # 它从零开始撞同一堵墙（maieutic priorIterations 同款）。
+                            _h = _iters.get(_did) or {}
+                            if _h and not _h.get("passed"):
+                                crit1 = str(_h.get("asked") or _h.get("gap") or "")
+                                if crit1:
+                                    print(f"  · 追问历史：{_q1[:24]}｜上次问过："
+                                          f"{crit1[:70]}", flush=True)
+                            # 证据账（同构助产士的 gathered）：每次工具调用成功取回的
+                            # 内容 —— 失败项 ok=False，**不进材料**。闸门判的是「材料
+                            # 有没有答到维度」，不是「模型写的文本像不像答案」。
+                            _ev1: list[dict[str, Any]] = []
+                            # ===== 原版同构：一个维度 = 一次 rollout，4 步封顶 =====
+                            # （voyager.py:277-279 `done = rollout_num_iter >=
+                            #   action_agent_task_max_retries(4) or success`；
+                            #  curriculum.py:342 失败即 "Skipping to next task"）
+                            # 2026-10-26 用户验收日志拍板「和原版做一样」：曾经的
+                            # SUBTASK_MAX_RETRIES=4 外层循环，每一轮是一次**完整
+                            # solve()**（自带 4 步 + 步内 critique 回灌——那本来就是
+                            # 原版 step 的机制，voyager.py:262-268），外层再套一层
+                            # 重试 = 单维度 16 步、双重重试，是原版 4 倍（实测交通
+                            # 补贴维度 3+ 个 solve 块连跑 4 分钟）。
+                            # 现在：一次 solve（4 步）封顶 → 4 步**之内**双判定
+                            # （步级闸门，见下方 _gate_stepwise）→ 不闭合进
+                            # failed_dims、跳过下一维度；闸门追问写进 _iters，下一轮
+                            # 带着它再来（原版 failed_tasks 的软重试语义，
+                            # curriculum.py:184 把 failed 列表给出题器看）。
+                            # 步级闸门（候选A，2026-10-26 用户拍板「子维度追问闭合
+                            # 由 voyager 根据自己的状况规划、一直实时注入」）：
+                            # 原版 Maieutic 的 examiner 就是**一步一判**
+                            # （spec/route.ts:82-100：passed = gaps_still_open 为空，
+                            #  判词当轮进下一轮输入）；原版 Voyager 的 critique 回灌
+                            # 也在 rollout 内（action.py:197-200）。MVE 曾把闸门放在
+                            # rollout **之后**判一次 → 4 步全用在没人告诉它清单缺口的
+                            # 事上，追问要等下一轮重跑才注入。现在闸门进 step()：
+                            # 内层 critic 每步判「真取到数 + 口径对」之后，闸门核
+                            # 「这条维度清单答到了没有」，questions（≤3 条）当步并进
+                            # critique 槽；双过 = 本步成功（done 提前），任一方不过
+                            # 就带着合并判词进下一步；4 步封顶仍不双过 → 跳过。
+                            # 闸门自己看**本 rollout 已问 + 跨轮 _iters.asked_q**
+                            # （同构 priorIterations，spec-examiner.ts:224-235），
+                            # 不重复问同一句。
+                            # ⚠️ 第二个返回值是**这一轮跑通的代码**（原版的
+                            # `program_code`）。以前写成 `obs1, _ =`，代码直接丢
+                            # 掉 → 知识型场景永远学不到技能（2026-10-20 定位）。
+                            # 场景数据题（db_path）走 VLMLActionAgent + SceneDBEnv
+                            # 写 SQL；本机题走 local_agent 写代码跑本机原语 ——
+                            # **两种后端都逐维度 solv，每维度闭合写一条技能**
+                            # （原版对每任务都拆，不区分知识/数据）。
+                            # ---- 步级闸门回调（候选A）：内层 critic 每步判过之后
+                            # 由 step() 调用（见 action.py 的 gate_check 契约）。
+                            # 闸门读的三样都从 agent 上取（实时，不是快照）：
+                            # ① 本 rollout 实取的观察（材料账，失败项已由 ok 过滤）
+                            # ② 交上来的答案（取到的数据 / 内层判官结论句）
+                            # ③ 已问清单：本 rollout 已问 + 跨轮 _iters.asked_q
+                            #    （同构 priorIterations）—— 不重复问同一句。
+                            # 异常/不可用 → origin=failed 且 passed=True（不阻塞，
+                            # 退化成内层 critic 单独判；它自带 env_obs 口径判据）。
+                            # env_obs 块一次 attempt 算一次（库只读，rollout 内
+                            # 不会变；db_observation 无缓存，每步打库是浪费）。
+                            _env1 = _env_obs_block(db_path)
 
-                        def _gate_stepwise(ag) -> dict[str, Any]:
-                            _ev = [o for o in (getattr(ag, "observations", None)
-                                               or [])
-                                   if isinstance(o, dict) and o.get("ok")]
-                            _ans = _answer_text(_ev, ok_only=True) \
-                                or str(getattr(ag, "critic_reasoning", "") or "")
-                            _asked = [str(q).strip() for q in
-                                      (getattr(ag, "_gate_asked", None) or [])
-                                      if str(q).strip()]
-                            for _q in ((_iters.get(_did) or {}).get("asked_q")
-                                       or []):
-                                if str(_q).strip() and str(_q).strip() not in _asked:
-                                    _asked.append(str(_q).strip())
+                            def _gate_stepwise(ag) -> dict[str, Any]:
+                                _ev = [o for o in (getattr(ag, "observations", None)
+                                                   or [])
+                                       if isinstance(o, dict) and o.get("ok")]
+                                _ans = _answer_text(_ev, ok_only=True) \
+                                    or str(getattr(ag, "critic_reasoning", "") or "")
+                                _asked = [str(q).strip() for q in
+                                          (getattr(ag, "_gate_asked", None) or [])
+                                          if str(q).strip()]
+                                for _q in ((_iters.get(_did) or {}).get("asked_q")
+                                           or []):
+                                    if str(_q).strip() and str(_q).strip() not in _asked:
+                                        _asked.append(str(_q).strip())
+                                try:
+                                    import maieutic_gate as _mg
+                                    return _mg.check(
+                                        _q1, _ans, [_d], evidence=_ev,
+                                        env_obs=_env1,
+                                        prior_questions=_asked,
+                                        # DeepSeek「判定以材料为准」同构（2026-10-29）：
+                                        # SQL = 计算过程的地面真话，不给它闸门只能
+                                        # 对着一行结果反复追问「请提供计算过程」。
+                                        sql=str(getattr(ag, "last_sql", "") or ""))
+                                except Exception as _ge:
+                                    return {"passed": True, "questions": [],
+                                            "origin": "failed",
+                                            "reason": f"{type(_ge).__name__}: {_ge}"}
+
+                            # 来源绑定（2026-10-31，A 项）：维度题面点名了本库哪张表，
+                            # 就在执行前把「答案必须来自这几张表」讲成硬约束 —— 判据
+                            # （下方 _bind）与这句提示同一口径，不做事后才知道的坑。
+                            _bind_db = exec_db or db_path
                             try:
-                                import maieutic_gate as _mg
-                                return _mg.check(
-                                    _q1, _ans, [_d], evidence=_ev,
-                                    env_obs=_env1,
-                                    prior_questions=_asked,
-                                    # DeepSeek「判定以材料为准」同构（2026-10-29）：
-                                    # SQL = 计算过程的地面真话，不给它闸门只能
-                                    # 对着一行结果反复追问「请提供计算过程」。
-                                    sql=str(getattr(ag, "last_sql", "") or ""))
-                            except Exception as _ge:
-                                return {"passed": True, "questions": [],
-                                        "origin": "failed",
-                                        "reason": f"{type(_ge).__name__}: {_ge}"}
-
-                        # 来源绑定（2026-10-31，A 项）：维度题面点名了本库哪张表，
-                        # 就在执行前把「答案必须来自这几张表」讲成硬约束 —— 判据
-                        # （下方 _bind）与这句提示同一口径，不做事后才知道的坑。
-                        _bind_db = exec_db or db_path
-                        try:
-                            import source_binding as _sb
-                            _bind_desc = _sb.describe(_q1, _bind_db)
-                            _bind_names = _sb.named_sources(_q1, _bind_db)
-                            _bind_tip = _sb.bind_hint(_q1, _bind_db)
-                        except Exception:
-                            _bind_desc, _bind_names, _bind_tip = "", [], ""
-                        if _bind_desc:
-                            print(f"  · 来源绑定：本题点名了{_bind_desc} → "
-                                  f"必须真的取到手", flush=True)
-                        if _code_exec:
-                            obs1, code1 = await local_agent.solve(
-                                _q1, local_dir or exec_dir, llm=llm,
-                                scene_id=scene, max_iters=INNER_MAX_ITERS,
-                                avoid=_avoid, critique=str(crit1 or ""),
-                                evidence=_ev1,
-                                skills=_py_skills, require_tools=True,
-                                timeout=EXEC_TIMEOUT, db_path=exec_db,
-                                # 库的表/列/真实取值 = 环境观察面（三方共用）。
-                                # 不给它，模型只能猜表名（"库里有没有 web_docs、
-                                # 里面是正文还是两行摘要"全靠猜）；给了它才判得出
-                                # 「这张表里没有答案」→ 换 gh_read 去读仓库。
-                                # 这就是"见人说人话"，不是我们替它分类。
-                                context=((_env1 if exec_db else "") + _bind_tip))
-                            # ⚠️ 代码路径的观测**必须汇进顶层**（2026-11-07 修）：
-                            # 只有下面 else（VLML）分支有 `observations.extend(obs1)`，
-                            # 代码路径漏了 → 顶层汇总时 observations 为空 →
-                            # calls=0 / real_calls=0 → 真空防线判「一次数据源都没调」
-                            # → 明明维度层查到了真数（_ev1 有料、维度闭合、里程碑
-                            # achieved），整轮却被标 status=no_data。
-                            # 实测（场景 L）：维度两条全闭合、里程碑达成，
-                            # 顶层仍 no_data —— 就是这条漏账。
-                            # 口径：代码路径的观测自带 data_sources=list(tracer)
-                            # （local_agent.py:898），直接汇入即可，不用补。
+                                import source_binding as _sb
+                                _bind_desc = _sb.describe(_q1, _bind_db)
+                                _bind_names = _sb.named_sources(_q1, _bind_db)
+                                _bind_tip = _sb.bind_hint(_q1, _bind_db)
+                            except Exception:
+                                _bind_desc, _bind_names, _bind_tip = "", [], ""
+                            if _bind_desc:
+                                print(f"  · 来源绑定：本题点名了{_bind_desc} → "
+                                      f"必须真的取到手", flush=True)
+                            if _code_exec:
+                                obs1, code1 = await local_agent.solve(
+                                    _q1, local_dir or exec_dir, llm=llm,
+                                    scene_id=scene, max_iters=INNER_MAX_ITERS,
+                                    avoid=_avoid, critique=str(crit1 or ""),
+                                    evidence=_ev1,
+                                    skills=_py_skills, require_tools=True,
+                                    timeout=EXEC_TIMEOUT, db_path=exec_db,
+                                    # 库的表/列/真实取值 = 环境观察面（三方共用）。
+                                    # 不给它，模型只能猜表名（"库里有没有 web_docs、
+                                    # 里面是正文还是两行摘要"全靠猜）；给了它才判得出
+                                    # 「这张表里没有答案」→ 换 gh_read 去读仓库。
+                                    # 这就是"见人说人话"，不是我们替它分类。
+                                    context=((_env1 if exec_db else "") + _bind_tip))
+                                # ⚠️ 代码路径的观测**必须汇进顶层**（2026-11-07 修）：
+                                # 只有下面 else（VLML）分支有 `observations.extend(obs1)`，
+                                # 代码路径漏了 → 顶层汇总时 observations 为空 →
+                                # calls=0 / real_calls=0 → 真空防线判「一次数据源都没调」
+                                # → 明明维度层查到了真数（_ev1 有料、维度闭合、里程碑
+                                # achieved），整轮却被标 status=no_data。
+                                # 实测（场景 L）：维度两条全闭合、里程碑达成，
+                                # 顶层仍 no_data —— 就是这条漏账。
+                                # 口径：代码路径的观测自带 data_sources=list(tracer)
+                                # （local_agent.py:898），直接汇入即可，不用补。
+                                observations.extend(obs1)
+                            else:
+                                obs1, code1 = await agent.solve(
+                                    _q1, skills=skills, grabs=grabs,
+                                    focus_tables=focus,
+                                    hints=_hint_ctx + [str(crit1 or "")],
+                                    gate_check=_gate_stepwise)
+                                # 数据题路径：agent.solve 不收 evidence，它实取的 SQL
+                                # 结果不会进学习循环的 _ev1 材料账；但闸门
+                                # （check_task_success）靠 evidence 判「有没有取到
+                                # 真实内容」，否则会误报「一次都没取到内容」把维度判死。
+                                # 这里把 agent 实取的观察回填进 _ev1（与 local_agent
+                                # 路径同构：本地题是 local_agent 直接写 _ev1）。
+                                _ev1 = list(obs1)
+                                # 同样，agent 实取的观察**不带** data_sources（那是
+                                # local_agent 的 MCP 工具才填的字段）。不补的话
+                                # r1["execution"]["real_calls"] 恒为 0（行 813-815 只
+                                # 数带 data_sources 的观察），闸门 task_critic.py:169
+                                # 会误判「一次数据源都没调」把维度判死。照全局观察补
+                                # data_sources 的口径（1009-1013）：只给 ok 的观察补，
+                                # 标签用 env 自报（SceneDBEnv.data_source →
+                                # "scene_db:payroll.duckdb"）。
+                                _env_src: list[str] = []
+                                try:
+                                    _ds_fn = getattr(
+                                        getattr(agent, "env", None),
+                                        "data_source", None)
+                                    if callable(_ds_fn):
+                                        _v = str(_ds_fn() or "").strip()
+                                        if _v:
+                                            _env_src = [_v]
+                                except Exception:
+                                    _env_src = []
+                                if _env_src:
+                                    obs1 = [
+                                        dict(o, data_sources=list(
+                                            o.get("data_sources") or (
+                                                _env_src if o.get("ok") else [])))
+                                        for o in obs1]
                             observations.extend(obs1)
-                        else:
-                            obs1, code1 = await agent.solve(
-                                _q1, skills=skills, grabs=grabs,
-                                focus_tables=focus,
-                                hints=_hint_ctx + [str(crit1 or "")],
-                                gate_check=_gate_stepwise)
-                            # 数据题路径：agent.solve 不收 evidence，它实取的 SQL
-                            # 结果不会进学习循环的 _ev1 材料账；但闸门
-                            # （check_task_success）靠 evidence 判「有没有取到
-                            # 真实内容」，否则会误报「一次都没取到内容」把维度判死。
-                            # 这里把 agent 实取的观察回填进 _ev1（与 local_agent
-                            # 路径同构：本地题是 local_agent 直接写 _ev1）。
-                            _ev1 = list(obs1)
-                            # 同样，agent 实取的观察**不带** data_sources（那是
-                            # local_agent 的 MCP 工具才填的字段）。不补的话
-                            # r1["execution"]["real_calls"] 恒为 0（行 813-815 只
-                            # 数带 data_sources 的观察），闸门 task_critic.py:169
-                            # 会误判「一次数据源都没调」把维度判死。照全局观察补
-                            # data_sources 的口径（1009-1013）：只给 ok 的观察补，
-                            # 标签用 env 自报（SceneDBEnv.data_source →
-                            # "scene_db:payroll.duckdb"）。
-                            _env_src: list[str] = []
-                            try:
-                                _ds_fn = getattr(
-                                    getattr(agent, "env", None),
-                                    "data_source", None)
-                                if callable(_ds_fn):
-                                    _v = str(_ds_fn() or "").strip()
-                                    if _v:
-                                        _env_src = [_v]
-                            except Exception:
-                                _env_src = []
-                            if _env_src:
-                                obs1 = [
-                                    dict(o, data_sources=list(
-                                        o.get("data_sources") or (
-                                            _env_src if o.get("ok") else [])))
-                                    for o in obs1]
-                        observations.extend(obs1)
-                        r1: dict[str, Any] = {
-                            "execution": {
-                                "calls": len(obs1),
-                                "real_calls": sum(
-                                    1 for o in obs1 if _has_real([o])
-                                    and (o.get("data_sources") or [])),
-                                "rows": sum(int(o.get("rows") or 0)
-                                            for o in obs1 if o.get("ok")),
-                                "data_sources": sorted(
-                                    {s for o in obs1
-                                     for s in (o.get("data_sources") or [])}),
-                                "sql": "", "ok": _has_real(obs1)},
-                            "answer": _answer_text(obs1, ok_only=True),
-                            # 材料（代码剪裁的，不是模型自述的）交给
-                            # critic/闸门：没有材料 = 没取到内容，直接不闭合
-                            "evidence": _ev1,
-                            "status": "learned"}
-                        # ---- 闭合判定：步级双判定的结果读取（候选A）----
-                        # 数据路径：内层 critic（真伪）× 闸门（清单覆盖）已在
-                        # rollout 内**每步**判完（action.py step() 的 gate_check
-                        # 契约）：agent.last_success 已含闸门（双过才 True），
-                        # agent.last_gate_passed = None 表示闸门没跑/不可用
-                        # （不阻塞，退化成内层单独判）。轮级 check_task_success
-                        # 对数据路径**退役**——它的活儿步级已经干了，再跑一遍
-                        # 是双倍 LLM 调用 + 轮级/步级两个判官口径漂移的风险。
-                        # 代码路径（_code_exec：本机 + 所有 scene，见 ⑤ 执行层
-                        # 开头）没有内层 critic，轮级闸门仍是唯一判官 —— 它的
-                        # 观察面里现在带**材料账**（task_critic._evidence_text
-                        # 渲染 result["evidence"]），判的是"答案里的说法能不能
-                        # 在工具实际返回里对上"，不再只看模型自述。
-                        _inner_ok = True
-                        if _code_exec:
-                            try:
-                                import task_critic as _tc1
-                                # dimensions=[一个维度] → 走 maieutic_gate 闭合
-                                # 判定。env_obs 必须一起给：闸门只核清单核不出
-                                # 口径幻觉，2026-10-26 实测 base_salary ×
-                                # overtime_hours 当加班费穿过只核清单的闸门入库
-                                # （164000 假数）——列×列合成新口径 = 假设费率。
-                                import reward as _rw
-                                ok1, crit1 = _tc1.check_task_success(
-                                    _q1, str(crit1 or ""), r1, dimensions=[_d],
-                                    env_obs=_env_obs_block(exec_db or db_path),
-                                    prior_questions=list(
-                                        (_iters.get(_did) or {}).get("asked_q")
-                                        or []),
-                                    has_env=_rw.scene_has_env(scene))
-                            except Exception as e1:
-                                ok1, crit1 = False, f"critic 异常：{type(e1).__name__}: {e1}"
-                        else:
-                            _inner_ok = bool(getattr(agent, "last_success", False))
-                            _gp = getattr(agent, "last_gate_passed", None)
-                            ok1 = _inner_ok and (_gp is not False)
-                            # 判词 = 闸门追问 + 内层判词（可操作的反馈；
-                            # 2026-10-26 实证：内层两次 4/4 拒绝
-                            # base_salary×overtime_hours 费率幻觉，闸门放行——
-                            # 两份判词都要留，人和下一轮都需要）
-                            _icrit = ""
-                            try:
-                                _icrit = str(getattr(
-                                    getattr(agent, "critic", None),
-                                    "last_critique", "") or "")
-                            except Exception:
+                            r1: dict[str, Any] = {
+                                "execution": {
+                                    "calls": len(obs1),
+                                    "real_calls": sum(
+                                        1 for o in obs1 if _has_real([o])
+                                        and (o.get("data_sources") or [])),
+                                    "rows": sum(int(o.get("rows") or 0)
+                                                for o in obs1 if o.get("ok")),
+                                    "data_sources": sorted(
+                                        {s for o in obs1
+                                         for s in (o.get("data_sources") or [])}),
+                                    "sql": "", "ok": _has_real(obs1)},
+                                "answer": _answer_text(obs1, ok_only=True),
+                                # 材料（代码剪裁的，不是模型自述的）交给
+                                # critic/闸门：没有材料 = 没取到内容，直接不闭合
+                                "evidence": _ev1,
+                                "status": "learned"}
+                            # ---- 闭合判定：步级双判定的结果读取（候选A）----
+                            # 数据路径：内层 critic（真伪）× 闸门（清单覆盖）已在
+                            # rollout 内**每步**判完（action.py step() 的 gate_check
+                            # 契约）：agent.last_success 已含闸门（双过才 True），
+                            # agent.last_gate_passed = None 表示闸门没跑/不可用
+                            # （不阻塞，退化成内层单独判）。轮级 check_task_success
+                            # 对数据路径**退役**——它的活儿步级已经干了，再跑一遍
+                            # 是双倍 LLM 调用 + 轮级/步级两个判官口径漂移的风险。
+                            # 代码路径（_code_exec：本机 + 所有 scene，见 ⑤ 执行层
+                            # 开头）没有内层 critic，轮级闸门仍是唯一判官 —— 它的
+                            # 观察面里现在带**材料账**（task_critic._evidence_text
+                            # 渲染 result["evidence"]），判的是"答案里的说法能不能
+                            # 在工具实际返回里对上"，不再只看模型自述。
+                            _inner_ok = True
+                            if _code_exec:
+                                try:
+                                    import task_critic as _tc1
+                                    # dimensions=[一个维度] → 走 maieutic_gate 闭合
+                                    # 判定。env_obs 必须一起给：闸门只核清单核不出
+                                    # 口径幻觉，2026-10-26 实测 base_salary ×
+                                    # overtime_hours 当加班费穿过只核清单的闸门入库
+                                    # （164000 假数）——列×列合成新口径 = 假设费率。
+                                    import reward as _rw
+                                    ok1, crit1 = _tc1.check_task_success(
+                                        _q1, str(crit1 or ""), r1, dimensions=[_d],
+                                        env_obs=_env_obs_block(exec_db or db_path),
+                                        prior_questions=list(
+                                            (_iters.get(_did) or {}).get("asked_q")
+                                            or []),
+                                        has_env=_rw.scene_has_env(scene))
+                                except Exception as e1:
+                                    ok1, crit1 = False, f"critic 异常：{type(e1).__name__}: {e1}"
+                            else:
+                                _inner_ok = bool(getattr(agent, "last_success", False))
+                                _gp = getattr(agent, "last_gate_passed", None)
+                                ok1 = _inner_ok and (_gp is not False)
+                                # 判词 = 闸门追问 + 内层判词（可操作的反馈；
+                                # 2026-10-26 实证：内层两次 4/4 拒绝
+                                # base_salary×overtime_hours 费率幻觉，闸门放行——
+                                # 两份判词都要留，人和下一轮都需要）
                                 _icrit = ""
-                            _gcrit = str(getattr(
-                                agent, "last_gate_critique", "") or "")
-                            crit1 = "；".join(x for x in (_gcrit, _icrit)
-                                             if x)[:400]
-                            # 闸门留痕（取代轮级 check_task_success 写的
-                            # r1["critic_gate"]）—— 面板/日志要能回看
-                            # 「清单核到哪几条、追问了什么」
-                            _gr = getattr(agent, "last_gate_result", None) or {}
-                            r1["critic_gate"] = {
-                                "addressed": list(_gr.get("addressed") or []),
-                                "open": list(_gr.get("open") or []),
-                                "questions": list(_gr.get("questions") or []),
-                                "emergent": list(_gr.get("emergent") or []),
-                                "origin": str(_gr.get("origin") or ""),
-                                "gate_passed": _gp,
-                            }
-                        # （闭合判定在下方：一次 attempt 后的单次判定）
-                        # 超时 = 外部工具没回来（慢/被限流），**不是代码写错
-                        # 了** —— 原地重试毫无意义（原线程还在等，新线程又
-                        # 起），照原版 curriculum.py:342 "Skipping to next
-                        # task" 跳过这条维度，等下一轮（断点续学）再来。
-                        if any(bool(o.get("timed_out")) for o in obs1):
-                            crit1 = (f"上一次执行超时（>{int(EXEC_TIMEOUT)}s，"
-                                     "外部工具没回来：慢或被限流）—— 本条维度"
-                                     "判未闭合，下一轮带追问历史续学")
-                            print(f"  · 执行超时 → 本条维度判未闭合（不重试）："
-                                  f"{_q1[:28]}", flush=True)
-                            _timed_out_dims += 1
-                            ok1 = False
-                            _inner_ok = False
-                        # ---- 来源绑定判定（A 项，确定性，不花 LLM）----
-                        # 旧判据只问「取到没有」：H 实测 dim4 调 gh_repo_info 拿仓库
-                        # description 回答「web_facts 表 claim 字段是什么」，材料非空、
-                        # 措辞也对得上 → 闭合 → 里程碑假亮。这里补问一句
-                        # 「取的是不是这一份」：题面点名的真实表，必须有一条成功
-                        # 调用其**入参**点到它（判据见 source_binding.py）。
-                        #
-                        # ★ 取证落点表的「上游等价」放宽（2026-11-09 服务器实测）：
-                        #   维度问「web_facts 表中…平台判定列…」而执行层调的是
-                        #   `mcp_sherlock_lookup_username` —— web_facts 恰恰就是
-                        #   Sherlock 结果落库后的摊平宽表（同一份数据的源头）。
-                        #   不放宽 → 把最直接的取法判死 → 这条维度永远闭合不了
-                        #   （实测：维度卡在 web_evidence/web_facts 上，连着几轮
-                        #   都「维度闭合」但题答不出来）。
-                        #   两个清单都是**实况**：取证落点表 = `local_agent.
-                        #   _ingest_tables` 实查；远端抓手 = actions 注册表
-                        #   origin=net|mcp 的条目。与消费侧同一份实现、同一口径。
-                        try:
-                            import source_binding as _sb2
-                            _up_tables: list[str] = []
-                            try:
-                                import local_agent as _la
-                                _up_tables = list(
-                                    _la._ingest_tables(str(_bind_db or "")) or [])
-                            except Exception:
-                                _up_tables = []
-                            _up_tools: list[str] = []
-                            try:
-                                import actions as _act
-                                _bucket = getattr(_act, "_REGISTRY", {}).get(
-                                    str(scene_id or "")) or {}
-                                if not _bucket:
-                                    try:
-                                        _act.restore()
-                                    except Exception:
-                                        pass
-                                    _bucket = getattr(_act, "_REGISTRY", {}).get(
-                                        str(scene_id or "")) or {}
-                                _up_tools = sorted({
-                                    str(a.name) for a in _bucket.values()
-                                    if str(getattr(a, "origin", "")) in ("net", "mcp")})
-                            except Exception:
-                                _up_tools = []
-                            _bind_ok, _bind_why = _sb2.check(
-                                _q1, _ev1, _bind_db,
-                                upstream_tables=_up_tables,
-                                upstream_tools=_up_tools)
-                        except Exception:
-                            _bind_ok, _bind_why = True, ""
-                        if not _bind_ok:
-                            ok1 = False
-                            _inner_ok = False
-                            _tail = str(crit1 or "").strip()
-                            crit1 = (_bind_why + ("；" + _tail if _tail else ""))[:400]
-                            print(f"  · 来源未绑定 → 判未闭合：{_bind_why[:90]}",
-                                  flush=True)
-                        # ---- 语义收口（2026-10-31，用户按 DeepSeek 定的职责划分）----
-                        # 取证归工具、判断归模型：材料已经取到手却没答到（判官说
-                        # 「你只交回了原文」），就**关掉工具**，只让模型在材料上
-                        # 作答 —— 这正是 V3.2 "Thinking in Tool-Use" 的分工，
-                        # 也是「发现一直回答不上 → 启动模型能力」。
-                        # 只在来源已绑定时才做：材料取错了对象时，再推理只会错得更远。
-                        _via_reason = False
-                        try:
-                            import reason_pass as _rp
-                            _mat = _rp.material_text(_ev1)
-                        except Exception:
-                            _rp, _mat = None, ""
-                        # 执行账按**材料账**对齐（2026-10-31 实测）：solve 最终步
-                        # 没产出 RESULT 时 real_calls/rows 会记成 0，但材料账里
-                        # 明明有 ok 条目 + 上万字正文。不校对的话，真空防线会抢在
-                        # 闸门前面把维度判死，判词还写成「每行都是空值(NULL/0)」
-                        # —— 说了一句跟事实相反的话（材料就在手上）。
-                        _ok_ev = [e for e in _ev1
-                                  if isinstance(e, dict) and e.get("ok")
-                                  and str(e.get("text") or "").strip()]
-                        if _ok_ev:
-                            _ex1 = dict(r1.get("execution") or {})
-                            _ex1["real_calls"] = max(
-                                int(_ex1.get("real_calls") or 0), len(_ok_ev))
-                            _ex1["rows"] = max(int(_ex1.get("rows") or 0), len(_ok_ev))
-                            _ex1["calls"] = max(int(_ex1.get("calls") or 0), len(_ok_ev))
-                            _ex1["ok"] = True
-                            _ex1["data_sources"] = sorted(
-                                {str(e.get("tool") or "") for e in _ok_ev})
-                            r1["execution"] = _ex1
-                            # 整轮口径也要对齐：no_data 闸门看的是 out（见 _material_real）
-                            _mat_ok = _material_real(_ok_ev)
-                            if _mat_ok:
-                                out["_mat_real"] = max(
-                                    int(out.get("_mat_real") or 0), len(_mat_ok))
-                        # ---- 搬运材料 ≠ 回答（确定性判据，先于判官）----
-                        # 2026-10-31 实测：同一个行为「gh_read → RESULT = 整篇
-                        # README」被判官连拒 5 次、又放过 2 次（vlml_details
-                        # r=1.0，答案就是 15145 字节原文）。**判官会抖，判据不能抖**。
-                        # 材料已经到手还交原文，说明它在用取数逻辑冒答语义题 ——
-                        # 判未闭合，接着走下面的语义收口（同一份材料上作答）。
-                        if _mat and ok1 and _inner_ok:
-                            try:
-                                _is_dump, _nhit = _rp.is_material_dump(
-                                    str(r1.get("answer") or ""), _mat)
-                            except Exception:
-                                _is_dump, _nhit = False, 0
-                            if _is_dump:
+                                try:
+                                    _icrit = str(getattr(
+                                        getattr(agent, "critic", None),
+                                        "last_critique", "") or "")
+                                except Exception:
+                                    _icrit = ""
+                                _gcrit = str(getattr(
+                                    agent, "last_gate_critique", "") or "")
+                                crit1 = "；".join(x for x in (_gcrit, _icrit)
+                                                 if x)[:400]
+                                # 闸门留痕（取代轮级 check_task_success 写的
+                                # r1["critic_gate"]）—— 面板/日志要能回看
+                                # 「清单核到哪几条、追问了什么」
+                                _gr = getattr(agent, "last_gate_result", None) or {}
+                                r1["critic_gate"] = {
+                                    "addressed": list(_gr.get("addressed") or []),
+                                    "open": list(_gr.get("open") or []),
+                                    "questions": list(_gr.get("questions") or []),
+                                    "emergent": list(_gr.get("emergent") or []),
+                                    "origin": str(_gr.get("origin") or ""),
+                                    "gate_passed": _gp,
+                                }
+                            # （闭合判定在下方：一次 attempt 后的单次判定）
+                            # 超时 = 外部工具没回来（慢/被限流），**不是代码写错
+                            # 了** —— 原地重试毫无意义（原线程还在等，新线程又
+                            # 起），照原版 curriculum.py:342 "Skipping to next
+                            # task" 跳过这条维度，等下一轮（断点续学）再来。
+                            if any(bool(o.get("timed_out")) for o in obs1):
+                                crit1 = (f"上一次执行超时（>{int(EXEC_TIMEOUT)}s，"
+                                         "外部工具没回来：慢或被限流）—— 本条维度"
+                                         "判未闭合，下一轮带追问历史续学")
+                                print(f"  · 执行超时 → 本条维度判未闭合（不重试）："
+                                      f"{_q1[:28]}", flush=True)
+                                _timed_out_dims += 1
                                 ok1 = False
                                 _inner_ok = False
-                                crit1 = ("你交回的是材料原文（答案里 "
-                                         f"{_nhit}% 的片段能在材料里逐字找到），"
-                                         "不是对问题的判断 —— 材料已经到手，"
-                                         "直接在它上面作答：先给判断，再指认依据"
-                                         )[:300]
-                                print("  · 答案是材料搬运 → 判未闭合"
-                                      "（确定性判据，不听判官心情）", flush=True)
-                        if not (ok1 and _inner_ok) and _bind_ok:
-                            if _mat and len(_mat) >= 120:
-                                print(f"  · 材料已到手（{len(_mat)} 字）但没答到 → "
-                                      f"关掉工具，在材料上作答", flush=True)
-                                # 同类问题**验得对**的示范（DeepSeek cold-start 同构，
-                                # 见 reason_demos.py）：只教"怎么下判断"，材料仍是
-                                # 唯一事实来源。召回按题面词面重叠，不硬塞。
-                                _demos = ""
+                            # ---- 来源绑定判定（A 项，确定性，不花 LLM）----
+                            # 旧判据只问「取到没有」：H 实测 dim4 调 gh_repo_info 拿仓库
+                            # description 回答「web_facts 表 claim 字段是什么」，材料非空、
+                            # 措辞也对得上 → 闭合 → 里程碑假亮。这里补问一句
+                            # 「取的是不是这一份」：题面点名的真实表，必须有一条成功
+                            # 调用其**入参**点到它（判据见 source_binding.py）。
+                            #
+                            # ★ 取证落点表的「上游等价」放宽（2026-11-09 服务器实测）：
+                            #   维度问「web_facts 表中…平台判定列…」而执行层调的是
+                            #   `mcp_sherlock_lookup_username` —— web_facts 恰恰就是
+                            #   Sherlock 结果落库后的摊平宽表（同一份数据的源头）。
+                            #   不放宽 → 把最直接的取法判死 → 这条维度永远闭合不了
+                            #   （实测：维度卡在 web_evidence/web_facts 上，连着几轮
+                            #   都「维度闭合」但题答不出来）。
+                            #   两个清单都是**实况**：取证落点表 = `local_agent.
+                            #   _ingest_tables` 实查；远端抓手 = actions 注册表
+                            #   origin=net|mcp 的条目。与消费侧同一份实现、同一口径。
+                            try:
+                                import source_binding as _sb2
+                                _up_tables: list[str] = []
                                 try:
-                                    import reason_demos as _rd
-                                    _demos = _rd.render(_rd.recall(scene, _q1))
-                                    if _demos:
-                                        print("  · 带上 "
-                                              f"{_demos.count('示范 ')} 条同类示范"
-                                              "（已验对的判断过程）", flush=True)
+                                    import local_agent as _la
+                                    _up_tables = list(
+                                        _la._ingest_tables(str(_bind_db or "")) or [])
                                 except Exception:
-                                    _demos = ""
-                                _r_out = _rp.answer_over_material(
-                                    _q1, _mat, critique=str(crit1 or ""),
-                                    demos_text=_demos)
-                                if _r_out.get("ok"):
-                                    _r2 = dict(r1)
-                                    _r2["answer"] = str(_r_out.get("answer") or "")
-                                    try:
-                                        import task_critic as _tc3
-                                        import reward as _rw3
-                                        ok2, crit2 = _tc3.check_task_success(
-                                            _q1, str(crit1 or ""), _r2,
-                                            dimensions=[_d],
-                                            env_obs=_env_obs_block(exec_db or db_path),
-                                            prior_questions=list(
-                                                (_iters.get(_did) or {}).get("asked_q")
-                                                or []),
-                                            has_env=_rw3.scene_has_env(scene))
-                                    except Exception as e2:
-                                        ok2, crit2 = False, (
-                                            f"判官异常：{type(e2).__name__}: {e2}")
-                                    if ok2:
-                                        ok1, _inner_ok, _via_reason = True, True, True
-                                        crit1 = crit2
-                                        r1["answer"] = _r2["answer"]
-                                        r1["reason_pass"] = {
-                                            "verdict": _r_out.get("verdict"),
-                                            "quotes": len(_r_out.get("quotes") or []),
-                                            "material_chars": len(_mat)}
-                                        print("  · 语义收口通过同一把尺子 → 本条维度闭合",
-                                              flush=True)
-                                        # 收一条示范：**只在验得对之后**（quotes 逐字
-                                        # 核验过 + 判官判过）—— 这就是 DeepSeek 的
-                                        # rejection sampling 口径：只留对的轨迹。
+                                    _up_tables = []
+                                _up_tools: list[str] = []
+                                try:
+                                    import actions as _act
+                                    _bucket = getattr(_act, "_REGISTRY", {}).get(
+                                        str(scene_id or "")) or {}
+                                    if not _bucket:
                                         try:
-                                            import reason_demos as _rd2
-                                            if _rd2.add(scene, _q1, _r_out,
-                                                        material=_mat):
-                                                print("  · 这条判断收进示范库"
-                                                      f"（共 {_rd2.count(scene)} 条）",
-                                                      flush=True)
+                                            _act.restore()
                                         except Exception:
                                             pass
-                                    else:
-                                        crit1 = ("语义层给了判断，判官仍不认："
-                                                 + str(crit2 or ""))[:400]
-                                else:
-                                    # 失败原因要**可执行**（原版 critique 就是下一轮的
-                                    # 输入）：语义层说「材料不足以判断：缺 X」时，把 X
-                                    # 带进判词，下一轮才知道该去取哪一份材料。
-                                    # 只说「没有指认任何引文」等于让下一轮原地重撞。
-                                    _w = str(_r_out.get("why") or "")
-                                    _g = str(_r_out.get("gap") or "").strip()
-                                    if _g and _g[:40] not in _w:
-                                        _w += f"（材料缺：{_g[:120]}）"
-                                    crit1 = (_w + "；" + str(crit1 or ""))[:400]
-                        # ---- (success, critique) 不可分契约（2026-10-26 补）----
-                        # 原版 check_task_success **一次调用同时产出** success 与
-                        # critique（voyager.py:232-238 返回二元组），结构上不存在
-                        # 「判过但没判词」这个状态。MVE 的判词是三处拼的（闸门
-                        # 追问 + 内层 critic + 执行报错），没有一处兜底 —— 实测出现
-                        # 过 4 步全「取到 1 行」、critique 为空就判未闭合，下一轮
-                        # 拿着空判词续学 = 原地打转（日志里形如「｜｜」）。
-                        # 补齐契约而不是补丁：**没判词 = 这次判定没发生**，如实
-                        # 记一行，不拿它当下一轮的追问输入。
-                        _crit_missing = not str(crit1 or "").strip()
-                        if _crit_missing:
-                            crit1 = ("（本轮没有产生判词：闸门与内层 critic 都未给出"
-                                     "理由 —— 如实记录，判未闭合，不带入下一轮追问）")
-                        # ---- r 沉淀（数据路径，2026-10-28 服务器实测补漏）----
-                        # check_task_success（内含 compute_r 包装层）只在
-                        # is_local 分支被调；数据路径判定权在内层 critic + 闸门，
-                        # 判完从不算 r → r1 恒无 "r" → dim_codes 全 -1.0 →
-                        # 入库口 r >= 0 不成立 → r 字段整体缺失，组内择优与
-                        # 索引排序（0.3*r）全空转（learn_74c71ce2 四条技能
-                        # 实证）。这里与 is_local 分支同口径补算：判定已定
-                        # （ok1 含超时修正），配方载体从实跑代码补进执行账。
-                        try:
-                            import reward as _rw_r
-                            r1["execution"]["sql"] = str(code1 or "")
-                            r1["r"] = _rw_r.compute_r(
-                                r1, bool(ok1 and _inner_ok),
-                                _rw_r.scene_has_env(scene))
-                        except Exception:
-                            pass
-                        if ok1 and _inner_ok:
-                            learned_dims.append(_d)
-                            a1 = str(r1.get("answer") or "").strip()
-                            if a1:
-                                answers.append(f"【{_q1}】{a1[:500]}")
-                            # 这条维度**实测**调用过的动作（执行层 tracer 记的；
-                            # tracer 空就从代码解析兜底）——回写图谱的工具来源
-                            _t1 = sorted({s for o in obs1
-                                          for s in (o.get("data_sources") or [])
-                                          if str(s).strip()}) \
-                                or _called_tools(code1)
-                            if _did and _t1:
-                                tools_map[_did] = _t1
-                            dim_codes.append({"id": _did, "question": _q1,
-                                              "code": str(code1 or ""),
-                                              "answer": str(a1 or ""),
-                                              # 事实记录：这条是靠取证后的语义收口
-                                              # 闭合的，还是取证当轮就闭合的
-                                              # （判据不变，只是让人看得出路径）
-                                              "how": "reason" if _via_reason
-                                              else "tool",
-                                              "tools": list(tools_map.get(_did)
-                                                            or []),
-                                              # critic 出口沉淀的标量 reward
-                                              # （task_critic 包装层写进 r1["r"]）
-                                              # → 断点续学账本 + 入库择优都用它
-                                              "r": float(r1.get("r", -1.0))})
-                            # 最小技能单位 = **一枚节点 = 闭合一个（维度）问题**
-                            # （用户 2026-10-19 定）：闭合一条就落一条，不等整个
-                            # 任务闭合 —— 否则 8/9 那种 partial 会因为 ⑤' 提前
-                            # return 而颗粒无收（2026-10-19 服务器实测）。
-                            closed_nodes.extend(
-                                close_one_dimension(
-                                    scene, _tid, question, _d, import_id=imp_id,
-                                    tools=tools_map.get(_did)))
-                            if _did:
-                                closed_ids.add(_did)
-                            # 每闭合一条就**落盘 + 打一行**：原版 rollout 是一条
-                            # 一条推进的，日志不逐条可见时，人只能干等（实测
-                            # 15 分钟看不到任何输出，以为卡死）。同时断点续学
-                            # 的粒度也从"整轮"细到"每条"——中途挂掉不丢已闭合的。
+                                        _bucket = getattr(_act, "_REGISTRY", {}).get(
+                                            str(scene_id or "")) or {}
+                                    _up_tools = sorted({
+                                        str(a.name) for a in _bucket.values()
+                                        if str(getattr(a, "origin", "")) in ("net", "mcp")})
+                                except Exception:
+                                    _up_tools = []
+                                _bind_ok, _bind_why = _sb2.check(
+                                    _q1, _ev1, _bind_db,
+                                    upstream_tables=_up_tables,
+                                    upstream_tools=_up_tools)
+                            except Exception:
+                                _bind_ok, _bind_why = True, ""
+                            if not _bind_ok:
+                                ok1 = False
+                                _inner_ok = False
+                                _tail = str(crit1 or "").strip()
+                                crit1 = (_bind_why + ("；" + _tail if _tail else ""))[:400]
+                                print(f"  · 来源未绑定 → 判未闭合：{_bind_why[:90]}",
+                                      flush=True)
+                            # ---- 语义收口（2026-10-31，用户按 DeepSeek 定的职责划分）----
+                            # 取证归工具、判断归模型：材料已经取到手却没答到（判官说
+                            # 「你只交回了原文」），就**关掉工具**，只让模型在材料上
+                            # 作答 —— 这正是 V3.2 "Thinking in Tool-Use" 的分工，
+                            # 也是「发现一直回答不上 → 启动模型能力」。
+                            # 只在来源已绑定时才做：材料取错了对象时，再推理只会错得更远。
+                            _via_reason = False
                             try:
-                                _ms.save_progress(
-                                    scene, question,
-                                    [str(d.get("id") or "")
-                                     for d in learned_dims])
-                                _ms.save_progress_codes(scene, question,
-                                                        dim_codes)
+                                import reason_pass as _rp
+                                _mat = _rp.material_text(_ev1)
+                            except Exception:
+                                _rp, _mat = None, ""
+                            # 执行账按**材料账**对齐（2026-10-31 实测）：solve 最终步
+                            # 没产出 RESULT 时 real_calls/rows 会记成 0，但材料账里
+                            # 明明有 ok 条目 + 上万字正文。不校对的话，真空防线会抢在
+                            # 闸门前面把维度判死，判词还写成「每行都是空值(NULL/0)」
+                            # —— 说了一句跟事实相反的话（材料就在手上）。
+                            _ok_ev = [e for e in _ev1
+                                      if isinstance(e, dict) and e.get("ok")
+                                      and str(e.get("text") or "").strip()]
+                            if _ok_ev:
+                                _ex1 = dict(r1.get("execution") or {})
+                                _ex1["real_calls"] = max(
+                                    int(_ex1.get("real_calls") or 0), len(_ok_ev))
+                                _ex1["rows"] = max(int(_ex1.get("rows") or 0), len(_ok_ev))
+                                _ex1["calls"] = max(int(_ex1.get("calls") or 0), len(_ok_ev))
+                                _ex1["ok"] = True
+                                _ex1["data_sources"] = sorted(
+                                    {str(e.get("tool") or "") for e in _ok_ev})
+                                r1["execution"] = _ex1
+                                # 整轮口径也要对齐：no_data 闸门看的是 out（见 _material_real）
+                                _mat_ok = _material_real(_ok_ev)
+                                if _mat_ok:
+                                    out["_mat_real"] = max(
+                                        int(out.get("_mat_real") or 0), len(_mat_ok))
+                            # ---- 搬运材料 ≠ 回答（确定性判据，先于判官）----
+                            # 2026-10-31 实测：同一个行为「gh_read → RESULT = 整篇
+                            # README」被判官连拒 5 次、又放过 2 次（vlml_details
+                            # r=1.0，答案就是 15145 字节原文）。**判官会抖，判据不能抖**。
+                            # 材料已经到手还交原文，说明它在用取数逻辑冒答语义题 ——
+                            # 判未闭合，接着走下面的语义收口（同一份材料上作答）。
+                            if _mat and ok1 and _inner_ok:
+                                try:
+                                    _is_dump, _nhit = _rp.is_material_dump(
+                                        str(r1.get("answer") or ""), _mat)
+                                except Exception:
+                                    _is_dump, _nhit = False, 0
+                                if _is_dump:
+                                    ok1 = False
+                                    _inner_ok = False
+                                    crit1 = ("你交回的是材料原文（答案里 "
+                                             f"{_nhit}% 的片段能在材料里逐字找到），"
+                                             "不是对问题的判断 —— 材料已经到手，"
+                                             "直接在它上面作答：先给判断，再指认依据"
+                                             )[:300]
+                                    print("  · 答案是材料搬运 → 判未闭合"
+                                          "（确定性判据，不听判官心情）", flush=True)
+                            if not (ok1 and _inner_ok) and _bind_ok:
+                                if _mat and len(_mat) >= 120:
+                                    print(f"  · 材料已到手（{len(_mat)} 字）但没答到 → "
+                                          f"关掉工具，在材料上作答", flush=True)
+                                    # 同类问题**验得对**的示范（DeepSeek cold-start 同构，
+                                    # 见 reason_demos.py）：只教"怎么下判断"，材料仍是
+                                    # 唯一事实来源。召回按题面词面重叠，不硬塞。
+                                    _demos = ""
+                                    try:
+                                        import reason_demos as _rd
+                                        _demos = _rd.render(_rd.recall(scene, _q1))
+                                        if _demos:
+                                            print("  · 带上 "
+                                                  f"{_demos.count('示范 ')} 条同类示范"
+                                                  "（已验对的判断过程）", flush=True)
+                                    except Exception:
+                                        _demos = ""
+                                    _r_out = _rp.answer_over_material(
+                                        _q1, _mat, critique=str(crit1 or ""),
+                                        demos_text=_demos)
+                                    if _r_out.get("ok"):
+                                        _r2 = dict(r1)
+                                        _r2["answer"] = str(_r_out.get("answer") or "")
+                                        try:
+                                            import task_critic as _tc3
+                                            import reward as _rw3
+                                            ok2, crit2 = _tc3.check_task_success(
+                                                _q1, str(crit1 or ""), _r2,
+                                                dimensions=[_d],
+                                                env_obs=_env_obs_block(exec_db or db_path),
+                                                prior_questions=list(
+                                                    (_iters.get(_did) or {}).get("asked_q")
+                                                    or []),
+                                                has_env=_rw3.scene_has_env(scene))
+                                        except Exception as e2:
+                                            ok2, crit2 = False, (
+                                                f"判官异常：{type(e2).__name__}: {e2}")
+                                        if ok2:
+                                            ok1, _inner_ok, _via_reason = True, True, True
+                                            crit1 = crit2
+                                            r1["answer"] = _r2["answer"]
+                                            r1["reason_pass"] = {
+                                                "verdict": _r_out.get("verdict"),
+                                                "quotes": len(_r_out.get("quotes") or []),
+                                                "material_chars": len(_mat)}
+                                            print("  · 语义收口通过同一把尺子 → 本条维度闭合",
+                                                  flush=True)
+                                            # 收一条示范：**只在验得对之后**（quotes 逐字
+                                            # 核验过 + 判官判过）—— 这就是 DeepSeek 的
+                                            # rejection sampling 口径：只留对的轨迹。
+                                            try:
+                                                import reason_demos as _rd2
+                                                if _rd2.add(scene, _q1, _r_out,
+                                                            material=_mat):
+                                                    print("  · 这条判断收进示范库"
+                                                          f"（共 {_rd2.count(scene)} 条）",
+                                                          flush=True)
+                                            except Exception:
+                                                pass
+                                        else:
+                                            crit1 = ("语义层给了判断，判官仍不认："
+                                                     + str(crit2 or ""))[:400]
+                                    else:
+                                        # 失败原因要**可执行**（原版 critique 就是下一轮的
+                                        # 输入）：语义层说「材料不足以判断：缺 X」时，把 X
+                                        # 带进判词，下一轮才知道该去取哪一份材料。
+                                        # 只说「没有指认任何引文」等于让下一轮原地重撞。
+                                        _w = str(_r_out.get("why") or "")
+                                        _g = str(_r_out.get("gap") or "").strip()
+                                        if _g and _g[:40] not in _w:
+                                            _w += f"（材料缺：{_g[:120]}）"
+                                        crit1 = (_w + "；" + str(crit1 or ""))[:400]
+                            # ---- (success, critique) 不可分契约（2026-10-26 补）----
+                            # 原版 check_task_success **一次调用同时产出** success 与
+                            # critique（voyager.py:232-238 返回二元组），结构上不存在
+                            # 「判过但没判词」这个状态。MVE 的判词是三处拼的（闸门
+                            # 追问 + 内层 critic + 执行报错），没有一处兜底 —— 实测出现
+                            # 过 4 步全「取到 1 行」、critique 为空就判未闭合，下一轮
+                            # 拿着空判词续学 = 原地打转（日志里形如「｜｜」）。
+                            # 补齐契约而不是补丁：**没判词 = 这次判定没发生**，如实
+                            # 记一行，不拿它当下一轮的追问输入。
+                            _crit_missing = not str(crit1 or "").strip()
+                            if _crit_missing:
+                                crit1 = ("（本轮没有产生判词：闸门与内层 critic 都未给出"
+                                         "理由 —— 如实记录，判未闭合，不带入下一轮追问）")
+                            # ---- r 沉淀（数据路径，2026-10-28 服务器实测补漏）----
+                            # check_task_success（内含 compute_r 包装层）只在
+                            # is_local 分支被调；数据路径判定权在内层 critic + 闸门，
+                            # 判完从不算 r → r1 恒无 "r" → dim_codes 全 -1.0 →
+                            # 入库口 r >= 0 不成立 → r 字段整体缺失，组内择优与
+                            # 索引排序（0.3*r）全空转（learn_74c71ce2 四条技能
+                            # 实证）。这里与 is_local 分支同口径补算：判定已定
+                            # （ok1 含超时修正），配方载体从实跑代码补进执行账。
+                            try:
+                                import reward as _rw_r
+                                r1["execution"]["sql"] = str(code1 or "")
+                                r1["r"] = _rw_r.compute_r(
+                                    r1, bool(ok1 and _inner_ok),
+                                    _rw_r.scene_has_env(scene))
                             except Exception:
                                 pass
-                            print(f"  · 维度闭合 {len(learned_dims)}/{len(_dims)}"
-                                  f"：{_q1[:30]}"
-                                  + (f"（工具：{','.join(_t1)}）" if _t1
-                                     else "（没调工具）"), flush=True)
-                        else:
-                            failed_dims.append({
-                                "id": _did, "question": _q1,
-                                "attempts": 1,  # 一次 rollout 封顶（原版同口径；步数上限在 solve 内）
-                                "critique": str(crit1)[:200]})
-                            # 失败的也要逐条可见：否则整轮跑完只看到"N 条没闭合"，
-                            # 不知道是模型没调工具、还是工具本身报错（2026-10-20）
-                            _e1 = str((obs1 or [{}])[-1].get("error") or "")[:90]
-                            print(f"  · 维度未闭合 {len(learned_dims)}"
-                                  f"/{len(_dims)}：{_q1[:28]}"
-                                  f"｜{str(crit1)[:60]}"
-                                  + (f"｜执行报错：{_e1}" if _e1 else "")
-                                  + f"｜调过：{','.join(sorted({s for o in obs1 for s in (o.get('data_sources') or [])})) or '无'}",
-                                  flush=True)
-                            # 可观测性缺口（2026-10-31 用户指出「tools=[] 时看不到
-                            # 模型写了什么」）：失败必须留下它最后那段代码的指纹，
-                            # 否则只能靠判词猜它是"没写"、"写错"还是"根本没取数"。
-                            _code_hint = str(code1 or "").strip().replace("\n", " ⏎ ")
-                            print(f"  · 上次代码（{len(str(code1 or ''))} 字）："
-                                  f"{_code_hint[:300] or '（没产出代码）'}",
-                                  flush=True)
-                        # 记一条追问历史（同 maieutic 的 appendPhase1Iteration）：
-                        # **成没闭合都要记** —— 下次才知道这题问过、卡在哪一句。
-                        #
-                        # ⚠️ rounds 这里是**本轮的尝试次数**（恒为 1：一次 rollout
-                        # 封顶），累加发生在 save_progress_iterations（老值 + 本次，
-                        # 同 maieutic priorIterations 的按轮累积）。别在这里再加一
-                        # 遍 —— 实测会双重计数（2026-10-26 修）。
-                        _iters[_did] = {
-                            "rounds": 1,
-                            "asked": str(crit1)[:300],
-                            # asked_q：本次闭合问过的**干净追问清单**（步级
-                            # 闸门的 questions）—— 下一轮 gate 回调的
-                            # prior_questions 从这取（同构 priorIterations，
-                            # 防重复问）。asked 是合并判词（人看的），
-                            # asked_q 是问句列表（机器复用的），两份都要。
-                            # ⚠️ 判词缺失时**不写 asked_q**：那是下一轮闸门回调的
-                            # prior_questions（机器复用的追问清单），拿一条占位
-                            # 话进去等于让下一轮对着空气问（见上面契约注释）。
-                            "asked_q": ([] if _crit_missing else
-                                        [str(q)[:200] for q in
-                                         (getattr(agent, "_gate_asked", None)
-                                          or [])][:6]) if not _code_exec else [],
-                            "gap": ("" if (ok1 and _inner_ok) else str(_q1)[:300]),
-                            "passed": bool(ok1 and _inner_ok),
-                            "tools": list(tools_map.get(_did) or []),
-                        }
-                        # 只把**本轮尝试过的**交出去落盘（老值 + 本次）；未尝试的
-                        # 旧账留在文件里不动，见 _iters_round 处的注释。
-                        _iters_round[_did] = _iters[_did]
+                            if ok1 and _inner_ok:
+                                learned_dims.append(_d)
+                                a1 = str(r1.get("answer") or "").strip()
+                                if a1:
+                                    answers.append(f"【{_q1}】{a1[:500]}")
+                                # 这一维的结论进整篇作答（轮末拿全文判全集）
+                                if _did:
+                                    _ledger[_did] = (a1 or "")[:1200]
+                                # 这条维度**实测**调用过的动作（执行层 tracer 记的；
+                                # tracer 空就从代码解析兜底）——回写图谱的工具来源
+                                _t1 = sorted({s for o in obs1
+                                              for s in (o.get("data_sources") or [])
+                                              if str(s).strip()}) \
+                                    or _called_tools(code1)
+                                if _did and _t1:
+                                    tools_map[_did] = _t1
+                                dim_codes.append({"id": _did, "question": _q1,
+                                                  "code": str(code1 or ""),
+                                                  "answer": str(a1 or ""),
+                                                  # 事实记录：这条是靠取证后的语义收口
+                                                  # 闭合的，还是取证当轮就闭合的
+                                                  # （判据不变，只是让人看得出路径）
+                                                  "how": "reason" if _via_reason
+                                                  else "tool",
+                                                  "tools": list(tools_map.get(_did)
+                                                                or []),
+                                                  # critic 出口沉淀的标量 reward
+                                                  # （task_critic 包装层写进 r1["r"]）
+                                                  # → 断点续学账本 + 入库择优都用它
+                                                  "r": float(r1.get("r", -1.0))})
+                                # 最小技能单位 = **一枚节点 = 闭合一个（维度）问题**
+                                # （用户 2026-10-19 定）：闭合一条就落一条，不等整个
+                                # 任务闭合 —— 否则 8/9 那种 partial 会因为 ⑤' 提前
+                                # return 而颗粒无收（2026-10-19 服务器实测）。
+                                closed_nodes.extend(
+                                    close_one_dimension(
+                                        scene, _tid, question, _d, import_id=imp_id,
+                                        tools=tools_map.get(_did)))
+                                if _did:
+                                    closed_ids.add(_did)
+                                # 每闭合一条就**落盘 + 打一行**：原版 rollout 是一条
+                                # 一条推进的，日志不逐条可见时，人只能干等（实测
+                                # 15 分钟看不到任何输出，以为卡死）。同时断点续学
+                                # 的粒度也从"整轮"细到"每条"——中途挂掉不丢已闭合的。
+                                try:
+                                    _ms.save_progress(
+                                        scene, question,
+                                        [str(d.get("id") or "")
+                                         for d in learned_dims])
+                                    _ms.save_progress_codes(scene, question,
+                                                            dim_codes)
+                                except Exception:
+                                    pass
+                                print(f"  · 维度闭合 {len(learned_dims)}/{len(_dims)}"
+                                      f"：{_q1[:30]}"
+                                      + (f"（工具：{','.join(_t1)}）" if _t1
+                                         else "（没调工具）"), flush=True)
+                            else:
+                                failed_dims.append({
+                                    "id": _did, "question": _q1,
+                                    "attempts": 1,  # 一次 rollout 封顶（原版同口径；步数上限在 solve 内）
+                                    "critique": str(crit1)[:200]})
+                                # 失败的也要逐条可见：否则整轮跑完只看到"N 条没闭合"，
+                                # 不知道是模型没调工具、还是工具本身报错（2026-10-20）
+                                _e1 = str((obs1 or [{}])[-1].get("error") or "")[:90]
+                                print(f"  · 维度未闭合 {len(learned_dims)}"
+                                      f"/{len(_dims)}：{_q1[:28]}"
+                                      f"｜{str(crit1)[:60]}"
+                                      + (f"｜执行报错：{_e1}" if _e1 else "")
+                                      + f"｜调过：{','.join(sorted({s for o in obs1 for s in (o.get('data_sources') or [])})) or '无'}",
+                                      flush=True)
+                                # 可观测性缺口（2026-10-31 用户指出「tools=[] 时看不到
+                                # 模型写了什么」）：失败必须留下它最后那段代码的指纹，
+                                # 否则只能靠判词猜它是"没写"、"写错"还是"根本没取数"。
+                                _code_hint = str(code1 or "").strip().replace("\n", " ⏎ ")
+                                print(f"  · 上次代码（{len(str(code1 or ''))} 字）："
+                                      f"{_code_hint[:300] or '（没产出代码）'}",
+                                      flush=True)
+                            # 记一条追问历史（同 maieutic 的 appendPhase1Iteration）：
+                            # **成没闭合都要记** —— 下次才知道这题问过、卡在哪一句。
+                            #
+                            # ⚠️ rounds 这里是**本轮的尝试次数**（恒为 1：一次 rollout
+                            # 封顶），累加发生在 save_progress_iterations（老值 + 本次，
+                            # 同 maieutic priorIterations 的按轮累积）。别在这里再加一
+                            # 遍 —— 实测会双重计数（2026-10-26 修）。
+                            _iters[_did] = {
+                                "rounds": 1,
+                                "asked": str(crit1)[:300],
+                                # asked_q：本次闭合问过的**干净追问清单**（步级
+                                # 闸门的 questions）—— 下一轮 gate 回调的
+                                # prior_questions 从这取（同构 priorIterations，
+                                # 防重复问）。asked 是合并判词（人看的），
+                                # asked_q 是问句列表（机器复用的），两份都要。
+                                # ⚠️ 判词缺失时**不写 asked_q**：那是下一轮闸门回调的
+                                # prior_questions（机器复用的追问清单），拿一条占位
+                                # 话进去等于让下一轮对着空气问（见上面契约注释）。
+                                "asked_q": ([] if _crit_missing else
+                                            [str(q)[:200] for q in
+                                             (getattr(agent, "_gate_asked", None)
+                                              or [])][:6]) if not _code_exec else [],
+                                "gap": ("" if (ok1 and _inner_ok) else str(_q1)[:300]),
+                                "passed": bool(ok1 and _inner_ok),
+                                "tools": list(tools_map.get(_did) or []),
+                            }
+                            # 只把**本轮尝试过的**交出去落盘（老值 + 本次）；未尝试的
+                            # 旧账留在文件里不动，见 _iters_round 处的注释。
+                            _iters_round[_did] = _iters[_did]
+                            try:
+                                _ev_all.extend([o for o in (obs1 or [])
+                                                if isinstance(o, dict)
+                                                and o.get("ok")])
+                            except Exception:
+                                pass
+                        # ---- 轮末提交：整篇作答 × 全集清单（同构 maieutic Phase 1）----
+                        # 原版 spec-examiner.ts:14-16：学生每轮交的是**整篇 spec**，
+                        # examiner 拿「全部维度 + 当前全文 + priorIterations」判一次，
+                        # 输出 gaps_addressed / gaps_still_open / emergent_gaps / questions。
+                        # MVE 原先每维一次单点判定（dims=[_d]），判官既看不到全文也看不到
+                        # 历史 → 单句像在答就过（2026-11-11 实证 4/4 全过、答案全错）。
+                        # 这里补的是「一次提交」的那一次判定；rollout 内的步级闸门不动
+                        # （它是执行期的即时反馈，对应原版 voyager 的 critique 回灌）。
+                        if _dims:
+                            _spec = "\n\n".join(
+                                "【" + str(_i + 1) + "】"
+                                + str(_d.get("question") or "").strip() + "\n"
+                                + str(_ledger.get(str(_d.get("id") or ""))
+                                      or "（未作答）")
+                                for _i, _d in enumerate(_dims))
+                            _gate_all: dict[str, Any] = {}
+                            try:
+                                import maieutic_gate as _mg2
+                                _gate_all = _mg2.check(
+                                    question, _spec, _dims,
+                                    evidence=_ev_all,
+                                    env_obs=_env_obs_block(exec_db or db_path),
+                                    prior_iterations=_ms.load_spec_rounds(
+                                        scene, question))
+                            except Exception as _ga_e:
+                                _gate_all = {"origin": "failed",
+                                             "reason": str(type(_ga_e).__name__)}
+                            if str(_gate_all.get("origin") or "") == "llm":
+                                _add2 = [str(x) for x in
+                                         (_gate_all.get("addressed") or [])]
+                                _open2 = [str(x) for x in
+                                          (_gate_all.get("open") or [])]
+                                _qs2 = [str(q)[:200] for q in
+                                        (_gate_all.get("questions") or [])][:3]
+                                # ---- Phase1 轮循环的状态（同构原版：
+                                # gaps_still_open 决定下一轮做什么）----
+                                _p1_open = list(_open2)
+                                _p1_passed = bool(_gate_all.get("passed"))
+                                _p1_qs = list(_qs2)
+                                _have = {str(d.get("id") or "")
+                                         for d in learned_dims}
+                                # ⚠️ 不把 gate 的 addressed 直接并进 learned_dims：
+                                # MVE 的"闭合"= 落一枚技能节点（有代码、有工具）；判据
+                                # 说答到、但本轮 rollout 没成功 = 只有文本、没有配方。
+                                # 两本账分开（判据看 out["spec_gate"]，账看
+                                # dimension_results），免得账面闭合、技能库却是空的。
+                                _only_gate = [x for x in _add2 if x not in _have]
+                                # 追问归到未闭合维度（原版 questions 与 gaps_still_open
+                                # 是两个平行列表，不强行一一配对）。
+                                for _oid in _open2:
+                                    _rec2 = dict(_iters.get(_oid) or {})
+                                    if _qs2:
+                                        _rec2["asked"] = "；".join(_qs2)[:300]
+                                        _rec2["asked_q"] = list(_qs2)
+                                    _rec2["passed"] = False
+                                    _rec2.setdefault("gap", "")
+                                    _iters[_oid] = _rec2
+                                    _iters_round[_oid] = _rec2
+                                out["spec_gate"] = {
+                                    "addressed": _add2, "open": _open2,
+                                    "questions": _qs2,
+                                    "emergent": list(_gate_all.get("emergent") or []),
+                                    "passed": bool(_gate_all.get("passed")),
+                                    "only_gate": _only_gate,
+                                }
+                                try:
+                                    _ms.append_spec_round(scene, question, {
+                                        "spec_text": _spec,
+                                        "questions": _qs2,
+                                        "gaps_identified": _open2,
+                                        "gaps_addressed": _add2,
+                                        "emergent": list(
+                                            _gate_all.get("emergent") or []),
+                                        "passed": bool(_gate_all.get("passed")),
+                                        "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                                    })
+                                except Exception:
+                                    pass
+                                print("  · 整篇提交判定：答到 "
+                                      + str(len(_add2)) + "/" + str(len(_dims))
+                                      + "｜仍开 " + str(len(_open2))
+                                      + (("｜追问 " + str(len(_qs2)) + " 条")
+                                         if _qs2 else "")
+                                      + (("｜清单外发现 "
+                                          + str(len(_gate_all.get("emergent") or []))
+                                          + " 条（不阻断）")
+                                         if (_gate_all.get("emergent") or []) else ""),
+                                      flush=True)
+                            elif _gate_all:
+                                print("  · 整篇提交判定不可用（"
+                                      + str(_gate_all.get("reason") or "")[:60]
+                                      + "）—— 本轮沿用逐维账，不假装判过", flush=True)
+                        # ---- phase1 轮末：闭合就收工，没闭合就带追问再答 ----
+                        # 追问已在 _iters 里写了 asked/asked_q（上面的落账段），
+                        # 下一轮该维度第一次进 solve 时 crit1 会自动带上它
+                        # （maieutic priorIterations 同款，spec-examiner.ts:224-235）。
+                        out["phase1"] = {"rounds": _p1_round,
+                                         "open": list(_p1_open),
+                                         "passed": bool(_p1_passed)}
+                        if _p1_passed:
+                            print("  ✓ Phase1 闭合：gaps_still_open 为空"
+                                  + (f"（第 {_p1_round} 轮）"
+                                     if _p1_round > 1 else "")
+                                  + " —— 本轮结束，等下次派任务", flush=True)
+                            break
+                        if not _p1_open:
+                            # 判官没给 open 却也没说 passed（异常态）→ 不硬转
+                            break
+                        if _p1_round >= _P1_MAX:
+                            print(f"  · Phase1 达轮次上限 {_P1_MAX}，仍开着 "
+                                  f"{len(_p1_open)} 维："
+                                  f"{', '.join(_p1_open[:6])}"
+                                  " —— 如实记未闭合，等下次派任务", flush=True)
+                            break
+                    # ---- 跨轮去重（第二起重跑同一维会重复 append）----
+                    if _p1_round > 1:
+                        _seen_ids: set[str] = set()
+                        _ld = []
+                        for _d in learned_dims:
+                            _k = str(_d.get("id") or "")
+                            if _k in _seen_ids:
+                                continue
+                            _seen_ids.add(_k)
+                            _ld.append(_d)
+                        learned_dims = _ld
+                        _seen_ids = set()
+                        _dc: list[dict] = []
+                        for _c in dim_codes:
+                            _k = str(_c.get("id") or "")
+                            if _k in _seen_ids:
+                                continue
+                            _seen_ids.add(_k)
+                            _dc.append(_c)
+                        dim_codes = _dc
                     try:
                         _ms.save_progress(scene, question,
                                           [str(d.get("id") or "")
