@@ -1853,19 +1853,15 @@ async def consume(
             # 见下面路由块之后的通用段（人导入的每句都立为当前里程碑锚点）。
     except Exception:
         pass                                     # 待审区写不进去不能拦消费
-    # ---- 回灌环境建里程碑锚点（用户 2026-10-25 拍板）----
-    # 人导入的每句都作为本场景**当前里程碑锚点**（对齐原版 inference 把人工给定
-    # 任务当里程碑反复重试直到掌握）。驾驶舱（scene_learn 里程碑优先块）启动后
-    # 按本句拆维学、未闭合维度优先（"没完成的优先"）。无论是否命中图谱都立锚点
-    # —— 命中但还没学成里程碑的（"不存在于里程碑队列"）同样回灌；跨域明显不属
-    # 本场景的靠 suggest_new_scene 提示可另建场景承接，这里不阻断消费。
-    if str(question or "").strip():
-        try:
-            import maieutic_scaffold as _ms
-            _ms.set_current_target(str(_scene_id or "A"), question)
-            miss_info["milestone_target_set"] = True
-        except Exception:
-            pass
+    # ---- 里程碑锚点不再在此无条件立（用户 2026-11-11 拍板，撤 2026-10-25 口径）----
+    # 原口径「人导入的每句都立为当前里程碑锚点」是**强制归一**：把每一句消费输入
+    # 都归进同一个"当前任务"槽。原助产士设计里，同样的输入也可以拆出不同的骨架
+    # （completed/failed 观察面已变）——强制归一会把派发锁死成重复任务，污染学习。
+    # 生产实证：11-10 16:49 消费侧粘包装话术看技能 → 此处无条件立锚 → 锚点被抢，
+    # 学习侧整夜优先攻 curriculum 自动题，人导入的种子题被晾 12+ 轮没轮到。
+    # 现在：**派发只在真派任务时发生** —— 见下面刀 C/D 的 kick_learning 分支
+    # （答不出来才拉学习，拉起时才立锚）。人导入/手动「让它学这句」仍走
+    # dashboard 的显式入口（那是明确的派发动作，不受影响）。
     # （需求级 id 的登记在上面「路由读骨架」之前就做完了 —— 见那段注释。
     #  放这里会太晚：骨架键挂在 req id 上，读骨架之前身份必须先定下来。）
     # ---- ②.5 场景后端（数据源）----
@@ -2681,6 +2677,18 @@ async def consume(
                 _kk = _lo2.kick_learning(
                     question, _scene_id,
                     reason="消费没答出来（未学/口径不符/真空）—— 新对话顺带拉起学习")
+                if _kk.get("kicked"):
+                    # ★ 派发=立锚（用户 2026-11-11）：只有真派任务（这题答不出来、
+                    # 学习真的被拉起）才把本句立为里程碑锚点 —— 派发与锚点一一对应，
+                    # 「看一眼/答出来」不再顺手下任务。锚点句**原样传递、不做归一**：
+                    # 学习侧拿到什么拆什么（原助产士语义：同样输入因观察面已变
+                    # 可拆出不同骨架；是否归并回旧账由学习侧的召回自己判）。
+                    try:
+                        import maieutic_scaffold as _ms
+                        _ms.set_current_target(str(_scene_id or "A"), question)
+                        miss_info["milestone_target_set"] = True
+                    except Exception:
+                        pass
                 learn_kick = {
                     "kicked": bool(_kk.get("kicked")),
                     "manual": not bool(_kk.get("kicked")),
