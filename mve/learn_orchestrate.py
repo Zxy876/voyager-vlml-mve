@@ -4680,7 +4680,8 @@ async def _start_learning_impl(
                                             prior_questions=list(
                                                 (_iters.get(_did) or {}).get("asked_q")
                                                 or []),
-                                            has_env=_rw.scene_has_env(scene))
+                                            has_env=_rw.scene_has_env(scene),
+                                            scene_id=scene)
                                     except Exception as e1:
                                         ok1, crit1 = False, f"critic 异常：{type(e1).__name__}: {e1}"
                                 else:
@@ -6346,7 +6347,8 @@ async def _start_learning_impl(
                 _ctx = str(context or "") + _env_obs_block(db_path)
                 import reward as _rw
                 _ok, _crit = task_critic.check_task_success(
-                    question, _ctx, out, has_env=_rw.scene_has_env(scene))
+                    question, _ctx, out, has_env=_rw.scene_has_env(scene),
+                    scene_id=scene)
             except Exception as e:
                 _ok, _crit = bool(real), f"critic 异常：{type(e).__name__}: {e}"
             out["critic"] = {"success": bool(_ok), "critique": str(_crit or ""),

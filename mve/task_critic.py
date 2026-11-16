@@ -67,8 +67,12 @@ _SYSTEM = """你是 Voyager 的 critic：评估一个助手有没有完成给定
 - 任务要求达到或超过 → success=true；没达到 → success=false，并且必须给 critique
   告诉它差在哪、下一步怎么改（critique 会被拼进它的下一次尝试，别写空话）。
 - 两类任务要分开看（分型由**环境**决定，由调用方传入，不看题面措辞）：
-  · **有环境**的任务（场景配了数据源或本机文件/原语）：必须有**真实取回
-    的数据**支撑。只给结论、没取数、取回空表或与任务无关 → success=false。
+  · **有环境**的任务（场景配了数据源或本机文件/原语）：必须**真的取过数**
+    （一次数据源都没调、或取回空表、或取回的内容与任务无关 → success=false）。
+    取过数之后，**答案的形态不限**：值、表、判断、口径、清单都算 ——
+    判断/口径型答案（「按 chapter 字段匹配」这类）只要能在材料账里指认依据
+    （由哪一行、哪个字段、哪个值支持）就算达成；**不要**因为「答案不是一个
+    数值 / 不是原样数据」就判 success=false，那是答非所问以外的另一种误判。
   · **无环境**的任务（没有可指认的数据源）：不要求取数。
     答案切题、有依据、不自相矛盾、不编造具体数字/来源 → success=true；
     空话套话、答非所问、编造事实 → success=false 并指出缺什么。
@@ -188,7 +192,8 @@ def check_task_success(task: str, context: str, result: dict[str, Any], *,
                        dimensions: list[dict[str, Any]] | None = None,
                        env_obs: str = "",
                        prior_questions: list[str] | None = None,
-                       has_env: bool = False
+                       has_env: bool = False,
+                       scene_id: str = ""
                        ) -> tuple[bool, str]:
     """返回 (success, critique)。照原版：出错 → (False, "")；其余交 LLM 判。
 
@@ -205,17 +210,70 @@ def check_task_success(task: str, context: str, result: dict[str, Any], *,
 
     `prior_questions` = 本次闭合已问过的追问 → 透传闸门防重复问（同构
     spec-examiner 的 priorIterations；步级闸门每步都判，不给历史会重复问）。
+
+    `scene_id` = 场景执行门（2026-11-17 用户拍板「执行门就用它自己（权限全开）
+    去探索」的机检判据侧）：scenes.json 声明了 `verify_claim: true` 的场景
+    （S「MVE 学 MVE」），LLM 判过 ≠ 闭合 —— 答案必须附 ```mve_verify``` 证据块
+    （file:line 引用 + 可选真跑）且过 `verify_code_ref.verify_claim` 机检。
+    ground truth = AST/grep/解释器，**不过 LLM**（与冻结版 DuckDB 判据同构）。
+    不传（默认 ""）→ 行为与从前完全一致，其它场景零影响。
     """
     success, critique = _check_task_success_impl(
         task, context, result, llm=llm, max_retries=max_retries,
         dimensions=dimensions, env_obs=env_obs,
         prior_questions=prior_questions, has_env=has_env)
+    if success and scene_id:
+        _ok2, _why2 = _verify_claim_gate(scene_id, result)
+        if not _ok2:
+            success = False
+            critique = ("证据机检未过：" + _why2 +
+                        "｜请在答案末尾附一段 ```mve_verify 代码块（JSON）："
+                        '{"refs": [{"file": "模块名.py", "line": 行号, '
+                        '"expect": "该行包含的片段"}], "run": {"code": "…", '
+                        '"expect": "…"}} —— file 相对仓库 mve/ 目录写（如 '
+                        '"skill_store.py"），行号与片段必须真实存在（可先 '
+                        'read_file 核对），run 可选但必须真跑得出 expect')[:400]
     try:
         from reward import compute_r
         result["r"] = compute_r(result, success, has_env)
     except Exception:
         pass
     return success, critique
+
+
+def _verify_claim_gate(scene_id: str, result: dict[str, Any]) -> tuple[bool, str]:
+    """场景执行门：声明了 verify_claim 的场景，LLM 判过后再过一道机检。
+
+    返回 (ok, reason)；场景未声明 → (True, "") 直通（其它场景零影响）。
+    证据块从答案文本（RESULT.answer 与 observations）里提取 ```mve_verify```。
+    """
+    try:
+        import scenes as _sc
+        if not bool((_sc.get_scene(str(scene_id or "")) or {}).get("verify_claim")):
+            return True, ""
+    except Exception:
+        return True, ""          # 声明读不到就直通 —— 门不能比系统更脆
+    import re
+    texts = [str(result.get("answer") or "")]
+    for o in (result.get("observations") or []):
+        if isinstance(o, dict):
+            texts.append(str(o.get("text") or o.get("answer") or ""))
+    blob = "\n".join(texts)
+    m = re.search(r"```mve_verify\s*(.*?)\s*```", blob, re.S)
+    if not m:
+        return False, ("答案里没有 ```mve_verify``` 证据块 —— 判词说得再具体，"
+                       "没有可机检的 file:line 引用就不算学会")
+    try:
+        import json as _json
+        claim = _json.loads(m.group(1))
+    except Exception as e:
+        return False, f"mve_verify 块不是合法 JSON：{type(e).__name__}: {e}"
+    try:
+        from verify_code_ref import verify_claim
+        vr = verify_claim(claim if isinstance(claim, dict) else {})
+    except Exception as e:
+        return False, f"机检器异常：{type(e).__name__}: {e}"
+    return bool(vr.get("ok")), str(vr.get("reason") or "")
 
 
 def _check_task_success_impl(task: str, context: str, result: dict[str, Any], *,
