@@ -194,7 +194,7 @@ if __name__ == "__main__":
     a = ap.parse_args()
     if a.selftest:
         # 三条自检：真引用 / 假行号 / 真跑
-        t1 = verify_ref({"file": "skill_store.py", "line": 1, "expect": '"""'})
+        t1 = verify_ref({"file": "skill_store.py", "line": 2, "expect": "技能库持久化"})
         t2 = verify_ref({"file": "skill_store.py", "line": 999999})
         t3 = verify_run({"code": "import sys; print('run-ok')",
                          "expect": "run-ok"})
