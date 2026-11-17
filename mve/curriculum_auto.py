@@ -79,6 +79,61 @@ Context: <一句话说明：用哪个文件/表、算什么、完成标准是什
    无法计算」本身作为任务。
 """
 
+# 书单场景（graph_books seed 过书单的，如 P）专用的出题系统提示。
+# 2026-11-14 实测事故：P 目录里有个空的 scene.duckdb，scene_profile 就把它判成
+# kind=scene，出题器拿着 _SYSTEM「SQL 库 / 表名 / 真实取值」那套硬约束，连出
+# 「查询当前数据库中共有多少张表」—— 书单进度被淹在后面，图谱等于没接上。
+# 书单场景没有表、没有文件，可出题的范围只有一个：当前单元的知识点。
+_SYSTEM_BOOKS = """你是 Voyager 式自动课程规划器，运行在一条**教材书单自学路线**上。
+
+环境：一条按单元排好的书单（每行 = 一个单元，标了层级、书名、已学/需学）。
+没有 SQL 库、没有数据文件；你看得到三样东西：「书单进度」、「当前单元」，
+以及（真有 PDF 的书才有）这一单元对应页的**教材原文摘录**。
+你要做的：为**当前单元**规划下一道题（一句自然语言的数学题），交给一个能写
+Python（sympy 可用）、能推导演算的助手去解。
+
+硬约束：
+0. 题面**只能**用本章考点清单（或摘录）里出现的定理、公式、判定法。
+   反例：本章是「全等三角形」，却用余弦定理求第三边、用海伦公式求面积、
+   用相似比求周长 —— 这些都判不合格，必须退回重出。
+1. 【原题优先，这条压倒一切】上下文里出现【原题候选】清单时，说明这本书
+   真印着题。此时**必须从清单里挑一整道原题照出**，你只做两件事：
+   翻成简体中文、把被换行截断的句子补成完整一句。
+   · 数字、字母、条件**一个都不许改** —— 计数/概率题的答案随数字变，改了
+     就不是这道题了；
+   · **不许**把原题降级成「请说明依据 / 判断是否成立」这种一句话送分变体；
+   · 优先选带 (a)(b)(c) 小问的、或需要分情况讨论的那一道；
+   · 清单是按教材顺序排的，**按顺序挑最靠前的那道合格题**，不要跳来跳去；
+   · Context 里写清出处，格式 `原题 p52 1.8`。
+   只有当清单里**每一道**都依赖配图（原文里出现 Fig. / the figure below）或
+   题面残缺到读不通时，才允许照摘录的定义/例题自编一道同类的，并在 Context
+   写明「自编」。摘录之外的内容一律不许考。
+2. 没有【原题候选】清单时，退回到「本单元考点」清单：题必须考清单里
+   **1~2 个具体考点**，Context 行逐字写出考的是哪一个考点；清单也没有
+   （L2~L4 尚未补考点）才按单元标题出；
+   难度不看教材层级标签，只看**推理步数**：目标是一道需要 2~4 步、通常
+   要自己分情况或构造的题。直接套一个公式得出一个数（如「算 C(9,4)」）
+   是简单题，除非它是原题清单里唯一一道。**不许**只做加减乘除。
+3. 必须有**确定答案**：一个数、一个表达式、一组解，或一个可判定的结论；
+   几何题出之前必须自检一遍：已知条件够不够唯一确定图形？
+   条件不足（只给一角、缺边长、某点未定义、所求量随自由参数变）就判
+   不合格，宁可换一道更小但**完备**的题 —— 出无解题比出简单题更糟；
+4. **不要**出「这本书讲什么 / 第几章第几页 / 目录里有什么」这类元信息题，
+   也不许出查表、查库、读文件的题；
+5. 不要与 Completed / Failed 里出现过的题重复。当前单元失败过，**换清单里
+   另一道原题**（通常挑题号更靠前、更小的一步），仍然不许改数字；
+   清单只有一道且失败两次以上，才允许把它拆成一个更小的子问再出；
+6. 【语言】题面和 Context 一律用**简体中文**写（数学式子、符号、变量名保持原样，
+   如 `2^5 × 3^2`）。教材原文是英文，但不要跟着出英文题 —— 这张面板是中文的；
+7. 摘录是 OCR/文本层抽的，**数学上标会丢**：`4?`、`3°`、`42 = 4×4` 这类要
+   按幂理解（4²）；`©…ª` 是花括号。照原文出题时按数学常识还原，不要照抄
+   一个自相矛盾的记号（比如把 `42 = 4×4` 当成四十二等于十六）；
+8. 严格按格式输出两行：
+Task: <题目。已知条件写全，能独立求解，不要写"请用某某方法"这类提示>
+Context: <一句话：考哪个知识点、答案是什么形式、判定标准；照原题出的必须
+写明「原题 p52 1.8」这样的出处；自编的写「自编」>
+"""
+
 
 # 观察面的**体量上限**（2026-11-09 服务器实测踩到的）：
 # 场景 L 的 web_facts 是宽表（3736 行 × 910 列），逐列打「真实取值」会产出
@@ -123,6 +178,15 @@ def db_observation(db_path: str) -> str:
         try:
             tables = [r[0] for r in con.execute("show tables").fetchall()]
             lines: list[str] = []
+            # ★ 目录优先（2026-11-13）：**表清单 + 全部列名**单独一份，永不被
+            # 字数上限截掉；后面的取值/样本才是可截断的细节。
+            # 事故：场景 N 有 9 张表、观察面 16028 字，上限 16000 → 按字母序排在
+            # 最后的 math_toc 被整段砍掉 → Phase2 的 critic 断言「数据源里不存在
+            # math_toc 表，该步骤不可答」，Phase1 学生也一直说「数据源结构未提供
+            # 这两个模块的分布」——**表其实存在**，只是清单被截断了。
+            # 判官/学生看到的环境面不全 = 它们判"不可答"是对的（按它们看到的），
+            # 所以修法必须是"清单完整、细节有上限"，而不是放宽某个阈值。
+            catalog: list[str] = []
             for t in tables:
                 try:
                     cnt = con.execute(f'select count(*) from "{t}"').fetchone()[0]
@@ -130,19 +194,28 @@ def db_observation(db_path: str) -> str:
                 except Exception:
                     continue
                 cnames = [str(c[0]) for c in cols]
-                # ---- 列名：宽表等距抽样（保住头尾与中段）----
+                _cl = ", ".join(cnames)
+                if len(_cl) > 600:
+                    _cl = _cl[:600] + f" …（共 {len(cnames)} 列）"
+                catalog.append(f"- 表 {t}（{cnt} 行）：" + _cl)
+            for t in tables:
+                try:
+                    cnt = con.execute(f'select count(*) from "{t}"').fetchone()[0]
+                    cols = con.execute(f'describe "{t}"').fetchall()
+                except Exception:
+                    continue
+                cnames = [str(c[0]) for c in cols]
+                # 详细段只留短表头（全部列名在目录段，那里不截断）
                 if len(cnames) > _MAX_COLS_PER_TABLE:
                     head = cnames[:8]
                     rest = cnames[8:]
                     step = max(1, len(rest) // max(1, _MAX_COLS_PER_TABLE - len(head)))
                     picked = list(head) + list(rest[::step])[: _MAX_COLS_PER_TABLE - len(head)]
-                    lines.append(
-                        f"- 表 {t}（{cnt} 行，{len(cnames)} 列；列名等距抽样 "
-                        f"{len(picked)} 个）：" + ", ".join(picked))
+                    lines.append(f"- 表 {t}（{cnt} 行）：")
                     shown_cols = {str(c[0]): str(c[1]).upper() for c in cols
                                   if str(c[0]) in picked}
                 else:
-                    lines.append(f"- 表 {t}（{cnt} 行）：" + ", ".join(cnames))
+                    lines.append(f"- 表 {t}（{cnt} 行）：")
                     shown_cols = {str(c[0]): str(c[1]).upper() for c in cols}
                 # ---- 取值：基数 + 取值×计数（2026-11-10）----
                 # 计数是原始事实（同构原版 iron_ore ×1），不是解读：
@@ -211,6 +284,13 @@ def db_observation(db_path: str) -> str:
             if len(out) > _MAX_OBS_CHARS:
                 out = (out[:_MAX_OBS_CHARS]
                        + f"\n…（观察面共 {len(out)} 字，只给前 {_MAX_OBS_CHARS} 字）")
+            # 目录在前、细节在后，整体再按上限收（先砍细节）：
+            _cat = "【全部表与列（完整，不截断）】\n" + "\n".join(catalog)
+            _budget = max(2000, _MAX_OBS_CHARS - len(_cat))
+            if len(out) > _budget:
+                out = (out[:_budget]
+                       + f"\n…（取值与样本共 {len(out)} 字，只给前 {_budget} 字）")
+            out = _cat + "\n\n【取值与样本】\n" + (out or "（无）")
         finally:
             con.close()
     except Exception:
@@ -326,10 +406,76 @@ class CurriculumAgent:
         except Exception:
             return True
 
+    def _book_text(self) -> str:
+        """书单场景的课程投影（graph_books.render_text + 本单元原文摘录）。
+
+        只在场景真的 seed 过书单（P 的 709 个单元）时非空，别的场景走原来的
+        SQL / 工作区观察面。缓存一次，出题器一轮里会问很多次。
+        """
+        cache = getattr(self, "_book_text_cache", None)
+        if cache is not None:
+            return cache
+        self._book_text_cache = ""
+        try:
+            import graph_books
+            # limit=1：只把**当前单元**这一行摆给出题器。给 6 行时实测它会
+            # 从窗口里挑一个"好出题"的（当前是 Similarity，却出了 Circles 的
+            # 圆面积），出题范围就被窗口宽度带偏了。
+            head = str(graph_books.render_text(self.scene_id, limit=1) or "").strip()
+            if not head:
+                return ""
+            # 光有章节名还是「照标题编题」（实测 Similarity 出勾股）。真有 PDF
+            # 的书把这一节对应页的原文也贴进来，题才有出处。没有原文（其余
+            # 70 本只有模板单元）就只给进度，不伪造来源。
+            tail = ""
+            try:
+                import book_text
+                import graph_books as _gb
+                cur = _gb.plan(self.scene_id)
+                if cur:
+                    _bid, _i = _gb.parse_unit_key(str(cur.get("module_id") or ""))
+                    if _bid and _i:
+                        tail = book_text.scene_hint(_bid, _i)
+            except Exception:
+                tail = ""
+            self._book_text_cache = (head + ("\n\n" + tail if tail else "")).strip()
+        except Exception:
+            pass
+        return self._book_text_cache
+
     def render_observation(self) -> dict[str, str]:
         import local_agent
         local_ok = self.local_enabled()
         net_ok = self.net_enabled()
+        # ---- 书单场景：数据源是「当前单元」，不是库也不是文件 ----
+        # 2026-11-14 实测：P 场景目录里有个空的 scene.duckdb，scene_profile 就把它
+        # 判成 kind=scene，观察面变成「SQL 库 + 实查结构（空表）」，于是连出
+        # 「查询当前数据库中共有多少张表」。书单场景必须先走这条岔路。
+        book = self._book_text()
+        if book:
+            done_b = ("；".join(self.completed_tasks[-20:])
+                      if self.completed_tasks else "None")
+            failed_b = ("；".join(self.failed_tasks[-20:])
+                        if self.failed_tasks else "None")
+            wo_b = "；".join(f"{k[:40]}（{v[:80]}）"
+                            for k, v in list(self._failed_why.items())[-8:])
+            return {
+                "biome": ("环境：一条**教材书单自学路线**（按单元顺序逐关推进）。"
+                          "没有 SQL 库、没有数据文件 —— 任务是**数学题**本身，"
+                          "不是查表、也不是查目录。\n\n"),
+                "nearby_blocks": ("数据源：None（书单场景不查库、不读文件）。"
+                                  "下一题只能从「当前单元」的知识点范围里出，"
+                                  "答案靠推导与计算得到，不靠检索。\n\n"),
+                "chests": (book
+                           + f"已学会的技能（可复用配方）: {self._skill_count()} 条\n\n"),
+                "completed_tasks": f"Completed tasks so far: {done_b}\n\n",
+                "failed_tasks": (
+                    f"Failed tasks that are too hard: {failed_b}\n\n"
+                    + (f"为什么失败: {wo_b}\n\n" if wo_b else "")
+                    + ("（失败题按规则 4：出它**前置的、现在就能做对**的小题，"
+                       "不要原样重出。）\n\n" if self.failed_tasks else "")),
+            }
+
         # kind=scene（场景自有 duckdb）→ 观察面给**实查的表结构 + 枚举值**，
         # 不给文件清单（那只会让模型把 .duckdb 当文本文件编）。这是原版
         # "nearby_blocks 能看到附近有什么"的同构：出题器必须看得见数据长什么样。
@@ -375,7 +521,8 @@ class CurriculumAgent:
             # 连出 3 道必失败的题。环境描述只给类别，不给可被脑补成文件名的路径。
             "biome": self._biome_text(local_ok, net_ok) + "\n\n",
             "nearby_blocks": f"{files}\n\n",
-            "chests": f"已学会的技能（可复用配方）: {self._skill_count()} 条\n\n",
+            "chests": (self._curriculum_text()
+                       + f"已学会的技能（可复用配方）: {self._skill_count()} 条\n\n"),
             "completed_tasks": f"Completed tasks so far: {done}\n\n",
             "failed_tasks": (
                 f"Failed tasks that are too hard: {failed}\n\n"
@@ -384,6 +531,34 @@ class CurriculumAgent:
                    "围绕它出**前置的、现在就能做对**的子任务，不要原样重出。）\n\n"
                    if self.failed_tasks else "")),
         }
+
+    def _curriculum_text(self) -> str:
+        """课程进度（图谱的投影）：学过哪几关、当前该攻哪一关。
+
+        这不是另一本账 —— 它就是知识图谱上 topic 节点的完成度
+        （graph_curriculum.progress）。出题器看到「第 1 关还差 1 题」才知道
+        该出哪一关的题；原来只有「已学会技能 N 条」一个计数，它唯一能看的
+        结构化状态就是表 schema，于是只能出「有多少章 / 多少行」的计数题。
+        场景库里没有 math 课程表时静默返回空串。
+        """
+        cache = getattr(self, "_cur_text", None)
+        if cache is not None:
+            return cache
+        self._cur_text = ""
+        # 两类场景共用同一段观察位：
+        #   有题库（N）→ graph_curriculum：关 = 教材的一节，进度按可算题算；
+        #   无题库（P）→ graph_books：关 = 书的一个单元，题由模型按单元现场出。
+        # 先问 graph_books（只对 seed 过书单的场景有内容），再退回 curriculum。
+        for mod in ("graph_books", "graph_curriculum"):
+            try:
+                m = __import__(mod)
+                t = str(m.render_text(self.scene_id) or "").strip()
+            except Exception:
+                t = ""
+            if t:
+                self._cur_text = t + "\n\n"
+                break
+        return self._cur_text
 
     def _biome_text(self, local_ok: bool, net_ok: bool = True) -> str:
         if not local_ok and not net_ok:
@@ -487,7 +662,10 @@ class CurriculumAgent:
         # 环境模式：没文件（或本机关）时切换到知识型拓展 —— 不然模型只能对着
         # "工作区"这个词编文件名（2026-10-19 实测连出 3 道 room_data.txt）。
         mode = ""
-        if not self.has_environment():
+        book_mode = bool(self._book_text())
+        # 书单场景不加「知识型拓展」那段：它要求出定义/区别/机制类问题，与
+        # 「按当前单元出一道数学题」直接打架（_SYSTEM_BOOKS 已写清边界）。
+        if not book_mode and not self.has_environment():
             local_ok, net_ok = self.local_enabled(), self.net_enabled()
             mode = ("\n\n本次环境模式（重要）：\n"
                     f"- 本机取数能力：{'开' if local_ok else '关'}；"
@@ -503,9 +681,47 @@ class CurriculumAgent:
                          "的领域。\n")
         user = (self.render_human_message() + mode
                 + "\n请按系统要求输出 Task: 与 Context: 两行。")
+        if book_mode:
+            # 2026-11-14 实测：当前单元是 Similarity，模型却出了「直角三角形已知
+            # 两边求第三边」——那是下一个单元的内容。光在上下文里标「当前」不够，
+            # 这里把合法范围单独钉一遍（动态取，不写死任何单元名）。
+            try:
+                import graph_books as _gbp
+                _cur = _gbp.plan(self.scene_id) or {}
+            except Exception:
+                _cur = {}
+            if _cur:
+                user += ("\n\n本轮唯一合法的出题范围：当前单元「%s」（%s，L%s）。"
+                         "题面必须考这个单元的知识点；考到别的单元会判不合格"
+                         "退回重出。" % (_cur.get("title") or "",
+                                        _cur.get("book") or "",
+                                        _cur.get("level") or "?"))
+            # 可取证约束（2026-11-17）：verify_claim 场景的判据是「引用仓库
+            # 里真实 file:line 并通过机检」。实测出题器爱造纯假设数据的计算题
+            # （"三层图谱里列出所有 A→D 路径"）—— 这类题与仓库无关、天生
+            # 没有可引用的代码，判据不可满足（977s 真跑 + critic 判做到，
+            # 最后被机检拒收）。所以按声明把出题形态锁在「考真实代码行为」。
+            try:
+                import scenes as _sc_ca
+                if bool((_sc_ca.get_scene(str(self.scene_id or "")) or {}).get(
+                        "verify_claim")):
+                    user += ("\n\n【出题形态硬约束】本场景的答案必须能被"
+                             "**仓库里真实的 file:line 引用**验证（判卷会机检"
+                             "行号存在且内容匹配）。所以：\n"
+                             "1. 题目必须考**这个单元对应模块的真实代码行为**"
+                             "（某函数怎么判重、某分支返回什么、某字段谁写谁读、"
+                             "某守卫在什么条件下生效）；\n"
+                             "2. 题面里点明要考的模块/函数/文件，让答题者能"
+                             "read_file 去核对；\n"
+                             "3. **禁止**出只依赖题面假设数据的纯计算题/推演题"
+                             "（例如「假设有节点 A、B，请枚举所有路径」）——"
+                             "那种题没有代码可引，判据不可满足。")
+            except Exception:
+                pass
         if _feedback:
             user += f"\n\n上一次不行：{_feedback}。请务必换一个**不同**的任务。"
-        msgs = [{"role": "system", "content": _SYSTEM},
+        msgs = [{"role": "system",
+                 "content": _SYSTEM_BOOKS if book_mode else _SYSTEM},
                 {"role": "user", "content": user}]
         try:
             if self._llm is not None:
