@@ -224,8 +224,13 @@ def repo_observation(root: str, *, max_files: int = 60,
                        if d not in (".git", "__pycache__", ".venv", "venv",
                                     "node_modules", ".mypy_cache")]
         for fn in filenames:
-            if fn.endswith(".py"):
-                files.append(_os.path.join(dirpath, fn))
+            if not fn.endswith(".py"):
+                continue
+            # 调试残渣不进实查（2026-11-17 实测：出题器挑中 _probe_* 的假桩
+            # 当落点 —— 那是调试现场，不是这个世界里真实可用的行为）。
+            if fn.startswith("_probe") or ".bak" in fn:
+                continue
+            files.append(_os.path.join(dirpath, fn))
     files.sort()
     total = len(files)
     out, used = [], 0
