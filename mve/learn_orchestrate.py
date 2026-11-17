@@ -6378,6 +6378,18 @@ async def _start_learning_impl(
     # 一律再过一道 _verify_claim_gate；机检不过 → 整体判未完成，评语回灌。
     if _ok and bool((out.get("critic") or {}).get("success")):
         import task_critic as _tcg
+        # 证据闸口喂全文（2026-11-17）：out["answer"] 是 1200 字截断，
+        # 末尾的证据块会被切掉 —— 这里把最后几轮观察的完整 data 拼全。
+        try:
+            _gt = [str(out.get("answer") or "")]
+            for _o in reversed((observations or [])[-4:]):
+                _d = (_o or {}).get("data")
+                if _d:
+                    _gt.append(_d if isinstance(_d, str) else json.dumps(
+                        _d, ensure_ascii=False, default=str))
+            out["_gate_texts"] = "\n".join(_gt)[-30000:]
+        except Exception:
+            pass
         _ok2, _why2 = _tcg._verify_claim_gate(scene, out)
         if not _ok2:
             out["critic"]["success"] = False

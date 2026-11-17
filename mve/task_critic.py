@@ -254,13 +254,22 @@ def _verify_claim_gate(scene_id: str, result: dict[str, Any]) -> tuple[bool, str
     except Exception:
         return True, ""          # 声明读不到就直通 —— 门不能比系统更脆
     import re
-    texts = [str(result.get("answer") or "")]
+    # 2026-11-17 修截断盲区：out["answer"] 是 _answer_text 的 1200 字截断，
+    # 证据块按要求附在答案末尾 —— 长答案的证据块全被切掉。调用方把完整
+    # 观察 data 拼在 _gate_texts 里，优先读它。
+    texts = [str(result.get("_gate_texts") or result.get("answer") or "")]
     for o in (result.get("observations") or []):
         if isinstance(o, dict):
             texts.append(str(o.get("text") or o.get("answer") or ""))
     blob = "\n".join(texts)
     m = re.search(r"```mve_verify\s*(.*?)\s*```", blob, re.S)
     if not m:
+        try:
+            print(f"  · [gate-debug] blob={len(blob)}字 "
+                  f"含mve_verify字样={'mve_verify' in blob}｜"
+                  f"尾部160: {blob[-160:]!r}", flush=True)
+        except Exception:
+            pass
         return False, ("答案里没有 ```mve_verify``` 证据块 —— 判词说得再具体，"
                        "没有可机检的 file:line 引用就不算学会")
     try:
