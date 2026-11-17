@@ -3272,6 +3272,11 @@ async def _start_learning_impl(
             # 幂等与归题两道闸，骨架怎么拆、账怎么记仍走既有账。
             _req_id = str(_rr.register(scene, question,
                                        force_new=True).get("req_id") or "")
+            # 与 kick_learning 同款（:6568-6572）：派发即发布 = 原版 maieutic
+            # 「教师发布 Exercise」，新题登记完立刻建 req 节点。之前漏抄，
+            # 自由出题的题在图谱上没有身份节点（2026-11-17 S 场景实测 0 节点）。
+            if _req_id:
+                _rr.ensure_req_node(scene, question, _req_id)
         else:
             _req_id = str(_rr.register(scene, question).get("req_id") or "")
     except Exception:

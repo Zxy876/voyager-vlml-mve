@@ -364,6 +364,34 @@ def _light_up_milestone(scene: str, question: str, db_path: str,
              f"{type(e).__name__}: {e}")
         return False
     _light_up_milestone._fail_streak = 0      # 成功清零失败计数
+    # 课程推进（原版 voyager.py:417 progress = len(completed_tasks) 同构）：
+    # 里程碑成功 = 这道题做成了，exercise 账必须记上 —— 与 attach_phase_nodes
+    # 判过回写同一段逻辑（unit_of_proposed → locate≥0.45 → record_solved）。
+    # 之前只点亮 topic 节点、不写单元账 → graph_books 进度恒 0/1 → 出题器
+    # 永远锁在同一单元（实测 Scene S 同考点连出 3 题，2026-11-17）。
+    try:
+        import hashlib as _hl_l
+        import graph_books as _gb_l
+        import graph_curriculum as _gc_l
+        _mid_l = str(_gb_l.unit_of_proposed(scene, question) or "")
+        if not _mid_l:
+            _cand_l = (_gb_l.locate(scene, question).get("candidates") or [])
+            if _cand_l and float(_cand_l[0].get("score") or 0) >= 0.45:
+                _mid_l = str(_cand_l[0]["unit"])
+        if _mid_l:
+            _bid_l, _i_l = _gb_l.parse_unit_key(_mid_l)
+            _tag_l = _hl_l.md5(str(question).encode("utf-8")).hexdigest()[:8]
+            _eid_l = f"gen:{scene}:{_bid_l}:{_i_l}:{_tag_l}"
+            _gc_l.record_solved(scene, _eid_l, module_id=_mid_l,
+                                req_id=str((r0 or {}).get("req_id") or ""),
+                                verified=True, problem=question)
+            _log(f"  · 单元记账：{_mid_l} ← exercise:{_eid_l}（verified，"
+                 "书单进度推进，下一单元解锁）")
+        else:
+            _log("  · 单元记账：提题账/词面都归不到单元 → 本题不计入进度"
+                 "（milestone 点亮保留）")
+    except Exception as e:
+        _log(f"  · 单元记账失败（不阻断点亮）：{type(e).__name__}: {e}")
     _log("[场景学习] 里程碑任务成功：重跑取到真数 → 节点点亮变实"
          "（组合复合技能入库由本轮 learn_orchestrate achieved 分支自动完成）。")
     return True
