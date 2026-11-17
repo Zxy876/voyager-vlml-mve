@@ -714,14 +714,26 @@ async def solve(question: str, scene_dir: str, *, llm=None,
     # ⚠️ 延迟 import：传了 `llm` 的调用方（测试/别的编排）不该被迫拉起整条
     # VLML 依赖链 —— 实测 `from voyager_vlml.llm import chat` 在只插了 mve/
     # 的进程里直接 ModuleNotFoundError，把调用方拖死。
-    def call(msgs):
-        if llm is not None:
-            return llm(msgs)
-        from voyager_vlml.llm import chat
-        return chat(msgs, temperature=0.2)
-
     if submit_fn is None and str(scene_id) in _SUBMIT_HANDLERS:
         submit_fn = _SUBMIT_HANDLERS[str(scene_id)]
+
+    # 证据块要求（2026-11-17 统一入口注入）：verify_claim 场景的证据要求
+    # 写进 question 本身 —— 实测只放 system prompt 压不过 RESULT 的 JSON
+    # 格式指令，学生交付里从不出现 ```mve_verify``` 块（gate-debug 证实）。
+    # 判据：题面要求是硬约束；没有证据块的答案判过也不算完成。
+    try:
+        if str(scene_id):
+            import scenes as _sc_ev
+            if bool((_sc_ev.get_scene(str(scene_id)) or {}).get("verify_claim")):
+                if "mve_verify" not in str(question or ""):
+                    question = (str(question or "") + "\n\n【证据要求】最终 RESULT "
+                                "之外，答案末尾必须附一段独立代码块：```mve_verify\n"
+                                '{\"refs\": [{\"file\": \"模块名.py\", \"line\": '
+                                '行号, \"expect\": \"该行包含的片段\"}]}\n```'
+                                "—— file 相对仓库 mve/ 目录（可先 read_file 核对行号），"
+                                "关键承诺各附至少一条真实引用；没有证据块 = 判过也不算完成。")
+    except Exception:
+        pass
 
     def _ns(tracer: list[str]) -> dict[str, Any]:
         # solve 是协程、跑在事件循环线程里 → 这里能拿到主循环。技能函数
