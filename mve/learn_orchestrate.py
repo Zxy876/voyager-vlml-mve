@@ -3515,11 +3515,16 @@ async def _start_learning_impl(
                 # （0.25*min(hits,6) + 0.6*ok/hits）因此恒为 0：学到的配方永远爬
                 # 不上来，人看到的就是「学了半天没用」。注入就是一次 hit
                 # （consume.py:232 一直这么记，学习侧漏了）。
+                _inj_keys = [str((s or {}).get("key") or "") for s in skills]
                 try:
-                    skill_store.mark_used(
-                        [str((s or {}).get("key") or "") for s in skills])
+                    skill_store.mark_used(_inj_keys)
                 except Exception:
                     pass
+                # 有效性记账的分子（2026-11-17 补链）：原版 voyager.py:2517
+                # 判对后 mark_result(self._injected_keys, True)，场景路径漏接
+                # —— hits 涨 ok 恒 0，面板把在用技能全标「🔴 失效」。先存
+                # out，判过 → ⑥ 前统一 mark_result。
+                out["_injected_skill_keys"] = _inj_keys
                 _snm = [str((s or {}).get("name") or (s or {}).get("topic") or "")
                         for s in skills[:6]]
                 print(f"  · 已学配方回注执行层：{len(skills)} 条"
@@ -6357,6 +6362,24 @@ async def _start_learning_impl(
             # 无内层判定、又不让调 critic（judge=False 的老入口）：维持原
             # 行为 —— 不拦，交给 ⑥ 入库侧决定（absorb 的 mastered 口径）。
             _ok = True
+    # 证据机检统一闸口（2026-11-17）：out["critic"] 的判定入口有多个
+    # （维度汇总 / 整篇 spec_gate / 内层 critic / task_critic 兜底）——
+    # 「入口不同不改口径」：声明了 verify_claim 的场景，最终 success=True
+    # 一律再过一道 _verify_claim_gate；机检不过 → 整体判未完成，评语回灌。
+    if _ok and bool((out.get("critic") or {}).get("success")):
+        import task_critic as _tcg
+        _ok2, _why2 = _tcg._verify_claim_gate(scene, out)
+        if not _ok2:
+            out["critic"]["success"] = False
+            out["critic"]["critique"] = (
+                "证据机检未过：" + str(_why2 or "")[:200] +
+                "｜请在答案末尾附一段 ```mve_verify``` 代码块（JSON）："
+                '{"refs": [{"file": "模块名.py", "line": 行号, '
+                '"expect": "该行包含的片段"}]} —— file 相对仓库 mve/ '
+                '目录写，行号与片段必须真实存在（可先 read_file 核对）')[:400]
+            _ok = False
+            _crit = out["critic"]["critique"]
+            print("  · 证据机检：未过 —— " + str(_why2 or "")[:160], flush=True)
     if not _ok:
         # 已闭合的维度各自是一次成功 rollout：它们的技能在维度循环里已经
         # 落库（learn_milestone_skills 不连坐，见 1368 行注释）—— **同轮
@@ -6371,6 +6394,17 @@ async def _start_learning_impl(
                    why=(str(_crit or "") or "闸门/critic 判未完成")[:300])
         _record(out)
         return out
+
+    # 技能有效记账（2026-11-17 补链）：本轮判过（含证据机检闸口放行），
+    # 注入过的技能按原版语义 mark_result(..., True) —— ok≤hits 不变量由
+    # mark_result 内部兜底。未判过的路径不记（让低效技能自然沉底）。
+    try:
+        import skill_store as _ssr
+        _ik = [k for k in (out.get("_injected_skill_keys") or []) if k]
+        if _ik:
+            _ssr.mark_result(_ik, True)
+    except Exception:
+        pass
 
     # ---- ⑥ 判过 → 图谱建点 + 掌握 + 配方入库（复用消费侧同一套账）----
     try:
