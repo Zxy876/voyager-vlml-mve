@@ -2018,8 +2018,12 @@ def _intent_diff_call(messages: list[dict[str, str]]) -> str:
     原版称 intent-diff 是 highest-value prompt —— 这类判定不能省模型钱。
     """
     model = os.getenv("MVE_ID_MODEL", "") or "glm-4.6"
+    # ★ 2026-11-17：6000 不够 —— 思考段与正文共用额度，spec 全文 + 大代码
+    # 输入下输出被截断/退化（gate_raw.log 铁证：退化成 "missing missing"），
+    # 解析必然失败 → Phase2「未过」+ Phase3 跳过。给足 16000（同 gate
+    # 2026-11-11 教训：这类调用要「关思考或给足额度」，判官保留思考就给足）。
     kw: dict[str, Any] = {"temperature": 0, "model": model,
-                          "max_tokens": 6000, "timeout": 240.0}
+                          "max_tokens": 16000, "timeout": 240.0}
     if os.getenv("MVE_ID_THINKING", "1") not in ("0", "false", "no"):
         kw["thinking"] = {"type": "enabled"}
     try:
@@ -2210,7 +2214,7 @@ async def intent_diff(scene_id: str, question: str, spec_text: str,
             _rt = str(run_result)
         _result_block = (
             "\n【程序真实跑出来的结果（Phase2 执行得到，不是声明）】\n\"\"\"\n"
-            + _rt[:6000] + "\n\"\"\"\n\n")
+            + _rt[:16000] + "\n\"\"\"\n\n")
     user = (
         INTENT_DIFF_FEW_SHOTS
         + "\n\n现在轮到你了。下面是真实的提交。\n\n"
@@ -2220,7 +2224,9 @@ async def intent_diff(scene_id: str, question: str, spec_text: str,
         + _exp + "\n\n"
         + "【学生的 spec 全文】\n\"\"\"\n" + spec + "\n\"\"\"\n\n"
         + "【会话内修订】\n" + _rev + "\n\n"
-        + "【学生的 finalCode】\n\"\"\"\n" + code[:12000] + "\n\"\"\"\n\n"
+        # 原版 submit/route.ts:24-26 finalCode 上限 100_000 —— intent-diff
+        # 是「spec 全文 vs finalCode 全文」的对账，截断了就对不了账。
+        + "【学生的 finalCode】\n\"\"\"\n" + code[:100000] + "\n\"\"\"\n\n"
         + _result_block
         + "逐条分类分歧。按 schema 只输出 JSON。")
     call = llm or _intent_diff_call
