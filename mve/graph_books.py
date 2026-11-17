@@ -795,6 +795,24 @@ def next_task(scene: str = "P", *, llm=None) -> dict:
     返回 {ok, source, question, unit, module_id, why, todo_left, req_id}；
     提不出就 ok=False 并带 error，不硬凑。
     """
+    # 自由学（2026-11-17 用户拍板）：声明了 free_learn="turing" 的场景，
+    # 不看书单单元、也不看图谱将做 —— Voyager 原版的人不打扰模式只有
+    # 实查 + 两本账 + 一句话任务（prompts/curriculum.txt），单元/地图是
+    # 书单场景才有的东西。这里直接交给出题器，由它按仓库实查出下一句。
+    try:
+        import scenes as _sc_fl
+        if str((_sc_fl.get_scene(str(scene)) or {}).get("free_learn") or "") == "turing":
+            import curriculum_auto as _ca_fl
+            _r = _ca_fl.propose_for(scene, llm=(llm or default_llm))
+            if not _r.get("question"):
+                return {"ok": False, "source": "自由学", "question": "",
+                        "error": str(_r.get("why") or "出题器没给出题")}
+            return {"ok": True, "source": "自由学",
+                    "question": str(_r["question"]), "unit": "", "module_id": "",
+                    "why": str(_r.get("why") or "")}
+    except Exception as _e_fl:
+        print("  · [自由学] 出题器不可用，回落到书单："
+              + type(_e_fl).__name__ + ": " + str(_e_fl), flush=True)
     todo = todo_reqs(scene)
     if todo:
         r = dict(todo[0])

@@ -134,6 +134,55 @@ Context: <一句话：考哪个知识点、答案是什么形式、判定标准�
 写明「原题 p52 1.8」这样的出处；自编的写「自编」>
 """
 
+# 代码取证场景的**自由学**系统提示（2026-11-17 用户拍板）。
+#
+# 口径来源：Voyager 原版 prompts/curriculum.txt —— 人不打扰的自动课程只有
+#   ① 实查观察面（Biome / Nearby blocks / Inventory）
+#   ② 两本状态账（Completed tasks / Failed tasks）
+#   ③ 一句话任务（`Task: Mine 1 wood log`）+ 8 条 criteria
+# **没有关卡、没有章节、没有进度百分比。** 我 2026-11-14 给书单场景写的
+# _SYSTEM_BOOKS 是「按当前单元出数学题」，那是地图；自由学不能用它。
+#
+# 本场景唯一的判据是一句话（用户原话）：
+#   B ⊆ A，证明 B ≠ A —— A=原机（仓库跑起来）的真实运行，
+#   B=仓库对自己的声明（docstring / README / 类型签名 / 测试断言 / CLI help）。
+# 数学上这是 Cantor 对角化，停机问题只是取「会不会停」这个属性时的特例：
+# 停机性不可判定 ⇒ 任何有限声明集都预测不全原机行为 ⇒ B ≠ A 必然成立，
+# 任务只是找**哪一个**见证。所以不需要题库、不需要考点，永远有下一句。
+_SYSTEM_GROUNDED = """你是 Voyager 式自动课程规划器（原版 curriculum agent 的同构），
+运行在一个**真实代码仓库**上。玩家是一个能读文件、能真跑 python 的助手；
+它的世界就是这个仓库跑起来会发生什么。
+
+你要做的：给出**下一句**任务。整场只有一个目标，不分关卡、不分章节、不报进度：
+  A = 原机（这个仓库跑起来）的真实运行
+  B = 仓库对自己的声明（docstring / README / 类型签名 / 测试断言 / CLI 帮助）
+  已知 B ⊆ A。**证明 B ≠ A**：给出一个原机真实行为，它不在 B 的声明里。
+
+硬约束（照原版 8 条 criteria 的角色）：
+1. 一次只提**一个**任务，`Task:` 行就是这句话本身，不解释、不列清单。
+2. 这句话必须带一个**具体落点**（某个文件里的某个函数/类/分支/参数），
+   落点逐字取自下面「仓库实查」里的文件名与符号名 —— 原版
+   `Mine [quantity] [block]` 的同构是：`证明 B ≠ A：<文件> 的 <符号>`。
+   实查里没有的名字一律不许写（写了就是编的文件名，必然失败）。
+3. **优先停机方向**（最强见证，机器一跑就判得出，不需要人看）：
+   · 无圈：B 读起来会正常结束/返回，实跑在限定步数内不返回（超时、死循环、
+     递归爆栈前的无进展）；
+   · 单圈：B 读起来不会正常结束/会抛错/会拒绝，实跑却正常返回。
+   次选：B 声称的返回值、异常类型、副作用，与实跑不同。
+4. 必须**一圈落一个判定**：要么印证（这条声明确实是 A 的真实行为），
+   要么证伪（B 漏了这个行为）。不许出「还需要更多信息才能判」的任务。
+5. 不要重复 Completed tasks 里已经证过的落点；Failed tasks 里失败过的落点，
+   换一个更小的切口（更小的函数、更窄的输入），不要原样或换个说法再出。
+6. 不要出「这个仓库是做什么的 / 有几个文件 / 某个模块大概干什么」这类
+   元信息题 —— 那不需要真跑，验不了。
+7. 不要提单元、章节、第几关、进度百分比：**这个场景没有这些东西**。
+8. 题面用简体中文（代码标识符、文件名保持原样）。
+
+严格按两行输出：
+Task: 证明 B ≠ A：<落点> —— <要构造的那个行为>
+Context: <B 读起来会怎样 / 实跑要构造什么输入 / 凭什么判 B 漏了它>
+"""
+
 
 # 观察面的**体量上限**（2026-11-09 服务器实测踩到的）：
 # 场景 L 的 web_facts 是宽表（3736 行 × 910 列），逐列打「真实取值」会产出
@@ -156,6 +205,53 @@ _MAX_OBS_CHARS = 16000
 _MAX_SAMPLE_ROWS = 3
 _MAX_SAMPLE_CELLS = 14
 
+
+def repo_observation(root: str, *, max_files: int = 60,
+                     max_chars: int = 7000) -> str:
+    """仓库实查（原版 `Nearby blocks` 的同构）：真实文件 + 顶层符号。
+
+    只给「能碰到什么」，不给「该走哪条路」—— 没有单元、没有章节、没有进度。
+    原版 agent 看到的是 `nearby_blocks: grass, oak_log, ...`；这里看到的是
+    `llm_client.py：chat()、_post()`。出题器据此挑落点，模型没法脑补文件名。
+    """
+    import ast
+    import os as _os
+    if not root or not _os.path.isdir(root):
+        return "None（数据源不是一个可读目录 —— 绝对不要编造文件名）"
+    files = []
+    for dirpath, dirnames, filenames in _os.walk(root):
+        dirnames[:] = [d for d in dirnames
+                       if d not in (".git", "__pycache__", ".venv", "venv",
+                                    "node_modules", ".mypy_cache")]
+        for fn in filenames:
+            if fn.endswith(".py"):
+                files.append(_os.path.join(dirpath, fn))
+    files.sort()
+    total = len(files)
+    out, used = [], 0
+    for pth in files[:max_files]:
+        rel = _os.path.relpath(pth, root)
+        syms = []
+        try:
+            with open(pth, encoding="utf-8", errors="ignore") as f:
+                tree = ast.parse(f.read())
+            for n in tree.body:
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    syms.append(n.name + "()")
+                elif isinstance(n, ast.ClassDef):
+                    syms.append(n.name)
+        except Exception:
+            pass
+        line = "- " + rel + (("：" + "、".join(syms[:10])) if syms else "")
+        used += len(line) + 1
+        if used > max_chars:
+            out.append("- …（还有 %d 个 .py 文件未列出）"
+                       % (total - len(out)))
+            break
+        out.append(line)
+    return ("这个场景的数据源是一个**真实代码仓库**（%d 个 .py）。下面是实查到的"
+            "文件与顶层符号（全部真实；任务里的落点必须逐字来自这里）：\n"
+            % total + "\n".join(out))
 
 def db_observation(db_path: str) -> str:
     """实查场景库：表 → 行数 → 列 → 低基数字符串/布尔列的真实取值。
@@ -451,6 +547,29 @@ class CurriculumAgent:
         # 2026-11-14 实测：P 场景目录里有个空的 scene.duckdb，scene_profile 就把它
         # 判成 kind=scene，观察面变成「SQL 库 + 实查结构（空表）」，于是连出
         # 「查询当前数据库中共有多少张表」。书单场景必须先走这条岔路。
+        # 代码取证场景（2026-11-17 用户拍板「自由学就是 Voyager 那套：人不
+        # 打扰、一句话、无单元无地图」）：观察面 = 仓库实查（Nearby blocks
+        # 同构），状态 = completed/failed 两本账。**不注入书单进度**——那是
+        # 地图，不是自由学；S 虽然也有 books_json，这里必须把它绕开。
+        if self._is_grounded():
+            done_g = ("；".join(self.completed_tasks[-20:])
+                      if self.completed_tasks else "None")
+            failed_g = ("；".join(self.failed_tasks[-20:])
+                        if self.failed_tasks else "None")
+            wo_g = "；".join(f"{k[:40]}（{v[:80]}）"
+                            for k, v in list(self._failed_why.items())[-8:])
+            return {
+                "biome": ("环境：一个**真实代码仓库**（原机）。没有 SQL 库、没有"
+                          "教材书单；任务是**证明仓库的声明与它的真实行为不一致**。\n\n"),
+                "nearby_blocks": repo_observation(self._material_root()) + "\n\n",
+                "chests": ("整场只有一个目标：B ⊆ A，证明 B ≠ A。"
+                           "不分关卡、不分章节、不报进度。\n"
+                           f"已学会的技能（可复用配方）: {self._skill_count()} 条\n\n"),
+                "completed_tasks": f"Completed tasks so far: {done_g}\n\n",
+                "failed_tasks": (f"Failed tasks that are too hard: {failed_g}\n\n"
+                                 + (f"为什么失败: {wo_g}\n\n" if wo_g else "")),
+            }
+
         book = self._book_text()
         if book:
             done_b = ("；".join(self.completed_tasks[-20:])
@@ -545,6 +664,10 @@ class CurriculumAgent:
         if cache is not None:
             return cache
         self._cur_text = ""
+        # 取证场景没有地图可注入（2026-11-17）：书单进度是"该走哪条路"，
+        # 自由学只给"能碰到什么"（见 render_observation 的仓库实查分支）。
+        if self._is_grounded():
+            return ""
         # 两类场景共用同一段观察位：
         #   有题库（N）→ graph_curriculum：关 = 教材的一节，进度按可算题算；
         #   无题库（P）→ graph_books：关 = 书的一个单元，题由模型按单元现场出。
@@ -635,6 +758,31 @@ class CurriculumAgent:
                         "的问题后再启动。")
         return self.propose_next_ai_task(max_retries=max_retries)
 
+    def _is_grounded(self) -> bool:
+        """代码取证场景：数据源是一棵树，不是书单、也不是 SQL 库。
+
+        判据用场景声明（verify_claim），不用目录猜 —— 声明比探测可靠。
+        """
+        try:
+            import scenes as _sc_gr
+            d = _sc_gr.get_scene(str(self.scene_id or "")) or {}
+            return bool(d.get("verify_claim")) and bool(self.scene_dir)
+        except Exception:
+            return False
+
+    def _material_root(self) -> str:
+        """学习材料仓库根 —— 与机检器 verify_code_ref._repo_root 同一口径。
+
+        机检认的 file 相对 data_source/mve（S 的仓库在 scene_data/S/repo，
+        模块在 repo/mve）；实查清单必须用同一个根，否则出题器给的落点带
+        `repo/` 前缀，学生照抄就被机检拒（2026-11-17 实测）。
+        """
+        try:
+            from verify_code_ref import _repo_root
+            return str(_repo_root(str(self.scene_id or "S")))
+        except Exception:
+            return str(self.scene_dir or "")
+
     def has_environment(self) -> bool:
         """工作区里有没有东西可探索（原版：nearby_blocks 非空才谈得上出任务）。"""
         if not self.scene_dir or not self.local_enabled():
@@ -681,7 +829,7 @@ class CurriculumAgent:
                          "的领域。\n")
         user = (self.render_human_message() + mode
                 + "\n请按系统要求输出 Task: 与 Context: 两行。")
-        if book_mode:
+        if book_mode and not self._is_grounded():
             # 2026-11-14 实测：当前单元是 Similarity，模型却出了「直角三角形已知
             # 两边求第三边」——那是下一个单元的内容。光在上下文里标「当前」不够，
             # 这里把合法范围单独钉一遍（动态取，不写死任何单元名）。
@@ -744,8 +892,10 @@ class CurriculumAgent:
                 pass
         if _feedback:
             user += f"\n\n上一次不行：{_feedback}。请务必换一个**不同**的任务。"
+        _grounded_mode = self._is_grounded()
         msgs = [{"role": "system",
-                 "content": _SYSTEM_BOOKS if book_mode else _SYSTEM},
+                 "content": (_SYSTEM_GROUNDED if _grounded_mode
+                             else (_SYSTEM_BOOKS if book_mode else _SYSTEM))},
                 {"role": "user", "content": user}]
         try:
             if self._llm is not None:
