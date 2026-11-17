@@ -725,7 +725,15 @@ class CurriculumAgent:
                 _seen = [str((x or {}).get("question") or "")
                          for x in (_rr_cal.list_reqs(str(self.scene_id or ""))
                                    or [])]
-                _seen = [q for q in _seen if q][-12:]
+                _seen = [q for q in _seen if q]
+                # 同一问句重复登记（里程碑重试/多次派发）只占一个名额：
+                # 实测 23 次派发同一题后，12 个名额被同名刷满，清单形同虚设。
+                _dd, _seen = set(), []
+                for _q in _seen:
+                    if _q not in _dd:
+                        _dd.add(_q)
+                        _seen.append(_q)
+                _seen = _seen[-12:]
                 if _seen:
                     user += ("\n\n本场景已登记过这些问题（含正在学的，别重复）：\n"
                              + "\n".join("- " + q[:140] for q in _seen)
