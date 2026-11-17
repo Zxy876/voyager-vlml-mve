@@ -4187,6 +4187,16 @@ async def _start_learning_impl(
                                        "②算/出题——怎么从题面独立推出答案、怎么跟真"
                                        "值核；③交出什么——RESULT 里有哪些键、每个键"
                                        "是什么形态。每步一句，别写笼统口号。")
+                            # 证据块要求（2026-11-17）：verify_claim 场景在作答
+                            # 要求里直接写明 —— 不写就是「LLM 判过→机检拒」白烧
+                            # 一整轮（实测 3 次 status=failed，452s/次）。
+                            try:
+                                import scenes as _sc_p1
+                                if bool((_sc_p1.get_scene(scene) or {}).get(
+                                        "verify_claim")):
+                                    _q1 += '\n\n【证据要求】答案末尾必须附一段 ' + chr(96)*3 + 'mve_verify' + chr(96)*3 + ' 代码块（JSON，与 python 代码块并列独立）：{\"refs\": [{\"file\": \"模块名.py\", \"line\": 行号, \"expect\": \"该行包含的片段\"}]} —— file 相对仓库 mve/ 目录写（可先 read_file 核对行号再写），关键承诺各附至少一条真实引用；没有证据块的答案判过也不算完成。'
+                            except Exception:
+                                pass
                             _crit = ""
                             if _p1_round > 1 and str(
                                     (out.get("spec_gate") or {}).get("reason")
