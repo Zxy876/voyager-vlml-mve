@@ -718,6 +718,22 @@ class CurriculumAgent:
                              "那种题没有代码可引，判据不可满足。")
             except Exception:
                 pass
+            # 已登记问题避重（2026-11-17）：见上——精确去重挡不住换措辞，
+            # 把清单交给模型判，别加相似度阈值（会误杀合法新题）。
+            try:
+                import req_registry as _rr_cal
+                _seen = [str((x or {}).get("question") or "")
+                         for x in (_rr_cal.list_reqs(str(self.scene_id or ""))
+                                   or [])]
+                _seen = [q for q in _seen if q][-12:]
+                if _seen:
+                    user += ("\n\n本场景已登记过这些问题（含正在学的，别重复）：\n"
+                             + "\n".join("- " + q[:140] for q in _seen)
+                             + "\n\n**不要**再出考同一个点、同一问法的题——换个"
+                               "措辞不算新题；要出就出这个单元里上面这些题没"
+                               "覆盖的部分。")
+            except Exception:
+                pass
         if _feedback:
             user += f"\n\n上一次不行：{_feedback}。请务必换一个**不同**的任务。"
         msgs = [{"role": "system",
