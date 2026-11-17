@@ -797,7 +797,7 @@ Phase1 冻结 finalText 之后，code 交上来就跟 finalText 逐条对账
 我会给你这些信息：
 - Task：冻结的 finalText。它就是验收标准，里面承诺的每一项都要在 RESULT 里有对应。
 - Execution：这一轮程序真跑出来的东西 —— 报错原话、程序实际取回的外部内容、
-  RESULT 里有哪些键。（没有外部材料的场景，取回内容为空是**正常**的，不算失败。）
+  RESULT 全文（键+值，原样）。（没有外部材料的场景，取回内容为空是**正常**的，不算失败。）
 - Context：环境实查 —— 有外部材料时才给表/列/取值；没有时为空也是正常的。
 - 它可以调用的函数。
 
@@ -840,7 +840,7 @@ critique 的要求（下一轮它只能看到这一段，写不好它就原地�
 P2_CRITIC_FEW_SHOTS = """先看三个例子。
 
 例1
-Execution: 程序跑通，无报错；实际取回 {"cols":["name","type"],"rows":[["id","INTEGER"],["score","DOUBLE"]]}；RESULT 的键 ["columns"]
+Execution: 程序跑通，无报错；实际取回 {"cols":["name","type"],"rows":[["id","INTEGER"],["score","DOUBLE"]]}；RESULT 全文 {"columns":[["id","INTEGER"],["score","DOUBLE"]]}
 Task（spec）：① 列出这张表有哪些列 ② 每列的类型 ③ 有没有主键
 JSON: {"reasoning":"①②都取到了；spec 第③项在结果里没有对应内容，RESULT 里也没有这个键。","success":false,"critique":"还差第③项「有没有主键」：用 query_sql 查这个引擎的**约束元数据**（不要从列信息里猜），把结论放进 RESULT['primary_key']；查之前先把这次调用的返回原样放进 RESULT['probe']，看清字段名再取值。"}
 
@@ -850,23 +850,28 @@ Task（spec）：同上
 JSON: {"reasoning":"它从这个接口的返回里取第 7 列，但这个引擎只返回 3 列 —— 字段顺序是按另一种引擎的记忆写的。","success":false,"critique":"不要从这个接口取它根本不返回的字段。改法三条：① 先把这次调用的返回**原样**放进 RESULT['probe']，看清有几列、每列是什么；② 只取真实存在的列（按键名或按长度判断，不要写死下标）；③ 主键/外键/索引这类约束不在列信息里，改去查约束元数据，把查询和返回一起放进 RESULT。"}
 
 例3
-Execution: 程序跑通；实际取回 [{"cnt":175}]；RESULT 的键 ["chapter","count"]
+Execution: 程序跑通；实际取回 [{"cnt":175}]；RESULT 全文 {"chapter":"Functions","count":175}
 Task（spec）：按 chapter 等于 Functions 筛选，给出条数
 JSON: {"reasoning":"筛的是 chapter='Functions'，真取回 175，与 RESULT 一致。","success":true,"critique":""}
 
 例4（没有外部材料，全靠推导 —— 取回内容为空是正常的，别拿它判失败）
-Execution: 程序跑通，无报错；没有外部数据源调用（本题材料在题面里）；RESULT 的键 ["ef","verified"]
+Execution: 程序跑通，无报错；没有外部数据源调用（本题材料在题面里）；RESULT 全文 {"ef":12,"verified":true}
 Task（spec）：① 写出比例式 ② 代入求 EF ③ 验算；已知 AB/DE=2/3、BC=8
 JSON: {"reasoning":"程序里比例式与代入都真算了，EF=12；验算把 BC/EF 与 2/3 对照后写 verified=True。三项都有对应。","success":true,"critique":""}
 """
 
 
 def _p2_round_facts(obs: list[dict[str, Any]], result: Any,
-                    code: str) -> tuple[str, str, str]:
-    """把这一轮的观察压成 critic 要看的三个事实（同构 critic.py:36-105 的 render）。
+                    code: str) -> tuple[str, str, str, str]:
+    """把这一轮的观察压成 critic 要看的事实（同构 critic.py:36-105 的 render）。
 
     critic 读的是**环境末态**而不是代码文本 —— 报错原话、真实取回什么东西、
-    RESULT 里到底有哪些键。这三样给全，评语才落得到「哪一项没做到」上。
+    RESULT 全文。原版 render_human_message 是**全量零截断**（完整 inventory、
+    chests、context 都给）；此前这里只给「末次成功数据 1200 字 + RESULT 键名」，
+    判官看不到 RESULT 的**值** —— 结论与 mve_verify 证据全在值里，验收第 1 条
+    （每项在 RESULT 里有对应）无法对账 → 判官只能瞎答 → 输出散文 →
+    「输出解析不出 success」（2026-11-17 实测 Scene S 连续 2 轮 6 次）。
+    ★ 2026-11-17 调大原文视野：RESULT 全文 16000、取回内容 16000、报错 4000。
     """
     errs = [str(o.get("error") or "") for o in (obs or [])
             if isinstance(o, dict) and str(o.get("error") or "").strip()]
@@ -879,6 +884,14 @@ def _p2_round_facts(obs: list[dict[str, Any]], result: Any,
             except Exception:
                 _data = str(o.get("data"))
             break
+    _res = ""
+    if isinstance(result, dict):
+        try:
+            _res = json.dumps(result, ensure_ascii=False, default=str)
+        except Exception:
+            _res = str(result)
+    elif result is not None and str(result).strip():
+        _res = str(result)
     _keys = ""
     if isinstance(result, dict) and result:
         try:
@@ -886,7 +899,7 @@ def _p2_round_facts(obs: list[dict[str, Any]], result: Any,
                                ensure_ascii=False)
         except Exception:
             _keys = str(list(result.keys()))
-    return ("\n".join(errs)[-1200:], _data[:1200], _keys)
+    return ("\n".join(errs)[-4000:], _data[:16000], _res[:16000], _keys)
 
 
 async def _p2_critic(*, question: str, spec: str,
@@ -901,7 +914,7 @@ async def _p2_critic(*, question: str, spec: str,
     """
     out: dict[str, Any] = {"success": False, "critique": "",
                            "reasoning": "", "origin": "failed"}
-    _err, _data, _keys = _p2_round_facts(obs, result, code)
+    _err, _data, _res, _keys = _p2_round_facts(obs, result, code)
     _funcs = [str(f) for f in (funcs or []) if str(f).strip()]
     user = (
         P2_CRITIC_FEW_SHOTS + "\n\n现在轮到你了。下面是真实的这一轮。\n\n"
@@ -909,6 +922,8 @@ async def _p2_critic(*, question: str, spec: str,
         + "  · 报错：" + (_err or "（无）") + "\n"
         + "  · 程序实际取回的内容（末次成功）："
         + (_data or "（什么都没取到）") + "\n"
+        + "  · RESULT 全文（键+值，原样）："
+        + (_res or "（空）") + "\n"
         + "  · RESULT 里的键：" + (_keys or "（空）") + "\n\n"
         + "Task（冻结的 spec，验收标准）：\n\"\"\"\n" + str(spec or "") + "\n\"\"\"\n\n"
         + "题目：" + str(question or "")[:600] + "\n\n"
@@ -919,7 +934,9 @@ async def _p2_critic(*, question: str, spec: str,
         + "\n按 schema 只输出 JSON。")
     call = llm or _intent_diff_call
     last = ""
-    for _ in range(3):
+    # 原版 critic.py:79 ai_check_task_success(max_retries=5) —— 对齐 5 次
+    _raw_log = Path(__file__).resolve().parent / "p2_critic_raw.log"
+    for _ in range(5):
         try:
             text = call([{"role": "system", "content": P2_CRITIC_SYSTEM},
                          {"role": "user", "content": user}])
@@ -931,6 +948,16 @@ async def _p2_critic(*, question: str, spec: str,
             data = _mg._parse(text)
             if not isinstance(data, dict) or "success" not in data:
                 last = "输出解析不出 success"
+                # 原版 critic.py:91 把判官原文打出来留证；不落盘就永远
+                # 无法事后定位「判官到底答了什么散文」（gate_raw.log 同因）
+                print("  · [p2-critic raw] " + str(text)[:300], flush=True)
+                try:
+                    with open(_raw_log, "a", encoding="utf-8") as _f:
+                        _f.write("\n===== "
+                                 + time.strftime("%Y-%m-%dT%H:%M:%S")
+                                 + " parse-fail =====\n" + str(text) + "\n")
+                except Exception:
+                    pass
                 continue
         except Exception as e:
             last = f"解析失败：{type(e).__name__}: {e}"
