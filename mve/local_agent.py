@@ -714,6 +714,12 @@ async def solve(question: str, scene_dir: str, *, llm=None,
     # ⚠️ 延迟 import：传了 `llm` 的调用方（测试/别的编排）不该被迫拉起整条
     # VLML 依赖链 —— 实测 `from voyager_vlml.llm import chat` 在只插了 mve/
     # 的进程里直接 ModuleNotFoundError，把调用方拖死。
+    def call(msgs):
+        if llm is not None:
+            return llm(msgs)
+        from voyager_vlml.llm import chat
+        return chat(msgs, temperature=0.2)
+
     if submit_fn is None and str(scene_id) in _SUBMIT_HANDLERS:
         submit_fn = _SUBMIT_HANDLERS[str(scene_id)]
 
