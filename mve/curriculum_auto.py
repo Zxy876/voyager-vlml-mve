@@ -392,6 +392,11 @@ def _log_band(band: str, msg: str) -> None:
 
 INV_CAP = 36           # 背包槽位（curriculum.py:205 `{inventory_used}/36`）
 INV_FULL = 33          # 满格阈值（curriculum.py:251 `inventoryUsed >= 33`）
+# progress==0 游程兜底（2026-11-18 浅蔚口径：连续 3 次无进展 → 停，交人看
+# 分段 session）。progress 的口径照原版 :133-135 = len(completed_tasks)；
+# skip **不占背包格** —— 原版 inventory 只装采集到的（event["inventory"]
+# 读取口），失败只进 failed_tasks（:342-344），游程是账上的读数，不是格子。
+FAIL_STREAK_STOP = 3
 # 存包阈值（档 B）。**必须是常量**：交给模型决定就退化成「感觉连续」，不可判定。
 # 依据 Voyager `curriculum.py:264-291`：世界规则（progress==0 / inventory full）
 # 是写死的两条 if，不是判官的自由裁量。
@@ -504,6 +509,12 @@ class CurriculumAgent:
         # 游程会在每次出题时被反复封格（实测：slots 涨、r_site 不降 → 每轮封一格）。
         # 记「封点」而不是删 exchange：exchange 是 append-only（route.ts:85）。
         self.sealed_marks: dict[str, int] = {}
+        # 种子（人给的第 0 题）与存箱批结论判定标志（2026-11-18）。
+        self.seed_task: str = ""
+        self.pending_verdict: bool = False
+        # progress==0 游程（原版 skip：失败不推进 progress 只换题，:342-344；
+        # 连续 FAIL_STREAK_STOP 次 → scene_learn 主循环兜底停）。
+        self.fail_streak: int = 0
         # chat 账本归属（原版 Phase2Data 是 per-session；自由学里 per-topic）。
         # 空 = 用 scene_id。只决定读哪个文件，不改变 chat 的任何语义。
         self.chat_topic: str = ""
@@ -538,6 +549,9 @@ class CurriculumAgent:
                 self.chests = list(inv.get("chests") or [])
                 self.sealed_marks = {str(k): int(v or 0)
                                      for k, v in (inv.get("sealed") or {}).items()}
+                self.seed_task = str(inv.get("seed_task") or "")
+                self.pending_verdict = bool(inv.get("pending_verdict") or False)
+                self.fail_streak = int(inv.get("fail_streak") or 0)
         except Exception:
             pass
         # 旧账迁移（2026-11-18）：covered_sites.json 是「落点全集 - 已证」时代的
@@ -570,7 +584,10 @@ class CurriculumAgent:
             json.dumps({"slots": self.slots,
                         "batch": self.batch,
                         "chests": self.chests,
-                        "sealed": self.sealed_marks},
+                        "sealed": self.sealed_marks,
+                        "seed_task": self.seed_task,
+                        "pending_verdict": self.pending_verdict,
+                        "fail_streak": self.fail_streak},
                        ensure_ascii=False, indent=2), "utf-8")
 
     @property
@@ -1025,6 +1042,13 @@ class CurriculumAgent:
             if q and q not in self.completed_tasks and not _human_q:
                 _human_q = q
         if _human_q:
+            if not self.seed_task:
+                # 种子 = 人给的第 0 题（原版 manual 的 input，:322-330；auto
+                # 的 "Mine 1 wood log" 也是写死的第 0 题，:244-247）。只记
+                # 一次，自由学换题不改它。存箱批的种子结论判定（scene_learn
+                # 主循环，原版 voyager.inference :403-434 同构）重跑这一题。
+                self.seed_task = _human_q
+                self._save()
             return _human_q, "人导入的待学问题（原版 manual 模式对应物）"
         # 原版 :264-291 在交给 LLM 之前先走硬编码分支（inventory 满 → 固定任务）。
         # MVE 的对应物就是这条：先看**有没有任何可用的取数手段**。
@@ -1054,6 +1078,12 @@ class CurriculumAgent:
             self._escalate()
             _log_band("档C", f"背包满（{_used}/{INV_CAP}）→ 存箱第 "
                              f"{len(self.chests)} 批，背包清空继续")
+            # 归档批的结论判定交给主循环（scene_learn）：原版存箱后继续跑
+            # 不停机，但 MVE 把「这一批学到什么程度」绑在存箱事件上 —— 携带
+            # 本批经验对种子重跑一次（原版 voyager.inference :403-434 同构）。
+            # 只置标志：rollout 属于 learn 循环层，课程层不执行。
+            self.pending_verdict = True
+            self._save()
         # ---- 档 B：chat 游程满 → 这一段成形，存包一格继续 ----
         # 2026-11-18：人看不到 chat（它是内部传感器），但它的 mode 游程在内部
         # 决定「什么时候收这一格」。之前这里只是返回一个标签，没有任何动作。
@@ -1304,12 +1334,16 @@ class CurriculumAgent:
                 self.completed_tasks.append(task)
             # 落点记进背包（P1）：证成了才算，题面反查不到落点就不记账。
             self.recall_site(task)
+            self.fail_streak = 0          # 有产出 → progress==0 游程归零
         else:
             if task not in self.failed_tasks:
                 self.failed_tasks.append(task)
             why = str(info.get("critique") or info.get("why") or "")
             if why:
                 self._failed_why[task] = why[:200]
+            # 原版 skip 语义：失败不推进 progress，只换题（:342-344）。游程
+            # 连续 FAIL_STREAK_STOP 次 → 主循环兜底停（浅蔚 2026-11-18）。
+            self.fail_streak += 1
         self.clean_up_tasks()
         self._save()
 

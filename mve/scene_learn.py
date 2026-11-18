@@ -691,6 +691,33 @@ def main() -> int:
                         "（工作区没数据 / LLM 不可用 / 连续 5 次解析失败）")
                      + " —— 如实退出，不硬凑。")
                 break
+        # ---- 存箱批的种子结论判定（原版 voyager.inference :403-434 同构）----
+        # 档 C 归档一批后，携带这批自由学攒下的经验（技能库检索注入、归题的
+        # 追问历史都走现有通路）对种子（人给的第 0 题）重跑一次，判定这一批
+        # 「学到什么程度」。判定照 update_exploration_progress 记账（唯一
+        # 提交点）；未过照原版 inference 语义不判死，游程 +1，下轮回攻。
+        if cur.pending_verdict:
+            cur.pending_verdict = False
+            cur._save()
+            if cur.seed_task:
+                _log("\n[场景学习] 背包满已归档 → 种子结论判定（原版 "
+                     f"inference 同构）：携带本批经验重跑「{cur.seed_task[:60]}」")
+                try:
+                    _info_v = _run_one(cur.seed_task, scene,
+                                       max_retries=max_retries,
+                                       context="（存箱批种子结论判定："
+                                               "携带自由学经验重跑）")
+                    cur.update_exploration_progress(_info_v)
+                    _log("[场景学习] 种子结论判定 → "
+                         + ("✅ 通过（同一题多了一行轨迹，可与首过轮次对比）"
+                            if _info_v.get("success") else
+                            "❌ 未过（原版 inference 语义：不判死，游程 +1）"))
+                except Exception as _e:
+                    _log(f"[场景学习] 种子结论判定失败（不拦循环）："
+                         f"{type(_e).__name__}: {_e}")
+            else:
+                _log("[场景学习] 背包满已归档，但本场景没有种子账（seed_task "
+                     "空）—— 无可判定对象，跳过结论判定。")
         tried_this_run.add(task)
         # 重试题把上次的失败评语带回去当 critique 初值（原版把 critique 拼进
         # 下一次 rollout 的同一条通路）。
@@ -732,6 +759,15 @@ def main() -> int:
         _log(f"[场景学习] 进度 {iteration}/{max_iter}：已完成 "
              f"{len(cur.completed_tasks)} / 失败 {len(cur.failed_tasks)}"
              + ("（失败→Skipping to next task）" if not info.get("success") else ""))
+        # progress==0 游程兜底（2026-11-18 浅蔚口径）：原版 skip 无限次也不停
+        # （curriculum.py:342-344 只换题），但类图灵测试的自由学需要「连续无
+        # 进展就停、交人看分段 session」。口径：progress = len(completed_tasks)
+        # （原版 :133-135）；种子结论判定未过也计入游程（同一提交点）。
+        if cur.fail_streak >= curriculum_auto.FAIL_STREAK_STOP:
+            _log(f"\n[场景学习] 连续 {cur.fail_streak} 轮无进展（progress==0 "
+                 f"游程 ≥ {curriculum_auto.FAIL_STREAK_STOP}）—— 如实停，交人看"
+                 "最近失败评语与分段 session。")
+            break
     return 0
 
 if __name__ == "__main__":

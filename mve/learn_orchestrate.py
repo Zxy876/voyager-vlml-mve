@@ -1061,6 +1061,7 @@ def _p2_chat_ask(*, scene_id: str, topic_id: str, question: str, spec: str,
               % (round_i, r["mode"], n2, ask[:80]), flush=True)
         return {"topic": tid, "mode": r["mode"], "ask": ask,
                 "response": str(r.get("response") or "")[:400],
+                "response_full": str(r.get("response") or "")[:1600],
                 "r_site": n2}
     except Exception as e:
         print("  · Phase2 第 %d 轮：chat 异常（%s: %s），已跳过"
@@ -1812,9 +1813,20 @@ async def phase2_final_code(scene_id: str, question: str, spec_text: str,
                              critique=_crit, round_i=_r, llm=llm)
         if _chat:
             out["chat"] = _chat
+            # ★ 原版同构（chat/route.ts:79-87 + ExerciseClient:1800-1811）：
+            #   response 进学生的眼睛，不进状态机。MVE 的「学生」是下一轮
+            #   作答的 agent，「眼睛」= 下一轮 human message 的 critique 通道
+            #   （原版 action.py:200-205 Critique: 段同位）。判官/critic 照旧
+            #   不消费 chat —— 只有学生自己看见，自己折进下一次写码。
+            _chat_resp = str(_chat.get("response_full") or "")
             out.setdefault("chat_history", []).append(
                 {"round": _r, "mode": _chat.get("mode"),
-                 "r_site": _chat.get("r_site"), "ask": _chat.get("ask")})
+                 "r_site": _chat.get("r_site"), "ask": _chat.get("ask"),
+                 "delivered": bool(_chat_resp)})
+            if _chat_resp:
+                _crit = (_crit
+                         + "\n\n【chat 回应 · 对照你冻结的 spec 重看承诺】\n"
+                         + _chat_resp)
     # 到上限仍未做到：以最后那份跑得通的程序"提交"（原版提交不受过关限制）
     if _best:
         out.update(_best)
