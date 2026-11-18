@@ -48,6 +48,7 @@ PILOT_STATE = HERE / "pilot_state.json"
 # learn_orchestrate 不反向 import scene_learn（已 grep 确认只在注释里出现），
 # 放到顶层没有循环导入风险。
 import learn_orchestrate  # noqa: E402
+import graph_books  # noqa: E402  （自由学选题：将做 → 书单；不反向 import 本文件）
 
 
 def _asked_to_stop() -> bool:
@@ -156,6 +157,8 @@ def scene_questions(scene_id: str) -> list[dict[str, Any]]:
                 todo.append(q)
     except Exception:
         pass
+    # 2026-11-18：图谱「将做」排头已删 —— 材料入口只剩背包，没有"将做清单"
+    # 这种预设队列（原版 curriculum 也只有 completed/failed 两本账）。
     return [{"question": q} for q in todo]
 
 
@@ -201,14 +204,19 @@ def _log_learning_detail(r: dict[str, Any]) -> None:
     cry = r.get("crystallized") or {}
     if isinstance(cry, dict) and cry.get("ok"):
         _log("  · 技能结晶：" + str(cry.get("entry") or cry.get("name") or "ok"))
-    # 闸门（Maieutic spec gate）：逐维度答到没答到 —— 这是"任务完成没有"的硬判据
-    # 2026-10-19 修：维度即子任务后 critic.gate 是 {addressed/open/questions}，
-    # 旧打印按 list 数（len = 3 个 key）→ 打出"0/3"这种假数字。
-    dres = r.get("dimension_results")
-    if dres:
-        _ok = dres.get("learned") or []
-        _bad = dres.get("failed") or []
-        _log(f"  · 维度子任务：{len(_ok)}/{dres.get('total')} 个答到"
+    # 闭合点只有两个（用户 2026-11-12 口径）：Phase1 spec 冻结、Phase2
+    # finalCode 交付。维度条数是动态的，不再数「几维闭合」。
+    _so = r.get("spec_outcome") or {}
+    if _so:
+        _log("  · Phase1 spec：" + ("已冻结" if _so.get("phase1_passed")
+                                    else "未冻结")
+             + "｜Phase2 finalCode：" + ("已交" if _so.get("phase2_submitted")
+                                        else "未交"))
+    _dres = r.get("dimension_results")
+    if _dres:  # 仅 MVE_P1_WHOLE=0 的逐维回退路径
+        _ok = _dres.get("learned") or []
+        _bad = _dres.get("failed") or []
+        _log(f"  · 维度子任务：{len(_ok)}/{_dres.get('total')} 个答到"
              + (f"（未闭合：{'，'.join(str(f.get('id') or '') for f in _bad)}）"
                 if _bad else "（全部闭合）"))
     ms = r.get("milestone_scaffold") or {}
@@ -291,9 +299,21 @@ def _light_up_milestone(scene: str, question: str, db_path: str,
         # 顶层会永远 fetched=False，哪怕本体 rollout 真取了 4 次数（实测：
         # calls=4 真取到=4 证据=data 却判"未取到真数"，死活不点亮）。
         _exec0 = r0.get("execution") or {}
-        fetched = (bool(r0.get("real_calls")) or bool(_exec0.get("real_calls"))
-                   or (int(r0.get("rows") or 0) > 0)
-                   or (int(_exec0.get("rows") or 0) > 0))
+        # 助产士同构（2026-11-16）：闭合标准 = 缺口序列闭合；「真取到数」只是
+        # **有外部材料的场景**（grounded=True）的验真手段。推导场景（无外部
+        # 材料）重跑成功 = 代码真算过一遍，本身就是验真 —— 之前这里无条件
+        # 要求 real_calls/rows，P 的里程碑全闭合后永远“未取到真数”，4 次重试
+        # 挂冷却，永远点不亮（用户 2026-11-16「我们要和助产士同构」）。
+        _g_light = True
+        try:
+            import scene_profile as _sp_l
+            _g_light = bool(_sp_l.grounded(scene))
+        except Exception:
+            _g_light = True
+        fetched = ((bool(r0.get("real_calls")) or bool(_exec0.get("real_calls"))
+                    or (int(r0.get("rows") or 0) > 0)
+                    or (int(_exec0.get("rows") or 0) > 0))
+                   or (bool(info.get("success")) and not _g_light))
         _log(f"[场景学习] 里程碑重试 → status={r0.get('status')}"
              f"（{time.time() - t0:.0f}s，真取到={fetched}）")
         _log_learning_detail(r0)
@@ -337,6 +357,9 @@ def _light_up_milestone(scene: str, question: str, db_path: str,
              f"{type(e).__name__}: {e}")
         return False
     _light_up_milestone._fail_streak = 0      # 成功清零失败计数
+    # 2026-11-18：书单单元账（unit_of_proposed → record_solved）已删 ——
+    # 材料入口只剩背包，进度不再按「书单单元」记，而是按会话装格
+    # （curriculum_auto.recall_session，在 update_exploration_progress 里）。
     _log("[场景学习] 里程碑任务成功：重跑取到真数 → 节点点亮变实"
          "（组合复合技能入库由本轮 learn_orchestrate achieved 分支自动完成）。")
     return True
@@ -345,7 +368,8 @@ def _light_up_milestone(scene: str, question: str, db_path: str,
 def _run_one(q: str, scene: str, *, context: str = "",
              max_retries: int = 1, critique: str = "",
              preset_dimension: dict | None = None,
-             milestone_retry: bool = False) -> dict[str, Any]:
+             milestone_retry: bool = False,
+             new_req: bool = False) -> dict[str, Any]:
     """一次外层 rollout（原版 voyager.py:298-301，默认**只跑 1 次**）。
 
     同构修正（2026-10-24）：原版每轮课程对每个任务只 rollout 一次
@@ -369,7 +393,7 @@ def _run_one(q: str, scene: str, *, context: str = "",
             r = asyncio.run(learn_orchestrate.start_learning(
                 q, scene, critique=critique, judge=True, context=context,
                 preset_dimension=preset_dimension,
-                milestone_retry=milestone_retry))
+                milestone_retry=milestone_retry, new_req=new_req))
         except Exception as e:
             r = {"status": "failed", "why": f"{type(e).__name__}: {e}"}
         status = str(r.get("status") or "")
@@ -391,7 +415,7 @@ def _run_one(q: str, scene: str, *, context: str = "",
                 import task_critic
                 from reward import scene_has_env as _she
                 success, critique2 = task_critic.check_task_success(
-                    q, context, r, has_env=_she(scene))
+                    q, context, r, has_env=_she(scene), scene_id=scene)
             except Exception as e:
                 success, critique2 = False, f"critic 失败：{type(e).__name__}: {e}"
         info.update(task=q, success=bool(success),
@@ -432,7 +456,11 @@ def main() -> int:
     forced = str(args.question).strip()
 
     import curriculum_auto
-    cur = curriculum_auto.agent_for(scene)
+    # ⚠️ 必须递真 llm：CurriculumAgent 是 `if self._llm is not None` 才调模型，
+    #    传 None 会**静默不出题**（2026-11-15 实测：点「▶ 启动 Voyager」在 P
+    #    场景跑起来后队列一空就"提不出任务"退出，不是数据学完了，是没人给它
+    #    一个能调的模型）。
+    cur = curriculum_auto.agent_for(scene, llm=graph_books.default_llm)
 
     # 强制重学：先单独跑一次（纠正误记），再进入正常循环。
     if forced:
@@ -563,6 +591,27 @@ def main() -> int:
                             # 里程碑任务成功：点亮解锁 → 清锚点 → 本轮直接降级
                             # 自由出题，等下一次人导入立新锚点。
                             _ms.clear_current_target(scene)
+                            # ★ 2026-11-18（用户拍板「第一个 123 已促成 → 自由学
+                            #   可续上」）：里程碑重跑成功 = 原版 inference 的
+                            #   「最后一条子目标 rollout 成功」—— progress =
+                            #   len(completed_tasks)（curriculum.py:133-135）必须
+                            #   记账。之前只点亮节点不进 curriculum 账，种子闸门
+                            #   永远拦着自由学（实测 07:54 循环如实退出）。
+                            try:
+                                cur.update_exploration_progress(
+                                    {"task": _tgt, "success": True,
+                                     "critique": ""})
+                            except Exception as _e:
+                                _log("[场景学习] 里程碑入 completed 账失败："
+                                     f"{_e.__class__.__name__}: {_e}")
+                            # 轨迹账回写点亮（2026-11-18）：里程碑点亮是
+                            # 事后事件，learn_trace 那行落盘时还不知道 ——
+                            # 这里补 lit=True，轨迹页才能显示「已点亮」。
+                            try:
+                                import learn_trace as _lt2
+                                _lt2.mark_lit(scene, _tgt)
+                            except Exception:
+                                pass
                         # 未成功：不解锁；失败计数/换题由 _light_up_milestone
                         # 内部按原版处置（挂冷却），本轮落到下面的自由出题。
                 # 成功或已点亮 → 落到下面的自由出题
@@ -583,9 +632,38 @@ def main() -> int:
                    if q in cur.failed_tasks and q not in cur.completed_tasks]
         queued = ([q for q in fresh if q not in tried_this_run]
                   + [q for q in retries if q not in tried_this_run])[:units]
+        _is_new_task = False
         if not queued and args.curriculum != "queue":
-            # 人导入队列空了 → 自动出题（auto 模式，原版 while True 的本义）。
-            queued = []
+            # 队列空了 → **自由学**：只剩一个入口（graph_books.next_task →
+            # curriculum_auto.propose_for → 出题器）。2026-11-18 起没有
+            # 「图谱将做」「书单当前单元」两条分支了：材料入口只剩背包。
+            # 用户 2026-11-15 原话「我点这个按钮其实就是自由学呀，不用多做一个
+            # 按钮」——所以这条口径就长在驾驶舱这条链上，不再另开入口。
+            try:
+                _nt = graph_books.next_task(scene,
+                                            llm=graph_books.default_llm)
+            except Exception as e:
+                _nt = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+            if _nt.get("ok") and _nt.get("question"):
+                # 来源必须显式标 auto：出题器给的是**系统题**，不能顶
+                # 「人导入的种子」那个位（curriculum_auto 按这个字段判，
+                # 见 `_SEED_ORIGINS`）。2026-11-18 前这里塞的是裸字符串，
+                # 于是系统题在 progress==0 时冒充了第一个 123 的入口。
+                queued = [{"question": str(_nt["question"]), "origin": "auto"}]
+                # 自由学出的题是**新题**：让 learn_orchestrate 走 register
+                # (force_new=True)，跳过「归题找回」—— 否则词面相近的两道
+                # 数学题会共用一个 req，追问历史与 addressed 全串在一起
+                # （2026-11-15 实测：「2/3 × 9/8」被归到「3 的 6 次方」）。
+                _is_new_task = True
+                _log(f"[场景学习] 自由学选题（{_nt.get('source')}；"
+                     "系统题，不占种子位）"
+                     + (f" · {_nt['unit']}" if _nt.get("unit") else "")
+                     + f"：{queued[0].get('question', queued[0])[:70]}")
+            else:
+                queued = []
+                _log("[场景学习] 自由学提不出题（"
+                     + str(_nt.get("error") or "未知")
+                     + "）—— 交给出题器再试一次。")
         elif not queued and args.curriculum == "queue":
             _log("[场景学习] 队列空了（queue 模式：只学人导入的题），退出。"
                  "要原版那种不停出题，用 --curriculum auto。")
@@ -637,7 +715,7 @@ def main() -> int:
                  + qa_ctx[:400])
             context = "；".join(x for x in (context, qa_ctx) if x)
         info = _run_one(task, scene, context=context, max_retries=max_retries,
-                        critique=retry_critique)
+                        critique=retry_critique, new_req=_is_new_task)
         # 原版 curriculum.update_exploration_progress：成功进 completed、失败进 failed
         cur.update_exploration_progress(info)
         # 整题层节流：做完一道自由出题 → 里程碑的 cooldown 减一（原版「学完

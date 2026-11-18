@@ -170,6 +170,32 @@ def _answer_text(obs: list[dict[str, Any]], *, ok_only: bool = False) -> str:
     return ""
 
 
+def _verify_claim_from_obs(obs: list[dict[str, Any]]) -> dict | None:
+    """从**原始**观察的 RESULT 里取结构化证据（2026-11-18）。
+
+    场景 S 的答案是 `json.dumps(RESULT)`（见 `_answer_text`）——学生交的是
+    程序，没有「答案文本末尾」这个书写面，所以证据必须能长在 RESULT 里：
+        RESULT = {..., "verify": {"refs": [{"file": "x.py", "line": 68,
+                                            "expect": "def _is_abs"}],
+                                  "run": {...}}}
+    兼容键名 verify / mve_verify / evidence，也接受裸 refs 列表。
+    优先读原始 data（观察里的 data 已被截到 600 字，靠不住），取不到再由
+    `_gate_texts` 的 fenced ```mve_verify``` 块兜底（向后兼容）。
+    """
+    for o in reversed(obs or []):
+        d = (o or {}).get("data")
+        if not isinstance(d, dict):
+            continue
+        for k in ("verify", "mve_verify", "evidence"):
+            v = d.get(k)
+            if isinstance(v, dict) and ("refs" in v or "run" in v):
+                return v
+            if (isinstance(v, list) and v and isinstance(v[0], dict)
+                    and "file" in v[0]):
+                return {"refs": v}
+    return None
+
+
 def _has_real(obs: list[dict[str, Any]]) -> bool:
     """至少一次观察取到了**真数**（批判据复用 critic.has_real_data，不重造）。"""
     if not obs:
@@ -797,7 +823,7 @@ Phase1 冻结 finalText 之后，code 交上来就跟 finalText 逐条对账
 我会给你这些信息：
 - Task：冻结的 finalText。它就是验收标准，里面承诺的每一项都要在 RESULT 里有对应。
 - Execution：这一轮程序真跑出来的东西 —— 报错原话、程序实际取回的外部内容、
-  RESULT 里有哪些键。（没有外部材料的场景，取回内容为空是**正常**的，不算失败。）
+  RESULT 全文（键+值，原样）。（没有外部材料的场景，取回内容为空是**正常**的，不算失败。）
 - Context：环境实查 —— 有外部材料时才给表/列/取值；没有时为空也是正常的。
 - 它可以调用的函数。
 
@@ -840,7 +866,7 @@ critique 的要求（下一轮它只能看到这一段，写不好它就原地�
 P2_CRITIC_FEW_SHOTS = """先看三个例子。
 
 例1
-Execution: 程序跑通，无报错；实际取回 {"cols":["name","type"],"rows":[["id","INTEGER"],["score","DOUBLE"]]}；RESULT 的键 ["columns"]
+Execution: 程序跑通，无报错；实际取回 {"cols":["name","type"],"rows":[["id","INTEGER"],["score","DOUBLE"]]}；RESULT 全文 {"columns":[["id","INTEGER"],["score","DOUBLE"]]}
 Task（spec）：① 列出这张表有哪些列 ② 每列的类型 ③ 有没有主键
 JSON: {"reasoning":"①②都取到了；spec 第③项在结果里没有对应内容，RESULT 里也没有这个键。","success":false,"critique":"还差第③项「有没有主键」：用 query_sql 查这个引擎的**约束元数据**（不要从列信息里猜），把结论放进 RESULT['primary_key']；查之前先把这次调用的返回原样放进 RESULT['probe']，看清字段名再取值。"}
 
@@ -850,23 +876,28 @@ Task（spec）：同上
 JSON: {"reasoning":"它从这个接口的返回里取第 7 列，但这个引擎只返回 3 列 —— 字段顺序是按另一种引擎的记忆写的。","success":false,"critique":"不要从这个接口取它根本不返回的字段。改法三条：① 先把这次调用的返回**原样**放进 RESULT['probe']，看清有几列、每列是什么；② 只取真实存在的列（按键名或按长度判断，不要写死下标）；③ 主键/外键/索引这类约束不在列信息里，改去查约束元数据，把查询和返回一起放进 RESULT。"}
 
 例3
-Execution: 程序跑通；实际取回 [{"cnt":175}]；RESULT 的键 ["chapter","count"]
+Execution: 程序跑通；实际取回 [{"cnt":175}]；RESULT 全文 {"chapter":"Functions","count":175}
 Task（spec）：按 chapter 等于 Functions 筛选，给出条数
 JSON: {"reasoning":"筛的是 chapter='Functions'，真取回 175，与 RESULT 一致。","success":true,"critique":""}
 
 例4（没有外部材料，全靠推导 —— 取回内容为空是正常的，别拿它判失败）
-Execution: 程序跑通，无报错；没有外部数据源调用（本题材料在题面里）；RESULT 的键 ["ef","verified"]
+Execution: 程序跑通，无报错；没有外部数据源调用（本题材料在题面里）；RESULT 全文 {"ef":12,"verified":true}
 Task（spec）：① 写出比例式 ② 代入求 EF ③ 验算；已知 AB/DE=2/3、BC=8
 JSON: {"reasoning":"程序里比例式与代入都真算了，EF=12；验算把 BC/EF 与 2/3 对照后写 verified=True。三项都有对应。","success":true,"critique":""}
 """
 
 
 def _p2_round_facts(obs: list[dict[str, Any]], result: Any,
-                    code: str) -> tuple[str, str, str]:
-    """把这一轮的观察压成 critic 要看的三个事实（同构 critic.py:36-105 的 render）。
+                    code: str) -> tuple[str, str, str, str]:
+    """把这一轮的观察压成 critic 要看的事实（同构 critic.py:36-105 的 render）。
 
     critic 读的是**环境末态**而不是代码文本 —— 报错原话、真实取回什么东西、
-    RESULT 里到底有哪些键。这三样给全，评语才落得到「哪一项没做到」上。
+    RESULT 全文。原版 render_human_message 是**全量零截断**（完整 inventory、
+    chests、context 都给）；此前这里只给「末次成功数据 1200 字 + RESULT 键名」，
+    判官看不到 RESULT 的**值** —— 结论与 mve_verify 证据全在值里，验收第 1 条
+    （每项在 RESULT 里有对应）无法对账 → 判官只能瞎答 → 输出散文 →
+    「输出解析不出 success」（2026-11-17 实测 Scene S 连续 2 轮 6 次）。
+    ★ 2026-11-17 调大原文视野：RESULT 全文 16000、取回内容 16000、报错 4000。
     """
     errs = [str(o.get("error") or "") for o in (obs or [])
             if isinstance(o, dict) and str(o.get("error") or "").strip()]
@@ -879,6 +910,14 @@ def _p2_round_facts(obs: list[dict[str, Any]], result: Any,
             except Exception:
                 _data = str(o.get("data"))
             break
+    _res = ""
+    if isinstance(result, dict):
+        try:
+            _res = json.dumps(result, ensure_ascii=False, default=str)
+        except Exception:
+            _res = str(result)
+    elif result is not None and str(result).strip():
+        _res = str(result)
     _keys = ""
     if isinstance(result, dict) and result:
         try:
@@ -886,7 +925,7 @@ def _p2_round_facts(obs: list[dict[str, Any]], result: Any,
                                ensure_ascii=False)
         except Exception:
             _keys = str(list(result.keys()))
-    return ("\n".join(errs)[-1200:], _data[:1200], _keys)
+    return ("\n".join(errs)[-4000:], _data[:16000], _res[:16000], _keys)
 
 
 async def _p2_critic(*, question: str, spec: str,
@@ -901,7 +940,7 @@ async def _p2_critic(*, question: str, spec: str,
     """
     out: dict[str, Any] = {"success": False, "critique": "",
                            "reasoning": "", "origin": "failed"}
-    _err, _data, _keys = _p2_round_facts(obs, result, code)
+    _err, _data, _res, _keys = _p2_round_facts(obs, result, code)
     _funcs = [str(f) for f in (funcs or []) if str(f).strip()]
     user = (
         P2_CRITIC_FEW_SHOTS + "\n\n现在轮到你了。下面是真实的这一轮。\n\n"
@@ -909,6 +948,8 @@ async def _p2_critic(*, question: str, spec: str,
         + "  · 报错：" + (_err or "（无）") + "\n"
         + "  · 程序实际取回的内容（末次成功）："
         + (_data or "（什么都没取到）") + "\n"
+        + "  · RESULT 全文（键+值，原样）："
+        + (_res or "（空）") + "\n"
         + "  · RESULT 里的键：" + (_keys or "（空）") + "\n\n"
         + "Task（冻结的 spec，验收标准）：\n\"\"\"\n" + str(spec or "") + "\n\"\"\"\n\n"
         + "题目：" + str(question or "")[:600] + "\n\n"
@@ -919,7 +960,9 @@ async def _p2_critic(*, question: str, spec: str,
         + "\n按 schema 只输出 JSON。")
     call = llm or _intent_diff_call
     last = ""
-    for _ in range(3):
+    # 原版 critic.py:79 ai_check_task_success(max_retries=5) —— 对齐 5 次
+    _raw_log = Path(__file__).resolve().parent / "p2_critic_raw.log"
+    for _ in range(5):
         try:
             text = call([{"role": "system", "content": P2_CRITIC_SYSTEM},
                          {"role": "user", "content": user}])
@@ -931,6 +974,16 @@ async def _p2_critic(*, question: str, spec: str,
             data = _mg._parse(text)
             if not isinstance(data, dict) or "success" not in data:
                 last = "输出解析不出 success"
+                # 原版 critic.py:91 把判官原文打出来留证；不落盘就永远
+                # 无法事后定位「判官到底答了什么散文」（gate_raw.log 同因）
+                print("  · [p2-critic raw] " + str(text)[:300], flush=True)
+                try:
+                    with open(_raw_log, "a", encoding="utf-8") as _f:
+                        _f.write("\n===== "
+                                 + time.strftime("%Y-%m-%dT%H:%M:%S")
+                                 + " parse-fail =====\n" + str(text) + "\n")
+                except Exception:
+                    pass
                 continue
         except Exception as e:
             last = f"解析失败：{type(e).__name__}: {e}"
@@ -946,6 +999,91 @@ async def _p2_critic(*, question: str, spec: str,
         return out
     out["critique"] = last or "critic 判定失败"
     return out
+
+
+# ── Phase2 chat（2026-11-17）：agent 以「学生」身份问一句 ────────────────────
+# 同构 maieutic `chat/route.ts`：门 phase==2、五段输入、**只追加 exchange**。
+# 分工（用户定）：**人**在人导入口拆骨架；**agent** 在 phase2 写码并提问 ——
+# agent 就是原版里坐在 IDE 前的那个学生，所以发问器不需要新设计。
+# mode 由 chat 判（`schemas.ts:397`），这里不预设 —— 预设就等于刷 r_site。
+
+def _p2_chat_llm() -> Callable:
+    """Phase2 chat 的默认 LLM 适配器（2026-11-18 接上，原助产士同构缺角）。
+
+    chat 是 r_site（会话格封点账本）的唯一数据源 —— 之前调用链上没人传 llm，
+    永远 no_llm、exchanges 永远空、r_site 永远 0，档 B 整个是死代码。
+    chat 是苏格拉底短问答（输出被 maieutic_gate._parse 解析成 {mode,response}）：
+    全局同一模型（ZHIPU_MODEL=glm-4.6）、关思考、预算给足正文。
+    mode 判定仍只由 chat 自己做（红线 C3），这里只提供可调的模型。
+    """
+    from llm_client import chat as _chat
+    import os as _os
+
+    def _call(messages: list[dict[str, str]]) -> str:
+        return _chat(messages, temperature=0.3, max_tokens=1200, timeout=90.0,
+                     model=_os.getenv("ZHIPU_MODEL", "glm-4.6"),
+                     thinking={"type": "disabled"})
+    return _call
+
+
+def _p2_chat_ask(*, scene_id: str, topic_id: str, question: str, spec: str,
+                 code: str, obs: list[dict[str, Any]], result: Any,
+                 critique: str, round_i: int,
+                 llm: Callable | None) -> dict[str, Any]:
+    """问一句，记一笔，返回读数。任何异常都不影响 Phase2 主流程。"""
+    try:
+        import phase2_chat as _pc
+    except Exception:
+        return {}
+    if not _pc.enabled():
+        return {}
+    try:
+        _err, _data, _res, _keys = _p2_round_facts(list(obs or []), result, code)
+        ask = _pc.build_student_message(err=_err, critique=critique,
+                                        code=code, spec=spec)
+        import hashlib as _hl
+        tid = str(topic_id or "") or ("learn_" + _hl.md5(
+            str(question or "").encode("utf-8")).hexdigest()[:12])
+        d = _pc.state_dir_for(scene_id)
+        exs = _pc.load_exchanges(d, tid)
+        r = _pc.chat(prompt_text=str(question or ""), spec_text=spec,
+                     current_code=code, student_message=ask,
+                     recent_exchanges=exs, phase=2,
+                     llm=llm or _p2_chat_llm())
+        if not r.get("mode"):
+            print("  · Phase2 第 %d 轮：chat 未成立（%s），不记账"
+                  % (round_i, str(r.get("refused") or "?")), flush=True)
+            return {"refused": r.get("refused"), "ask": ask, "topic": tid}
+        _pc.append_exchange(d, tid, r["exchange"], spec_text=spec, code=code)
+        exs2 = _pc.load_exchanges(d, tid)
+        n2 = _pc.chat_streak(exs2)
+        print("  · Phase2 第 %d 轮：chat 判 %s（连续 %d 轮）｜问：%s"
+              % (round_i, r["mode"], n2, ask[:80]), flush=True)
+        return {"topic": tid, "mode": r["mode"], "ask": ask,
+                "response": str(r.get("response") or "")[:400],
+                "r_site": n2}
+    except Exception as e:
+        print("  · Phase2 第 %d 轮：chat 异常（%s: %s），已跳过"
+              % (round_i, type(e).__name__, e), flush=True)
+        return {}
+
+
+def _p2_chat_finish(*, scene_id: str, topic_id: str, question: str,
+                    out: dict[str, Any]) -> None:
+    """收尾：记「刚做完哪道题 + 游程」的指针，供出题侧读 r_site。"""
+    try:
+        import phase2_chat as _pc
+    except Exception:
+        return
+    try:
+        tid = str((out.get("chat") or {}).get("topic") or topic_id or "")
+        if not tid:
+            return
+        n2 = int((out.get("chat") or {}).get("r_site") or 0)
+        _pc.record_last_topic(_pc.state_dir_for(scene_id), tid,
+                              r_site=n2, question=str(question or ""))
+    except Exception:
+        pass
 
 
 def _p2_retrieve(scene_id: str, question: str,
@@ -1188,6 +1326,35 @@ async def phase2_final_code(scene_id: str, question: str, spec_text: str,
            "跑不通、跑完 RESULT 是空的、或 RESULT 的值全是从代码里抄的字面量，\n"
            "都不算交了（那样它只是一段探查脚本，谁也用不了）。\n")
         + (("\n【spec 承诺了这些项】\n" + _dtxt + "\n") if _dtxt else ""))
+
+    # ---- 本机材料根必须写进提示（2026-11-18 实测）----
+    # 现场证据（S 场景 req_20261118T014716d590）：P2 连跑 3 轮，critic 每轮都判
+    # 「RESULT 全是 null」，评语一直在教「下一步：用 open('/root/mve/scene_data/S/
+    # repo/mve/curriculum_auto.py') 读」—— 学生从头到尾不知道材料根在哪。
+    # 机制：read_file 的相对路径**相对 scene_dir**（= /root/mve/scene_data/S），
+    # 而真实文件在 repo/mve/ 下；题面写的是 mve/curriculum_auto.py，照抄读
+    # 必然 FileNotFound，于是它改用 gh_read 去 GitHub 找「同一份」—— 那是远端
+    # 另一个东西，RESULT 自然全空。这里把「根在哪、题面路径怎么接」写进提示。
+    if scene_dir and os.path.isdir(str(scene_dir)):
+        _mat_rel = ""
+        try:
+            import verify_code_ref as _vcr_p2
+            _rr = str(_vcr_p2._repo_root(str(scene_id or "")))
+            if _rr and _rr.startswith(str(scene_dir)) and _rr != str(scene_dir):
+                _mat_rel = os.path.relpath(_rr, str(scene_dir))
+        except Exception:
+            _mat_rel = ""
+        if _mat_rel:
+            _base += (
+                "\n【本机材料 —— 必须真读，不许凭题面猜，也不许去网上找同一份】\n"
+                "  · 材料根（绝对路径）：" + os.path.join(str(scene_dir), _mat_rel) + "\n"
+                "  · read_file / list_files 的相对路径**相对 " + str(scene_dir) + "**，"
+                "所以题面里的 `" + _mat_rel + "/xxx.py` 要写成 "
+                "read_file(\"" + _mat_rel + "/xxx.py\")；\n"
+                "  · 不确定就先 list_files(\"" + _mat_rel + "\") 看目录，"
+                "再用 os.path.isfile 确认文件真的在，然后读；\n"
+                "  · **禁止**用 gh_read / gh_api / web_fetch 去找同一份文件："
+                "那是远端另一份，不算读到本机材料，RESULT 会因此被判空。\n")
     _rounds = int(max_rounds or 0)
     if _rounds <= 0:
         try:
@@ -1630,11 +1797,24 @@ async def phase2_final_code(scene_id: str, question: str, spec_text: str,
               flush=True)
         if _c.get("success"):
             out["verified"] = True
+            _p2_chat_finish(scene_id=scene_id, topic_id=str(topic_id or ""),
+                            question=question, out=out)
             return out
         # 跑得通、但没做到 spec —— 记下这份"可提交"的最新版
         _best = {"code": out["code"], "rows": out["rows"],
                  "result": out["result"], "obs": out["obs"]}
         _crit = str(_c.get("critique") or "")
+        # ★ agent 以「学生」身份就这一轮的真实缺口问一句（原版 chat 位置）。
+        #   只在「没做到」时问 —— 做到了就直接返回，学生这时不会去聊天。
+        _chat = _p2_chat_ask(scene_id=scene_id, topic_id=str(topic_id or ""),
+                             question=question, spec=spec, code=out["code"],
+                             obs=list(obs or []), result=out["result"],
+                             critique=_crit, round_i=_r, llm=llm)
+        if _chat:
+            out["chat"] = _chat
+            out.setdefault("chat_history", []).append(
+                {"round": _r, "mode": _chat.get("mode"),
+                 "r_site": _chat.get("r_site"), "ask": _chat.get("ask")})
     # 到上限仍未做到：以最后那份跑得通的程序"提交"（原版提交不受过关限制）
     if _best:
         out.update(_best)
@@ -1645,6 +1825,8 @@ async def phase2_final_code(scene_id: str, question: str, spec_text: str,
                       + "｜程序本身跑得通，已按现状提交，交 Phase3 逐条解释")
     else:
         out["verified"] = False
+    _p2_chat_finish(scene_id=scene_id, topic_id=str(topic_id or ""),
+                    question=question, out=out)
     return out
 
 
@@ -1991,8 +2173,12 @@ def _intent_diff_call(messages: list[dict[str, str]]) -> str:
     原版称 intent-diff 是 highest-value prompt —— 这类判定不能省模型钱。
     """
     model = os.getenv("MVE_ID_MODEL", "") or "glm-4.6"
+    # ★ 2026-11-17：6000 不够 —— 思考段与正文共用额度，spec 全文 + 大代码
+    # 输入下输出被截断/退化（gate_raw.log 铁证：退化成 "missing missing"），
+    # 解析必然失败 → Phase2「未过」+ Phase3 跳过。给足 16000（同 gate
+    # 2026-11-11 教训：这类调用要「关思考或给足额度」，判官保留思考就给足）。
     kw: dict[str, Any] = {"temperature": 0, "model": model,
-                          "max_tokens": 6000, "timeout": 240.0}
+                          "max_tokens": 16000, "timeout": 240.0}
     if os.getenv("MVE_ID_THINKING", "1") not in ("0", "false", "no"):
         kw["thinking"] = {"type": "enabled"}
     try:
@@ -2183,7 +2369,7 @@ async def intent_diff(scene_id: str, question: str, spec_text: str,
             _rt = str(run_result)
         _result_block = (
             "\n【程序真实跑出来的结果（Phase2 执行得到，不是声明）】\n\"\"\"\n"
-            + _rt[:6000] + "\n\"\"\"\n\n")
+            + _rt[:16000] + "\n\"\"\"\n\n")
     user = (
         INTENT_DIFF_FEW_SHOTS
         + "\n\n现在轮到你了。下面是真实的提交。\n\n"
@@ -2193,7 +2379,9 @@ async def intent_diff(scene_id: str, question: str, spec_text: str,
         + _exp + "\n\n"
         + "【学生的 spec 全文】\n\"\"\"\n" + spec + "\n\"\"\"\n\n"
         + "【会话内修订】\n" + _rev + "\n\n"
-        + "【学生的 finalCode】\n\"\"\"\n" + code[:12000] + "\n\"\"\"\n\n"
+        # 原版 submit/route.ts:24-26 finalCode 上限 100_000 —— intent-diff
+        # 是「spec 全文 vs finalCode 全文」的对账，截断了就对不了账。
+        + "【学生的 finalCode】\n\"\"\"\n" + code[:100000] + "\n\"\"\"\n\n"
         + _result_block
         + "逐条分类分歧。按 schema 只输出 JSON。")
     call = llm or _intent_diff_call
@@ -3002,41 +3190,10 @@ def attach_phase_nodes(scene_id: str, req_id: str, question: str, *,
         g.save()
     except Exception:
         return out_ids
-    # 技能沉淀的位置同时也是「这一关的这道题做完了」的证据：把 exercise 节点
-    # 挂到它所属的 topic（关）下面，规划层据此算完成度（graph_curriculum）。
-    # 过关记 verified（计入完成度）；没过关也记，但 status=unverified，
-    # 只表示「试过」，不推进进度。
-    try:
-        import graph_curriculum as _gc
-        _eid, _mid = "", ""
-        _m = _gc.EID_RE.search(q)
-        if _m:
-            _eid = _m.group(1)
-        if not _eid:
-            # 没有 exercise_id 的场景（P：题由模型按单元现场出）。位置不由
-            # 题面指定，先用自由学的精确账（提题时记的 题→单元，中文题面
-            # 与英文目录词面不重合，locate 的词面打分够不到 0.45），再退
-            # 回内容认：题面跟哪个单元最贴，这次学习就落在那儿。
-            try:
-                import hashlib
-                import graph_books as _gb
-                _mid = str(_gb.unit_of_proposed(sid, q) or "")
-                if not _mid:
-                    _c = (_gb.locate(sid, q).get("candidates") or [])
-                    if _c and float(_c[0].get("score") or 0) >= 0.45:
-                        _mid = str(_c[0]["unit"])
-                if _mid:
-                    _bid, _i = _gb.parse_unit_key(_mid)
-                    _tag = hashlib.md5(str(q).encode("utf-8")).hexdigest()[:8]
-                    _eid = f"gen:{sid}:{_bid}:{_i}:{_tag}"
-            except Exception:
-                _eid = ""
-        if _eid:
-            _gc.record_solved(sid, _eid, module_id=_mid, req_id=rid,
-                              verified=_verified,
-                              problem=q)
-    except Exception:
-        pass
+    # 2026-11-18：书单单元回写（exercise → topic 关，graph_curriculum.record_solved）
+    # 已删。材料入口只剩背包，没有「关/单元」这种预设进度单位；一次学习做成
+    # 什么，记在会话背包里（curriculum_auto.recall_session，一格一 session），
+    # 掌握度由消费侧算，学习侧不再自己挂关卡。
     return out_ids
 
 
@@ -3515,11 +3672,16 @@ async def _start_learning_impl(
                 # （0.25*min(hits,6) + 0.6*ok/hits）因此恒为 0：学到的配方永远爬
                 # 不上来，人看到的就是「学了半天没用」。注入就是一次 hit
                 # （consume.py:232 一直这么记，学习侧漏了）。
+                _inj_keys = [str((s or {}).get("key") or "") for s in skills]
                 try:
-                    skill_store.mark_used(
-                        [str((s or {}).get("key") or "") for s in skills])
+                    skill_store.mark_used(_inj_keys)
                 except Exception:
                     pass
+                # 有效性记账的分子（2026-11-17 补链）：原版 voyager.py:2517
+                # 判对后 mark_result(self._injected_keys, True)，场景路径漏接
+                # —— hits 涨 ok 恒 0，面板把在用技能全标「🔴 失效」。先存
+                # out，判过 → ⑥ 前统一 mark_result。
+                out["_injected_skill_keys"] = _inj_keys
                 _snm = [str((s or {}).get("name") or (s or {}).get("topic") or "")
                         for s in skills[:6]]
                 print(f"  · 已学配方回注执行层：{len(skills)} 条"
@@ -4182,6 +4344,15 @@ async def _start_learning_impl(
                                        "②算/出题——怎么从题面独立推出答案、怎么跟真"
                                        "值核；③交出什么——RESULT 里有哪些键、每个键"
                                        "是什么形态。每步一句，别写笼统口号。")
+                            # ★ 2026-11-18（对照原版 maieutic 撤回）：Phase1 不带【证据要求】。
+                            # 原版 Phase1 = textarea 承诺（spec/route.ts:14-17 只收 specText；
+                            # spec-examiner.ts 判「concrete commitment」，编辑器 Phase2 才解锁），
+                            # 本函数上方 _p1_sys 也明写「这一轮不执行、不取数」—— 行号只有执行
+                            # 才能产生，把它要求进 Phase1 与自己的口径直接矛盾（open_quiz 卡死
+                            # 的上游之一：学生被逼在承诺轮里「用代码扫 def 行号」）。
+                            # verify refs 归 Phase2 finalCode：local_agent.py:737-746 对 verify_claim
+                            # 场景自带同款注入；机检闸在 ⑤' 完成判定统一跑，证据从 Phase2 的
+                            # RESULT 里读 —— Phase1 不需要也不会有。
                             _crit = ""
                             if _p1_round > 1 and str(
                                     (out.get("spec_gate") or {}).get("reason")
@@ -4680,7 +4851,8 @@ async def _start_learning_impl(
                                             prior_questions=list(
                                                 (_iters.get(_did) or {}).get("asked_q")
                                                 or []),
-                                            has_env=_rw.scene_has_env(scene))
+                                            has_env=_rw.scene_has_env(scene),
+                                            scene_id=scene)
                                     except Exception as e1:
                                         ok1, crit1 = False, f"critic 异常：{type(e1).__name__}: {e1}"
                                 else:
@@ -6189,24 +6361,34 @@ async def _start_learning_impl(
             out.pop("_mat_real", None)      # 只是轮内口径，不进 run_log
             if _mat_n:
                 real = True
+            # 2026-11-18：Phase1 的 spec_draft 草稿**不是执行**（原版
+            # maieutic：Phase1 无执行、编辑器 Phase2 才解锁）。此前草稿被
+            # 算进 calls/rows/real_calls —— 写一轮 spec 就"取到 1 行"，
+            # 还可能被上面 _env_src 绑上 data_sources 直接算成真取到
+            # （open_quiz 两轮 trace"真取到✅"实为一行数没取）。执行账
+            # 一律排除草稿；草稿只留在 observations/answer（过程记录与
+            # 知识型任务的答案来源）。闸门 real 的口径不动（whole-mode
+            # 「推理算作答」场景的 no_data 闸门依赖草稿成立）。
+            _exec_obs = [o for o in (observations or [])
+                         if str(o.get("tool") or "") != "spec_draft"]
             out["execution"] = {
                 "ok": real, "sql": sql,
-                "calls": max(len(observations or []), _mat_n),
+                "calls": max(len(_exec_obs), _mat_n),
                 # 「真取到」只数**真的有数据源支撑**的观察：知识型答案（RESULT 是一段
                 # 回答、没有任何数据源调用）不该记成"取到数"——否则日志会自欺
                 # （2026-10-19 实测：养育问题打出了"真取到=1"）。
                 "real_calls": max(
-                    sum(1 for o in (observations or [])
+                    sum(1 for o in _exec_obs
                         if _has_real([o]) and (o.get("data_sources") or [])),
                     _mat_n, _course_real),
                 "rows": max(
                     sum(int(o.get("rows") or 0)
-                        for o in (observations or []) if o.get("ok")),
+                        for o in _exec_obs if o.get("ok")),
                     _mat_n, _p2r),
-                "data_sources": sorted({s for o in (observations or [])
+                "data_sources": sorted({s for o in _exec_obs
                                         for s in (o.get("data_sources") or [])}),
                 "evidence": ("data" if any(o.get("data_sources")
-                                           for o in (observations or []))
+                                           for o in _exec_obs)
                              else "knowledge"),
             }
             # 材料账挂在 result 顶层（execution.evidence 是另一个含义：data/knowledge）
@@ -6346,7 +6528,8 @@ async def _start_learning_impl(
                 _ctx = str(context or "") + _env_obs_block(db_path)
                 import reward as _rw
                 _ok, _crit = task_critic.check_task_success(
-                    question, _ctx, out, has_env=_rw.scene_has_env(scene))
+                    question, _ctx, out, has_env=_rw.scene_has_env(scene),
+                    scene_id=scene)
             except Exception as e:
                 _ok, _crit = bool(real), f"critic 异常：{type(e).__name__}: {e}"
             out["critic"] = {"success": bool(_ok), "critique": str(_crit or ""),
@@ -6355,6 +6538,45 @@ async def _start_learning_impl(
             # 无内层判定、又不让调 critic（judge=False 的老入口）：维持原
             # 行为 —— 不拦，交给 ⑥ 入库侧决定（absorb 的 mastered 口径）。
             _ok = True
+    # 证据机检统一闸口（2026-11-17）：out["critic"] 的判定入口有多个
+    # （维度汇总 / 整篇 spec_gate / 内层 critic / task_critic 兜底）——
+    # 「入口不同不改口径」：声明了 verify_claim 的场景，最终 success=True
+    # 一律再过一道 _verify_claim_gate；机检不过 → 整体判未完成，评语回灌。
+    if _ok and bool((out.get("critic") or {}).get("success")):
+        import task_critic as _tcg
+        # 证据闸口喂全文（2026-11-17）：out["answer"] 是 1200 字截断，
+        # 末尾的证据块会被切掉 —— 这里把最后几轮观察的完整 data 拼全。
+        try:
+            _gt = [str(out.get("answer") or "")]
+            for _o in reversed((observations or [])[-4:]):
+                _d = (_o or {}).get("data")
+                if _d:
+                    _gt.append(_d if isinstance(_d, str) else json.dumps(
+                        _d, ensure_ascii=False, default=str))
+            out["_gate_texts"] = "\n".join(_gt)[-30000:]
+        except Exception:
+            pass
+        # 结构化证据面（2026-11-18）：RESULT["verify"] —— 学生交的是程序，
+        # 证据写不进「答案文本」，必须能从 RESULT 里直接读到原始 dict。
+        try:
+            _vc = _verify_claim_from_obs(observations)
+            if _vc:
+                out["_verify_claim"] = _vc
+        except Exception:
+            pass
+        _ok2, _why2 = _tcg._verify_claim_gate(scene, out)
+        if not _ok2:
+            out["critic"]["success"] = False
+            out["critic"]["critique"] = (
+                "证据机检未过：" + str(_why2 or "")[:200] +
+                "｜把证据放进 RESULT 的 verify 字段："
+                'RESULT = {..., "verify": {"refs": [{"file": "模块名.py", '
+                '"line": 行号, "expect": "该行包含的片段"}]}} —— file 相对仓库 '
+                'mve/ 目录写，line/expect 必须真实；用代码扫出 def 行号再写，'
+                '别凭记忆（也可在答案末尾附 ```mve_verify``` 块）')[:400]
+            _ok = False
+            _crit = out["critic"]["critique"]
+            print("  · 证据机检：未过 —— " + str(_why2 or "")[:160], flush=True)
     if not _ok:
         # 已闭合的维度各自是一次成功 rollout：它们的技能在维度循环里已经
         # 落库（learn_milestone_skills 不连坐，见 1368 行注释）—— **同轮
@@ -6369,6 +6591,10 @@ async def _start_learning_impl(
                    why=(str(_crit or "") or "闸门/critic 判未完成")[:300])
         _record(out)
         return out
+
+    # 技能有效记账已统一进 _record（2026-11-18）：ok 不再记「整轮过证据
+    # 门」而是记「注入后真取到数」—— critic 的尺子归 critic，技能的尺子
+    # 是取数。各 return 路径都过 _record，不会漏记。
 
     # ---- ⑥ 判过 → 图谱建点 + 掌握 + 配方入库（复用消费侧同一套账）----
     try:
@@ -6579,7 +6805,38 @@ def _record(result: dict[str, Any]) -> None:
     result["finished_at"] = round(time.time(), 1)
     _LAST.append(result)
     del _LAST[:-_LAST_MAX]
-    # ---- run_log 一行（轨迹页可见；写失败不拦学习本身）----
+    # ---- 学习轨迹账 + 技能命中率接现账（2026-11-18 用户拍板）----
+    # 轨迹页不再读 run_log（原版练习线的账，coverage/score 恒空，
+    # 里程碑点亮了它还记 failed），改读 learn_trace.jsonl：一次 learn()
+    # 一行，字段 = MVE 现在真正看的指标（Phase1 spec 冻结 / Phase2
+    # finalCode 交付 / 取数真行数 / 里程碑闭合与点亮 / 证据门开关）。
+    # 技能「有效」（ok）同步换尺：不再等整轮过证据门，而是「注入后这轮
+    # 真取到数」（real_calls/rows>0；知识型场景降级为 critic 判过）——
+    # 与 _light_up_milestone 的 fetched 口径同一条。hits 仍是注入次数
+    # （⑤ 里 mark_used），ok≤hits 不变量不变。
+    try:
+        import learn_trace as _lt
+        _trow, _fetched = _lt.row_from_result(result)
+        _lt.append(_trow)
+        _ik = [k for k in (result.get("_injected_skill_keys") or []) if k]
+        if _ik:
+            import skill_store as _ssr
+            # 2026-11-18 分母修正：先把「这轮真进了执行」记到 runs，
+            # 再记「取到数」到 ok —— 率 = ok/runs。进了执行就记 runs，
+            # 即使最后没取到数（那才是配方该背的账）；Phase1 就死的轮
+            # 不进 runs，否则分母被不可满足的轮稀释成「全员失效」。
+            _entered = bool(_fetched or _trow.get("phase2_submitted")
+                            or int(_trow.get("fetch_calls") or 0) > 0)
+            if _entered:
+                try:
+                    _ssr.mark_reached(_ik)
+                except Exception:
+                    pass
+            if _fetched:
+                _ssr.mark_result(_ik, True)
+    except Exception:
+        pass
+    # ---- run_log 一行（planner/exam 等旧消费方还要读；写失败不拦学习）----
     try:
         import run_log
         status = str(result.get("status") or "")

@@ -32,6 +32,7 @@ critique 语言：仍是 **SQL 口径**（哪张表、哪个列、口径对不�
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Iterator
 
@@ -102,7 +103,20 @@ def is_vacuous(data: Any) -> bool:
     """结果里没有任何真实值（全 NULL，或除了 0 之外全 NULL）。
 
     一行真实数据都没有（空列表 / None）同样算真空。
+
+    2026-11-14：执行层有时先把结果 json.dumps 成**字符串**再放进 data
+    （local_agent 的 RESULT 通道就是这样）。只在 list/dict 上迭代会让
+    `"[5.3333]"` 这种字符串被判成"没有行"→ vacuous → 整轮 no_data，
+    学生明明算出了数却算"没取到"。所以字符串先尝试解析成 JSON。
     """
+    if isinstance(data, (str, bytes)):
+        raw = data.decode("utf-8", "ignore") if isinstance(data, bytes) else data
+        t = raw.strip()
+        if t[:1] in ("[", "{"):
+            try:
+                data = json.loads(t)
+            except Exception:
+                pass
     saw_row = False
     for row in _iter_value_rows(data):
         saw_row = True

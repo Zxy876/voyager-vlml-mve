@@ -41,6 +41,7 @@ import fnmatch
 import json
 import os
 import re
+import sys as _sys
 from pathlib import Path
 from typing import Any
 
@@ -292,17 +293,49 @@ PROMPT_SYSTEM = """你是本机数据助手。你能用的是**这个应用工�
   read_file(path, max_bytes=200000) → {"path","bytes","text"}（只读）
   read_json(path)                   → 直接读出解析好的 JSON 对象（.json 用它，别自己解析）
   query_sql(sql)                    → 场景目录里 .duckdb 的只读查询（有库时）
+      · 表结构：`DESCRIBE <表名>`（返回列名、类型、是否可空）
+      · 主键 / 外键 / 唯一约束：`SELECT * FROM duckdb_constraints()`
+      · 索引：`SELECT * FROM duckdb_indexes()`
+      · ⚠️ **不要用 `PRAGMA table_info` 推断约束或索引**：duckdb 只返回 6 列
+        （cid, name, type, notnull, dflt_value, pk），没有外键/索引信息；按
+        sqlite 的习惯去取 row[5]/row[6]/row[7] 会越界，或把 bool 当 1 判错。
   web_search(query, max_results=5)  → 联网搜索，返回 [{"title","url","snippet"}]
   web_fetch(url)                    → 抓一个公网页面的正文文本（只读、限长）
 
-⚠️ 这个环境里**没有 import**：`os` / `json` / `pandas` 都用不了，写 `os.path`
-就是 ImportError。要文件名用 `list_files` 结果里的 name，要 JSON 用 `read_json`。
+✅ 模块权限（2026-11-18 起）：`os` / `sys` 以**只读门面**注入，可直接用，也可
+`import`。可用的是：`os.path`（isabs/join/dirname/basename/normpath/split…）、
+`os.name` / `os.sep` / `os.linesep` / `os.getcwd()` / `os.getenv()`；
+`sys.platform` / `sys.version` / `sys.version_info` / `sys.maxsize`。
+还给：json / re / math / itertools / functools / collections / string / datetime /
+statistics / fractions / decimal / hashlib / base64 / textwrap / difflib / random。
+**不给**：subprocess / socket / shutil / pathlib / open / os.system / os.remove
+（写盘、起进程、读场景外文件都不行）。要文件名用 `list_files` 的 name，要 JSON
+用 `read_json`，不要用 os 去绕场景目录。
+
+⚠️ 内置函数只有这些（其余名字一律 NameError，**没有 open / eval / exec /
+getattr**；`__import__` 仅放行上面那份模块清单）：
+  len list dict str int float bool tuple set sorted sum min max any all range
+  enumerate zip reversed isinstance type abs round repr next iter map filter
+  divmod slice ord chr format bytes frozenset
+  要输出中间结果不要 print —— 把它放进 `RESULT`（那才是能回传给我的地方）。
 
 要求：
 1. 只输出一个 ```python 代码块；
-2. 把最终答案赋给 `RESULT`（列表或字典），**答案必须来自你调用上面函数取回的真实数据**；
+2. 把最终答案赋给 `RESULT`（列表或字典）——**先看问句要什么，再决定交什么**：
+   · 问「多少 / 几个 / 总数」→ 交数（值原样来自本次调用）；
+   · 问「哪些 / 长什么样 / 结构」→ 交清单或结构；
+   · 问「按什么口径 / 用什么条件 / 怎么判断 / 哪一列」→ **交那句话本身**
+     （例：`{"answer": "按 chapter 字段等于 Functions 筛选"}`）。
+     只交筛选后的数字 = 没回答 —— **跑过带 WHERE 的查询 ≠ 说出了口径**。
+   ⚠️ 这一条最容易错：把「我执行时这么写了」当成回答，是本项目最常见的答非所问。
+   其余形态（判断 / 清单 / 表）都合格，硬要求是**能指认依据**：
+   · 值/表 → 值必须来自你**这次调用取回的数据**，原样交，不许改写；
+   · 判断/口径/结论 → 写进 `answer`，并用 `basis` 指认它由哪次调用、哪张表哪个
+     字段支持：`RESULT = {"answer": "…", "basis": [{"from": "query_sql", "what": "…"}]}`
+   · **不许**因为「这不是取回的数据」就改交一个数了事（那是答非所问），
+     也**不许**让判断句脱离 `basis`（那才是编造）；
    联网拿到的答案要带来源 URL；
-3. 不要 print，不要 import，不要写文件；
+3. 不要 print（中间结果放进 RESULT）；**可以 import 上面对应的模块**（os/sys 只读门面 + json/re/math 等白名单），但不要写文件、不要起进程、不要 import 白名单以外的模块；
 4. **先判断这题要不要数据**：
    · 要数据（文件/库/表/统计/排名/多少/最新/热门/推荐…）→ **必须调用至少一个
      数据源函数**（list_files/read_file/read_json/query_sql/web_search/
@@ -341,8 +374,29 @@ def _run_restricted(code: str, ns: dict[str, Any], timeout: float = 30.0
         except ImportError as e:
             box["ok"] = False
             box["error"] = (f"{type(e).__name__}: {e}"
-                            " —— 这个环境没有 import：文件名用 list_files 的 name，"
-                            "JSON 用 read_json，别用 os/json 模块")
+                            " —— 执行域只放行这些模块：os / sys（只读门面）+ "
+                            "json / re / math / itertools / functools / collections / "
+                            "string / datetime / statistics / fractions / decimal / "
+                            "hashlib / base64 / textwrap / difflib / random。"
+                            "读场景数据用 list_files / read_file / read_json / query_sql。")
+        except NameError as e:
+            # ★ 2026-11-12（场景 N 实测）：模型写 `next(...)` → NameError，只说
+            # "name 'next' is not defined"，它读到的是「我写错了自己」，于是下一轮
+            # **换个变量名照写 next**（两轮逐字相同）。原版同构：mineflayer 的
+            # control_primitives_context 把可用函数连源码一起摆在 system 里，模型
+            # 不需要猜边界。这里把「本执行域有什么、没有什么」一次性说清。
+            box["ok"] = False
+            _bi = sorted(k for k in (ns.get("__builtins__") or {})
+                         if not str(k).startswith("_"))
+            _fn = sorted(k for k in ns
+                         if not str(k).startswith("_") and k not in ("ok_text",))
+            box["error"] = (
+                f"NameError: {e} —— 这个名字**不在本执行域里**（不是你写错了）。\n"
+                "本执行域可用的内置函数：" + "、".join(_bi) + "\n"
+                "可用的数据源函数：" + "、".join(_fn[:25])
+                + "\n没有的是 import / open / print / eval / exec / getattr 及任何"
+                "未列出的名字。要用它们写等价代码（循环、索引、上面清单里的函数），"
+                "不要原样再写一次同一个名字。")
         except Exception as e:
             box["ok"] = False
             # 只回 "{type}: {msg}" 等于让模型蒙着眼睛改：H 实测 4 步迭代同一个
@@ -422,6 +476,52 @@ def _payload(value: Any) -> tuple[Any, str]:
     if isinstance(value, dict):
         return (_jsonable(value), "")
     return ({"value": _jsonable(value)}, "")
+
+
+def _collect_prose(code: str, result: Any, tracer: list) -> str:
+    """原版 maieutic「前端收集」的同构物（用户 2026-11-13：「答完后面补 result=」）。
+
+    原版 Phase1 学生在 textarea 写 spec，前端把 textarea 内容**原样** POST
+    给判官（spec/route.ts 只校验 specText 1~10000 字符）——提交物 = 学生
+    写下的全部文本，学生不可能「忘交」，因为 UI 就是提交物本身。
+    MVE 的学生写的是代码：它的 spec 文本散落在注释/docstring 里，RESULT
+    只是恰好可执行的容器。这里把学生**实际写下的文字**收集成提交物——
+    不是替它作答（原版前端也不生产内容），只是收集。返回空串表示
+    「学生什么文字都没写」，此时不造假提交物，照旧如实报 RESULT 为空。
+    """
+    import re as _re
+    parts: list[str] = []
+    # ① docstring（学生的意图陈述，优先）
+    for _m in _re.finditer(r'"""(.*?)"""', str(code or ""), _re.S):
+        _t = _m.group(1).strip()
+        if len(_t) >= 8:
+            parts.append(_t[:1200])
+    # ② 注释行（口径/计划通常全在这）：过滤分隔线与超短噪音
+    _notes: list[str] = []
+    for _ln in str(code or "").splitlines():
+        _s = _ln.strip()
+        if _s.startswith("#"):
+            _t = _s.lstrip("#").strip()
+            if len(_t) >= 3 and not _re.fullmatch(r"[-=*_~\s\d]*", _t):
+                _notes.append(_t)
+    if _notes:
+        parts.append("\n".join(_notes[:60])[:2000])
+    # ③ RESULT 里它写的人话（若有）：字符串值原样带上
+    if isinstance(result, dict):
+        for _k, _v in list(result.items())[:4]:
+            if isinstance(_v, str) and len(_v.strip()) >= 4:
+                parts.append(f"{_k}: {_v.strip()[:600]}")
+    elif isinstance(result, str) and len(result.strip()) >= 4:
+        parts.append(result.strip()[:600])
+    # ④ 取证记录（判官要能指认依据来自哪次调用）
+    if tracer:
+        parts.append("（本轮取证调用："
+                     + "、".join(str(t)[:40] for t in tracer[:8]) + "）")
+    if not parts:
+        return ""
+    return ("【学生本轮写下的作答】（原样收集自代码注释/docstring，"
+            "未做改写——同构原版 maieutic 前端收集 textarea）\n"
+            + "\n".join(parts))[:3000]
 
 
 def _skill_call_name(raw: str) -> str:
@@ -585,6 +685,9 @@ async def solve(question: str, scene_dir: str, *, llm=None,
                 evidence: list[dict[str, Any]] | None = None,
                 context: str = "",
                 db_path: str = "",
+                deliver: str = "",
+                allow_reasoning: bool = False,
+                submit_fn=None,
                 ) -> tuple[list[dict[str, Any]], str]:
     """写代码 → 跑 → 看结果；失败带反馈重写。返回 (观察列表, 最后一段代码)。
 
@@ -609,6 +712,15 @@ async def solve(question: str, scene_dir: str, *, llm=None,
     ⚠️ 兜底：场景里**根本没有可取数的手段**（本机能力 + 联网 + MCP 全关）时不
     强制 —— 那是"没工具可用"，不是"有工具不用"。否则学习循环会在这种场景里
     永远判失败，卡死（如实放行，让 critic 去判）。
+
+    `allow_reasoning` —— **Phase1 专用**（用户 2026-11-12 口径）：原版 maieutic
+    的 Phase1 学生交的就是**一段推理文字**（spec-examiner.ts 判官输入面只有
+    spec 文本 + 追问历史，没有取证通道），推理本身算作答。开了它，「真空成功」
+    判定（代码没调任何数据源）不再拦 —— 防编交给后面：Phase2 的 finalCode
+    要真跑出承诺的结果（跑不出 = verified=False = 不入库不建点），Phase3 的
+    intent-diff 再拿 spec 和 code 对账。Phase1 只出文字、不沉淀任何东西
+    （learn_orchestrate.py 整篇路径 `out["skills"]={"added":[]}`），所以
+    Phase1 编了也进不了技能库。
     """
     # ⚠️ 延迟 import：传了 `llm` 的调用方（测试/别的编排）不该被迫拉起整条
     # VLML 依赖链 —— 实测 `from voyager_vlml.llm import chat` 在只插了 mve/
@@ -618,6 +730,28 @@ async def solve(question: str, scene_dir: str, *, llm=None,
             return llm(msgs)
         from voyager_vlml.llm import chat
         return chat(msgs, temperature=0.2)
+
+    if submit_fn is None and str(scene_id) in _SUBMIT_HANDLERS:
+        submit_fn = _SUBMIT_HANDLERS[str(scene_id)]
+
+    # 证据块要求（2026-11-17 统一入口注入）：verify_claim 场景的证据要求
+    # 写进 question 本身 —— 实测只放 system prompt 压不过 RESULT 的 JSON
+    # 格式指令，学生交付里从不出现 ```mve_verify``` 块（gate-debug 证实）。
+    # 判据：题面要求是硬约束；没有证据块的答案判过也不算完成。
+    try:
+        if str(scene_id):
+            import scenes as _sc_ev
+            if bool((_sc_ev.get_scene(str(scene_id)) or {}).get("verify_claim")):
+                if "【证据要求】" not in str(question or ""):
+                    question = (str(question or "") + "\n\n【证据要求】除了 RESULT 的结论，"
+                                "必须把可机检证据放进 RESULT 的 verify 字段：\n"
+                                'RESULT = {..., "verify": {"refs": [{"file": "模块名.py", '
+                                '"line": 行号, "expect": "该行包含的片段"}]}}\n'
+                                "—— file 相对仓库 mve/ 目录（read_file 路径去掉 repo/mve/ 前缀），"
+                                "line/expect 必须真实；**用代码扫出 def 所在行号再写**，"
+                                "别凭记忆。没有 verify 字段 = 判过也不算完成。")
+    except Exception:
+        pass
 
     def _ns(tracer: list[str]) -> dict[str, Any]:
         # solve 是协程、跑在事件循环线程里 → 这里能拿到主循环。技能函数
@@ -629,7 +763,8 @@ async def solve(question: str, scene_dir: str, *, llm=None,
             _loop = None
         ns = _ns_base(scene_dir, scene_id, tracer=tracer, loop=_loop,
                       evidence=evidence, db_path=db_path,
-                      question=str(question or ""))
+                      question=str(question or ""),
+                      submit_fn=submit_fn)
         # 已学技能进**执行域**（不是只进 prompt）—— 同构原版
         # index.js:256 的 `programs + code` 同作用域 eval：模型写的
         # `skill_def()` 才真的调得到。
@@ -689,6 +824,33 @@ async def solve(question: str, scene_dir: str, *, llm=None,
     mcp_sec = _mcp_prompt_section(scene_id)
     if mcp_sec:
         system = PROMPT_SYSTEM + mcp_sec
+    # 场景执行门（2026-11-17 场景 S 接线；2026-11-18 改证据面）：
+    # 声明了 verify_claim 的场景必须在交付里带可机检证据 —— 学生交的是
+    # python 程序、答案 = json.dumps(RESULT)，没有「答案文本末尾」可写，
+    # 所以证据口径改成 RESULT["verify"] 结构化字段（fenced 块仍兼容）。
+    # 让模型**首轮就知道**格式，不靠 critic 拒收后的 critique 教（白烧一轮）。
+    try:
+        import scenes as _sc_vg
+        if bool((_sc_vg.get_scene(str(scene_id or "")) or {}).get("verify_claim")):
+            system += (
+                "\n\n⚠️ 本场景是**代码取证场景**：交付物 = python 程序 + RESULT，"
+                "而 RESULT 里必须带一段**机器可核证据**（写进 verify 字段，"
+                "判官和机检都直接读它）：\n"
+                'RESULT = {"你的结论": "...", "verify": {"refs": [\n'
+                '    {"file": "mcp_gateway.py", "line": 68, '
+                '"expect": "def _is_abs"}],\n'
+                '    "run": {"code": "print(1+1)", "expect": "2"}}}\n'
+                "· refs：你作答依据的源码位置。file 相对仓库 mve/ 目录写"
+                "（read_file 的路径去掉 repo/mve/ 前缀），line 是真实行号，"
+                "expect 是该行包含的片段 —— 行号与片段必须真实。\n"
+                "· **行号要用代码算**：read_file 取回源码后，在程序里扫 `def 函数名`"
+                " 所在行（或逐行匹配片段），把算出的行号写进 refs —— "
+                "凭训练记忆背写行号会被机检直接拒收。\n"
+                "· run（可选）：一段能真跑出 expect 的 python 片段；\n"
+                "· 没有 verify 字段的答案不算完成（答案末尾附 ```mve_verify"
+                " 文本块也认，但代码取证场景推荐写进 RESULT）。")
+    except Exception:
+        pass
     if _skill_names:
         # 已学会的技能**回注执行层** —— 这是「可达 = 一整个循环」的那一环
         # （用户 2026-10-20 指出）：原版不先判"能不能做到"，而是
@@ -708,25 +870,56 @@ async def solve(question: str, scene_dir: str, *, llm=None,
         # 只把 code 贴进 system 等于"给个例子"，模型看得见却调不到 →
         # 命中的题照样现场现做（2026-10-20 截图：两次导入都"用到 0 条技能"）。
         _lines: list[str] = []
+        _dlines: list[str] = []
         for _s in list(skills)[:8]:
             _nm = _skill_call_name(str((_s or {}).get("name") or ""))
             if not _nm or not str((_s or {}).get("code") or "").strip():
                 continue
             _what = str((_s or {}).get("text") or "")[:80].replace("\n", " ")
-            _lines.append(f"- {_nm}()  → {_what}")
-        if _lines:
+            # 本题草稿（2026-11-13）：Phase2 交过但没过验证的那份码。它**不是**
+            # "已经学会的技能"——回注给同一道题的意义是"在这份上改"，说成"已学
+            # 会"模型就会当成答案直接交（实测三轮交同一份）。分开渲染。
+            _is_draft = (not bool((_s or {}).get("verified", True))
+                         and bool((_s or {}).get("_own")))
+            _tag = ("" if bool((_s or {}).get("_own"))
+                    else "（别的题的做法，只作方法参考）")
+            (_dlines if _is_draft else _lines).append(
+                f"- {_nm}()  → {_what}{_tag}")
+        if _dlines:
             system += (
-                "\n\n【你已经学会的技能（原版 voyager.py:195 先 retrieve，"
-                "action.py:94 拼进可用函数清单；执行时它们与原语在**同一个作用域**，"
-                "可以直接调用）】\n" + "\n".join(_lines) + "\n"
+                "\n\n【你上一版为这道题写的程序（`verified=False` 草稿，"
+                "**没过验证**）】\n" + "\n".join(_dlines) + "\n"
+                "这一版留在库里就是为了让你**在这一版上改**，不要从头重写：\n"
+                "  1. 先读它的实现，对照这一轮的验收要求/评语，逐条找出没做到的项；\n"
+                "  2. 在原函数里补/改（保留已经做对的部分），改完**必须真的调用它一次**，"
+                "让它跑出真实结果 —— 只定义不调用 = 没被执行过，不算交付；\n"
+                "  3. 只有整份逻辑都不对时才重写，重写也要用同一个函数名覆盖。")
+        if _lines:
+            # 区分「本题已验证」与「别的题的参考」（2026-11-13）：此前一律叫
+            # 「你已经学会的技能」，跨题技能被当成"这题已经会了" —— 场景 N 实测
+            # 里唯一那条技能是**另一道简单题**的（查两个 module 的章名），
+            # 原题 Phase2 每轮都看到它"可用"，等于把不相干的做法当成本题能力。
+            _own_ok = [s for s in skills if s.get("_own") and s.get("verified", True)]
+            _refs = [s for s in skills if not s.get("_own")]
+            _lead = ("【本题已验证的技能（上次这道题就是这么做的）】"
+                     if _own_ok else
+                     "【别的题学到的参考技能（不是这道题的答案）】")
+            system += (
+                "\n\n" + _lead + "\n"
+                "（原版 voyager.py:195 先 retrieve，action.py:94 拼进可用函数清单；"
+                "执行时它们与原语在**同一个作用域**，可以直接调用）\n"
+                + "\n".join(_lines) + "\n"
                 "调用规则（原版 prompts/action_template.txt:39 「Reuse the above "
                 "useful programs as much as possible」）：\n"
-                "  1. 这些技能覆盖得了这道题就**直接调用**它们，不要重写它们做过的事；\n"
+                "  1. 覆盖得了这道题就**直接调用**，不要重写它们做过的事；\n"
                 "  2. 可以同时调多条**合成**一个完整答案：\n"
                 "     ```python\n"
                 "     RESULT = {\"定义\": skill_def(), \"起源\": skill_origin()}\n"
                 "     ```\n"
-                "  3. 全部用不上时才自己写取数代码（用上面的原语/MCP 工具）。")
+                "  3. 全部用不上时才自己写取数代码（用上面的原语/MCP 工具）。"
+                + ("\n  4. ⚠️ 上面这些是**别的题**的做法：只有当它做的事正是本题要做的"
+                   "那件事时才调用；它返回的数值/实体是那一道题的，**不能当本题答案**。"
+                   if _refs else ""))
     if require_skills and _skill_names:
         # 「命中的题必须用已学技能」（用户 2026-10-20）—— 同构原版：技能就是
         # 新的 primitive（action.py:94），命中意味着能力边界已经覆盖这道题，
@@ -750,11 +943,41 @@ async def solve(question: str, scene_dir: str, *, llm=None,
         # 落在第 17 位被砍掉 → 模型**根本不知道它存在**，于是去 web_search 搜
         # 「介绍 sherlock 的文章」。两份名单都砍 → 砍掉的能力等于不存在。
         # 现在：system 不再重复列名字（完整清单在 user 消息里，只有一份）。
-        system += ("\n\n【这是**学习环节**，不是答题】你的答案必须来自你**真正调用"
-                   "数据源取回的内容**（可用函数清单在下面「可用函数」一节，逐个都可用）。"
-                   "直接凭记忆写一段"
-                   "「正确」答案 = 没有取证 = 这轮判不通过，也不会被记成能力。"
-                   "先调工具取证，再据实组织答案；取不到就如实说取到了什么。")
+        system += ("\n\n【这是**学习环节**，不是答题】你交上去的是一段**给人看的"
+                   "答复**：读者只读你写的那段话，你的代码和执行结果**不会**随附"
+                   "给他看。所以不能「代码里有就算说了」—— 口径、条件、判断，"
+                   "都得在那段话里写成完整的一句。"
+                   "\n要求：答案必须**有取证**（真调过下面「可用函数」里的数据源，"
+                   "并能指认依据来自哪次调用）。直接凭记忆写「正确」答案 = 没有取证 "
+                   "= 这轮判不通过，也不会被记成能力。"
+                   "\n⚠️ 取证 ≠ 把取回的数据原样搬上来：问「多少」交数、问「长什么样」"
+                   "交结构、问「按什么口径筛 / 怎么判断」就**直接写出那句口径**，再用 "
+                   "basis 指认它由哪次调用、哪张表哪个字段支持 —— 数据只是依据，"
+                   "不是答案本身。把结果行原样贴上来不算回答口径类问题。")
+    if deliver == "prose":
+        # 整篇作答（原版 Phase1 交的就是一段 spec 文字）：这一轮交的是
+        # **一整篇说明**，不是一句答案。上面「问多少交数」的形态规则在这一轮
+        # 让位 —— 数要写进句子里，不能只交数（实测只交 175 时，判官无从核
+        # 口径与结构，整篇等于没交）。
+        system += ("\n\n【这一轮交的是**一整篇**，不是一句答案】"
+                   "用 3～6 条写完整，每条一句完整的话：\n"
+                   "  · 要查什么（哪张表、什么范围）；\n"
+                   "  · 按什么条件筛（用哪一列、什么值）；\n"
+                   "  · 结果长什么样（有哪些列、各列是什么类型）；\n"
+                   "  · 你**实际取到**的数是多少。\n"
+                   "**即使问的是「多少个」，也不能只交那个数** —— 把它写进句子"
+                   "（例：按 chapter 字段等于 'Functions' 筛，共 175 条）。"
+                   "整篇放进 `RESULT = {\"answer\": \"<整篇文字>\"}`。")
+    if submit_fn is not None:
+        system += ("\n\n【判词怎么来】轮末判官会自动看到你的执行记录"
+                   "（RESULT 里的整篇答案、代码、取证调用）——你不需要"
+                   "任何提交动作（原版 Voyager 同构：判词由环境采集）。"
+                   "  · 所以整篇答案务必写成**陈述句正文**放进 "
+                   "RESULT = {\"answer\": ...}（每条维度一句结论 + 依据"
+                   "数字），不是数据 dump —— 只交统计数字/JSON 判官判不出；"
+                   "  · submit_spec(<整篇>) 是**可选**的提前交卷：想在轮末"
+                   "之前拿到判词就调它，返回值 = 判词 passed/addressed/"
+                   "open/questions，未过按 open 改完再交。")
     for _i in range(max(1, max_iters)):
         dim_txt = ""
         if dimensions:
@@ -897,7 +1120,8 @@ async def solve(question: str, scene_dir: str, *, llm=None,
                 + fetch_txt
                 + _repo_block(_focus_repos(question) or _focus_repos(context))
                 + dim_txt + avoid_txt
-                + (f"\n上一轮没通过 critic 检查，它的评语（务必针对它改）：{critique}\n"
+                + (f"\n上一轮判官给你的反馈（这是这一轮必须解决的问题，逐条针对它改；"
+                   f"别只重述上一轮说过的话）：\n{critique}\n"
                    if critique else "")
                 + (f"\n上一次的代码：\n{code}\n执行反馈：{fb}\n请修正后重写。"
                    if fb else ""))
@@ -926,8 +1150,21 @@ async def solve(question: str, scene_dir: str, *, llm=None,
         try:
             import task_critic as _tc
             from pathlib import Path as _P
-            _has_env = bool(str(scene_dir or "").strip()) and any(
-                _P(str(scene_dir)).iterdir())
+            # 材料面语义声明优先（2026-11-16 助产士同构）：scenes.json 显式写了
+            # grounded 的场景，声明就是唯一权威 —— 不再拿目录内容当材料账。
+            # P 实测：scene_data/P 里只有系统自写的 proposed_units.json /
+            # web_ledger.duckdb（运行态文件），目录扫描把它们当数据源，推导题
+            # （C(8,3)=56）被逼“调数据源”，答对了仍判“凭记忆编造”。
+            # 没有显式声明的场景维持原判据（目录有文件 = 有环境），行为不变。
+            _gdecl = None
+            try:
+                import scenes as _scenes
+                _gdecl = (_scenes.get_scene(scene_id) or {}).get("grounded")
+            except Exception:
+                _gdecl = None
+            _has_env = (bool(_gdecl) if isinstance(_gdecl, bool) else
+                        (bool(str(scene_dir or "").strip()) and any(
+                            _P(str(scene_dir)).iterdir())))
             _needs_data = _tc.needs_data(question, has_env=_has_env)
         except Exception:
             _needs_data = True
@@ -935,7 +1172,13 @@ async def solve(question: str, scene_dir: str, *, llm=None,
         #   · 数据型题：一直就判失败（题面要数却没取数）；
         #   · 学习环节（require_tools）：**无条件**判失败 —— 原版 rollout 必须调
         #     primitive，凭记忆写完就交的东西进不了技能库（用户 2026-10-20）。
+        # 手上已有上一轮真取到的材料 → 不算「凭记忆编造」。追问轮的语义是
+        # 「把上次取到的东西说出来」，不是「再跑一遍」（原版 Phase1 学生手上
+        # 就有 gathered 材料，从不要求现场执行）。材料为空时防线照旧。
+        _prior_mat = [x for x in (evidence or [])
+                      if isinstance(x, dict) and x.get("ok")]
         if (not err and res.get("ok") and data is not None and not tracer
+                and not _prior_mat and not allow_reasoning
                 and (_needs_data or (require_tools and _can_fetch))):
             err = ("场景里有可指认的数据源（本机文件/库），但这轮没调用任何"
                    "数据源（list_files/read_file/read_json/query_sql/"
@@ -952,6 +1195,19 @@ async def solve(question: str, scene_dir: str, *, llm=None,
             err = (f"你一条已学技能都没调用（可调用的有："
                    + "、".join(_skill_names[:6]) + "）。这道题已经学过，"
                    "必须调用它们取数/组合答案 —— 凭记忆写的答案不算复用，重写。")
+        # ── 前端收集同构（用户 2026-11-13：「答完后面补 result=」）──
+        # 代码跑通但 RESULT 为空 ≠ 学生没作答：它的口径/计划写在注释和
+        # docstring 里。原版前端会把 textarea 内容原样上交（学生不可能
+        # 忘交）；这里做同一件事 —— 收集它写下的文字，不重写、不追问。
+        # 代码没跑通（err/res.ok 不干净）不补：报错要如实呈现，补了会
+        # 掩盖失败。收集不到任何文字（连注释都没有）也如实不补。
+        if data is None and not err and res.get("ok"):
+            _prose = _collect_prose(code, ns.get("RESULT"), tracer)
+            if _prose:
+                data = {"answer": _prose, "auto_collected": True}
+                why_empty = ""
+                rows = 1
+
         o = {"ok": bool(res.get("ok")) and data is not None and not err,
              "tool": "local_python", "rows": rows, "data": data,
              "data_sources": list(tracer),
@@ -1676,6 +1932,61 @@ async def ensure_mcp_tools(scene_id: str) -> dict[str, Any]:
 #     origin="local" / group="本机能力"
 # 这样执行层给模型的抓手清单（actions.enabled_entries）里就有它们，面板上也
 # 能看到「本机能力」这一组的总开关；关掉 = 对模型不可见、也调不动。
+def run_python(scene_dir: str, code: str, timeout: float = 20.0) -> dict[str, Any]:
+    """在本机受限执行域里跑一段 Python，返回它 print 出来的东西。
+
+    为什么必须单开（2026-11-14 场景 P 实测）：P 没有题库，题目由模型按书的
+    单元现场出，判据是「它自己算过」。旧菜单只有 list_files/read_file/
+    query_sql —— 没有库就没有算力，模型只能口头推理，Phase1 连续 3 轮整篇
+    逐字相同（判官原话：「与上一次提交一字不差 —— 这不是修改」）。
+    数学场景的「取证手段」就是计算本身，没有它整条闭环空转。
+
+    允许：math / statistics / itertools / fractions / decimal / sympy（有则注入）。
+    不允许：import / open / eval / exec / 任何未列出的名字（同 _run_restricted）。
+    """
+    import builtins as _bi
+    import math, statistics, itertools, fractions, decimal
+    import json as _json
+
+    lines: list[str] = []
+
+    def _print(*a, sep=" ", end="\n", **k):
+        lines.append(sep.join(str(x) for x in a))
+
+    names = ("range", "len", "min", "max", "abs", "sum", "round", "sorted",
+             "enumerate", "zip", "map", "filter", "list", "dict", "set",
+             "tuple", "str", "int", "float", "bool", "pow", "divmod", "any",
+             "all", "repr", "format", "reversed", "isinstance", "slice",
+             "frozenset", "complex", "Exception")
+    builtins_map = {n: getattr(_bi, n) for n in names if hasattr(_bi, n)}
+    builtins_map["print"] = _print
+    # 与 _ns_base 同一份口径（2026-11-18）：os/sys 只读门面 + 白名单 import。
+    builtins_map["__import__"] = _safe_import
+
+    ns: dict[str, Any] = {
+        "__builtins__": builtins_map,
+        "os": _OS_FACADE, "sys": _SYS_FACADE,
+        "math": math, "statistics": statistics, "itertools": itertools,
+        "Fraction": fractions.Fraction, "Decimal": decimal.Decimal,
+        "json": _json, "print": _print,
+    }
+    try:
+        import sympy as _sp
+        ns.update({
+            "sympy": _sp, "solve": _sp.solve, "symbols": _sp.symbols,
+            "sqrt": _sp.sqrt, "Rational": _sp.Rational, "simplify": _sp.simplify,
+            "Eq": _sp.Eq, "nsolve": _sp.nsolve, "point": _sp.Point,
+            "Line": _sp.geometry.Line, "Triangle": _sp.geometry.Triangle,
+            "polygon": _sp.Polygon, "Segment": _sp.Segment,
+        })
+    except Exception:
+        pass
+
+    r = _run_restricted(code, ns, timeout)
+    return {**r, "stdout": "\n".join(lines)[-8000:],
+            "hint": "stdout 只收 print 出来的内容；算完不 print 等于没算。"}
+
+
 PRIMITIVES: list[dict[str, Any]] = [
     {"name": "list_files",
      "fn": list_files,
@@ -1705,8 +2016,81 @@ PRIMITIVES: list[dict[str, Any]] = [
               "取第一行第一列 = r[\"rows\"][0][0]；不要直接 for 循环 r"),
      "schema": {"type": "object", "properties": {"sql": {"type": "string"}},
                 "required": ["sql"]}},
+    {"name": "run_python",
+     "fn": run_python,
+     "desc": ("在本机跑一段 Python 并返回 print 出来的内容（数学题就用它算）。"
+              "可用：math / statistics / itertools / Fraction / Decimal / "
+              "sympy(solve, symbols, sqrt, Rational, Point, Line, Triangle, "
+              "simplify, Eq, nsolve)；内置 range/len/min/max/abs/sum/round/"
+              "sorted/enumerate/zip 等。可 import：os / sys（只读门面：os.path、"
+              "os.name、sys.platform 等）+ json / re / datetime / statistics / "
+              "fractions / decimal / hashlib；**没有 open / eval / subprocess**。"
+              "返回 {\"ok\": true, \"stdout\": ...}，算完必须 print"),
+     "schema": {"type": "object", "properties": {
+         "code": {"type": "string"}, "timeout": {"type": "number"}},
+         "required": ["code"]}},
 ]
 LOCAL_GROUP = "本机能力"
+
+# 「交卷」动作（2026-11-13，用户口径：注册成和 MCP 一样的工具）：
+# Phase1 学生的一个正式动作，注册进场景动作表（面板动作清单里能看到），
+# 而不是只写在一段提示词里。handler 由编排层每轮设置（submit_spec 要带
+# 当轮的 question / dimensions / 判官上下文），这里只做转发。
+_SUBMIT_HANDLERS: dict = {}
+
+
+def set_submit_handler(scene_id: str, fn) -> None:
+    """注册本场景的 Phase1 交卷处理器，并登记成场景的一个动作条目。"""
+    sid = str(scene_id)
+    _SUBMIT_HANDLERS[sid] = fn
+    try:
+        import actions as _acts
+        spec = _acts.ActionSpec(
+            name="submit_spec",
+            description=("交卷：把这一轮的整篇答案交给助产士判官。返回值就是判词"
+                         "（passed / addressed / open / questions）——未过时 open "
+                         "是还没答到的维度、questions 是追问，改完再交一次。"),
+            fn=lambda text="": _dispatch_submit(sid, text),
+            scene_id=sid, origin="local", group=LOCAL_GROUP,
+            input_schema={"type": "object",
+                          "properties": {"text": {
+                              "type": "string",
+                              "description": "整篇答案文字（陈述句，逐维度写结论）"}},
+                          "required": ["text"]},
+            impl="local_agent:submit_spec")
+        _acts._REGISTRY.setdefault(sid, {})["submit_spec"] = spec
+    except Exception:
+        pass
+
+
+def clear_submit_handler(scene_id: str) -> None:
+    """Phase1 结束后撤掉（consume 侧不该看到一个只能判 Phase1 的交卷动作）。"""
+    sid = str(scene_id)
+    _SUBMIT_HANDLERS.pop(sid, None)
+    try:
+        import actions as _acts
+        _acts._REGISTRY.get(sid, {}).pop("submit_spec", None)
+    except Exception:
+        pass
+
+
+def _dispatch_submit(scene_id: str, text: str) -> Any:
+    fn = _SUBMIT_HANDLERS.get(str(scene_id))
+    print(f"  · [交卷按钮] 学生调用了 submit_spec（场景 {scene_id}，"
+          f"{len(str(text or ''))} 字）", flush=True)
+    if fn is None:
+        return {"error": "当前没有可交卷的阶段（submit_spec 只在学习环节 "
+                         "Phase1 有效）"}
+    return fn(text)
+
+
+def submit_spec(text: str = "", scene_id: str = "") -> Any:
+    """模块级入口（给快照恢复 / actions.invoke 用）。"""
+    if scene_id:
+        return _dispatch_submit(scene_id, text)
+    for sid in list(_SUBMIT_HANDLERS):
+        return _dispatch_submit(sid, text)
+    return {"error": "当前没有可交卷的阶段"}
 
 
 def bind(scene_dir: str, db_path: str = "") -> list[dict[str, Any]]:
@@ -1890,18 +2274,133 @@ def tool_descriptions() -> dict[str, str]:
         d = " ".join(str(spec.get("desc") or "").split())
         if d:
             out[tid] = d[:200] + ("…" if len(d) > 200 else "")
+    # 交卷动作：只在 Phase1 有效（handler 由编排层每轮设置），说明写清楚它
+    # 回什么 —— 否则模型看到一个陌生名字不会用（它按菜单挑函数）。
+    out["submit_spec"] = ("交卷：把整篇答案交给助产士判官，返回值就是判词"
+                          "（passed/addressed/open/questions）。未过就按 open "
+                          "把结论改写成完整句子再交一次")
     return out
 
 
 # ---------------------------------------------------------------------------
 # 技能结晶：把一段跑通的 Python 存成可重放的条目
 # ---------------------------------------------------------------------------
+# ─── 模块权限：os / sys 只读门面（2026-11-18 用户：「给学生 agent 环境权限」）───
+# 旧口径是「执行域没有 import」。这条边界拿**语法**当安全，代价很实在：学生要
+# 判断「这台机器是不是 Windows」「这个路径算不算绝对」「平台是什么」时无路可
+# 走 —— _is_abs() 审计题实测：os/sys 全 ImportError，学生只能猜环境，RESULT
+# 里永远写 unknown（chat 账本原话：「这个环境禁用了 os/sys 模块」）。
+#
+# 原版 Voyager 给 agent 的是**能力面**（mineflayer 的 bot API），不是宿主进程；
+# 这里同理：给 os/sys 的**只读能力子集**，不给宿主 shell。
+#
+# 给的：os.path 全套 + name/sep/altsep/curdir/pardir/linesep/extsep/devnull +
+#       getcwd/getenv/environ(拷贝快照)；sys.platform/version/version_info/
+#       maxsize/executable/argv。
+# 不给：写盘（remove/unlink/rename/mkdir/chmod…）、起进程（system/popen/spawn*/
+#       fork/exec*）、open、subprocess、eval/exec/getattr 逃逸。
+# 场景数据的读写仍走 read_file / list_files / query_sql —— 那条路有 tracer 落账，
+# 拿 os 兜圈子会绕开取证账，所以能力面只开到「判断环境」为止。
+
+
+class _OsFacade:
+    """os 的只读门面（路径判断 + 常量 + 只读环境）。"""
+
+    path = os.path
+    name = os.name
+    sep = os.sep
+    altsep = os.altsep
+    curdir = os.curdir
+    pardir = os.pardir
+    linesep = os.linesep
+    extsep = os.extsep
+    devnull = os.devnull
+
+    @staticmethod
+    def getcwd() -> str:
+        return os.getcwd()
+
+    @staticmethod
+    def getenv(key: str, default: Any = None) -> Any:
+        return os.getenv(key, default)
+
+    @property
+    def environ(self) -> dict[str, str]:
+        # 拷贝快照：改它不影响宿主进程的环境。
+        return dict(os.environ)
+
+    def __repr__(self) -> str:
+        return "<module 'os' (MVE 只读门面)>"
+
+
+class _SysFacade:
+    """sys 的只读门面（平台/版本/上限；不含 path 与任何可写入口）。"""
+
+    platform = _sys.platform
+    version = _sys.version
+    version_info = _sys.version_info
+    maxsize = _sys.maxsize
+    maxunicode = _sys.maxunicode
+    byteorder = _sys.byteorder
+    executable = _sys.executable
+
+    def __init__(self) -> None:
+        # 每份门面自己的 argv（类属性会让所有学生会话共享同一个列表）。
+        self.argv = []
+
+    @staticmethod
+    def getdefaultencoding() -> str:
+        return _sys.getdefaultencoding()
+
+    def __repr__(self) -> str:
+        return "<module 'sys' (MVE 只读门面)>"
+
+
+_OS_FACADE = _OsFacade()
+_SYS_FACADE = _SysFacade()
+
+# 允许 import 的纯标准库（无可写入口、无进程/网络能力）。
+# 刻意不含：subprocess / socket / shutil / pathlib / tempfile / importlib.machinery。
+_ALLOWED_STDLIB = (
+    "json", "re", "math", "itertools", "functools", "collections", "string",
+    "datetime", "statistics", "fractions", "decimal", "hashlib", "base64",
+    "textwrap", "difflib", "unicodedata", "random", "operator", "heapq",
+    "bisect", "copy", "uuid", "csv", "io", "typing", "enum", "dataclasses",
+)
+
+
+def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
+    """执行域的 import：os/sys 只回门面，其余只放白名单 stdlib。
+
+    `from os.path import isabs` 的 name 是 "os.path"，必须回**真模块**
+    （门面对 from-import 的 getattr 不成立）；`from os import path` 走 name="os"，
+    getattr(门面, "path") 已在 _OsFacade 上。
+    """
+    full = str(name or "")
+    base = full.split(".")[0]
+    if full == "os.path":
+        return os.path
+    if base == "os":
+        return _OS_FACADE
+    if base == "sys":
+        return _SYS_FACADE
+    if level == 0 and base in _ALLOWED_STDLIB:
+        import importlib
+        return importlib.import_module(full)
+    raise ImportError(
+        "执行域只允许这些模块：os / sys（只读门面）+ "
+        + " / ".join(_ALLOWED_STDLIB)
+        + "；subprocess / socket / shutil / pathlib / open 不提供。"
+        "读场景数据请用 read_file / list_files / query_sql。")
+
+
 def _ns_base(scene_dir: str, scene_id: str = "",
              tracer: list[str] | None = None,
              loop: Any = None,
              evidence: list[dict[str, Any]] | None = None,
              db_path: str = "",
-             question: str = "") -> dict[str, Any]:
+             question: str = "",
+             submit_fn=None) -> dict[str, Any]:
     """执行命名空间。
 
     给了 scene_id 就**按注册表里的启用条目**建（猫爪总开关关掉的组不注入 ——
@@ -1933,6 +2432,15 @@ def _ns_base(scene_dir: str, scene_id: str = "",
         "read_json": lambda path: read_json(scene_dir, path),
         "query_sql": lambda sql: query_sql(scene_dir, sql, db_path),
     }
+    # 「提交」是学生的一个动作（用户 2026-11-13：尝试送不进答题的根因是
+    # 提交不在它的动作集里 —— 它发不出去，就拿不到判词的裁决语义，只会
+    # 一直堆数据）。submit_fn 由编排层传入：调它 = 交卷，返回值 = 判词。
+    # 没传 submit_fn 时按场景取已注册的 handler（probe 也走这里 →
+    # 菜单里能看到 submit_spec；用户 2026-11-13：交卷要是注册过的工具）。
+    if submit_fn is None and str(scene_id) in _SUBMIT_HANDLERS:
+        submit_fn = _SUBMIT_HANDLERS[str(scene_id)]
+    if submit_fn is not None:
+        full["submit_spec"] = submit_fn
     # 联网类原语（origin=net）：它们的返回是**从外面取回的资料**，该落进
     # 数据源（web_ingest_learning）。本机原语（读文件/列目录/查库）不落 ——
     # 那是读自己已有的东西，不是取证。
@@ -2003,6 +2511,12 @@ def _ns_base(scene_dir: str, scene_id: str = "",
         except Exception:
             names = set(full)
     ns: dict[str, Any] = {k: v for k, v in full.items() if k in names}
+    # 交卷动作不走注册表门控（2026-11-13）：submit_spec 是编排层每轮传入的
+    # 闭包，注册表里没有它 → 上面按启用清单过滤时会被剔掉 → 学生执行域里
+    # 根本没有这个名字（实测：提示词写了用法、模型也调不到，12 轮零交卷，
+    # 全部走轮末判官路径）。过滤后补回。
+    if submit_fn is not None and "submit_spec" in full:
+        ns["submit_spec"] = full["submit_spec"]
     # ---- MCP 远端工具经 stdio 接入，喂给模型（打通「死通道」）----
     # expose_as_actions 早已把 mcp_* 注册进 registry，但执行层只注入了 local/net，
     # 模型写代码调不到它们 → 整条「猫娘能力经 MCP」是断的。这里把 origin=mcp 的
@@ -2038,8 +2552,13 @@ def _ns_base(scene_dir: str, scene_id: str = "",
     # 不放进 `full`：`full` 要按启用清单过滤，helper 不在注册表里会被剔掉。
     # 判据只有 `_looks_like_tool_error` 一份 —— 证据层拒收失败项、模型挑来源，
     # 用的是同一个函数，不会出现「闸门认失败、模型认成功」两套口径。
+    # ★ 2026-11-18 模块权限：os/sys 只读门面随命名空间注入（代码里直接 os.path
+    #   可用，不必 import）；__import__ 走白名单，`import os` 也能成立。
+    ns["os"] = _OS_FACADE
+    ns["sys"] = _SYS_FACADE
     ns["ok_text"] = lambda ret: not _looks_like_tool_error(_flat_text(ret))
-    ns["__builtins__"] = {"len": len, "list": list, "dict": dict, "str": str,
+    ns["__builtins__"] = {"__import__": _safe_import,
+                          "len": len, "list": list, "dict": dict, "str": str,
                           "int": int, "float": float, "sorted": sorted,
                           "sum": sum, "min": min, "max": max, "any": any,
                           "all": all, "range": range, "enumerate": enumerate,
@@ -2051,10 +2570,30 @@ def _ns_base(scene_dir: str, scene_id: str = "",
                           "isinstance": isinstance, "bool": bool, "tuple": tuple,
                           "set": set, "type": type, "abs": abs, "round": round,
                           "zip": zip, "reversed": reversed, "repr": repr,
+                          # ★ 2026-11-12 同一条口径再补一批（场景 N 实测）：
+                          # 模型写 `next((c[3] for c in cols if c[3] == 1), None)`
+                          # 取主键 → `NameError: name 'next' is not defined`，
+                          # 两轮都写 next（只换了个变量名），因为它只知道
+                          # "这个名字没定义"，不知道是**执行域压根不给**。
+                          # 与 isinstance 完全同类：这些是写 Python 的语法，
+                          # 不是"能力"；禁它们只制造无意义的重试。
+                          "next": next, "iter": iter, "map": map,
+                          "filter": filter, "divmod": divmod, "slice": slice,
+                          "ord": ord, "chr": chr, "format": format,
+                          "bytes": bytes, "frozenset": frozenset,
                           "ValueError": ValueError, "TypeError": TypeError,
                           "KeyError": KeyError, "AttributeError": AttributeError,
                           "IndexError": IndexError, "Exception": Exception}
     return ns
+
+
+# 给模型看的「可用内置」清单（见 PROMPT_SYSTEM 的「内置函数只有这些」那一段）。
+# 与上面 `ns["__builtins__"]` 同源，改一处就够 —— 人肉维护两份必然走味。
+BUILTINS_HINT = (
+    "len list dict str int float bool tuple set sorted sum min max any all "
+    "range enumerate zip reversed sorted isinstance type abs round repr "
+    "next iter map filter divmod slice ord chr format bytes frozenset")
+
 
 
 def _missing_names(code: str, ns: dict[str, Any]) -> set[str]:

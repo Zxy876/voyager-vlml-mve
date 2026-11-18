@@ -76,7 +76,8 @@ def scene_observation(question: str, scene_id: str) -> dict[str, Any]:
     """当前场景的「观测」：图谱节点 + 实查实体 + 已注册动作条目。
 
     三项全部来自真实状态，不手写：
-      · 节点 —— KnowledgeGraph.load() 里 root_scene==scene 的 label
+      · 节点 —— KnowledgeGraph.load() 里的知识点（topic 只带本题所属关；
+                phase/req/import 路由账不进观察面）
       · 实体 —— entity_catalog 实查当前库（ orchestrate.entities_for 同源）
       · 条目 —— actions 注册表（含 builtin / learned / forged）
     """
@@ -84,14 +85,55 @@ def scene_observation(question: str, scene_id: str) -> dict[str, Any]:
     try:
         from knowledge_graph import KnowledgeGraph
         g = KnowledgeGraph.load()
+        # 2026-11-14：只取「知识点」节点，且只带本题所属的那一关。
+        #   · topic 是书的目录（场景 N 有 111 关），全塞进来观察面就变成目录页，
+        #     模型转去数章节、查页码 —— 实测跑偏正是从这里开始的；
+        #     所以先用 exercise_id 反查 module_id，只带这一关。
+        #   · phase / req / import / consume 是路由账，不是知识：场景 N 原来
+        #     那 4 个节点里 3 个是脏的（一条「表有多少行」的查询、上一发的题面）。
+        cur_module = ""
+        q = str(question or "")
+        # 书单场景（P）没有题库，题面里带的是单元 id：unit:<book>:<i>
+        try:
+            import re as _re
+            m2 = _re.search(r"unit:[A-Za-z0-9_\-]+:\d+", q)
+            if m2:
+                cur_module = m2.group(0)
+        except Exception:
+            pass
+        if not cur_module:
+            try:
+                import graph_curriculum as _gc
+                m = _gc.EID_RE.search(q)
+                if m and not m.group(1).startswith("gen:"):
+                    _, eid2mod = _gc._usable(_gc.db_path(scene_id))
+                    cur_module = eid2mod.get(m.group(1), "")
+            except Exception:
+                cur_module = ""
+        # book 是书单的书目节点（P 有 72 个），灌进观察面就是一张书单目录，
+        # 和「把 111 关目录塞进去」是同一种污染。
+        skip_kinds = {"phase", "req", "import", "scene_root",
+                      "exercise", "consume", "book"}
+        others: list[str] = []
         for n in g.nodes.values():
             if str(getattr(n, "root_scene", "A") or "A") != str(scene_id):
                 continue
             if str(getattr(n, "status", "") or "") == "deleted":
                 continue
+            kind = str(getattr(n, "kind", "") or "")
+            nid = str(getattr(n, "id", "") or "")
             label = str(getattr(n, "label", "") or "").strip()
-            if label:
-                nodes.append(label)
+            if not label:
+                continue
+            if kind in skip_kinds or nid.startswith(("consume:", "req:", "import:")):
+                continue
+            if kind == "topic":
+                d = getattr(n, "detail", {}) or {}
+                if cur_module and str(d.get("module_id") or "") == cur_module:
+                    nodes.append(label)      # 本题所属的那一关，放最前
+                continue
+            others.append(label)
+        nodes.extend(others)
     except Exception:
         nodes = []
     entities: dict[str, list[str]] = {}
@@ -149,9 +191,16 @@ def _parse_subgoals(text: str) -> list[str]:
 
 
 def _default_llm(messages: list[dict[str, str]]) -> str:
-    """真实 LLM（智谱）。延迟导入，测试可注入假 llm。"""
+    """真实 LLM（智谱）。延迟导入，测试可注入假 llm。
+
+    2026-11-12：ZHIPU_MODEL 换 glm-4.6 后这里必须**显式关思考**——
+    拆骨架是结构化打勾活（原 llm_client 注释同款口径），4.6 思考默认开，
+    1024 额度全被 reasoning 吃光 → content 空 → 解析失败 → 反复重试
+    （实测拆骨架卡 10 分钟）。额度给 3000、思考关掉，按清单填槽位足够。
+    """
     from llm_client import chat
-    return chat(messages, temperature=0.2, max_tokens=1024)
+    return chat(messages, temperature=0.2, max_tokens=3000,
+                thinking={"type": "disabled"})
 
 
 def decompose(task: str, scene_id: str, *, llm: Callable | None = None,
@@ -412,6 +461,17 @@ def plan(task: str, scene_id: str, *, llm: Callable | None = None,
     # 这是同构原版口径：原版子目标"附近有可挖的方块"才进 execute；这里"场景库
     # 里有这张表"就等价于"附近有方块"，而 scaffold 已先验过维度都落在这张库上。
     _scaffold_db = bool(scaffold) and bool(db_path)
+    # 无外部材料的场景（判据是环境事实，不是学科）：没有库可撞，但每条维度
+    # 都是**用 run_python 能算/能验**的。不标可达的话，reachability() 会拿
+    # 中文维度词面去撞英文表名，全判 unreachable → 硬不可达短路
+    # （2026-11-14 P 场景会踩）。
+    _scaffold_course = False
+    if scaffold and not _scaffold_db:
+        try:
+            import scene_profile as _spc_d
+            _scaffold_course = not bool(_spc_d.grounded(scene_id))
+        except Exception:
+            _scaffold_course = False
     for i, need in enumerate(dec["subgoals"], start=1):
         if _scaffold_db:
             from pathlib import Path as _Path
@@ -420,6 +480,13 @@ def plan(task: str, scene_id: str, *, llm: Callable | None = None,
                           "description": f"查场景库 {_Path(db_path).name}（只读）"},
                  "score": 1.0,
                  "why": "数据题维度（Maieutic 拆出、已落真实表/列）→ 场景库可查"}
+        elif _scaffold_course:
+            r = {"need": need, "status": "reachable",
+                 "grab": {"name": "run_python",
+                          "description": "本机受限 Python（sympy 可用）算/验这条维度"},
+                 "score": 1.0,
+                 "why": "推导型维度（Maieutic 拆出、材料就在题面里）"
+                        "→ run_python 可算可验"}
         else:
             r = reachability(need, scene_id, db_path=db_path)
         counts[r["status"]] = counts.get(r["status"], 0) + 1

@@ -56,10 +56,20 @@ DUP_THRESHOLD = 0.62    # 超过 → 视为同一条技能 → 覆盖（Rewritin
 SKIP_THRESHOLD = 0.90   # 超过 → 内容几乎没变 → 连覆盖都不用，直接丢弃
 MIN_LESSON_LEN = 12     # 照 "Deposit useless items" 特判：太短的经验没有复用价值
 MAX_HISTORY = 3         # 旧版本最多留几条（归档，不进 prompt）
+# 一条技能最多记几个「学过它的会话」（2026-11-11）：详情页是「会话 1 → 技能 N」，
+# 而同一道题再派一次时，复用到的技能文本往往一字未变（走 skipped 分支）——
+# 旧实现这时连 blueprint 都不更新，归属就停在上一次会话上 → 新会话少一条、
+# 旧会话多一条。归属必须是**列表**，且三个分支都要写。
+MAX_SESSIONS_PER_SKILL = 12
 
 # 跨题经验注入 prompt 的两条门槛（不加就会被上一题的经验带偏）
 CROSS_TOPIC_MIN_SIM = 0.12   # 与本题题干的词面相关度下限
 CROSS_TOPIC_MAX = 2          # 跨题最多几条
+# 向量路径的跨题门槛（2026-11-13）：余弦尺度与 Jaccard 不同，0.12 在这里等于
+# 「什么都能进」。实测场景 N 只有 1 条简单题技能，向量盲取把它塞进了原题
+# Phase2 的每一轮（日志「回注技能 1 条（milestone）」×3）。0.45 ≈ 同一领域但
+# 不是同一件事的下沿；同题不受这条约束（同题走 own_topic 加权）。
+VEC_CROSS_MIN_SIM = 0.45
 
 
 # ---------------- 文件读写 ----------------
@@ -307,6 +317,41 @@ def _ensure_embs(skills_by_key: dict[str, dict[str, Any]],
 
 # ---------------- 写入（去重覆盖） ----------------
 
+def _merge_req_ids(old_bp: dict[str, Any] | None,
+                   new_bp: dict[str, Any] | None) -> dict[str, Any]:
+    """把「这次是哪条会话学的」并进技能的会话归属（**列表**）。
+
+    为什么是列表而不是单值（2026-11-11 用户：「按现在的会话详情页对技能
+    一对多就好啦」）：
+
+      · 详情页的形态是 **会话 1 → 技能 N**。一个会话列出它学成的全部技能；
+        同一条技能也可能被后来的会话**重新学一遍**（同题再派、泛化复用）。
+      · 技能主键是 `topic::name`，同题再派时 name 不变 → 命中覆盖通道；
+        若文本与源码都没变，`add()` 走的是 skipped 分支（连写入都省），
+        旧实现因此**不更新 blueprint** —— 归属永远停在上一次会话。
+        实测：`learn_9b8c863d::example_count` 停在 `req_...2211345f67`，
+        而最新会话 `req_...223642fb62` 的 5 维里就缺这一条。
+
+    所以归属记成 `req_ids`（按学习先后追加、去重、留最近 N 个），
+    同时保留单值 `req_id` = **最近一次**（老读者：面板/脚本照旧能读）。
+    """
+    out: dict[str, Any] = dict(new_bp or {})
+    ids: list[str] = []
+    for _bp in (old_bp or {}, new_bp or {}):
+        for _x in ((_bp or {}).get("req_ids") or []):
+            _s = str(_x or "").strip()
+            if _s and _s not in ids:
+                ids.append(_s)
+        _one = str((_bp or {}).get("req_id") or "").strip()
+        if _one and _one not in ids:
+            ids.append(_one)
+    if ids:
+        ids = ids[-MAX_SESSIONS_PER_SKILL:]
+        out["req_ids"] = ids
+        out["req_id"] = ids[-1]
+    return out
+
+
 def add(
     topic: str,
     name: str,
@@ -319,8 +364,22 @@ def add(
     exact_only: bool = False,
     r: float = -1.0,
     provenance: str = "",
+    verified: bool | None = None,
 ) -> tuple[str, str]:
     """写一条技能。返回 (动作, key)，动作 ∈ added / rewritten / skipped。
+
+    `verified` —— 这条技能**被验证过能交差**吗（2026-11-13 用户拍板「它写的技能
+    要可以用」，验收标准就是这一位）：
+      - None（默认）—— 老调用方语义不变，按已验证处理（历史上只有跑通才入库）；
+      - True  —— Phase2 critic 判「做到了」或 Phase3 revision 真跑通并补上分歧项；
+      - False —— **草稿**：Phase2 交上来了、跑得通，但没过验证。
+    草稿的存在理由：Phase2 交了码却不过关时，旧实现什么都不留（`verified` 才
+    入库）→ 下一轮又是从零写，Phase3 的修订也只写进 ckpt、改不动技能库，于是
+    同一道题永远学不会（2026-11-13 实测：原题 3 轮 Phase2 + Phase3 全部落空）。
+    草稿**只回注给同题**（`retrieve(own_topic=...)`），绝不当"已学经验"喂别的题；
+    过关后升级为 verified，与 Voyager `skills_all`（全部版本）/ `skills`（生效）
+    同构。
+    
 
     `source_scene` 是 1→n 泛化加的**场景归属**标记：技能全局共享，但每条记着自己
     来自哪个场景命名空间（见 mve/scenes.py）。跨场景复用某条技能时，它的
@@ -376,6 +435,9 @@ def add(
 
     # 同名主键命中 → 直接覆盖
     hit = data["skills"].get(key)
+    # 会话归属（会话 → 技能 的一对多）：**三个分支都要落**，包括 skipped ——
+    # 同题再派时技能内容常一字未变，但那一次会话确实学过它。
+    _bp = _merge_req_ids((hit or {}).get("blueprint") or {}, blueprint)
     best_key, best_sim = key, 1.0 if hit else 0.0
     if not hit and not exact_only:
         # LLM 每轮可能给不同名字 —— 照 curriculum 的 qa_cache：
@@ -397,6 +459,12 @@ def add(
         # 一字未变 → 走 skipped 分支 → 技能库里一直是旧源码 → 模型照旧 dig
         # 到分子 3 就交上来（3 ≠ 50.0）。文字相同不代表内容相同。
         stale_code = bool(code) and code != str(s.get("code") or "")
+        # 草稿升级（2026-11-13）：旧版是草稿、这次 verified=True 且代码没变 ——
+        # 内容相同也要**改写**（否则 upgraded 被 skipped 分支吞掉，技能永远停在
+        # 草稿态，下一题永远看不到它）。
+        _ver_up = (verified is True and not bool(s.get("verified", True)))
+        if _ver_up:
+            stale_code = True
         # ⭐ 组内择优（2026-10-28 第 2 步 B）：重写通道只在**新 r 更高**时才
         # 接受新 code——防止同维度后续尝试把已验证的更优版本改坏（天授诊断
         # 实测 214→68 漂移：没有"保留最优"机制时，改坏了也不回退）。
@@ -406,6 +474,9 @@ def add(
         r_regression = (_new_r >= 0 and _old_r >= 0 and _new_r < _old_r)
         if similarity(text, s.get("text", "")) >= SKIP_THRESHOLD and not stale_code:
             data["skipped"] += 1
+            # 内容没变也要记「这一次会话也学过它」（否则详情页少一条）
+            if _bp and _bp != (s.get("blueprint") or {}):
+                s["blueprint"] = _bp
             _save(data)
             return "skipped", best_key
         if stale_code and r_regression:
@@ -413,6 +484,8 @@ def add(
             data["skipped"] += 1
             s["text"] = text
             s["updated"] = now
+            if _bp:
+                s["blueprint"] = _bp
             _save(data)
             return "skipped", best_key
         hist = list(s.get("history") or [])
@@ -427,12 +500,21 @@ def add(
             s["provenance"] = str(provenance)
         # 场景归属：已有则保持原场景（技能属于它学到的那个场景），否则按本次标注
         s.setdefault("source_scene", str(source_scene or "default"))
-        if blueprint:
-            s["blueprint"] = blueprint
-        if code and not r_regression:
+        if _bp:
+            s["blueprint"] = _bp
+        # verified 条目的**代码**不许被草稿写入改坏：一条已经通过验证的技能，
+        # 后来某次没过的尝试（verified=False）只允许更新文本/归属，代码保持
+        # 已验证的那份 —— 否则"再跑一次失败"就把好码换成了草稿码。
+        _keep_code = (verified is False and bool(s.get("verified", True)))
+        if code and not r_regression and not _keep_code:
             s["code"] = code
         if _new_r >= 0 and (_old_r < 0 or _new_r >= _old_r):
             s["r"] = _new_r          # r 只升不降（择优语义）
+        # verified 只升不降：草稿被升级后，后续一次不过关的尝试不许把它打回草稿
+        # （那是 Voyager `skills` 与 `skills_all` 的分工 —— 生效集只被"更好"覆盖）。
+        if _ver_up:
+            s["verified"] = True
+            s["verified_at"] = now
         data["rewrites"] += 1
         _save(data)
         return "rewritten", best_key
@@ -444,8 +526,10 @@ def add(
         "source": str(source or "practice"),
         "source_scene": str(source_scene or "default"),
         "provenance": str(provenance or ""),
-        "blueprint": dict(blueprint or {}),
+        "blueprint": _bp,
         "code": str(code or ""),
+        # 缺省 True：老调用方（consume/bypass/practice）只在判对时写，天然已验证
+        "verified": True if verified is None else bool(verified),
         **({"r": float(r)} if r >= 0 else {}),
     }
     data["added"] += 1
@@ -457,12 +541,14 @@ def add(
 
 def retrieve(
     topic: str, query: str, top_k: int = RETRIEVAL_TOP_K, *,
-    scene_id: str = "",
+    scene_id: str = "", own_topic: str = "",
 ) -> list[dict[str, Any]]:
     """照 SkillManager.retrieve_skills：只取 top_k 条进 prompt。
 
     没有向量库，用「同题优先 + 词面相关 + 有效性」打分近似：
-      score = 3.0(同题) + 2.5*sim(query, name+text) + 0.25*min(hits,6) + 0.6*(ok/hits)
+      score = 3.0(同题) + 2.5*sim(query, name+text) + 0.6*(ok/hits)
+      （2026-11-18：删掉 0.25*min(hits,6) 命中加成 —— 被注入≠有用，奖励它
+       会让失败配方越失败越容易被回注；ok 记「注入后真取到数」。）
 
     两条硬门槛（实测不加就会被跨题经验带偏）：
       1. **跨题经验必须真的相关**才注入。库小的时候 top_k 装不满，
@@ -470,6 +556,13 @@ def retrieve(
          被套到 pattern 题上，Voyager 就跑偏了）。原仓库靠向量相似度天然
          挡住不相关技能，这里必须显式补一个相关度下限。
       2. 跨题最多 2 条。prompt 里该占主导的是本题经验。
+
+    `own_topic`（2026-11-13）：**当前这道题**的技能归属。两件事靠它分流——
+      · 草稿（`verified=False`）**只对同题可见**：Phase2 没过关时交的码是
+        待修草稿，回注给同一道题就是"在这份上改"，喂给别的题就是假经验；
+      · 同题在向量模式下也加权（向量没有 topic 概念，只有语义相似度——
+        实测场景 N 里"同一本书的两个 module"这种题，跨题相似度天然很高，
+        简单题的技能被当成原题的"已学能力"注入了三轮）。
     """
     data = _load_raw()
     # 场景隔离（2026-10-19 用户要求「学习时场景隔离，只学习当前场景」）：
@@ -478,6 +571,7 @@ def retrieve(
     # 不传 scene_id 仍按全局取（老调用方/测试行为不变）。
     _sid = str(scene_id or "").strip()
     allowed = {_sid, "default", ""} if _sid else set()
+    _own = str(own_topic or topic or "").strip()
     # 原版同构：向量化检索（skill.py:117-130）。旧条目缺向量先懒补一批；
     # 查询向量化失败或库里完全没有向量 → 整体回退词面 Jaccard。
     embs = _load_embs()
@@ -494,6 +588,10 @@ def retrieve(
     for key, s in data["skills"].items():
         if _sid and str(s.get("source_scene") or "default") not in allowed:
             continue
+        _same = bool(_own) and str(s.get("topic") or "") == _own
+        # 草稿只回注同题（没有 verified 字段的老条目 = 已验证）
+        if not bool(s.get("verified", True)) and not _same:
+            continue
         if _vec_mode and key in embs:
             # 原版 chroma：相似度盲取 top_k（没有题目/词面门槛，:122-130）；
             # 「不是同一个量」由回填层规则 0 与守卫拦，不在检索层硬卡。
@@ -503,25 +601,36 @@ def retrieve(
             # r 是入库时验证沉淀的标量（reward.compute_r），语义上与词面路径
             # 的 ok/hits 同类：都是「这条经验被验证过多可信」。
             sim = _cosine(qvec, embs[key])
-            score = sim + 0.3 * max(float(s.get("r", -1.0)), 0.0)
+            # 跨题也要过相关度门槛（2026-11-13）：chroma 盲取是原版的已知缺口，
+            # MVE 的库小（场景 N 只有 1 条），盲取会把**唯一那条**跨题技能
+            # 无条件塞进每一道题 —— 就是"学了个不相关的配方当经验"。
+            if not _same and sim < VEC_CROSS_MIN_SIM:
+                continue
+            score = sim + (0.5 if _same else 0.0)
+            score += 0.3 * max(float(s.get("r", -1.0)), 0.0)
         else:
             sim = similarity(query, f"{s.get('name','')} {s.get('text','')}")
-            same_topic = s.get("topic") == topic
-            if not same_topic and sim < CROSS_TOPIC_MIN_SIM:
+            if not _same and sim < CROSS_TOPIC_MIN_SIM:
                 continue                      # 门槛 1：不相关的跨题经验不进 prompt
-            score = 3.0 if same_topic else 0.0
+            score = 3.0 if _same else 0.0
             score += 2.5 * sim
-            hits = int(s.get("hits") or 0)
-            score += 0.25 * min(hits, 6)
-            score += 0.6 * (int(s.get("ok") or 0) / max(hits, 1))
+            # 2026-11-18：删掉 0.25*min(hits,6) 奖励项 —— hits 是「被
+            # 注入次数」，被注入≠有用；奖励它=失败配方越失败越容易被
+            # 回注（实测：同一条里程碑配方注入 11 次全失败，却靠命中
+            # 加成霸榜）。质量项只剩 ok/hits，ok 记「注入后真取到数」。
+            # 2026-11-18：质量项分母从 hits 换成 runs —— hits 含
+            # 「注入后压根没进执行」的轮，那些轮取不到数不是配方的错。
+            runs = int(s.get("runs") or 0)
+            score += 0.6 * (int(s.get("ok") or 0) / max(runs, 1))
         scored.append((score, key, s))
     scored.sort(key=lambda x: -x[0])
 
     out: list[dict[str, Any]] = []
     cross = 0
     for score, key, s in scored:
-        if not (_vec_mode and key in embs) and s.get("topic") != topic:
-            if cross >= CROSS_TOPIC_MAX:  # 门槛 2（仅词面回退路径）
+        _same = bool(_own) and str(s.get("topic") or "") == _own
+        if not _same:
+            if cross >= CROSS_TOPIC_MAX:  # 门槛 2：跨题最多 2 条
                 continue
             cross += 1
         if len(out) >= max(1, top_k):
@@ -529,6 +638,7 @@ def retrieve(
         item = dict(s)
         item.pop("emb", None)             # 向量不外流（prompt/日志/面板）
         item["key"] = key
+        item["_own"] = _same
         item["score"] = round(score, 3)
         out.append(item)
     return out
@@ -548,8 +658,36 @@ def mark_used(keys: list[str]) -> None:
         _save(data)
 
 
+def mark_reached(keys: list[str]) -> None:
+    """注入后这一轮**真的进入执行** → runs +1（2026-11-18）。
+
+    分母修正：真取到率原来算 ok/hits，而 hits 在开题注入时就 +1 ——
+    Phase1 卡死、骨架没冻结的轮全被算进分母，结构上不可能取到数，
+    任何配方都会显示「失效」。runs 只在「这轮进了 Phase2 / 真调过取数
+    工具」时才 +1，率 = ok/runs 才是「配方被真正用上时，取到数的比例」。
+
+    hits 保留为注入次数的原始读数（面板上单列「注入 N 次」）。
+    """
+    if not keys:
+        return
+    data = _load_raw()
+    touched = False
+    for k in keys:
+        if k in data["skills"]:
+            s = data["skills"][k]
+            s["runs"] = int(s.get("runs") or 0) + 1
+            s["hits"] = max(int(s.get("hits") or 0), s["runs"])
+            touched = True
+    if touched:
+        _save(data)
+
+
 def mark_result(keys: list[str], ok: bool) -> None:
-    """注入后这一轮判对了 → ok +1。有效性低的技能会在检索里自然沉底。
+    """注入后这一轮真取到数（2026-11-18 换尺，原为「判对了」）→ ok +1。
+
+    尺子换了：critic 的判（证据门）归轨迹账，技能的 ok 记「注入后
+    这轮真的取到数/真算过」—— 与 _light_up_milestone 的 fetched 口径
+    同一条。有效性低的技能会在检索里自然沉底。
 
     ⚠️ 不变量：**ok ≤ hits**（面板/检索都把 `ok/hits` 当"有效率"，
     dashboard.py:1376、`retrieve()` 的 0.6 权重）。旧实现只加 ok 不管 hits，
@@ -567,6 +705,7 @@ def mark_result(keys: list[str], ok: bool) -> None:
             s = data["skills"][k]
             s["ok"] = int(s.get("ok") or 0) + 1
             s["hits"] = max(int(s.get("hits") or 0), s["ok"])
+            s["runs"] = max(int(s.get("runs") or 0), s["ok"])
             touched = True
     if touched:
         _save(data)

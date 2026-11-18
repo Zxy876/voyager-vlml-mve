@@ -384,12 +384,20 @@ def crystallize_skill(skill: dict[str, Any] | str, *,
     code = str(s.get("code") or "")
     # 泛化模板（code 带 :slot）是给「检索 + _refill_sql 回填」通道用的，
     # 原样重放必错（槽位没填）。结晶条目要重放的是**判对后固化的那段程序**
-    # —— blueprint.rollout_sql（泛化前的原文，2026-10-26 补记）。没有该
-    # 字段的老技能照旧用 code（本机 Python 配方/未泛化的 SQL 都不受影响）。
+    # —— blueprint.rollout_sql（泛化前的原文，2026-10-26 补记）。
+    #
+    # ★ 2026-11-11 修正（用户：「phase2 对 voyager 来说才是真正沉淀积累技能
+    #   的」）：只在 code **确实是泛化模板**时才用 rollout_sql 顶替。
+    #   旧逻辑是「有 rollout_sql 就顶」—— 于是里程碑那条**整题程序**
+    #   （各维配方内联 + RESULT 汇总，447 字）被 blueprint.rollout_sql
+    #   （一条 `SELECT COUNT(*)`）顶掉，落盘的 learned_milestone.py 只剩
+    #   一维的计数。结果是：学完一整轮，真正的 task 级技能没沉淀下来
+    #   （库里 code 是对的，可 invoke 的条目却是残的）。
     _raw = str((s.get("blueprint") or {}).get("rollout_sql") or "").strip()
-    if _raw:
+    _is_tpl = bool(re.search(r":[a-z_][a-z0-9_]*", code, re.I))
+    if _is_tpl and _raw:
         code = _raw
-    elif re.search(r":[a-z_][a-z0-9_]*", code, re.I):
+    elif _is_tpl:
         # 泛化模板（带 :slot）且没有 rollout_sql（2026-10-23 泛化上线前
         # 入库的老技能）—— 槽位没填的原样重放必错，如实拒绝，不注册坏条目。
         out["why"] = ("该技能是泛化模板（带 :slot）且无 blueprint.rollout_sql"

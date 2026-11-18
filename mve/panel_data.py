@@ -13,6 +13,8 @@ VLML 没有前端（仓库内无 html/tsx/jsx），所以面板形态取自伴�
 from __future__ import annotations
 
 import json
+import re
+import statistics
 import threading
 import time
 from pathlib import Path
@@ -23,6 +25,8 @@ import causal_timeline  # noqa: E402
 import skill_store  # noqa: E402
 import practice_scope  # noqa: E402
 
+import os
+import hashlib
 ROOT = Path(__file__).resolve().parent
 
 
@@ -52,6 +56,36 @@ _INFLIGHT: dict[str, Any] = {"on": False, "done": threading.Event()}
 # 而 /api/state 一个 build 里要调两次；换库/切场景之外没必要那么勤。15s 足够。
 _ENV_CACHE: dict[str, Any] = {"at": 0.0, "value": None}
 _ENV_TTL = 15.0
+
+
+_REV_CACHE: dict[str, Any] = {"at": 0.0, "value": ""}
+
+
+def state_rev() -> str:
+    """全库数据指纹（2026-11-18 面板卡顿治理）。
+
+    对 mve 目录下所有文件（跳 __pycache__/.git/node_modules）的
+    mtime_ns+size 做 sha1 —— 学习循环（独立进程）和面板（人操作）
+    写任何账目，指纹必变。前端轮询 /api/rev，指纹没变就不拉 1MB
+    全量 /api/state。1 秒微缓存：多页签同帧轮询只算一次。
+    """
+    now = time.monotonic()
+    if now - _REV_CACHE["at"] < 1.0 and _REV_CACHE["value"]:
+        return _REV_CACHE["value"]
+    h = hashlib.sha1()
+    skip = {"__pycache__", ".git", "node_modules"}
+    for dirpath, dirnames, filenames in os.walk(ROOT):
+        dirnames[:] = [d for d in dirnames if d not in skip]
+        for fn in filenames:
+            p = os.path.join(dirpath, fn)
+            try:
+                st = os.stat(p)
+                h.update(f"{p}|{st.st_mtime_ns}|{st.st_size}\n".encode())
+            except OSError:
+                pass
+    _REV_CACHE["at"] = now
+    _REV_CACHE["value"] = h.hexdigest()[:16]
+    return _REV_CACHE["value"]
 
 
 def build_state_invalidate() -> None:
@@ -459,6 +493,640 @@ def _consume_curve(limit: int = 40,
     return out
 
 
+def _trace_curve(scene_id: str | None = None, limit: int = 24) -> list[dict[str, Any]]:
+    """**题内缺口序列** —— 进步的唯一观测账本（同构助产士 Phase1Iteration）。
+
+    2026-11-14 用户拍板：这条线**取代**消费线的 `mastered_total` 曲线。
+
+    为什么换（两条都是实测，不是口径偏好）：
+      · 消费线画「累计会做几道题」—— 答出来 +1、失败不减，**单调不减**，
+        同一道题做十遍仍然是 1。它记的是"做了多少"，不是"做得多好"；
+        而且实测 `coach_log.jsonl` 24 条里 `mastered=True` **0 条**、
+        `coverage` 非空 **0 条**，这条线本来就是空的。
+      · 缺口序列是同一道题**逐轮**的剩余缺口数：助产士每提交一次 spec
+        追加一条 `Phase1Iteration`（`opus/schemas.ts:126`），收敛形状
+        （4→1→0）就是进步本身；重跑时段与段可逐轮比对。
+
+    数据源：`ckpt_maieutic/<scene>/req_*.json` 的 `phase1.iterations`，
+    经 `maieutic_scaffold.spec_progress` 按 run 分段**现算** —— 不信文件里
+    写死的 `progress`（历史文件没有这个字段，口径也变过）。
+
+    返回按最近活动倒序；`points` 直接可画：x=段内轮号，y=当轮剩余缺口数。
+    """
+    try:
+        import maieutic_scaffold as _ms
+    except Exception:
+        return []
+    root = ROOT / "ckpt_maieutic"
+    dirs = [root / scene_id] if scene_id else sorted(
+        p for p in root.glob("*") if p.is_dir())
+    out: list[dict[str, Any]] = []
+    for d in dirs:
+        if not d.is_dir():
+            continue
+        for f in sorted(d.glob("req_*.json")):
+            try:
+                rec = json.loads(f.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            q = str(rec.get("question") or "").strip()
+            if not q:
+                continue
+            # ⚠️ 必须用**这份文件自己的** iterations：`_ms.spec_progress(scene, q)`
+            # 按问句解析缓存路径（取"这句话最新的 req"），同一句发布过两次时
+            # 会把两份记录都读成最新那份 —— 旧记录的会话凭空消失。
+            _its = [x for x in ((rec.get("phase1") or {}).get("iterations") or [])
+                    if isinstance(x, dict)]
+            try:
+                pr = _ms.spec_progress_of(_its)
+            except Exception:
+                continue
+            runs = [r for r in (pr.get("runs") or []) if isinstance(r, dict)]
+            if not runs:
+                continue
+            tail = runs[-1]
+            opens = [int(x) for x in (tail.get("opens") or [])]
+            out.append({
+                "req_id": f.stem[4:] if f.stem.startswith("req_") else f.stem,
+                "question": q[:80],
+                "root_scene": d.name,
+                "runs": runs,
+                "n_runs": len(runs),
+                # 最近一段：逐轮剩余缺口（前端直接画，不再自己拼）
+                "points": [{"x": i + 1, "y": y} for i, y in enumerate(opens)],
+                "opens_now": opens[-1] if opens else None,
+                "rounds": int(tail.get("rounds") or 0),
+                "first_pass_round": tail.get("first_pass_round"),
+                "passed": bool(tail.get("passed")),
+                "delta": pr.get("delta"),
+                "monotonic": bool(pr.get("monotonic")),
+                "stuck": [str(x) for x in (pr.get("stuck") or [])],
+                "last_ts": str((_its[-1].get("ts") if _its else "") or ""),
+            })
+    # 最近动过的题排前面（空 ts 的沉底，但别丢）
+    out.sort(key=lambda r: (r.get("last_ts") or "", r.get("req_id") or ""),
+             reverse=True)
+    return out[:limit]
+
+
+def _quadrants(rec: dict[str, Any], runs: list[dict[str, Any]],
+               raw: list[dict[str, Any]], pr: dict[str, Any]
+               ) -> dict[str, Any]:
+    """四象限 + 一句话概述（同构 `CohortNarrativeOutput`）。
+
+    助产士字段（`src_lib_opus_schemas.ts:391-398`）：
+      `narrative` / `solution_techniques` / `common_drifts` /
+      `strengths` / `difficulties` / `provisional`
+    触发条件照抄：**至少一个会话完成**才出 Summary；不足 3 段标 provisional。
+
+    抽成独立函数是因为有两个消费者（原「能力模块」卡 + 新的练习详情页），
+    两处必须同一把尺子 —— 各算一遍就会出现「卡上说强项 3 条、点进去 5 条」。
+    """
+    dims = [str(x.get("id")) for x in (rec.get("dimensions") or [])
+            if isinstance(x, dict) and x.get("id")]
+
+    # 缺口账：哪些维度被反复点到
+    cnt: dict[str, int] = {}
+    for it in raw:
+        for g in (it.get("gaps_identified") or []):
+            k = str(g)
+            cnt[k] = cnt.get(k, 0) + 1
+    p3 = rec.get("phase3") or {}
+    drifts: list[str] = []
+    dv_ids: set[str] = set()
+    for dv in (p3.get("divergences") or [])[:6]:
+        if not isinstance(dv, dict):
+            continue
+        did = str(dv.get("divergence_id") or "").strip()
+        cls = str(dv.get("final_classification")
+                  or dv.get("initial_classification") or "").strip()
+        if not did:
+            continue
+        dv_ids.add(did)
+        # 用题面里那句人话，不要只给英文维度 id（原版也是人话条目）
+        ask = str(dv.get("student_facing_question") or "").strip()
+        if ask:
+            ask = ask[:36] + ("…" if len(ask) > 36 else "")
+        drifts.append(f"[{cls or '—'}] {did}" + (f" —— {ask}" if ask else ""))
+
+    # ⚠️ Phase1 缺口账与 Phase3 分歧账口径不同：一个维度可能在 Phase1
+    # 从没进过 gaps_identified，却在这里被判 bug（代码没实现）。
+    # 不排除就会同一条同时出现在「强项」和「常见偏差」里，自相矛盾。
+    never = [x for x in dims if x not in cnt and x not in dv_ids]
+    tech: list[str] = []
+    for r in runs:
+        seq = "→".join(str(x) for x in (r.get("opens") or [])) or "—"
+        if r.get("passed"):
+            tech.append(f"第 {r['run']} 段：{r.get('rounds')} 轮通过"
+                        f"（逐轮剩余缺口 {seq}）")
+        else:
+            tech.append(f"第 {r['run']} 段：{r.get('rounds')} 轮仍未通过"
+                        f"（逐轮剩余缺口 {seq}）")
+    strengths: list[str] = []
+    if never:
+        strengths.append("一次到位（从未进缺口）：" + "、".join(never[:5]))
+    if pr.get("monotonic"):
+        strengths.append("缺口逐轮单调收缩，没有回退")
+    diffs: list[str] = []
+    hard = sorted(((k, v) for k, v in cnt.items() if v >= 2),
+                  key=lambda x: -x[1])
+    if hard:
+        diffs.append("反复卡住：" + "、".join(
+            f"{k}（{v} 轮）" for k, v in hard[:4]))
+    if pr.get("stuck"):
+        diffs.append("末轮仍未闭合：" + "、".join(
+            str(x) for x in (pr.get("stuck") or [])[:5]))
+    tail = runs[-1] if runs else {}
+    if tail and not tail.get("passed"):
+        diffs.append(f"最近一段未通过（{tail.get('rounds')} 轮止步）")
+
+    done = sum(1 for r in runs if r.get("passed"))
+    prov = done < 3 or len(runs) < 3
+    head = (f"共 {len(runs)} 段会话、{done} 段通过；"
+            f"最近一段 {tail.get('rounds')} 轮"
+            f"{'通过' if tail.get('passed') else '未通过'}")
+    ops = (tail.get("opens") or []) if tail else []
+    if ops:
+        head += f"，剩余缺口 {ops[0]} → {ops[-1]}"
+    if drifts:
+        head += f"；Phase3 记了 {len(drifts)} 条分歧"
+    head += "。"
+    # 全段一轮过、缺口恒 0：这题没产生过追问轨迹（直接命中/跳过），
+    # 不说明的话四象限会读成"全都一次到位"，那是假象。
+    if runs and all((not (r.get("opens") or [])) or (r.get("opens") or [0])[0] == 0
+                    for r in runs) and all(r.get("rounds") == 1 for r in runs):
+        head += "每段都一轮通过、缺口恒为 0 —— 这题没有产生追问轨迹，四象限只反映终态。"
+    if prov:
+        head += "样本不足 3 段会话，下面的模式都是暂定的。"
+    return {
+        "narrative": head,
+        "solution_techniques": tech[:6],
+        "common_drifts": drifts,
+        "strengths": strengths[:5],
+        "difficulties": diffs[:5],
+        "provisional": bool(prov),
+        "completed": done,
+        "rounds": int((tail or {}).get("rounds") or 0),
+        "passed": bool((tail or {}).get("passed")),
+        "opens_now": (ops[-1] if ops else None),
+    }
+
+
+def _cohort_narrative(scene_id: str | None = None, limit: int = 12) -> list[dict[str, Any]]:
+    """每道题的「能力模块」四象限（`_quadrants` 的对外视图）。
+
+    只收**至少一段会话通过**的题 —— 原版规矩：没有完成就没有 Summary。
+    """
+    try:
+        import maieutic_scaffold as _ms
+    except Exception:
+        return []
+    root = ROOT / "ckpt_maieutic"
+    dirs = [root / scene_id] if scene_id else sorted(
+        p for p in root.glob("*") if p.is_dir())
+    out: list[dict[str, Any]] = []
+    for d in dirs:
+        if not d.is_dir():
+            continue
+        for f in sorted(d.glob("req_*.json")):
+            try:
+                rec = json.loads(f.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            q = str(rec.get("question") or "").strip()
+            if not q:
+                continue
+            # 同 _trace_curve：按文件读，不按问句解析（见那里的注释）
+            raw = [x for x in ((rec.get("phase1") or {}).get("iterations") or [])
+                   if isinstance(x, dict)]
+            try:
+                pr = _ms.spec_progress_of(raw)
+            except Exception:
+                continue
+            runs = [r for r in (pr.get("runs") or []) if isinstance(r, dict)]
+            if not runs or not any(r.get("passed") for r in runs):
+                continue
+            quad = _quadrants(rec, runs, raw, pr)
+            out.append({
+                "req_id": f.stem[4:] if f.stem.startswith("req_") else f.stem,
+                "question": q[:80],
+                "root_scene": d.name,
+                **quad,
+                "sessions": len(runs),
+                "delta": pr.get("delta"),
+                "monotonic": bool(pr.get("monotonic")),
+                "points": [{"x": i + 1, "y": y}
+                           for i, y in enumerate((runs[-1].get("opens") or []))],
+                "runs": runs,
+                "intended": [str(x.get("pattern") or "")
+                             for x in (rec.get("expected_drifts") or [])
+                             if isinstance(x, dict) and x.get("pattern")][:6],
+            })
+    out.sort(key=lambda r: (r.get("req_id") or ""), reverse=True)
+    return out[:limit]
+
+
+def _norm_q(s: str) -> str:
+    """题面归一化：只留字/数字，去掉标点与空白差异。
+
+    同一句话在 `coach_log.jsonl` 与 `req_*.json` 里常差一个句号、少一个空格
+    （实测："计算 64 的立方根，并写出其算式。" vs "计算64的立方根"），
+    不归一化就匹配不上，回答会被算成"没有"。
+    """
+    return re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "", str(s or "")).lower()
+
+
+def _coach_answers() -> list[dict[str, Any]]:
+    """旧消费线（`mode=voyager_consume`）留在 `coach_log.jsonl` 的口头作答。
+
+    为什么单独取（2026-11-14 用户：「现在在哪里看得见 Voyager 的回答呢」）：
+      Voyager 的作答有两种形态，分落两处 ——
+        · 学习闭环（`scene_learn`）：交的是**程序**，落在 req 记录的
+          `phase2.finalCode`，详情页「Phase 2」那块能看到；
+        · 旧消费线（`voyager_consume`）：答的是**人话**（"64的立方根是4，
+          算式为 ∛64 = 4"），只落在 `coach_log.jsonl` 的 `answer` 字段。
+      把「交给 Voyager 回答」的按钮解绑之后，第二种在面板上**再没有任何
+      入口** —— 它还在盘上（20 条有 answer），只是没人读。
+    这里只做**只读索引**：把它归到练习详情页，标清"不属于学习账"，
+    不参与任何进步 / 掌握口径（那两条线看的是缺口序列与 phase3 分歧）。
+    """
+    f = ROOT / "coach_log.jsonl"
+    if not f.exists():
+        return []
+    out: list[dict[str, Any]] = []
+    try:
+        lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
+    except Exception:
+        return []
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            d = json.loads(ln)
+        except Exception:
+            continue
+        ans = str(d.get("answer") or "").strip()
+        if not ans:
+            continue
+        out.append({
+            "q": str(d.get("question") or ""),
+            "qkey": _norm_q(d.get("question")),
+            "ts": str(d.get("ts") or ""),
+            "mode": str(d.get("mode") or ""),
+            "answer": ans[:6000],
+            "sql": str(d.get("sql") or "")[:1500],
+            "rows": d.get("rows"),
+            "caveats": [str(x)[:300] for x in (d.get("caveats") or [])][:4],
+            "narrative": str(d.get("narrative") or "")[:1200],
+            "import_id": str(d.get("import_id") or ""),
+            "root_scene": str(d.get("root_scene") or ""),
+        })
+    return out
+
+
+def _answers_for(q: str, scene: str, pool: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """把口头作答归到某道题上。精确优先，其次长前缀互相包含（题面被截断时）。"""
+    k = _norm_q(q)
+    if not k:
+        return []
+    hit = [x for x in pool
+           if x.get("qkey") == k
+           and (not x.get("root_scene") or x["root_scene"] == scene)]
+    if hit:
+        return hit[-6:]
+    soft = [x for x in pool
+            if x.get("qkey") and len(x["qkey"]) >= 8 and x["qkey"] in k
+            and (not x.get("root_scene") or x["root_scene"] == scene)]
+    return soft[-6:]
+
+
+def _exercise_index(scene_id: str | None = None,
+                    limit: int = 80) -> list[dict[str, Any]]:
+    """**练习索引** —— 同构助产士 Instructor · Exercises 的卡片 + 详情。
+
+    为什么要有这一层（2026-11-14 用户：「概览应该是可以点击的 exercise」）：
+      之前概览只有一张「能力模块」卡，靠下拉切题 —— 那是**详情**的样子，
+      不是**列表**的样子。原版列表页每张卡是一道 Exercise，头部三个数：
+      `Sessions 1 / 3`、`Spec iterations 4 median / max 4`、`Divergences`；
+      点进去才是每段会话的跑法与整份 Summary。
+
+    这里把两者一次算齐（N 很小，不做分页/懒加载）：
+      · 卡面：sessions / completed / 轮数中位数与最大 / 分歧分类 / 首轮最常漏的维度
+      · 详情：每段会话（run）的逐轮缺口、首过轮、Phase2 交码与对账、
+              Phase3 分歧逐条、四象限
+    一个 req = 一道 Exercise（原版 Exercise.id 的同构物，`_cache_path` 已按
+    req 分文件）；没有 req 的历史题按题面文件各自成卡。
+    """
+    try:
+        import maieutic_scaffold as _ms
+    except Exception:
+        return []
+    # 口头作答（旧消费线）整表读一次，循环里只做匹配 —— 不复读文件
+    try:
+        _ans_pool = _coach_answers()
+    except Exception:
+        _ans_pool = []
+    root = ROOT / "ckpt_maieutic"
+    dirs = [root / scene_id] if scene_id else sorted(
+        p for p in root.glob("*") if p.is_dir())
+    out: list[dict[str, Any]] = []
+    for d in dirs:
+        if not d.is_dir():
+            continue
+        for f in sorted(d.glob("req_*.json")):
+            try:
+                rec = json.loads(f.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            q = str(rec.get("question") or "").strip()
+            if not q:
+                continue
+            # 全部从**这份文件**读（q 只是用来定位文件名，不代表"这句话的最新账"）：
+            # phase1 / phase2 / phase3 / exercise 元信息都在这一个 json 里。
+            raw = [x for x in ((rec.get("phase1") or {}).get("iterations") or [])
+                   if isinstance(x, dict)]
+            try:
+                pr = _ms.spec_progress_of(raw)
+                srun = _ms.runs_from_iterations(raw)
+            except Exception:
+                continue
+            runs = [r for r in (pr.get("runs") or []) if isinstance(r, dict)]
+            # ⚠️ spec_progress 的 `rounds` 是**轮数**（int），不是轮记录列表；
+            # 要看"每段第一轮漏了哪几个维度"，得拿 runs_from_iterations 里那段
+            # 真正的 rounds 数组。混用会在 rounds[0] 上炸成 int 下标。
+            seg_rounds: dict[int, list[dict[str, Any]]] = {
+                int(x.get("run") or 0): [y for y in (x.get("rounds") or [])
+                                         if isinstance(y, dict)]
+                for x in (srun or []) if isinstance(x, dict)}
+            p2 = rec.get("phase2") if isinstance(rec.get("phase2"), dict) else {}
+            meta = rec.get("exercise") if isinstance(rec.get("exercise"), dict) else {}
+            p3 = rec.get("phase3") or {}
+            dims = [str(x.get("id")) for x in (rec.get("dimensions") or [])
+                    if isinstance(x, dict) and x.get("id")]
+            done_milestone = bool(rec.get("milestone_achieved"))
+
+            # ── 每段会话：P1 轮次 → P2 交码 → 是否完成 ──
+            # 「完成」照原版：这一段跑到过 Phase3/4（spec 冻结 + 交过码）。
+            # 历史记录没有 phase2（本版才落盘）→ 用 milestone_achieved 兜底，
+            # 并在卡上如实标 `phase2_recorded=false`，不假装记过。
+            # ⚠️ `phase2` 是**单槽位**（只存最新一遍），重做会覆盖上一遍 →
+            #   第 1 遍明明交过码却判"没做完"。save_phase2 现在把被覆盖的那份
+            #   推进 phase2_history，这里按 run 回填（按 run 取，不按时间猜）。
+            _p2_hist: dict[int, dict[str, Any]] = {}
+            for _x in (rec.get("phase2_history") or []):
+                if isinstance(_x, dict):
+                    _p2_hist[int(_x.get("run") or 0)] = _x
+            if isinstance(p2, dict) and p2:
+                _p2_hist[int(p2.get("run") or 0)] = p2
+            rows: list[dict[str, Any]] = []
+            for r in runs:
+                _p2r = _p2_hist.get(int(r["run"])) or (
+                    p2 if (int(p2.get("run") or 0) in (0, r["run"])) else {})
+                _p2_here = bool(_p2r) and (int(_p2r.get("run") or 0) == r["run"]
+                                           or r is runs[-1])
+                completed = bool(r.get("passed")) and (
+                    bool((_p2r or {}).get("submitted")) or done_milestone
+                    or bool(p3.get("divergences") is not None and r is runs[-1]))
+                rows.append({
+                    "run": r["run"],
+                    "rounds": r["rounds"],
+                    "opens": r.get("opens") or [],
+                    "closed": r.get("closed") or [],
+                    "passed": bool(r.get("passed")),
+                    "first_pass_round": r.get("first_pass_round"),
+                    "completed": completed,
+                    "phase2": (_p2r if _p2_here else {}),
+                    # 这一遍的"起点"（2026-11-15）：第 1 遍必然 0 条配方、无底稿，
+                    # 它就是基线；后面各遍带了几条配方、是不是从上一版代码起步，
+                    # 决定 Δ 能不能读成"变强了"。老记录没这两项 → 空列表 + 空串。
+                    "skills": list((_p2r or {}).get("skills") or []),
+                    "skills_known": ("skills" in (_p2r or {})),
+                    "draft_from": str((_p2r or {}).get("draft_from") or ""),
+                })
+
+            completed_runs = [x for x in rows if x["completed"]]
+            n_done = len(completed_runs)
+            iters = [int(x["rounds"]) for x in completed_runs]
+            med = (int(statistics.median(iters)) if iters else None)
+            mx = (max(iters) if iters else None)
+
+            # ── 首轮最常漏的维度（原版卡面 "dimensions most often missed
+            #    on the first round"）—— 只看每段的**第一轮**，不混终态 ──
+            missed: dict[str, int] = {}
+            for r in runs:
+                rounds = seg_rounds.get(int(r["run"])) or []
+                if not rounds:
+                    continue
+                for g in (rounds[0].get("gaps_identified") or []):
+                    missed[str(g)] = missed.get(str(g), 0) + 1
+            first_missed = sorted(missed.items(), key=lambda x: (-x[1], x[0]))[:6]
+
+            # ── 分歧分类（原版卡面 "Divergences: none flagged / drift n…"）──
+            dv: list[dict[str, Any]] = []
+            dcount: dict[str, int] = {}
+            for d0 in (p3.get("divergences") or []):
+                if not isinstance(d0, dict):
+                    continue
+                cls = str(d0.get("final_classification")
+                          or d0.get("initial_classification") or "").strip()
+                dcount[cls] = dcount.get(cls, 0) + 1
+                dv.append({
+                    "id": str(d0.get("divergence_id") or "")[:60],
+                    "cls": cls,
+                    "question": str(d0.get("student_facing_question") or "")[:200],
+                    "spec": str(d0.get("evidence_from_spec") or "")[:400],
+                    "code": str(d0.get("evidence_from_code") or "")[:400],
+                    "alignment": str(d0.get("alignment") or ""),
+                    "response": str(d0.get("student_response") or "")[:600],
+                })
+
+            quad = _quadrants(rec, runs, raw, pr) if runs else {}
+            tail = rows[-1] if rows else {}
+            out.append({
+                "qid": (f.stem[4:] if f.stem.startswith("req_") else f.stem),
+                # ⚠️ qid 是 `{req_id}_{dbhash8}`（见 req_registry.skeleton_path:514），
+                # 直接拿它当 req_id 去调 _cache_path 会拼出
+                # `req_{req_id}_{dbhash}_{dbhash}.json` —— 另一个不存在的文件，
+                # 于是"再做一遍"清的是空气（reset 返回 missing），账却看着正常。
+                # 这里单独给一个干净的 req_id，只剥最后一段 8 位 hash。
+                "req_id": ((f.stem[4:].rsplit("_", 1)[0]
+                            if re.fullmatch(r"[0-9a-f]{8}",
+                                            f.stem[4:].rsplit("_", 1)[-1] or "")
+                            else f.stem[4:])
+                           if f.stem.startswith("req_") else f.stem),
+                "title": str(meta.get("title") or q)[:80],
+                "question": q,
+                "unit": str(meta.get("unit") or ""),
+                "language": str(meta.get("target_language") or ""),
+                "root_scene": d.name,
+                "published_at": str(meta.get("published_at") or ""),
+                # —— 卡面三个数（原版：Sessions / Spec iterations / Divergences）——
+                "sessions": len(runs),
+                "completed": n_done,
+                "pct": (round(n_done * 100 / len(runs)) if runs else 0),
+                "iter_median": med,
+                "iter_max": mx,
+                "iter_values": iters,
+                "div_total": len(dv),
+                "div_counts": dcount,
+                "first_missed": [{"id": k, "n": v} for k, v in first_missed],
+                "provisional": bool(n_done < 3),
+                "llm_ready": bool(dims),
+                "dims": dims,
+                "milestone": (rec.get("milestone") or {}).get("name") or "",
+                "milestone_achieved": done_milestone,
+                "expected_drifts": [
+                    {"category": str(x.get("category") or ""),
+                     "pattern": str(x.get("pattern") or "")}
+                    for x in (rec.get("expected_drifts") or [])
+                    if isinstance(x, dict)][:6],
+                # —— 详情：一条会话账 P1 → P2 → P3 → 里程碑 ——
+                "runs": rows,
+                "phase1": {
+                    # 从 runs_from_iterations 展开，不自取 iterations 的 run/round：
+                    # 历史记录里这两个字段**根本没写**（全 0），直接读会显示成
+                    # "第 0 段 · 第 0 轮"，六段会话糊成一条。
+                    # runs_from_iterations 按"通过后再出现记录即新段"还原段号，
+                    # 轮号用段内序号兜底。
+                    "rounds": [
+                        {"run": int(_r.get("run") or 0),
+                         "round": int(_it.get("round") or 0) or (_ri + 1),
+                         "questions": [str(y) for y in (_it.get("questions") or [])],
+                         "gaps": [str(y) for y in (_it.get("gaps_identified") or [])],
+                         "addressed": [str(y) for y in (_it.get("gaps_addressed") or [])],
+                         "passed": bool(_it.get("passed")),
+                         # ★ Voyager 的**作答正文**：每一轮它交的整篇 spec
+                         #   （"已知 / 64 的立方根是 4，因为 4×4×4=64 / 代入…"）。
+                         #   以前面板只摆判官问了什么，从不摆它答了什么 ——
+                         #   用户问「在哪看得见 Voyager 的回答」多半指这一层。
+                         "spec": str(_it.get("spec_text") or "")[:6000],
+                         "ts": str(_it.get("ts") or "")}
+                        for _r in (srun or [])
+                        for _ri, _it in enumerate(_r.get("rounds") or [])][-40:],
+                    "addressed": sorted({
+                        str(y) for x in raw for y in (x.get("gaps_addressed") or [])}),
+                    "open_now": [str(y) for y in (raw[-1].get("gaps_identified") or [])]
+                                if raw else [],
+                },
+                "phase2": p2 or {},
+                "phase2_recorded": bool(p2),
+                # Voyager 的**口头作答**（旧消费线留在 coach_log 的 answer）。
+                # 与 phase2.finalCode 是两种形态，别混：一个交程序，一个说话。
+                "answers": _answers_for(q, d.name, _ans_pool),
+                "phase3": {"divergences": dv,
+                           "revision_choice": str(p3.get("revision_choice") or ""),
+                           "counts": dict(p3.get("counts") or {}),
+                           "skipped": [str(x)[:200] for x in (p3.get("skipped") or [])][:4]},
+                "quad": quad,
+                "points": [{"x": i + 1, "y": y}
+                           for i, y in enumerate((tail.get("opens") or []))],
+                "opens_now": (tail.get("opens") or [None])[-1] if tail else None,
+                "passed_last": bool(tail.get("passed")),
+                # spec_progress 不产 last_ts（它只算形状）；活动时间取最后一轮的 ts。
+                # 之前这里读 pr["last_ts"] 恒 None → 排序与"谁更新"全失效。
+                "last_ts": str((raw[-1].get("ts") if raw else "") or ""),
+                "delta": pr.get("delta"),
+                "monotonic": bool(pr.get("monotonic")),
+                # 「再做一遍」的台账 —— 每次重做前清了哪些背包项（见
+                # maieutic_scaffold.reset_practice_state）。面板据此把这一段
+                # 标成「第 N 遍 · 从零」，而不是"接着上一遍继续"。
+                "redos": [x for x in (rec.get("redos") or [])
+                          if isinstance(x, dict)][-10:],
+            })
+    # ── 按题面归并（同一句被发布多次 = 同一道练习的多份派发）──────────
+    # 实测（Scene T）：同一句点了 8 次「启动学习」→ 8 个 req、8 张卡片，
+    # 内容全一样、会话全是 0。原版一道 Exercise 只有一行，重复发布不会
+    # 多出一张卡；MVE 的 req 是"每次派发一份骨架"的粒度，比 Exercise 细一层。
+    # 列表按 (场景, 题面) 归并，`reqs` 记派发了几份，点进去仍能看到每份的账。
+    merged: dict[tuple[str, str], dict[str, Any]] = {}
+    for e in out:
+        k = (str(e.get("root_scene") or ""), str(e.get("question") or ""))
+        g = merged.get(k)
+        if g is None:
+            e = dict(e)
+            e["reqs"] = 1
+            e["req_ids"] = [e["qid"]]
+            merged[k] = e
+            continue
+        # 会话与完成数相加；P2/P3/四象限取**最新那份派发**（它才是当前的账）
+        g["sessions"] += int(e.get("sessions") or 0)
+        g["completed"] += int(e.get("completed") or 0)
+        g["reqs"] += 1
+        g["req_ids"].append(e["qid"])
+        # 重做台账按派发顺序拼（带上 req，才知道是哪一份被重做过）
+        for _rd in (e.get("redos") or []):
+            _rd = dict(_rd)
+            _rd["req"] = e["qid"]
+            g.setdefault("redos", []).append(_rd)
+        for r in (e.get("runs") or []):
+            r = dict(r)
+            r["req"] = e["qid"]
+            g["runs"].append(r)
+        # 标题/单元：哪份有教师起的名字就用哪份（题面兜底出来的不算"起过名"）
+        for f in ("title", "unit", "language", "published_at"):
+            _gv, _ev = str(g.get(f) or ""), str(e.get(f) or "")
+            _g_default = (f == "title" and _gv == str(g.get("question") or ""))
+            if _ev and (not _gv or _g_default):
+                g[f] = e[f]
+        if (e.get("last_ts") or "") >= (g.get("last_ts") or ""):
+            for f in ("qid", "req_id", "last_ts", "phase2", "phase2_recorded", "phase3",
+                      "quad", "delta", "monotonic", "answers",
+                      "expected_drifts", "milestone",
+                      "milestone_achieved", "dims", "llm_ready", "points",
+                      "opens_now", "passed_last", "phase1"):
+                if f in e:
+                    g[f] = e[f]
+        # 首轮最常漏的维度：多份派发的次数相加（口径一致，都是"每段第一轮"）
+        acc = {x["id"]: x["n"] for x in (g.get("first_missed") or [])}
+        for x in (e.get("first_missed") or []):
+            acc[x["id"]] = acc.get(x["id"], 0) + x["n"]
+        g["first_missed"] = [{"id": k2, "n": v2} for k2, v2 in
+                             sorted(acc.items(), key=lambda y: (-y[1], y[0]))[:6]]
+        # 分歧逐条相加（同一份题的分歧来自不同派发，不重复计同一 id）
+        seen = {d["id"] for d in (g["phase3"].get("divergences") or [])} \
+            if isinstance(g.get("phase3"), dict) else set()
+        for d0 in ((e.get("phase3") or {}).get("divergences") or []):
+            if d0.get("id") not in seen and isinstance(g.get("phase3"), dict):
+                g["phase3"]["divergences"].append(d0)
+                seen.add(d0.get("id"))
+    out = list(merged.values())
+    for e in out:
+        # 归并后重算派生量：完成率 / 轮数中位数与最大 / 分歧条数与分类
+        e["pct"] = (round(e["completed"] * 100 / e["sessions"])
+                    if e["sessions"] else 0)
+        iters = [int(r.get("rounds") or 0) for r in (e.get("runs") or [])
+                 if r.get("completed")]
+        e["iter_values"] = iters
+        e["iter_median"] = (int(statistics.median(iters)) if iters else None)
+        e["iter_max"] = (max(iters) if iters else None)
+        dv = (e.get("phase3") or {}).get("divergences") or []
+        e["div_total"] = len(dv)
+        cnt: dict[str, int] = {}
+        for d0 in dv:
+            cnt[str(d0.get("cls") or "")] = cnt.get(str(d0.get("cls") or ""), 0) + 1
+        e["div_counts"] = cnt
+        e["provisional"] = bool(e["completed"] < 3)
+        # ★ 归并后重算跨段 delta（2026-11-15）：原来直接沿用**单份派发**的
+        #   pr["delta"]，同一句被发布多次时，delta 说的是"那份里的最后两段"，
+        #   而不是"这道题的最后两段" —— 第 2 遍与第 1 遍的对比会指向错的段。
+        _rr = [r for r in (e.get("runs") or []) if isinstance(r, dict)]
+        if len(_rr) >= 2:
+            _a, _b = _rr[-2], _rr[-1]
+            _fa, _fb = _a.get("first_pass_round"), _b.get("first_pass_round")
+            e["delta"] = {
+                "rounds": int(_b.get("rounds") or 0) - int(_a.get("rounds") or 0),
+                "first_pass_round": (None if (_fa is None or _fb is None)
+                                     else int(_fb) - int(_fa)),
+                "from_run": _a.get("run"), "to_run": _b.get("run"),
+            }
+        else:
+            e["delta"] = None
+    out.sort(key=lambda r: (r.get("last_ts") or "", r.get("qid") or ""),
+             reverse=True)
+    return out[:limit]
+
+
 def curve_summary(scene_id: str) -> dict[str, Any]:
     """单场景学习曲线摘要（1→n）——给场景卡当「曲线上升」的数字证据。
 
@@ -500,6 +1168,13 @@ def curve_summary(scene_id: str) -> dict[str, Any]:
             reach += 1
             if not evidence:
                 evidence = f"「{q[:40]}」第 {seen[q]} 次导入 → 高置信命中"
+    # —— 题内缺口序列（2026-11-14 起是进步的主口径，取代 mastered_* 曲线）——
+    # 场景栏只需要"最近这道题还剩几个缺口"，不拉全部轨迹。
+    try:
+        _tc = _trace_curve(scene_id=scene_id, limit=1)
+    except Exception:
+        _tc = []
+    _t = _tc[0] if _tc else {}
     return {
         "imports": len(cc),
         "high": dec.get("HIGH_CONFIDENCE", 0),
@@ -515,6 +1190,12 @@ def curve_summary(scene_id: str) -> dict[str, Any]:
         "reachable": reach > 0,
         "reach_evidence": evidence,
         "reused": sum(1 for c in cc if c.get("reused")),
+        # 进步主口径：最近一题的收敛状态（None = 这场景还没有题内轨迹）
+        "trace_open": _t.get("opens_now"),
+        "trace_rounds": _t.get("rounds"),
+        "trace_runs": _t.get("n_runs"),
+        "trace_passed": _t.get("passed"),
+        "trace_question": str(_t.get("question") or "")[:40],
     }
 
 
@@ -714,23 +1395,82 @@ def _sessions_view(scene_id: str) -> list[dict[str, Any]]:
 
     # 技能库按 req_id 建索引（精确连接）。一次全表扫 + 建索引，
     # 不为每个需求单独扫一遍技能库。
+    #
+    # ★ 一对多（2026-11-11 用户：「按现在的会话详情页对技能一对多就好啦」）：
+    #   一个会话列出它学成的**全部**技能。两条连接并用、缺一不可：
+    #     ① `blueprint.req_ids`（列表）—— 这个会话确实写过/学过它（精确）；
+    #     ② 同一个 **topic**（= learn_<md5(问句)>）—— 同一道题再派时技能常一字
+    #        未变、走 skipped 分支，历史条目只有旧的单值 req_id，靠 ② 才不至于
+    #        在新会话里漏掉（实测 learn_9b8c863d::example_count 停在旧 req）。
+    #   老条目没有 req_ids → 单值 req_id 兜底（不按标题猜，标题可重名）。
+    import hashlib as _hl
+
+    def _topic_of(q: str) -> str:
+        return "learn_" + _hl.md5(str(q or "").strip().encode("utf-8")).hexdigest()[:8]
+
     by_req: dict[str, list[dict[str, Any]]] = {}
+    by_topic: dict[str, list[dict[str, Any]]] = {}
     unowned = 0
     try:
         for s in skill_store.all_skills():
-            rid = str((s.get("blueprint") or {}).get("req_id") or "")
-            if not rid:
+            bp = s.get("blueprint") or {}
+            rids = [str(x) for x in (bp.get("req_ids") or []) if str(x or "").strip()]
+            if not rids:
+                one = str(bp.get("req_id") or "").strip()
+                rids = [one] if one else []
+            topic = str(s.get("topic") or "")
+            if not rids and not topic.startswith("learn_"):
                 unowned += 1
                 continue
-            by_req.setdefault(rid, []).append({
+            row = {
                 "key": str(s.get("key") or ""),
                 "name": str(s.get("name") or ""),
-                "dimension": str((s.get("blueprint") or {}).get("dimension") or ""),
+                # dimension 非空 = 维度配方（会话的构件）；空 = 会话级（task 级）
+                "dimension": str(bp.get("dimension") or ""),
+                "question": str(bp.get("question") or ""),
+                "source": str(s.get("source") or ""),
+                "versions": int(s.get("versions") or 1),
+                "sessions": len(rids),
                 "hits": int(s.get("hits") or 0),
                 "ok": int(s.get("ok") or 0),
-            })
+                "runs": int(s.get("runs") or 0),
+                # 技能本体（跑通的那段程序/SQL）—— 详情页可展开看，默认折叠
+                "code": str(s.get("code") or "")[:4000],
+            }
+            for rid in rids:
+                by_req.setdefault(rid, []).append(dict(row))
+            if topic.startswith("learn_"):
+                by_topic.setdefault(topic, []).append(dict(row))
     except Exception:
-        by_req = {}
+        by_req, by_topic = {}, {}
+
+    def _skills_of(rec: dict[str, Any]) -> list[dict[str, Any]]:
+        """这个会话学成的技能（**一对多**）：精确归属 ∪ 同 topic。
+
+        - 精确归属：`blueprint.req_ids` / 单值 `req_id` 里有这个 req
+        - 同 topic：`learn_<md5(问句)>` 相同 —— 同一道题的不同派发共享同一批
+          技能（同题再派时技能常走 skipped 分支，归属字段不会刷新）
+        去重按 key；**会话级（task 级）排前面**，维度配方排后面，详情页按这两组渲染。
+        """
+        rid = str(rec.get("req_id") or "")
+        _qs = [str(rec.get("question") or "")] + [
+            str(x) for x in (rec.get("known_questions") or [])]
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for row in by_req.get(rid, []):
+            _k = str(row.get("key") or "")
+            if _k and _k not in seen:
+                seen.add(_k)
+                rows.append(row)
+        for q in _qs:
+            for row in by_topic.get(_topic_of(q), []):
+                _k = str(row.get("key") or "")
+                if _k and _k not in seen:
+                    seen.add(_k)
+                    rows.append(row)
+        rows.sort(key=lambda r: (1 if r.get("dimension") else 0,
+                                 str(r.get("dimension") or "")))
+        return rows
 
     out: list[dict[str, Any]] = []
     for rec in reqs:
@@ -752,7 +1492,7 @@ def _sessions_view(scene_id: str) -> list[dict[str, Any]]:
             "total": 0,
             "verified": {},
             "unclosed": [],
-            "skills": by_req.get(rid, []),
+            "skills": _skills_of(rec),
             "events": [],
             "why": "",
             # 维度级学习账（2026-11-10）：学习侧闭合过程的只读投影。
@@ -895,6 +1635,34 @@ def _build_state_uncached() -> dict[str, Any]:
     scene_ctx = _scene_ctx()
     sid = scene_ctx["id"]
     rows = run_log.for_scene(sid)
+    # 学习轨迹账（2026-11-18）：轨迹页/概览判据区改读 learn_trace.jsonl。
+    # run_log 是原版练习线的账（coverage/score 恒空、里程碑点亮了还记
+    # failed），新后端的真实指标（Phase1/Phase2/取数/里程碑/证据门）在
+    # learn_trace 里。
+    try:
+        import learn_trace as _lt
+        _trace = _lt.for_scene(sid)
+    except Exception:
+        _trace = []
+    # 概览判据区 KPI（2026-11-18 换账本）：全部从 learn_trace 现算，
+    # 不再读 run_log 的 success/行数（那是原版练习线的账）。
+    #   entered = 这轮真进了执行（Phase2 交付 / 调过取数 / 真取到）
+    #   fetched = 真取到数
+    #   lit     = 里程碑点亮（真做出来了的最硬信号）
+    try:
+        _entered_n = sum(1 for _r in _trace
+                         if _r.get("phase2_submitted")
+                         or int(_r.get("fetch_calls") or 0) > 0
+                         or _r.get("fetch_ok"))
+        _trace_kpi = {
+            "rounds": len(_trace),
+            "entered": _entered_n,
+            "fetched": sum(1 for _r in _trace if _r.get("fetch_ok")),
+            "lit": sum(1 for _r in _trace if _r.get("lit")),
+            "last": dict(_trace[-1]) if _trace else None,
+        }
+    except Exception:
+        _trace_kpi = {"rounds": 0, "entered": 0, "fetched": 0, "lit": 0, "last": None}
     memory = skill_store.load()
     # 防膨胀/防幻觉能不能自证，就看这两个数
     skill_stats = skill_store.stats()
@@ -917,6 +1685,9 @@ def _build_state_uncached() -> dict[str, Any]:
             "code": str(s.get("code") or ""),
             "hits": int(s.get("hits") or 0),
             "ok": int(s.get("ok") or 0),
+            # runs = 注入后真进了执行的轮数（2026-11-18 分母修正：
+            # 真取到率 = ok/runs；hits 只作注入次数读数）
+            "runs": int(s.get("runs") or 0),
             # 1→n 场景归属：技能卡上直接标「来自 Scene X」（溯源并入技能页，
             # 不再单开页面）。字段引入前入库的老技能显示 default。
             "source_scene": str(s.get("source_scene") or "default"),
@@ -929,8 +1700,8 @@ def _build_state_uncached() -> dict[str, Any]:
             "dimension": str((s.get("blueprint") or {}).get("dimension") or ""),
             "versions": s.get("versions", 1),
             "rate": (
-                round(int(s.get("ok") or 0) / int(s.get("hits") or 1), 3)
-                if int(s.get("hits") or 0) else None
+                round(int(s.get("ok") or 0) / int(s.get("runs") or 1), 3)
+                if int(s.get("runs") or 0) else None
             ),
         }
         # 1→n 场景过滤：技能是**跨场景复用资产**，所以口径是「本场景 + 无
@@ -977,6 +1748,13 @@ def _build_state_uncached() -> dict[str, Any]:
             # 进步是在消费这条线上测的，练习没跑过不影响它。
             # 1→n：按当前场景取（B 冷启动时曲线为空是事实，不是 bug）。
             "consume_curve": _consume_curve(scene_id=sid),
+            # 题内缺口序列：进步的主曲线（取代上面那条累计掌握数，2026-11-14）
+            "trace_curve": _trace_curve(scene_id=sid),
+            # 能力模块四象限（同构助产士 CohortNarrativeOutput，2026-11-14）
+            "cohort": _cohort_narrative(scene_id=sid),
+            # 练习索引（同构助产士 Instructor · Exercises）：概览页的卡片 + 详情
+            # 全从这一份读，不再二次计算（见 _exercise_index 的注释）。
+            "exercises": _exercise_index(scene_id=sid),
             "recommend": recommend,
             "causal": causal,
             "tasks": _task_library(),
@@ -995,9 +1773,10 @@ def _build_state_uncached() -> dict[str, Any]:
             "exam_curve": _exam_view(),
             # 导航上的「轨迹 N 轮」读它；不给就是 "undefined 轮"
             "total_rounds": 0,
+            "trace_kpi": _trace_kpi,
             "topic_id": "",
-            "hint": (f"Scene {sid} 还没有练习记录。摸底/考核不入 run_log"
-                     f"（走 exam_log）——有裸考数据时下面会照常显示。"),
+            "hint": ("还没有练习记录。摸底/考核不入 run_log"
+                     "（走 exam_log）——有裸考数据时下面会照常显示。"),
         }
 
     # ---- 全局进度序列（跨运行连续编号）----
@@ -1162,12 +1941,22 @@ def _build_state_uncached() -> dict[str, Any]:
         # 1→n：按当前场景取 —— B 的曲线只画 B 的导入历史（否则"B 从零开始"
         # 会被画成"接在 A 的尾声上"，Δ 掌握数虚高）。
         "consume_curve": _consume_curve(scene_id=sid),
+        # 题内缺口序列：进步的主曲线（取代累计掌握数，2026-11-14）
+        "trace_curve": _trace_curve(scene_id=sid),
+        # 能力模块四象限（同构助产士 CohortNarrativeOutput，2026-11-14）
+        "cohort": _cohort_narrative(scene_id=sid),
+        "exercises": _exercise_index(scene_id=sid),
         "recommend": recommend,
         "causal": causal,
         "attempted": attempted,
         "failed": failed,
         "total_rounds": len(series),
         "series": series,
+        # 学习轨迹账（MVE 现账，2026-11-18）：轨迹页/判据区读它
+        "trace": _trace,
+        "trace_total": len(_trace),
+        # 概览判据区（2026-11-18 换账本）：当前题判据/真取到率/累计轮次读它
+        "trace_kpi": _trace_kpi,
         "reading": reading,
         "reading_text": reading_text,
         "mastery_warning": mas_warning,
@@ -1307,6 +2096,26 @@ def scenes_view() -> dict[str, Any]:
         curve = {sid: {} for sid in scene_ids}
         groups = {sid: [] for sid in scene_ids}
         backend = {sid: "" for sid in scene_ids}
+    # 背包 + 材料（2026-11-18 用户拍板「只有一个 voyager 背包，内容物是跑出来的」）：
+    # 面板不再让人选/新建场景，所以这里直接把当前工作区的背包与材料根摆出来。
+    # 口径与 curriculum_auto 完全一致（同一份账，不另算一套）：
+    #   Inventory (used/36)，格 = 一次会话，容量是常量（curriculum.py:205）。
+    inventory = {"used": 0, "cap": 36, "slots": []}
+    material = ""
+    try:
+        import curriculum_auto as _ca_inv
+        import scene_profile as _sp_inv
+        _prof_inv = _sp_inv.profile(current) or {}
+        _ag_inv = _ca_inv.CurriculumAgent(
+            current, scene_dir=str(_prof_inv.get("scene_dir") or ""))
+        inventory = {"used": _ag_inv.inventory_used,
+                     "cap": getattr(_ca_inv, "INV_CAP", 36),
+                     "slots": [str((v or {}).get("q") or "")[:80]
+                               for v in list(_ag_inv.slots.values())[-6:]]}
+        material = str(_ag_inv._material_root() or "")
+    except Exception:
+        pass
+
     return {"scenes": scene_list, "current": current,
             "exclusive_nodes": exclusive, "graph_sparsity": sparsity,
             "entity_catalog": catalog, "fingerprint": fp,
@@ -1314,7 +2123,9 @@ def scenes_view() -> dict[str, Any]:
             "curve_summary": curve,
             # 猫爪总开关（同构 neko）：每场景的能力组 + 组内条目 + 开关状态；
             # scene_backend 说明这场景的数据源是哪一档（vlml / local / scene）。
-            "groups": groups, "scene_backend": backend}
+            "groups": groups, "scene_backend": backend,
+            # 单工作区视图：背包 + 材料（面板顶栏只渲染这两个）
+            "inventory": inventory, "material": material}
 
 
 # ⚠️ 跨场景技能溯源（skill_traceability）已并入技能页（2026-10-18 去重）：

@@ -677,169 +677,56 @@ def set_anchor(scene: str, key: str, *, save: bool = True) -> int:
 
 # ---------------------------------------------------------------- 读：规划
 
-# ---------------------------------------------------------------- 自由学的题→单元账
-# 为什么需要：中文题面（「计算 6 的 3 次方」）与英文目录（「Ch1 Arithmetic
-# Operations」）词面不重合，locate 的词面打分永远够不到 0.45 —— 书单推进的
-# 回写就断了。自由学提题时（/api/learn/propose）题面和单元是同一次 plan() 里
-# 出来的，当场记一笔，Phase2 回写（attach_phase_nodes）优先查这笔精确账。
-
-def _proposed_path(scene: str) -> Path:
-    try:
-        import scene_profile
-        d = Path(str(scene_profile.profile(scene).get("scene_dir") or ""))
-    except Exception:
-        d = Path(".")
-    return d / "proposed_units.json"
-
-
-def note_proposed(scene: str, question: str, module_id: str) -> None:
-    """自由学提的题 → 它出自哪个单元。Phase2 过关回写时用它挂回单元。"""
-    try:
-        p = _proposed_path(scene)
-        try:
-            d = json.loads(p.read_text("utf-8"))
-        except Exception:
-            d = {}
-        h = hashlib.md5(str(question).strip().encode("utf-8")).hexdigest()[:12]
-        d[h] = {"question": str(question)[:300],
-                "module_id": str(module_id or ""),
-                "ts": datetime.now().isoformat(timespec="seconds")}
-        if len(d) > 200:      # 只留最近的，防无限膨胀
-            d = dict(sorted(d.items(),
-                            key=lambda kv: str(kv[1].get("ts") or ""))[-200:])
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(d, ensure_ascii=False, indent=1), "utf-8")
-    except Exception:
-        pass
-
-
-def unit_of_proposed(scene: str, question: str) -> str:
-    """查这笔账；没有就返回空串（调用方退回 locate 词面匹配）。"""
-    try:
-        p = _proposed_path(scene)
-        d = json.loads(p.read_text("utf-8"))
-        h = hashlib.md5(str(question).strip().encode("utf-8")).hexdigest()[:12]
-        return str((d.get(h) or {}).get("module_id") or "")
-    except Exception:
-        return ""
-
-
-def plan(scene: str = "P", *, graph=None) -> dict | None:
-    """下一单元：按书单顺序，第一个没学过的（跳过 skipped）。"""
-    from graph_curriculum import progress
-
-    slots = progress(scene, graph=graph)
-    live = [s for s in slots if not s.get("skipped")]
-    for s in live:
-        if not s["done"]:
-            return s
-    return None
-
+# ---------------------------------------------------------------- 自由学：下一题
+#
+# 2026-11-18 用户拍板：**材料入口只剩一个背包** —— 没有书单、没有单元规划、
+# 没有「图谱将做清单」。「下一题」只有一条路：出题器（curriculum_auto）。
+#
+# 原版对照（voyager/agents/curriculum.py:243-291）：下一题只由两样东西决定
+#   —— 观察面（nearby_blocks + inventory，:142-209）和两条硬编码
+#   （progress==0 → 常量最小任务 / 背包满 → 存箱）。既不看「这本书讲到第几
+#   章」，也不看「图谱上还有哪些没做」。
+#
+# 因此这里不再有 ① 图谱将做 ② 书单当前单元 两条分支；`plan()` /
+# `todo_reqs()` / `note_proposed()` / `unit_of_proposed()` 一并删除 ——
+# 它们存在的唯一理由原是「给没有落点账的材料补一个进度单位」（旧 §16.5），
+# 而落点账现在由会话事件流自己产出（`curriculum_auto.slot_content`）。
 
 def default_llm(msgs):
-    """出题器要的 llm 可调用。
+    """出题器要的 llm 可调用（背包改造时被误删，2026-11-18 恢复）。
 
     ⚠️ `CurriculumAgent` 里是 `if self._llm is not None` 才调模型 —— 传 None
-    会**静默不出题**（2026-11-15 实测：`propose_for` 在面板上永远返回空，
-    因为它内部 `agent_for(scene)` 没递 llm）。所以调用方必须给一个真能调的。
+    会**静默不出题**。调用方必须给一个真能调的。
 
-    出题属"不需要深思"的活：关思考，max_tokens 给足正文（思考段会吃光额度）。
+    模型口径：全局同一模型 —— 默认跟 ZHIPU_MODEL 走（面板服务层=glm-4.6），
+    只在显式设置 MVE_PROMPT_MODEL 时才允许覆盖。出题属低频高影响调用，
+    关思考、max_tokens 给足正文。
     """
     from llm_client import chat
     import os
-    # 出题是低频、高影响的调用（每单元一次，决定接下来学什么），
-    # 用强模型；MVE_PROMPT_MODEL 可覆盖。执行层/判官仍是 MVE_CRITIC_MODEL。
     return chat(msgs, temperature=0.7, max_tokens=1800, timeout=150.0,
-                model=os.getenv("MVE_PROMPT_MODEL", "glm-4-plus"),
+                model=os.getenv("MVE_PROMPT_MODEL", "")
+                or os.getenv("ZHIPU_MODEL", "glm-4.6"),
                 thinking={"type": "disabled"})
 
 
-def todo_reqs(scene: str = "P") -> list[dict]:
-    """图谱上「将做」的题（status=unverified 的 req 节点）。
-
-    2026-11-15 起 req 节点新建即 unverified（req_registry.ensure_req_node），
-    Phase2 过关才翻 verified（learn_orchestrate.attach_phase_nodes）——
-    所以这份清单就是"出过、但还没真做出来的题"。
-    """
-    try:
-        from knowledge_graph import KnowledgeGraph
-        g = KnowledgeGraph.load()
-    except Exception:
-        return []
-    out: list[dict] = []
-    for n in g.nodes.values():
-        if str(getattr(n, "kind", "")) != "req":
-            continue
-        if str(getattr(n, "root_scene", "A") or "A") != str(scene):
-            continue
-        if str(getattr(n, "status", "")) != "unverified":
-            continue
-        det = getattr(n, "detail", {}) or {}
-        q = str(det.get("question") or getattr(n, "label", "") or "").strip()
-        if not q:
-            continue
-        out.append({"question": q,
-                    "req_id": str(det.get("req_id") or ""),
-                    "ts": str(det.get("published_at") or det.get("ts") or "")})
-    out.sort(key=lambda r: (r["ts"], r["question"]))
-    return out
-
-
 def next_task(scene: str = "P", *, llm=None) -> dict:
-    """自由学的下一题：① 图谱将做 → ② 书单当前单元。
+    """自由学的下一题 = 出题器。返回 {ok, source, question, unit, module_id, why}。
 
-    这就是「▶ 启动 Voyager」在非 VLML 场景（P / N / H …）点下去该做的事
-    —— 用户 2026-11-15 原话：「我点这个按钮其实就是自由学呀，不用多做一个
-    按钮」。所以这套口径只留这一份实现，面板与 scene_learn 都调它。
-
-    返回 {ok, source, question, unit, module_id, why, todo_left, req_id}；
-    提不出就 ok=False 并带 error，不硬凑。
+    面板「▶ 启动 Voyager」与 scene_learn 都调这里（同一份实现，不另开入口）。
     """
-    todo = todo_reqs(scene)
-    if todo:
-        r = dict(todo[0])
-        r.update(ok=True, source="将做", todo_left=len(todo),
-                 unit="", module_id="",
-                 why="图谱将做清单第 1 条（先把出过的题做完）")
-        return r
-    p = plan(scene)
-    if not p:
-        return {"ok": False, "source": "", "question": "",
-                "error": "将做清单是空的，书单也已全部学完 —— 这个场景没有"
-                         "可出的题（往图谱加题，或换有书单的场景）"}
-    import curriculum_auto
-    r = curriculum_auto.propose_for(scene, llm=(llm or default_llm))
-    _unit = f"{p.get('title')}（{p.get('book')}）"
-    _mid = str(p.get("module_id") or "")
-    if not r.get("question"):
-        return {"ok": False, "source": "书单", "question": "",
-                "unit": _unit, "module_id": _mid,
-                "error": str(r.get("why") or "出题器没给出题")}
-    # 当场记「题 → 单元」精确账：中文题面与英文目录词面不重合，Phase2 回写
-    # 时的 locate 兜不住，只能靠这一笔挂回单元（否则书单永远 0 进度）。
-    note_proposed(scene, str(r["question"]), _mid)
-    _mark_used_from_why(_mid, str(r.get("why") or ""), str(r["question"]))
-    return {"ok": True, "source": "书单", "question": str(r["question"]),
-            "unit": _unit, "module_id": _mid, "why": str(r.get("why") or "")}
-
-
-def _mark_used_from_why(module_id: str, why: str, question: str) -> None:
-    """把出题器报的出处（`原题 p52 1.8`）记成「这一题出过了」。
-
-    去重信号只有这个：中文题面每轮措辞都不同，按题面 md5 去重抓不住同一道
-    原题（实测 1.8 连着被出两次）。所以认**题号**。
-    """
+    import curriculum_auto as _ca
     try:
-        import book_text
-        bid, i = parse_unit_key(str(module_id or ""))
-        if not bid or not i:
-            return
-        m = re.search(r"原题\s*p?\d*\s*#?\s*(\d{1,3}(?:\.\d{1,3})?)", why or "")
-        if not m:
-            return
-        book_text.mark_used(bid, int(i), m.group(1), question)
-    except Exception:
-        pass
+        r = _ca.propose_for(scene, llm=(llm or default_llm))
+    except Exception as e:
+        return {"ok": False, "source": "自由学", "question": "",
+                "error": f"{type(e).__name__}: {e}"}
+    if not r.get("question"):
+        return {"ok": False, "source": "自由学", "question": "",
+                "error": str(r.get("why") or "出题器没给出题")}
+    return {"ok": True, "source": "自由学", "question": str(r["question"]),
+            "unit": "", "module_id": "", "why": str(r.get("why") or "")}
+
 
 
 def points_of(scene: str, module_id: str, *, graph=None) -> str:

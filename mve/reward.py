@@ -81,6 +81,12 @@ def scene_has_env(scene_id: str) -> bool:
     missing / none / 判定失败 → False（无环境 → 产物是 inference）。
     """
     try:
+        # 显式声明优先（2026-11-16 助产士同构）：scenes.json 写了 grounded 的
+        # 场景，声明就是唯一权威；其余场景维持 kind 分型，行为不变。
+        import scenes as _scenes
+        _val = (_scenes.get_scene(str(scene_id or "")) or {}).get("grounded")
+        if isinstance(_val, bool):
+            return _val
         from scene_profile import profile
         kind = str((profile(str(scene_id or "")) or {}).get("kind") or "")
         return kind in ("vlml", "scene", "local")

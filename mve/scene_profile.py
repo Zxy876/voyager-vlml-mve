@@ -90,6 +90,17 @@ def profile(scene_id: str = "") -> dict[str, Any]:
         out["tables"] = _tables(p)
         return out
 
+    # 课程场景（书单）：学习内容是教材的单元，不是 SQL 数据。
+    # 2026-11-14 实测事故：P 场景目录里被 ensure_source 自动建了个空
+    # scene.duckdb，于是走到下面的 glob 分支判成 kind=scene，出题器拿着
+    # 「SQL 库/表名/真实取值」那套约束，连出「数据库有多少张表」。
+    # 课程场景必须在这里截断，既不分配库，也不读目录里任何 .duckdb。
+    if bool(sc.get("course")):
+        out.update(kind=LOCAL, db_path="", scene_dir=str(scene_dir(sid)),
+                   why="课程场景（书单）：不查库、不读数据文件，题从当前单元出")
+        out["tables"] = []
+        return out
+
     ds = str(sc.get("data_source") or "").strip()
     if not ds:
         # 本机就是数据源：场景目录里有 .duckdb 就用它；否则给本机文件原语。
@@ -162,6 +173,11 @@ def ensure_source(scene_id: str) -> str:
     sid = str(scene_id or "").strip()
     d = Path(scene_dir(sid))
     sc = _scene(sid)
+    # 课程场景本来就不该有数据源：不建库、不复用目录里的库，返回空串。
+    # 否则每次面板启动都会把这个空 scene.duckdb 造回来，profile 又判成
+    # kind=scene（2026-11-14：删了三次，每次重启都重生）。
+    if bool(sc.get("course")):
+        return ""
     ds = str(sc.get("data_source") or "").strip()
     if ds:
         try:
@@ -195,8 +211,16 @@ def ensure_source(scene_id: str) -> str:
 
 
 def source_tables(scene_id: str) -> list[str]:
-    """这个场景数据源里现在有哪些表（空 = 还没有数据）。"""
-    return _tables(ensure_source(scene_id))
+    """这个场景数据源里现在有哪些表（空 = 还没有数据）。
+
+    课程场景没有数据源（ensure_source 返回空串）——此时必须直接返回空表，
+    不能把空串丢给 db_switch：那会解析成**当前 VLML 库**，让 P 凭空看到
+    rib 的 players/web_facts，等于拿别的场景的数据冒充自己的。
+    """
+    p = ensure_source(scene_id)
+    if not str(p or "").strip():
+        return []
+    return _tables(p)
 
 
 def scene_dir(scene_id: str) -> str:
@@ -215,6 +239,67 @@ def _tables(db_path: str) -> list[str]:
         return list(db_switch.list_tables(db_path))
     except Exception:
         return []
+
+
+_GROUND_CACHE: dict[str, bool] = {}
+
+
+def grounded(scene_id: str = "") -> bool:
+    """这个场景有没有**可查的外部材料**（库 / 数据文件 / 联网源）。
+
+    判的是环境事实，不是学科：问的是「这道题的真值能不能靠查拿到」，而不是
+    「这是不是数学题」。没有外部材料时，真值只能靠推导 —— 任何「去数据源
+    取数」的要求都不成立，Phase2 交的代码也就没有 query_sql 可调。
+
+    判据顺序（先看显式声明，再猜目录，不靠学科标签）：
+      ① scenes.json 的 `grounded`（true/false）—— 场景自己说了算；
+      ② 有没有配 data_source；
+      ③ 场景目录里有没有数据文件（.duckdb/.db/.sqlite/.csv/.xlsx/.json/.parquet）；
+      ④ 旧标记 `course: true` 仍然等于「无外部材料」（向后兼容，语义已泛化）。
+    """
+    sid = str(scene_id or "").strip()
+    if not sid:
+        return True
+    if sid in _GROUND_CACHE:
+        return _GROUND_CACHE[sid]
+    # VLML 场景（A）：材料面就是 VLML 库，一直是"有材料"，不看目录
+    try:
+        if is_vlml(sid):
+            _GROUND_CACHE[sid] = True
+            return True
+    except Exception:
+        pass
+    sc = _scene(sid)
+    val = sc.get("grounded")
+    if isinstance(val, bool):
+        _GROUND_CACHE[sid] = val
+        return val
+    if str(sc.get("data_source") or "").strip():
+        _GROUND_CACHE[sid] = True
+        return True
+    ok = False
+    d = Path(scene_dir(sid))
+    try:
+        if d.is_dir():
+            ok = any(f.is_file() and f.suffix.lower() in (
+                ".duckdb", ".db", ".sqlite", ".sqlite3", ".csv", ".tsv",
+                ".xlsx", ".parquet", ".json") for f in d.iterdir())
+    except Exception:
+        ok = False
+    if not ok and bool(sc.get("course")):
+        ok = False
+    _GROUND_CACHE[sid] = ok
+    return ok
+
+
+def is_course(scene_id: str = "") -> bool:
+    """「本题不依赖外部材料」—— 保留旧名，语义已泛化（旧注释叫"课程场景"）。
+
+    = `not grounded()`。为什么留这个名字：11 处调用点问的都是同一件事
+    「这个场景要不要去数据源取数」。判据已改成环境事实（见 `grounded`），
+    不再是"这个场景是不是数学/是不是书单"。
+    """
+    return not grounded(scene_id)
 
 
 def is_vlml(scene_id: str = "") -> bool:

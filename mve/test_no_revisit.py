@@ -55,7 +55,6 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 
 CONSUME = (_ROOT / "voyager_vlml" / "consume.py").read_text(encoding="utf-8")
-CHAT = (_HERE / "chat_page.py").read_text(encoding="utf-8")
 DASH = (_HERE / "dashboard.py").read_text(encoding="utf-8")
 LEARN = (_HERE / "learn_orchestrate.py").read_text(encoding="utf-8")
 
@@ -69,24 +68,13 @@ print("\n== 1. 模块与路由已删 ==")
 check("mve/revisit.py 已删除", not (_HERE / "revisit.py").exists())
 check("mve/test_revisit.py 已删除", not (_HERE / "test_revisit.py").exists())
 check("面板没有 /api/revisit 路由", '"/api/revisit"' not in DASH)
-check("对话页不再拉 /api/revisit", "fetch(P + '/api/revisit')" not in CHAT)
-check("对话页没有 pullRevisit 函数", "function pullRevisit(" not in CHAT)
-check("对话页没有「⏳ 还有 N 个」提示条", "var t = '⏳ " not in CHAT)
-check("对话页不再读 pending 数", "d.pending" not in CHAT)
-check("对话页没有「🔁 自动回访」气泡",
-      "'🔁 学习完成后自动回访：" not in CHAT)
-
-# ---- 产物级检查（比查源码更准：用户看的就是这份 HTML）----
-try:
-    import chat_page
-    _HTML = chat_page.CHAT_HTML
-    check("★ 页面产物里没有「排队」提示语", "排队问题" not in _HTML)
-    check("★ 页面产物里没有「不用你盯着」", "不用你盯着" not in _HTML)
-    check("★ 页面产物里没有「自动回访」气泡", "自动回访" not in _HTML)
-    check("★ 页面产物里没有回访拉取", "/api/revisit" not in _HTML)
-    check("★ 页面产物里没有 pullRevisit", "pullRevisit" not in _HTML)
-except Exception as e:
-    check("对话页产物可读", False, f"{type(e).__name__}: {e}")
+# 2026-11-18 用户指令：旧「对话页」（人导入消费线的 R1 形态页）整体删除，
+# chat_page.py 文件与 /chat、/v1/chat/completions 路由一并删（见 patch_del_chat）。
+check("mve/chat_page.py 已删除", not (_HERE / "chat_page.py").exists())
+check("面板没有 /chat 路由", '"/chat"' not in DASH)
+check("面板没有 /v1/chat/completions 路由",
+      '"/v1/chat/completions"' not in DASH)
+check("面板没有 _chat_html", "_chat_html" not in DASH)
 
 # ---------------------------------------------------------------------------
 print("\n== 2. 源码里没有残留调用 ==")

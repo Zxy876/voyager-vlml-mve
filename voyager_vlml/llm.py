@@ -56,8 +56,8 @@ def chat(
     messages: list[dict[str, str]],
     *,
     temperature: float = 0.4,
-    max_tokens: int = 1200,
-    timeout: float = 90.0,
+    max_tokens: int = 6000,
+    timeout: float = 300.0,
     retries: int = 3,
     model: str = "",
 ) -> str:
@@ -66,6 +66,11 @@ def chat(
     `model`：单次调用覆盖模型（默认走 MVE_QUIZ_MODEL / ZHIPU_MODEL）。
     用途：**critic 换强模型**（2026-10-24 实测 glm-4-flash 当 judge 三连放行
     错误答案 —— 判官这把尺子不能省模型钱；出题/执行层可继续用 flash）。
+
+    max_tokens 1200→6000、timeout 90→300（2026-11-12）：学生换 glm-4.6 后
+    思考默认开 —— 思考段与正文共用额度，1200 全被 reasoning 吃光、content
+    为空（llm_client.chat 头注释同款坑）；且带思考的生成普遍 >90s，默认
+    90s 直接 ReadTimeout×3 重试全超 → 整轮 failed（17:21 实测）。
     """
     import httpx
 
@@ -88,6 +93,16 @@ def chat(
                     "messages": messages,
                     "temperature": temperature,
                     "max_tokens": max_tokens,
+                    # 2026-11-18：思考开关由环境变量统一控制（默认关）。
+                    # 实测（同一题同一份 messages）：
+                    #   glm-4.6 th=enabled  → 单次 2~5 分钟，拆骨架那条直接
+                    #                         ReadTimeout（服务端一个字都不返回）
+                    #   glm-4.6 th=disabled → 单次约 20s，结果照样是合法 JSON
+                    # 全局同一个模型时，思考就是唯一的速度旋钮：不设这个，
+                    # 一圈几十次调用必然拖到半小时以上。
+                    **({"thinking": {"type": os.getenv("MVE_THINKING", "disabled")}}
+                       if os.getenv("MVE_THINKING", "disabled") in
+                       ("enabled", "disabled") else {}),
                 },
                 timeout=timeout,
             )

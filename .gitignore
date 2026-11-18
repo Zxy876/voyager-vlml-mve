@@ -76,3 +76,9 @@ mve/.env
 *.env.bak.*
 mve/plugins/
 mve/skill_emb.json
+
+# 一次性补丁脚本与备份（2026-11-18 起：改动走 patch_*.py 落地，不属源码）
+patch_*.py
+mve/patch_*.py
+*.bak_*
+._*

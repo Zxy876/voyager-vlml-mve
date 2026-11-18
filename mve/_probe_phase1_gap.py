@@ -19,10 +19,14 @@
 而 env_obs 里只列了真实存在的站点 ⇒ 判官面对「查 XHS 的 http 状态码」时，
 这个量在环境实查清单里指认不了。
 
+★ 独立脚本必须自己加载 .env（面板进程会加载，独立脚本不会）—— 否则
+  MVE_CRITIC_MODEL 为空，会走默认模型而不是判官模型。
+
 用法：python mve/_probe_phase1_gap.py <maieutic_gate.py 路径> <标签>
 """
 import importlib.util
 import json
+import os
 import sys
 
 MOD_PATH = sys.argv[1]
@@ -31,6 +35,16 @@ LABEL = sys.argv[2] if len(sys.argv) > 2 else MOD_PATH
 REPO = "/root/mve"
 sys.path.insert(0, REPO + "/mve")
 sys.path.insert(0, REPO)
+
+# ── 先加载 .env（判官模型要从这里读）──────────────────────────────
+with open(REPO + "/mve/.env", encoding="utf-8") as f:
+    for line in f:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        os.environ.setdefault(k.strip(), v.strip().strip("\"'"))
+print("判官模型 MVE_CRITIC_MODEL =", os.environ.get("MVE_CRITIC_MODEL", ""))
 
 spec = importlib.util.spec_from_file_location("gate_probe", MOD_PATH)
 mg = importlib.util.module_from_spec(spec)

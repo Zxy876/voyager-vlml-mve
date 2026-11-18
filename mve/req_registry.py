@@ -365,6 +365,27 @@ def _req_id_from_import(scene_id: str, import_id: str) -> str:
     return ""
 
 
+def _num_sig(s: str) -> frozenset[str]:
+    """问句里的数字指纹（「计算 3 的 6 次方」→ {3,6}）。
+
+    归题的第二道闸。数学题/数据题的核心判据是**数字**：换个问法数字不变，
+    数字一变就是另一道题。而 `routing.match` 只认词面 —— 「计算 2/3 × 9/8」
+    和「计算 3 的 6 次方是多少？」词面高度重合（都是「计算…是多少」），
+    实测被归成同一题，两道题的追问历史、addressed 串进同一份 ckpt
+    （2026-11-15 P 场景：分数题一上来就「累计答到 3/3（本轮新增 0）」，
+    还把幂运算的作答当「你上一轮提交的整篇」带进了 context）。
+    """
+    return frozenset(re.findall(r"\d+(?:\.\d+)?", str(s or "")))
+
+
+def _same_numbers(a: str, b: str) -> bool:
+    """两边都有数字时才比较；一边没数字（概念题/文字题）就不设这道闸。"""
+    na, nb = _num_sig(a), _num_sig(b)
+    if not na or not nb:
+        return True
+    return na == nb
+
+
 def req_id_of(scene_id: str, question: str, *,
               allow_alloc: bool = False) -> str:
     """这个问句属于哪个需求（req id）？找不到返回 ""。
@@ -424,19 +445,22 @@ def req_id_of(scene_id: str, question: str, *,
             m2 = _rt.match(q, sid, exclude_ids=(nid,))
             nid = str(m2.get("node_id") or "")
             lbl = str(m2.get("node_label") or "").strip()
-        if nid.startswith("req:"):
+        # 数字指纹闸：词面像但数字不同 = 另一道题（见 _num_sig 注释）。
+        # lbl 缺失（match 只给 node_id）时放行，保持旧行为。
+        _ok_num = _same_numbers(q, lbl) if lbl else True
+        if _ok_num and nid.startswith("req:"):
             # 命中的就是需求节点 → 直接拿 req id
             _rid = nid.split(":", 1)[1]
             if _rid:
                 note_question(sid, q, _rid)
                 return _rid
-        if nid.startswith("import:"):
+        if _ok_num and nid.startswith("import:"):
             # 命中的是人导入节点 → 用它的 import_id 去导入记录里取 req（不靠 label）
             _rid_i = _req_id_from_import(sid, nid.split(":", 1)[1])
             if _rid_i:
                 note_question(sid, q, _rid_i)
                 return _rid_i
-        if lbl:
+        if _ok_num and lbl:
             # 命中的是人导入原句 → 用原句反查 req id
             _rid = find_by_question(sid, lbl)
             if _rid:
@@ -482,10 +506,14 @@ def ensure_req_node(scene_id: str, question: str,
         if nid in (getattr(g, "nodes", {}) or {}):
             return nid
         g.ensure_scene_root(sid)
+        # status 语义沿用图谱既有词表：verified=已做、unverified=将做。
+        # Node 的默认值恰好是 verified —— 不显式给的话，题一导入就"已做"，
+        # 进步无从看见（同构猫娘伴学：题在图谱里先挂"将做"，做完才翻）。
         g.add_node(Node(id=nid, kind="req", label=q[:60] or nid,
                         detail={"req_id": rid, "question": q,
                                 "source": "human_import"},
-                        root_scene=str(sid)))
+                        root_scene=str(sid), status="unverified",
+                        evidence=0))
         g.save()
     except Exception:
         return nid

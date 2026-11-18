@@ -229,6 +229,50 @@ def _graph_json() -> str:
                    "tables": kinds.get("table", 0),
                    "edges": len(out["edges"])})
         out["summary"] = sm
+        # ── 课程图谱（2026-11-14）──────────────────────────────────
+        # 课程场景（P 书单 / N 教材）的节点是 book + topic + exercise，起步就是
+        # 648 个单元。前端只认 table / tool / dimension 三类，所以接口明明返回了
+        # 720 个节点，图谱页还是显示「这个场景还没有可画的节点」。
+        # 这里给一份**围绕当前关**的小图：当前这本书 → 它的单元 → 已学的题。
+        # 全量不画：648 个单元铺开是一张目录墙，看不出自己学到哪。
+        try:
+            import graph_curriculum as _gcur
+            _slots = list(_gcur.progress(sid) or [])
+            if _slots:
+                _cur = next((s for s in _slots
+                             if not s.get("done") and not s.get("skipped")), None) \
+                    or next((s for s in _slots if not s.get("done")), None)
+                _bk = str((_cur or _slots[0]).get("book") or "")
+                _units = [s for s in _slots if str(s.get("book") or "") == _bk]
+                _ex: dict[str, list] = {}
+                for _nid, _nd in g.nodes.items():
+                    if str(getattr(_nd, "kind", "")) != "exercise":
+                        continue
+                    _pp = str(_nid).split(":")
+                    if len(_pp) >= 5 and _pp[1] == "gen":
+                        _ex.setdefault("unit:%s:%s" % (_pp[2], _pp[3]), []).append({
+                            "id": _nid,
+                            "status": str(getattr(_nd, "status", "") or ""),
+                            "label": str(getattr(_nd, "label", "") or "")})
+                out["course"] = {
+                    "book": _bk,
+                    "units": [{
+                        "id": s.get("module_id") or "",
+                        "label": s.get("title") or "",
+                        "done": bool(s.get("done")),
+                        "skipped": bool(s.get("skipped")),
+                        "current": bool(_cur and s.get("module_id") == _cur.get("module_id")),
+                        "learned": int(s.get("learned") or 0),
+                        "need": int(s.get("need") or 1),
+                        "exercises": _ex.get(str(s.get("module_id")), []),
+                    } for s in _units],
+                    "unit_total": len(_slots),
+                    "unit_done": sum(1 for s in _slots if s.get("done")),
+                    "unit_skipped": sum(1 for s in _slots if s.get("skipped")),
+                    "current": str((_cur or {}).get("module_id") or ""),
+                }
+        except Exception as e:
+            out["course_error"] = f"{type(e).__name__}: {e}"[:200]
     except Exception as e:
         out["scene_filter_error"] = f"{type(e).__name__}: {e}"[:160]
     # 待审候选：运行期题带进来的新维度名，**不建节点**（照伴学：运行期新建的
@@ -250,6 +294,32 @@ def _graph_json() -> str:
     except Exception:
         out["subjects"] = []
         out["subject_unassigned"] = []
+    # ── 导入的题（req 节点）：将做 / 已做 ──────────────────────────
+    # 已做的排前面（同构猫娘伴学：图上先看见自己做完的，进步可见）。
+    # 状态语义沿用图谱词表：verified=已做，unverified=将做。只由
+    # Phase2 过关翻面（learn_orchestrate.attach_phase_nodes），重做
+    # 没过关不回翻。detail.question 存全题面，前端点选直接送去拆骨架。
+    try:
+        _reqs = [n for n in g.nodes.values()
+                 if str(getattr(n, "kind", "")) == "req"
+                 and str(getattr(n, "root_scene", "A") or "A") == sid
+                 and str(getattr(n, "status", "")) != "deleted"]
+        _req_rows = [{
+            "id": str(getattr(n, "id", "")),
+            "label": str(getattr(n, "label", "")),
+            "question": str((getattr(n, "detail", {}) or {}).get("question")
+                            or getattr(n, "label", "")),
+            "req_id": str((getattr(n, "detail", {}) or {}).get("req_id") or ""),
+            "status": str(getattr(n, "status", "") or ""),
+            "solved_at": str((getattr(n, "detail", {}) or {}).get("solved_at") or ""),
+        } for n in _reqs]
+        _req_rows.sort(key=lambda r: (0 if r["status"] == "verified" else 1,
+                                      r["label"]))
+        out["req_nodes"] = _req_rows
+        out["req_done"] = sum(1 for r in _req_rows if r["status"] == "verified")
+    except Exception:
+        out["req_nodes"] = []
+        out["req_done"] = 0
     return json.dumps(out, ensure_ascii=False)
 
 def _scope_json() -> str:
@@ -540,6 +610,36 @@ li{margin:3px 0}
   color:#5c6f66;cursor:pointer;user-select:none}
 .runctl-ck input{accent-color:var(--brand);cursor:pointer;vertical-align:-1px}
 .runctl-ck.off{opacity:.55;cursor:not-allowed}
+/* ---------- 练习列表（同构助产士 Instructor · Exercises） ----------
+   2026-11-14 用户：「概览应该是可以点击的 exercise」。以前概览是一张卡 + 下拉
+   切题 —— 那是详情；列表页该是一排卡，每张卡一道题、几个数一目了然。 */
+.exgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(272px,1fr));gap:12px;margin-top:10px}
+.excard{position:relative;display:flex;flex-direction:column;gap:6px;text-align:left;
+  border:1px solid var(--line);border-radius:var(--radius-sm);padding:13px 14px 12px;
+  background:#fcfcfd;cursor:pointer;font:inherit;color:var(--ink);transition:transform .12s,border-color .12s,box-shadow .12s}
+.excard:hover{transform:translateY(-2px);border-color:rgba(47,125,87,.34);
+  box-shadow:0 6px 18px rgba(31,41,36,.07)}
+.excard__unit{font-size:10.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.excard__title{font-size:13.5px;font-weight:700;line-height:1.4;min-height:38px;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.excard__row{display:flex;justify-content:space-between;gap:8px;font-size:11.5px;
+  color:var(--muted);border-top:1px dashed rgba(31,41,36,.10);padding-top:6px}
+.excard__row b{color:var(--ink);font-weight:600}
+.excard__bar{height:4px;border-radius:999px;background:rgba(31,41,36,.08);overflow:hidden}
+.excard__bar i{display:block;height:100%;background:var(--brand);border-radius:999px}
+.excard__miss{display:flex;flex-wrap:wrap;gap:4px;margin-top:2px}
+.excard__miss span{font-size:10.5px;padding:1px 6px;border-radius:999px;
+  background:rgba(47,125,87,.09);color:#2f5d49}
+.exladder{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-top:8px}
+.exstep{border:1px solid var(--line);border-radius:var(--radius-sm);padding:10px 12px;background:#fcfcfd}
+.exstep h4{margin:0 0 3px;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:600}
+.exstep .v{font-size:13px;font-weight:700;line-height:1.35}
+.exstep .m{font-size:11.5px;color:var(--muted);margin-top:4px;line-height:1.5}
+.exstep.ok{border-color:rgba(47,125,87,.34);background:rgba(47,125,87,.05)}
+.exstep.warn{border-color:rgba(196,132,42,.34);background:rgba(196,132,42,.06)}
+.exstep.dim{opacity:.75}
+pre.excode{margin:6px 0 0;padding:9px 11px;background:#12211a;color:#d7e6dc;border-radius:8px;
+  font:11.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;max-height:72vh;overflow:auto;white-space:pre-wrap}
 </style>
 </head>
 <body>
@@ -552,38 +652,27 @@ li{margin:3px 0}
         <p class="hero__status" id="statusLine">加载中…</p>
         <div class="runctl">
           <span class="lbl">驾驶舱</span>
-          <button class="btn btn-primary" id="runStart">▶ 启动 Voyager</button>
+          <button class="btn btn-primary" id="runStart"
+            title="自由学：它拿背包里的上下文记忆自己找下一件事，做完一格再找下一件，一直跑；点「■ 停止」才退。第一轮仍由人在「开始学」里促成。">▶ 启动 Voyager</button>
           <button class="btn btn-danger" id="runStop" disabled>■ 停止</button>
           <button class="btn btn-secondary" id="btnExport" title="把当前学习过程导出成一份 md">⬇ 导出 md</button>
           <!-- 对话页（2026-10-28）：OpenAI 兼容端点的零安装界面，判定口径与
                /api/coach 同一条 consume()，不新造第二把尺子。 -->
-          <a class="btn btn-secondary" href="#" id="gotoChat"
-             title="像问 DeepSeek 一样问它：技能库重放 + 环境实查，判定/复用技能都会标出来"
-             onclick="location.href=(window.MVE_PREFIX||'')+'/chat';return false;">💬 对话页</a>
           <button class="btn btn-secondary" id="mcLearn" title="先跑 MC 思路学习（提炼域无关规划思维）并入库，再自动启动标准练习循环（正常 MVE 全流程）">🧠 启动 MC 思路学习 → MVE</button>
           <label class="runctl-ck" id="ckWrap"
                  title="同构原版 Voyager（voyager.py:326 主循环是 while True）：学习循环不带停，只有点停止 / 跑满上限才退。勾上 = 不停；去掉勾 = 只跑一轮看看。">
             <input type="checkbox" id="ckContinuous" checked>
-            <span>不停（跑完图谱 / 点停止才退）</span>
+            <span>不停（一直找下一件事 / 点停止才退）</span>
           </label>
           <span class="runstate"><i class="dot off" id="runDot"></i><span id="runState">未运行</span></span>
         </div>
-        <!-- 练习范围：伴学 onboarding.md:82 —— 人在知识图谱上点知识点定范围，
-             出题器只在范围里出题。有了范围就不需要"选难度 / 选题"这类键钮，
-             驾驶舱只剩开始 / 停止。 -->
-        <div class="scopebar" id="scopeBar">
-          <span class="lbl">练习范围</span>
-          <span id="scopeChip"><span class="chip grey">未设置 · 出题器自选</span></span>
-          <span class="hint" id="scopeHint">去「知识图谱」页点某个维度的「练习此知识点」</span>
-        </div>
-        <!-- 场景栏（1→n）：插入场景不重启/不清库，只注册一个命名空间。
-             导入与学习曲线都按当前场景隔离；切回 A 时 A 的读数不变。 -->
-        <div class="scenebar" id="sceneBar">
-          <span class="lbl">场景</span>
-          <select id="sceneSel" onchange="switchScene(this.value)"></select>
-          <button class="btn btn-secondary" id="btnNewScene" title="插入一个新场景：注册命名空间 + 注册可执行动作，不重启不清库">＋ 新建场景</button>
-          <button class="btn btn-danger" id="btnResetScene" onclick="resetScene()" title="清掉当前场景的全部学习账：课程两本账、追问骨架、当前锚点（ckpt 目录）、图谱节点/边、掌握库、运行/导入/消费日志、本场景学到的配方。自动备份到 mve/_backup_*；数据源与场景注册不动，其它场景不受影响">🗑 清本场景</button>
-          <span class="hint" id="sceneHint">加载中…</span>
+        <!-- 背包（2026-11-18）：面板只服务一个工作区，不再有「场景」可选。
+             口径照原版 curriculum.py:205 `Inventory (used/36): {inventory}` ——
+             格 = 一次会话，内容物是跑出来的，不是预设清单。 -->
+        <div class="scenebar" id="bagBar">
+          <span class="lbl">背包</span>
+          <span class="chip grey" id="bagChip">Inventory (0/36)</span>
+          <span class="hint" id="bagHint">材料：加载中…</span>
         </div>
         <!-- 猫爪总开关（同构 neko）：一组能力一个开关，关掉该组「对模型不可见、
              也调不动」，拨回来即恢复（不删条目）。开关下面就是该组的条目，
@@ -608,17 +697,19 @@ const ESC = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;
 
 const TABS = [
   {id:'overview', icon:'📈', label:'概览',
-   // 学习曲线接消费能力侧之后，这一格直接报"累计会做几道"（原版口径），
-   // 没有消费记录时报本页有什么，不报"掌握度 xx%"（练习线不判分，那个数恒空）。
-   status:s=>{const cc=s.consume_curve||[];
-     return cc.length?('会做 '+(cc[cc.length-1].mastered_total||0)+' 道'):'判据区 / 学习曲线';}},
+   // 2026-11-14：概览 = 可点击的练习列表（同构助产士 Instructor · Exercises），
+   // 进步口径是每道题的缺口序列，不再折一个总分。
+   status:s=>{const ex=s.exercises||[];
+     if(!ex.length) return '还没有练习';
+     const done=ex.reduce((a,x)=>a+Number(x.completed||0),0);
+     return (`${ex.length} 道 · ${done} 段完成`);}},
   {id:'practice', icon:'🎯', label:'练习',   status:s=>s.topic_id||'—'},
-  {id:'import',   icon:'✍️', label:'人导入', status:s=>(s.imports||[]).length+' 条导入'},
+  {id:'import',   icon:'✍️', label:'开始学', status:s=>((s.exercises||[]).length+' 道已发布')},
   // 2026-10-23 用户否掉「外部任务」这一层：「没必要做外部 task，导入统一走人导入，
   // 相关度低就建新场景、绑新数据源」。它本来只是一条动作链（导入 → 学 → 重试），
   // 而导入/学习/重试在「人导入」和驾驶舱里都已经有入口 —— 再开一个页签就是重复。
   // 现在数据源边界只由**场景**决定（scene_profile 唯一定义），任务不再自成一套账。
-  {id:'trace',    icon:'🧭', label:'轨迹',   status:s=>s.total_rounds+' 轮'},
+  {id:'trace',    icon:'🧭', label:'轨迹',   status:s=>(s.trace_total||0)+' 轮'},
   {id:'skill',    icon:'🧠', label:'技能 · 因果', status:s=>(s.skill_stats&&s.skill_stats.skills||0)+' 条技能'},
   {id:'graph',    icon:'🕸', label:'知识图谱',
    status:s=>s.practice_scope&&s.practice_scope.active?('范围：'+s.practice_scope.label):'维度 → 工具'},
@@ -628,6 +719,10 @@ const TABS = [
    status:s=>(s.teaching&&s.teaching.target)?('目标难度'+s.teaching.target):'知识点图谱'},
   {id:'console',  icon:'🖥', label:'运行日志',
    status:s=>{const p=s.pilot||{}; return p.running?'运行中':(p.winding_down?'收尾中':'空闲');}},
+  // 2026-11-18 用户：「人在面板上也需要一个 chat，时不时问现在 mve 的学习进度」。
+  // 从 maieutic 抽：原版学生在 IDE chat 问自己的代码，教师位看进度 —— 这是教师位。
+  // 零写账（不碰 phase2 账本，r_site 游程不被污染）、不判定（掌握度归消费侧）。
+  {id:'pchat',    icon:'💬', label:'进度问答', status:s=>'只读 · 不记判定'},
 ];
 let TAB = localStorage.getItem('mve_tab') || 'overview';
 
@@ -688,12 +783,27 @@ function renderHero(s){
   const pills=[];
   if(s.has_data){
     const tr=(s.exam_curve||{}).transfer;
-    const lastOk = s.last_success ? '<span class="chip ok">success</span>'
-                                  : '<span class="chip bad">未达成</span>';
-    // 判据区 KPI：当前题 self-verification 结果（不是覆盖率、不是掌握度）
+    // 2026-11-18 换账本：判据区读 learn_trace（MVE 现账），不再读 run_log
+    // （原版练习线的 success / 行数 —— 里程碑点亮了它还记 failed）。
+    const tk=s.trace_kpi||{}, last=tk.last||null;
+    const lastOk = !last
+      ? '<span class="chip grey" title="learn_trace 还没有行 —— 起点学习循环后落账">还没有轮次</span>'
+      : (last.lit
+         ? '<span class="chip ok" title="里程碑点亮（真取到数 + 维度闭合）">达成 · 已点亮</span>'
+         : (last.ms_achieved
+            ? '<span class="chip warn" title="维度全闭合，证据门/点亮没过">维度已闭合</span>'
+            : `<span class="chip bad" title="${ESC((last.why||last.status||'').slice(0,160))}">未达成</span>`));
     pills.push(['当前题判据', lastOk]);
-    pills.push(['迁移成功率', tr ? (tr.ok_count+' / '+tr.count) : '—']);
-    pills.push(['累计轮次', s.total_rounds]);
+    // 有迁移考数据就显示原指标；没有（本场景没考过）时该位显示现账的真取到率。
+    if(tr){
+      pills.push(['迁移成功率', tr.ok_count+' / '+tr.count]);
+    }else{
+      const ent=+tk.entered||0, fet=+tk.fetched||0;
+      pills.push(['真取到率', ent
+        ? `<span title="learn_trace：真取到 ${fet} 轮 / 进执行 ${ent} 轮">${Math.round(100*fet/ent)}% <span style="opacity:.6;font-size:11px">(${fet}/${ent})</span></span>`
+        : '<span class="chip dim" title="还没有进入执行的轮次">—</span>']);
+    }
+    pills.push(['累计轮次', `<span title="learn_trace 行数（MVE 现账，一次 learn() 一行）">${+tk.rounds||0}</span>`]);
     pills.push(['技能库', (s.skill_stats&&s.skill_stats.skills||0)+' 条 / 膨胀率 '+(s.skill_stats&&s.skill_stats.bloat||1)]);
     // ⚠️ 「掌握度变化」「状态」「拦下编造」三块已下架（2026-10-13 按后端索引清理）。
     //    判据：线上 36 条 run_log 全部来自新后端（judge=db_evidence），这三个读的
@@ -740,36 +850,11 @@ function renderHero(s){
       : '同构原版 Voyager：主循环 while True，学习不带停，只有点停止 / 跑满上限才退。';
   }
 
+  window.__scope = {active:false};   // 练习范围已退役（2026-11-18）
   document.getElementById('statusLine').textContent = s.has_data
     ? (s.reading_text||'')
     : (s.hint||'还没有任何运行记录');
 
-  renderScopeBar(s);
-}
-
-/* 练习范围条：有范围就显示「范围 → 题」，没有就提示去图谱页设。
-   范围决定出题，所以驾驶舱不需要难度 / 选题键钮，只剩开始 / 停止。 */
-function renderScopeBar(s){
-  window.__scope = s.practice_scope || {active:false};
-  const sc=window.__scope;
-  const chip=document.getElementById('scopeChip');
-  const hint=document.getElementById('scopeHint');
-  if(!chip) return;
-  if(sc.active){
-    chip.innerHTML = `<span class="chip ok">${ESC(sc.label)}</span>`
-      + `<span class="chip grey">${ESC((sc.topics||[]).join('、'))}</span>`
-      + `<span class="chip grey">r${sc.scope_revision||0}</span>`
-      + ` <button class="btn btn-secondary scope-act" data-scope-clear="1"
-           style="padding:4px 9px;font-size:12px">清除范围</button>`;
-    hint.textContent = sc.point ? ('范围口径：'+sc.point) : '';
-  }else if(sc.invalidated){
-    chip.innerHTML = `<span class="chip warn">范围已失效</span>`
-      + `<span class="chip grey">${ESC(sc.label||'')}</span>`;
-    hint.textContent = ESC(sc.reason||'维度已不在图谱里');
-  }else{
-    chip.innerHTML = `<span class="chip grey">未设置 · 出题器自选</span>`;
-    hint.textContent = '去「知识图谱」页点某个维度的「练习此知识点」';
-  }
 }
 
 function renderNav(s){
@@ -788,9 +873,7 @@ function renderNav(s){
    场景字段 → 这些区块是**全局**数据，不随场景切换过滤。不假装隔离。 */
 function globalDataNote(s, what){
   if(!((s.scene||{}).id && s.scene.id!=='A')) return '';
-  return `<div class="note warn">当前场景是 <b>Scene ${ESC(s.scene.id)}</b>，但${ESC(what)}
-    读的是<b>全局</b>数据（不带场景字段，不随场景切换过滤）。要按场景隔离，得先给
-    对应数据补场景归属（未做，先如实说明）。</div>`;
+  return '';   // 练习范围/场景隔离已退役（2026-11-18）：不再有跨场景数据的说明
 }
 
 function examCard(s){
@@ -861,69 +944,448 @@ function examCard(s){
       出题器按「最弱优先」选题，读的是摸底那一列。</div></div>`;
 }
 
-function pOverview(s){
-  // 空态分两种，不能混：run_log 为空 ≠ 没有任何数据。
-  // 摸底/考核走 exam_log.jsonl（有意不入 run_log），跑完了照样要给看 ——
-  // 否则就会出现"摸底明明跑完了，总览页却说还没有任何运行记录"。
-  if(!s.has_data){
-    const ex=s.exam_curve||{};
-    if(!ex.has_data) return `<div class="panel"><div class="empty">${ESC(s.hint||'暂无运行记录')}</div>
-    <div class="note info">面板只读 run_log.jsonl（练习）。
-      <b>进步与掌握度看下面那条「学习曲线」</b> —— 练习线有意不判分，
-      学习曲线接在<b>消费能力侧</b>（人问一句、答出来了才计入）。
-      点顶部「▶ 启动 Voyager」，或先在命令行跑一次 <span class="mono">python mve/run_mve.py --llm</span>。</div></div>
-    <div class="panel">${consumeCurve(s)}</div>
-    ${envCard(s)}`;
-    return `<div class="note info"><b>练习记录（run_log）为空</b> —— 这是正常的：
-      摸底不入 run_log。<b>学习曲线在下面（消费能力侧）</b>；
-      下一步点「跑学习单元」，练习曲线和重考曲线就会一起长出来。</div>
-    <div class="panel">${consumeCurve(s)}</div>
-    ${examCard(s)}
-    ${envCard(s)}`;
+/* ================= 练习（Exercise）：同构助产士 Instructor · Exercises ========
+   2026-11-14 用户：「概览应该是可以点击的 exercise」。
+   列表页每张卡 = 一道题（跨全部会话汇总），点开才是这道题的账。
+   数据全来自 s.exercises（panel_data._exercise_index 现算）——
+   前端不另拼口径，卡上的数就是账上的数。 */
+let EXSORT = localStorage.getItem('mve_exsort') || 'recent';
+
+function exUnit(e){
+  return ESC(e.unit || '本局');
+}
+function exDivLabel(e){
+  if(!e.div_total) return 'none flagged';
+  const c = e.div_counts || {};
+  const parts = ['drift','revision','bug'].filter(k=>c[k]).map(k=>k+' '+c[k]);
+  return parts.length ? parts.join(' · ') : (e.div_total + ' 条');
+}
+function exIterLabel(e){
+  // 原版卡面：没有完成段就写「— no completions」，不要只画一条空横线
+  if(e.iter_median===null || e.iter_median===undefined)
+    return (e.sessions ? '— no completions' : '—');
+  return e.iter_median + ' median';
+}
+function exCard(e){
+  const done = Number(e.completed||0), all = Number(e.sessions||0), pct = Number(e.pct||0);
+  const miss = (e.first_missed||[]).slice(0,3)
+    .map(x=>`<span>${ESC(x.id)}${x.n>1?' ×'+x.n:''}</span>`).join('');
+  return `<button class="excard" onclick="openExercise('${ESC(e.qid)}')">
+    <div class="excard__unit">${exUnit(e)}${e.reqs>1?` · ${e.reqs} 次发布`:''}</div>
+    <div class="excard__title">${ESC(e.title||e.question)} →</div>
+    <div class="excard__row"><span>Sessions</span><b>${done} / ${all}</b></div>
+    ${all?`<div class="excard__bar"><i style="width:${pct}%"></i></div>
+      <div class="excard__row" style="border:none;padding-top:0"><span>${pct}% complete</span><span></span></div>`
+      :`<div class="excard__row" style="border:none;padding-top:0"><span class="hint">no sessions yet</span><span></span></div>`}
+    <div class="excard__row"><span>Spec iterations</span><b>${exIterLabel(e)}${
+      (e.iter_max!==null && e.iter_max!==undefined) ? ` / max ${e.iter_max}` : ''}</b></div>
+    <div class="excard__row"><span>Divergences</span><b>${ESC(exDivLabel(e))}</b></div>
+    ${miss?`<div class="excard__miss">${miss}</div>`:''}
+  </button>`;
+}
+function exList(s){
+  const ex = (s.exercises||[]).slice();
+  const cur = (s.scene&&s.scene.id)||'A';
+  if(!ex.length){
+    return `<div class="panel">
+      <div class="panel__head"><h2>练习 · Exercises</h2>
+        <span class="hint">还没有练习</span></div>
+      <div class="empty">还没有练习。助产士的规矩：先在「人导入」发布一道题
+        （写题面 → 生成设问骨架 → 发布），会话才会在它下面累积成一张卡。</div>
+      <div class="note info">「练习」= 一个固定的题目系统（原版一道 Exercise）；
+        一次把题做一遍 = 一段会话。进步不是分数，是<b>同一道题里缺口序列怎么收敛</b>
+        （第几轮把缺口问空、重跑一遍少用几轮）。</div>
+    </div>`;
   }
-  // ⚠️ `cov`（覆盖率）与 `mas`（掌握度）两条线已下架：线上 run_log 全部来自新后端
-  //    （judge=db_evidence），coverage/score 恒写 None、mastery 根本不写 ——
-  //    画出来是两条永远为 0 的虚线，还会让人以为"覆盖率掉了"。
-  // 判据层：任务完成（Voyager 尺子：跑通 + 拿到数 + 没翻车，不数覆盖点）
-  const suc=s.series.filter(p=>p.done!==null && p.done!==undefined)
-                     .map(p=>({x:p.i,v:!!p.done}));
-  // VLML 观测：全部评分点达成（考核尺子，不驱动学习）
-  const vlm=s.series.filter(p=>p.success!==null && p.success!==undefined)
-                    .map(p=>({x:p.i,v:!!p.success}));
-  const rc=s.recommend||{};
-  const whyHtml=rc.topic_id?`<div class="note info"><b>出题依据（判据层）：</b>
-    ${ESC(rc.reason_label||rc.reason)} —— ${ESC(rc.explanation)}</div>`:'';
+  if(EXSORT==='az') ex.sort((a,b)=>String(a.title||'').localeCompare(String(b.title||''),'zh'));
+  else if(EXSORT==='unit') ex.sort((a,b)=>String(a.unit||a.root_scene||'').localeCompare(String(b.unit||b.root_scene||''),'zh'));
+  else ex.sort((a,b)=>Number(b.sessions||0)-Number(a.sessions||0));
+  const total = ex.length;
+  const started = ex.reduce((a,x)=>a+Number(x.sessions||0),0);
+  const done = ex.reduce((a,x)=>a+Number(x.completed||0),0);
+  const btns = [['recent','最多尝试'],['unit','按单元'],['az','A → Z']].map(([k,l])=>
+    `<button class="btn ${EXSORT===k?'btn-primary':'btn-secondary'}" style="padding:5px 11px;font-size:12px"
+      onclick="switchExSort('${k}')">${l}</button>`).join(' ');
   return `<div class="panel">
-    <div class="panel__head"><h2>当前状态 · 判据区</h2>
-      <span class="hint">判读看判据层 done（Voyager 尺子：任务完成），不是覆盖率，更不是掌握度</span></div>
-    <div class="kpis">
-      <div class="kpi"><div class="label">当前题判据</div>
-        <div class="value">${s.last_done?'<span class="chip ok">done · 任务完成（跑通+拿到数+没翻车）</span>':'<span class="chip bad">未完成 · 没跑通/没拿到数/翻车</span>'}</div></div>
-      <div class="kpi"><div class="label">VLML 观测</div>
-        <div class="value">${s.last_success?'<span class="chip ok">success · 全评分点达成</span>':'<span class="chip dim">未全达成</span>'}</div></div>
-      <div class="kpi"><div class="label">累计轮次</div><div class="value">${s.total_rounds}</div></div>
+    <div class="panel__head"><h2>练习 · Exercises</h2>
+      <span class="hint">每张卡一道题，跨全部会话汇总；点开看它的账</span></div>
+    <div class="imp-row" style="margin-top:0">
+      <span class="chip">${total} 道练习</span>
+      <span class="chip">${started} 段会话</span>
+      <span class="chip ${done?'ok':''}">${done} 段完成</span>
+      <span style="margin-left:auto">${btns}</span>
     </div>
-    <div class="note ${s.reading==='learned'?'info':''}"><b>判读：</b>${ESC(s.reading_text)}</div>
-    ${whyHtml}
+    <div class="exgrid">${ex.map(exCard).join('')}</div>
+    <div class="legend">Sessions = 这道题跑过几段会话（一段 = 从 Phase1 追问开始的一次完整重跑；
+      完成 = 该段 spec 冻结并交过 finalCode）。Spec iterations = 完成段用了几轮追问（中位数 / 最大）。
+      Divergences = Phase3 对账出来的分歧（drift 说法与实现不一致 / revision 换了做法但成立 / bug 没做到）。
+      <b>这张表不打分</b> —— 原版全库没有 score / grade / mastery，进步看的是缺口序列的收敛。</div>
+  </div>`;
+}
+
+function switchExSort(k){
+  EXSORT = k; localStorage.setItem('mve_exsort',k); rerender();
+}
+function openExercise(qid){
+  window.__exOpen = qid; rerender();
+  const st=document.getElementById('stage'); if(st) st.scrollIntoView({block:'start'});
+}
+function closeExercise(){
+  window.__exOpen = ''; rerender();
+}
+function rerender(){
+  const st=document.getElementById('stage');
+  if(st && window.__state) st.innerHTML = pOverview(window.__state);
+}
+
+/* 阶段阶梯：P1 spec → P2 finalCode → P3 对账 → P4 里程碑。
+   这就是「phase1 到之后的 phase 的账」—— 原版一条会话记录里
+   phase1/phase2/phase3 连在一起（`src_lib_opus_schemas.ts`），
+   MVE 之前只有 P1 和 P3 落了盘，P2 活在内存里，进程一重启就断。 */
+function exLadder(e){
+  const p2 = e.phase2 || {}, p3 = e.phase3 || {};
+  const q = e.quad || {};
+  const p1runs = (e.runs||[]).filter(r=>r.rounds);
+  const rounds = p1runs.map(r=>Number(r.rounds||0));
+  const firstPass = p1runs.map(r=>r.first_pass_round).filter(x=>x!==null && x!==undefined);
+  const p1ok = (e.runs||[]).some(r=>r.passed);
+  const p1cls = p1ok ? 'ok' : (e.sessions ? 'warn' : 'dim');
+  const p2sub = !!p2.submitted, p2ver = !!p2.verified;
+  const p2cls = !e.phase2_recorded ? 'dim' : (p2ver ? 'ok' : (p2sub ? 'warn' : 'dim'));
+  const dvn = Number(e.div_total||0);
+  const p3cls = !dvn ? (e.phase2_recorded ? 'ok' : 'dim') : 'warn';
+  const done = !!e.milestone_achieved;
+  return `<div class="exladder">
+    <div class="exstep ${p1cls}">
+      <h4>Phase 1 · spec 追问</h4>
+      <div class="v">${e.sessions?`${e.completed}/${e.sessions} 段通过`:'还没有会话'}</div>
+      <div class="m">${rounds.length?`轮数中位 ${e.iter_median===null?'—':e.iter_median} / 最大 ${e.iter_max===null?'—':e.iter_max}`:'无追问轨迹'}
+        ${firstPass.length?` · 首过轮 ${firstPass[firstPass.length-1]}`:''}</div>
+      <div class="m">已答到 ${(e.phase1&&e.phase1.addressed||[]).length} / ${(e.dims||[]).length} 个维度${
+        (e.phase1&&e.phase1.open_now||[]).length?` · 末轮仍开 ${e.phase1.open_now.length} 个`:''}</div>
+    </div>
+    <div class="exstep ${p2cls}">
+      <h4>Phase 2 · finalCode</h4>
+      <div class="v">${!e.phase2_recorded ? '未落盘' : (p2ver?'已交 · 与 spec 一致':(p2sub?'已交 · 仍有对不上的':'未交'))}</div>
+      <div class="m">${e.phase2_recorded
+        ? `${p2.code_chars||0} 字符 · 改 ${p2.rounds||0} 轮 · 分歧 ${p2.divergences||0} 条`
+        : '这段会话跑在 2026-11-14 之前 —— 那时 Phase2 只活在内存里，没落盘'}</div>
+    </div>
+    <div class="exstep ${p3cls}">
+      <h4>Phase 3 · intent-diff</h4>
+      <div class="v">${dvn?`${dvn} 条分歧`:'none flagged'}</div>
+      <div class="m">${dvn?ESC(exDivLabel(e)):(p3.skipped&&p3.skipped.length?ESC(String(p3.skipped[0]).slice(0,60)):'无分歧记录')}${
+        p3.revision_choice?` · 修订 ${ESC(p3.revision_choice)}`:''}</div>
+    </div>
+    <div class="exstep ${done?'ok':'dim'}">
+      <h4>Phase 4 · 归档</h4>
+      <div class="v">${done?'里程碑已解锁':'未解锁'}</div>
+      <div class="m">${ESC(e.milestone||'（这道题没有里程碑名）')}</div>
+    </div>
+  </div>`;
+}
+
+/* Voyager 的口头作答 —— 回答"在哪看得见 Voyager 说的话"。
+   两种形态分两处：
+     · 学习闭环交的是**程序**（phase2.finalCode，上面那块）；
+     · 旧消费线答的是**人话**，只落在 coach_log.jsonl 的 answer。
+   2026-11-14 把「交给 Voyager 回答」的按钮解绑后，第二种没有任何入口，
+   它还在盘上（20 条有 answer）但没人读 —— 这里补回来，且明确标"不做账"：
+   进步看缺口序列与 Phase3 分歧，不看它答得对不对。 */
+function exAnswers(e){
+  const ans=(e.answers||[]);
+  if(!ans.length){
+    return `<div class="empty">${e.phase2_recorded
+      ? '这道题只有程序作答（见上面 Phase 2），没有旧消费线的口头作答。'
+      : '这道题的作答没有落盘 —— 会话跑在 Phase2 落盘之前，旧消费线也没答过这句。'}</div>`;
+  }
+  return ans.map((a,i)=>{
+    const cave=(a.caveats||[]);
+    return `<div style="border:1px solid rgba(31,41,36,.12);border-radius:8px;padding:10px 12px;margin:8px 0;background:#fcfcfd">
+      <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+        <span class="chip grey">第 ${ans.length-i} 条</span>
+        ${a.ts?`<span class="chip grey">${ESC(a.ts)}</span>`:''}
+        ${a.mode?`<span class="chip grey">${ESC(a.mode)}</span>`:''}
+        ${(a.rows!==null&&a.rows!==undefined)?`<span class="chip grey">取数 ${ESC(a.rows)} 行</span>`:''}
+        ${a.import_id?`<span class="chip grey">${ESC(a.import_id)}</span>`:''}
+      </div>
+      <div style="margin-top:6px;font-size:13px;line-height:1.65;white-space:pre-wrap">${ESC(a.answer)}</div>
+      ${a.narrative?`<div class="legend" style="margin-top:6px;white-space:pre-wrap">叙述层：${ESC(a.narrative)}</div>`:''}
+      ${cave.length?`<div class="legend" style="margin-top:4px">它自己标的不确定：${cave.map(x=>ESC(x)).join('；')}</div>`:''}
+      ${a.sql?`<details style="margin-top:6px"><summary class="hint" style="cursor:pointer">它跑的 SQL / RESULT</summary>
+        <pre class="excode">${ESC(a.sql)}</pre></details>`:''}
+    </div>`;
+  }).join('');
+}
+
+function exQuadBox(en,zh,items){
+  const body=(items&&items.length)
+    ? items.map(x=>`<div style="margin:4px 0;font-size:12.5px;line-height:1.5">${ESC(x)}</div>`).join('')
+    : '<div style="margin:4px 0;font-size:12.5px;color:var(--muted)">（暂无）</div>';
+  return `<div style="border:1px solid rgba(31,41,36,.12);border-radius:8px;padding:10px 12px;background:rgba(255,255,255,.5)">
+    <div style="font-size:10.5px;letter-spacing:.07em;color:var(--muted);text-transform:uppercase">${ESC(en)}</div>
+    <div style="margin-top:1px;font-size:12px;font-weight:600">${ESC(zh)}</div>
+    <div style="margin-top:5px">${body}</div></div>`;
+}
+
+/* 进步 · 同一道题的各遍 —— 用户 2026-11-15 那条线：
+   出题 → 学习 → 做出来 → 自由学习 → 做以前出过的题 → 做得更好 → 指标更好。
+
+   「做得更好」不是分数，是同一道题里三个数一起看：
+     轮数       问几轮才把缺口问空
+     缺口峰值   一上来还差几个维度（第 1 轮的 opens）
+     首过轮     第几轮第一次全部答到
+   三个数一起降才是真变强；只有一个降、别的涨，通常是这一遍恰好撞对了路子。
+
+   ⚠️ 为什么必须配「清背包」：不做这件事的重跑，跨段会继承 phase1.addressed
+   （原版 src_lib_sessions.ts:264-266 的并集语义），第一轮就报"全答到了"，
+   Δ 恒为 0 —— 看起来"每次都很快"，其实什么都没测到。 */
+function exProgress(e){
+  const runs = (e.runs||[]);
+  const redos = (e.redos||[]);
+  if(runs.length < 2){
+    return `<div class="empty">这只有 1 遍，还没有"更好"可比。做完这一遍点上面的
+      <b>↻ 再做一遍</b>：它会清掉背包（已答到的维度 / 上次跑通的代码 / 追问历史 /
+      里程碑标记），账本留在册 —— 第 2 遍跑完，这里就是两遍的对照。
+      <div style="margin-top:6px;font-size:12px">不清背包的重跑不算数：跨段继承
+      「已经答到过哪些维度」，第一轮就报全答到，Δ 恒为 0。</div></div>`;
+  }
+  const peak = r => Math.max(0, ...((r.opens||[]).length?(r.opens||[0]):[0]));
+  const rows = runs.map((r,i)=>{
+    const rd = redos[i-1];
+    const nsk = (r.skills||[]).length;
+    return `<tr>
+      <td class="num">第 ${i+1} 遍${rd?`<div class="hint">重做 · 清了 ${(rd.cleared||[]).length} 项</div>`:''}</td>
+      <td class="num">${r.rounds}</td>
+      <td class="num">${peak(r)}</td>
+      <td class="num">${r.first_pass_round==null?'—':r.first_pass_round}</td>
+      <td class="mono">${(r.opens||[]).join('→')||'—'}</td>
+      <td>${r.skills_known
+        ? (nsk?`<span class="chip">${nsk} 条配方</span>`
+               :'<span class="chip grey">0 条配方</span>')
+        : '<span class="chip grey">起点未记</span>'}${r.draft_from?'<span class="chip warn">沿用上一版</span>':''}</td>
+      <td>${r.completed?'<span class="chip ok">做出来了</span>'
+        :(r.passed?'<span class="chip warn">spec 冻结</span>'
+        :'<span class="chip bad">没做完</span>')}</td>
+    </tr>`;
+  }).join('');
+  const a = runs[runs.length-2], b = runs[runs.length-1];
+  const dr = Number(b.rounds||0)-Number(a.rounds||0);
+  const dp = peak(b)-peak(a);
+  const df = (a.first_pass_round==null||b.first_pass_round==null)
+    ? null : Number(b.first_pass_round)-Number(a.first_pass_round);
+  const chip = (v,label)=>{
+    if(v===null||v===undefined) return `<span class="chip grey">${label} 无对比</span>`;
+    if(v===0) return `<span class="chip grey">${label} 持平</span>`;
+    return `<span class="chip ${v<0?'ok':'bad'}">${label} ${v>0?'+':''}${v}</span>`;
+  };
+  return `<table><thead><tr><th>遍</th><th>轮数</th><th>缺口峰值</th><th>首过轮</th>
+      <th>逐轮剩余缺口</th><th>起点</th><th>结果</th></tr></thead><tbody>${rows}</tbody></table>
+    <div class="imp-row" style="margin-top:8px">
+      <span class="chip grey">第 ${runs.length-1} 遍 → 第 ${runs.length} 遍</span>
+      ${chip(dr,'轮数')}${chip(dp,'缺口峰值')}${chip(df,'首过轮')}
+    </div>
+    <div class="legend">三个数都是<b>越小越好</b>。缺口峰值 = 一上来还差几个维度，
+      首过轮 = 第几轮第一次全部答到。三个一起降才是真变强 ——
+      只有一个降、别的涨，多半是这一遍恰好撞对了路子。
+      <div style="margin-top:5px"><b>起点</b>：第 1 遍库里没有本题配方、也没有上一版，
+      它就是<b>基线</b>；后面各遍带几条配方，就是这一遍能借到多少旧经验。重做不再沿用
+      上一版的代码（那是在自己的成品上改两行，量到的是抄写），所以"配方数"是各遍之间
+      唯一该保留的差别。</div></div>`;
+}
+
+/* 「再做一遍」：账本留在册，背包清成没学过。
+   后端 /api/learn/start 带 redo:true → 先 reset_practice_state 再开跑
+   （见 dashboard.py 该分支的注释：必须放在 start_learning **之前**）。 */
+async function redoExercise(){
+  const key = window.__exOpen || '';
+  const ex = (window.__state && window.__state.exercises) || [];
+  const e = ex.find(x=>x.qid===key) || ex.find(x=>(x.req_ids||[]).includes(key));
+  if(!e) return;
+  if(!e.sessions){
+    alert('这道题还没有会话 —— 先用「发布并开始学习」跑第一遍，再来重做。');
+    return;
+  }
+  const n = (e.runs||[]).length + 1;
+  // req_id 与 qid 不是一个东西：qid = `{req_id}_{dbhash8}`。拿 qid 当 req_id
+  // 传给后端会拼出另一个不存在的缓存文件名 —— reset 返回 missing、账却看着正常，
+  // 于是"清了背包"是假的（panel_data._exercise_index 另给了干净的 req_id）。
+  const rid = e.req_id || String(e.qid||'').replace(/_[0-9a-f]{8}$/,'');
+  if(!confirm('再做一遍（第 '+n+' 遍）？\n\n'+
+      '账本保留：前 '+(n-1)+' 遍的轮数、缺口、分歧、代码都在。\n'+
+      '背包清零：已答到的维度、上次跑通的代码、追问历史、里程碑标记。\n'+
+      '底稿清零：这一遍不从上一版的程序改起，从头写。\n'+
+      '技能保留：库里已有的配方照旧可检索 —— 第 1 遍是 0 条配方，逐遍往上加。\n\n'+
+      '这样它才会真再解一遍，而不是靠上一遍的记忆直接过。')) return;
+  const r = await fetch('/api/learn/start',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({question:e.question, req_id:rid, redo:true, round:n,
+      title:e.title, unit:e.unit, language:e.language})}).then(x=>x.json())
+    .catch(err=>({error:String(err)}));
+  if(r && (r.ok===false || r.error)){
+    alert('没能开始：'+(r.error||''));
+    return;
+  }
+  alert('第 '+n+' 遍已受理 —— 背包已清成没学过，学习在后台跑。跑完回这道题看对比。');
+  setTimeout(load, 1500);
+}
+
+function exDetail(s,e){
+  const q = e.quad || {}, p2 = e.phase2 || {}, p3 = e.phase3 || {};
+  const pts = (e.points||[]).map(p=>({x:p.x,y:p.y,label:`第 ${p.x} 轮 · 剩余缺口 ${p.y}`}));
+  const maxV = Math.max(1, ...(e.points||[]).map(p=>p.y));
+  const runRows = (e.runs||[]).map(r=>{
+    const seq = (r.opens||[]).join('→') || '—';
+    const p2r = r.phase2||{};
+    const p2txt = p2r.submitted ? (p2r.verified?'已交·一致':'已交·有分歧') : '—';
+    return `<tr>
+      <td class="num">第 ${r.run} 段${r.req?`<div class="hint">${ESC(String(r.req).slice(0,10))}</div>`:''}</td>
+      <td class="num">${r.rounds}</td>
+      <td class="mono">${seq}</td>
+      <td class="num">${r.first_pass_round==null?'—':r.first_pass_round}</td>
+      <td>${ESC(p2txt)}</td>
+      <td>${r.passed?'<span class="chip ok">spec 冻结</span>':'<span class="chip bad">未通过</span>'}</td>
+    </tr>`;
+  }).join('');
+  const trace = (e.phase1&&e.phase1.rounds||[]).map(x=>{
+    const qs=(x.questions||[]).map(t=>`<div style="margin:2px 0">→ ${ESC(t)}</div>`).join('');
+    const gaps=(x.gaps||[]).map(g=>`<span class="chip warn">${ESC(g)}</span>`).join(' ');
+    const addr=(x.addressed||[]).map(g=>`<span class="chip ok">${ESC(g)}</span>`).join(' ');
+    return `<div style="border-left:2px solid ${x.passed?'rgba(47,125,87,.45)':'rgba(31,41,36,.14)'};padding:2px 0 6px 10px;margin:6px 0">
+      <div style="font-size:11.5px;color:var(--muted)">第 ${x.run} 段 · 第 ${x.round} 轮 ${x.passed?'· 通过':''}</div>
+      ${qs||'<div style="font-size:12px;color:var(--muted)">（这一轮没提新问题）</div>'}
+      ${gaps?`<div style="margin-top:3px">仍开：${gaps}</div>`:''}
+      ${addr?`<div style="margin-top:3px">已答到（累计并集）：${addr}</div>`:''}
+      ${x.spec?`<details style="margin-top:5px"><summary class="hint" style="cursor:pointer">
+        它这一轮交的（${x.spec.length} 字符）</summary>
+        <pre class="excode">${ESC(String(x.spec).slice(0,4000))}</pre></details>`
+        :'<div class="hint" style="margin-top:3px">这一轮没有留下作答正文（spec_text 为空）</div>'}
+    </div>`;
+  }).join('');
+  const dv = (p3.divergences||[]).map(d=>`<div style="border:1px solid rgba(31,41,36,.12);border-radius:8px;padding:9px 11px;margin:6px 0;background:#fcfcfd">
+      <div><span class="chip ${d.cls==='bug'?'bad':(d.cls==='revision'?'warn':'grey')}">${ESC(d.cls||'未判')}</span>
+        <span class="mono" style="font-size:12px">${ESC(d.id)}</span>
+        ${d.alignment?`<span class="chip grey">对齐 ${ESC(d.alignment)}</span>`:''}</div>
+      <div style="margin-top:4px;font-size:12.5px">${ESC(d.question||'')}</div>
+      ${d.spec?`<div class="hint" style="margin-top:3px">spec：${ESC(d.spec)}</div>`:''}
+      ${d.code?`<div class="hint">code：${ESC(d.code)}</div>`:''}
+    </div>`).join('');
+  const intended = (e.expected_drifts||[]).map(x=>
+    `<span class="chip grey">${ESC(x.category)}：${ESC(String(x.pattern).slice(0,28))}</span>`).join(' ');
+  const dims = (e.dims||[]).map(d=>`<span class="chip grey">${ESC(d)}</span>`).join(' ');
+  return `<div class="panel">
+    <div class="imp-row" style="margin-top:0">
+      <button class="btn btn-secondary" onclick="closeExercise()" style="padding:5px 11px;font-size:12px">← 练习列表</button>
+      <button class="btn btn-primary" onclick="redoExercise()" style="padding:5px 11px;font-size:12px"
+        title="账本留在册，背包清成没学过（已答到的维度 / 上次的代码 / 追问历史 / 里程碑标记）—— 让它真再解一遍">↻ 再做一遍</button>
+      <span class="chip grey">${exUnit(e)}</span>
+      ${e.language?`<span class="chip grey">${ESC(e.language)}</span>`:''}
+      ${e.reqs>1?`<span class="chip grey">${e.reqs} 次发布</span>`:''}
+      ${e.provisional?'<span class="chip warn">Preliminary · 完成段不足 3</span>':'<span class="chip ok">样本 ≥3 段</span>'}
+      ${e.llm_ready?'<span class="chip ok">✓ llm-ready</span>':'<span class="chip bad">无骨架</span>'}
+    </div>
+    <h2 style="margin:10px 0 4px;font-size:16px;line-height:1.45">${ESC(e.title||e.question)}</h2>
+    <div class="mono" style="font-size:12.5px;color:var(--muted);white-space:pre-wrap">${ESC(e.question)}</div>
+    ${e.milestone?`<div class="legend" style="margin-top:4px">里程碑：<b>${ESC(e.milestone)}</b></div>`:''}
+    ${dims?`<div style="margin-top:6px">${dims}</div>`:''}
+    ${intended?`<div class="legend" style="margin-top:6px">教师预置的模式：${intended}</div>`:''}
   </div>
-  <div class="panel">${consumeCurve(s)}</div>
-  <div class="panel"><div class="panel__head"><h2>判据区 · 任务完成（Voyager 尺子）</h2>
-      <span class="hint">存技能 / 停止同题 / 推进换题只认这条布尔线；不数覆盖点</span></div>
+  <div class="panel">
+    <div class="panel__head"><h2>会话账 · P1 → P2 → P3 → P4</h2>
+      <span class="hint">同一道题的每个 phase 记在同一份记录里；缺哪一段会如实标出来</span></div>
+    ${exLadder(e)}
+    ${!e.phase2_recorded && e.sessions?`<div class="note warn">这道题的会话跑在 Phase2 落盘之前
+      —— 上表 P2 那一格是空的，不是"没交码"，而是当时没记。之后的会话会补上。</div>`:''}
+  </div>
+  <div class="panel">
+    <div class="panel__head"><h2>每段会话（${(e.runs||[]).length} 段）</h2>
+      <span class="hint">一段 = 一次完整的 spec 追问；重跑会另起一段，不接在上一段屁股后面</span></div>
+    <table><thead><tr><th>会话</th><th>轮数</th><th>逐轮剩余缺口</th><th>首过轮</th><th>Phase2</th><th>结果</th></tr></thead>
+      <tbody>${runRows||'<tr><td colspan="6" class="empty">还没有会话 —— 在「人导入」发布这道题后，点「开始学习」。</td></tr>'}</tbody></table>
+    ${pts.length?`<div style="margin-top:10px">${lineChart(pts,{max:maxV,color:'#2f7d57',fmt:v=>String(Math.round(v))})}</div>
+      <div class="legend">最近一段的逐轮剩余缺口：纵轴是还剩几个维度没答到，横轴是第几轮。
+        形状往下收敛 = 在进步；横着不动 = 卡住（原版的进步账本长这样，不是一条永远向上的分数）。</div>`:''}
+  </div>
+  <div class="panel">
+    <div class="panel__head"><h2>进步 · 同一道题的各遍</h2>
+      <span class="hint">第 N 遍 vs 上一遍。重做会清背包（不是接着上一遍继续），账本留着</span></div>
+    ${exProgress(e)}
+  </div>
+  <div class="panel">
+    <div class="panel__head"><h2>追问轨迹（Phase 1）</h2>
+      <span class="hint">每一轮：判官问了什么 / 哪些维度还开着；折叠块里是 <b>Voyager 这一轮交的作答</b>（spec 正文）</span></div>
+    ${trace||'<div class="empty">没有追问轨迹 —— 这道题还没进过 Phase1，或骨架是空转通过的。</div>'}
+  </div>
+  <div class="panel">
+    <div class="panel__head"><h2>Phase 2 · finalCode</h2>
+      <span class="hint">spec 冻结后照它写的程序；"交了"与"过关"不是一回事</span></div>
+    ${e.phase2_recorded?`
+      <div class="imp-row" style="margin-top:0">
+        <span class="chip ${p2.submitted?'ok':'grey'}">${p2.submitted?'已提交':'未提交'}</span>
+        <span class="chip ${p2.verified?'ok':'warn'}">${p2.verified?'与 spec 一致':(p2.submitted?'仍有对不上的':'未对账')}</span>
+        <span class="chip grey">${p2.code_chars||0} 字符</span>
+        <span class="chip grey">改 ${p2.rounds||0} 轮</span>
+        <span class="chip grey">分歧 ${p2.divergences||0} 条</span>
+        ${p2.verified_by?`<span class="chip grey">过关依据 ${ESC(p2.verified_by)}</span>`:''}
+        ${p2.submitted_at?`<span class="chip grey">${ESC(p2.submitted_at)}</span>`:''}
+      </div>
+      ${p2.why?`<div class="legend" style="margin-top:4px">${ESC(p2.why)}</div>`:''}
+      ${(p2.open_items||[]).length?`<div class="legend" style="margin-top:4px">对不上的条目：${p2.open_items.map(x=>ESC(x)).join('、')}</div>`:''}
+      ${p2.final_code?`${String(p2.final_code).length>400
+        ? `<button class="btn btn-secondary" style="margin-top:6px;padding:3px 9px;font-size:11.5px"
+             onclick="this.nextElementSibling.style.maxHeight='none';this.remove()">展开全文（${String(p2.final_code).length} 字符）</button>`:''}
+        <pre class="excode">${ESC(String(p2.final_code).slice(0,4000))}</pre>`
+        :'<div class="empty">这份记录里没有 finalCode 正文（只记了长度）。</div>'}
+    `:`<div class="empty">这次会话没有 Phase2 的账（本版之前跑的会话只记了 P1 / P3）${
+        (e.answers||[]).length?'；不过这道题有口头作答，见下一块':''}。</div>`}
+  </div>
+  <div class="panel">
+    <div class="panel__head"><h2>Voyager 的作答 · 口头</h2>
+      <span class="hint">旧消费线（「交给 Voyager 回答」）留在 coach_log.jsonl 的自然语言答案 —— 只读，不参与进步账</span></div>
+    ${exAnswers(e)}
+  </div>
+  <div class="panel">
+    <div class="panel__head"><h2>Phase 3 · 分歧（intent-diff）</h2>
+      <span class="hint">spec 说的 vs code 做的，逐条对账；这里只摆证据，不判学生好坏</span></div>
+    ${dv||`<div class="empty">${(p3.skipped&&p3.skipped.length)?ESC(String(p3.skipped[0])):'none flagged —— spec 与 finalCode 一致，或这段还没跑到 Phase3。'}</div>`}
+  </div>
+  <div class="panel">
+    <div class="panel__head"><h2>能力模块 · Summary</h2>
+      <span class="hint">同构 CohortNarrativeOutput：做法 / 常见偏差 / 强项 / 难点</span></div>
+    ${q.narrative?`<div class="legend" style="margin:2px 0 8px">${ESC(q.narrative)}</div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px">
+        ${exQuadBox('Solution techniques','做法',q.solution_techniques)}
+        ${exQuadBox('Common drifts','常见偏差',q.common_drifts)}
+        ${exQuadBox('Strengths','强项',q.strengths)}
+        ${exQuadBox('Difficulties','难点',q.difficulties)}
+      </div>`:'<div class="empty">还没有一段会话完成 —— 按原版规矩，没有完成就不出 Summary。</div>'}
+  </div>`;
+}
+
+function pOverview(s){
+  window.__state = s;
+  const ex = s.exercises || [];
+  const key = window.__exOpen || '';
+  let hit = null;
+  if(key) hit = ex.find(x=>x.qid===key) || ex.find(x=>(x.req_ids||[]).includes(key)) || null;
+  const head = hit ? exDetail(s,hit) : exList(s);
+  // 判据区与考核线留在下面：它们是**尺子**（Voyager 的 done / 摸底考核），
+  // 不是进步账 —— 进步看上面每道题的缺口序列。
+  // 2026-11-18：判据区改读学习轨迹账（learn_trace）—— 绿 = 真取到数，
+  // 蓝 = 过证据门（critic 判完成）。不再用原版 Voyager 的 done/success
+  // （新后端恒 ✗，画出来像全失败，其实节点都点亮了）。
+  const suc = (s.trace||[]).map((p,i)=>({x:i+1,v:!!p.fetch_ok}));
+  const vlm = (s.trace||[]).map((p,i)=>({x:i+1,v:p.status==='learned'||p.status==='partial'}));
+  // 详情页只讲这一道题：全局判据/摸底/环境留在列表层，不跟着滚进来
+  // （原版学生页也只有题面、追问和 spec，没有课堂级统计）。
+  if(hit) return head;
+  const judge = s.has_data ? `<div class="panel">
+      <div class="panel__head"><h2>判据区 · 任务完成（Voyager 尺子）</h2>
+        <span class="hint">绿 = 注入后真取到数（跑通 + 拿到数）；蓝 = 过证据门（critic 判完成）—— 数据来自 learn_trace 现账</span></div>
       ${stepChart(suc,{yes:'#2f7d57',no:'#e5484d'})}
-      <div class="legend">绿＝任务完成（跑通编排 + 拿到数 + 没翻车）；红＝未完成。
-        VLML 的 success（全评分点达成）只是观测 ↓</div>
+      <div class="legend">蓝 = 过证据门 —— critic 的尺子（决定轨迹 verdict 与技能入库）；技能的「真取到」记账不走它。</div>
       ${stepChart(vlm,{yes:'#3b82f6',no:'#c7ccd4'})}
-      <div class="legend">蓝＝VLML 观测 success（考核尺子，不驱动学习）。</div>
-      <div class="note">⚠️ <b>练习线有意不判分</b>：覆盖率 / 得分 / 掌握度在练习这条线上恒为空
-        —— 它们是<b>尺子</b>，进了反馈环它学的就是讨好裁判，不是取到数。
-        <b>所以学习曲线接在消费能力侧</b>（上面那条）：人问一句 → 答出来了才计入，
-        练习跑通<b>不计</b> —— 照原版 Voyager
-        <span class="mono">curriculum.py:339</span> 只在成功时 append、
-        <span class="mono">:135</span> 曲线 = <span class="mono">len(completed_tasks)</span>。
-        考核线（撤掉图谱重考）在最下面。</div>
-    </div>
-  ${examCard(s)}
-  ${envCard(s)}`;
+    </div>` : '';
+  return head + judge + examCard(s) + envCard(s);
 }
 
 function pPractice(s){
@@ -990,51 +1452,199 @@ function pPractice(s){
         答完判对即停，不会硬跑满轮数。</div>
     </div>
     <div class="panel">
-      <div class="panel__head"><h2>练习范围</h2><span class="hint">排序照伴学 ordered_scope_topics</span></div>
+      <div class="panel__head"><h2>题目</h2><span class="hint">本局所有题目</span></div>
       <div class="tasks">${taskCards}</div>
     </div>`;
 }
 
 function pImport(s){
+  const ex=(s.exercises||[]);
+  const exChips = ex.length ? ex.map(e=>`<button class="chip" style="cursor:pointer;border:none"
+      onclick="gotoExercise('${ESC(e.qid)}')">${ESC((e.title||e.question).slice(0,26))}
+      <span class="hint">${e.completed}/${e.sessions}</span></button>`).join(' ')
+    : '<span class="hint">还没有发布过练习。</span>';
   return `<div class="panel">
-    <div class="panel__head"><h2>人导入意图</h2>
-      <span class="hint">人提问 → Voyager 回答 · VLML 解析照旧披露</span></div>
-    ${coachRunningBar(s)}
+    <div class="panel__head"><h2>开始学 · 一句话</h2>
+      <span class="hint">第一轮由人促成：写下要学的材料/问题 → 拆骨架 → 直接跑 P1→P2→P3；之后要么在这里继续导入，要么点「▶ 启动 Voyager」自由学</span></div>
     ${learnBar(s)}
     <div class="imp">
-      <div style="font-size:12.5px;color:var(--muted);margin-bottom:8px">
-        写一句你想问的话。<b>Voyager 会用它已积累的能力回答</b>——mem0 召回的既往经验、
-        技能库里的取数思路、当前数据世界可见的工具/表——底下 VLML 的解析（调了哪些工具、
-        取到哪些事实）照旧披露。结果作为 <b>control fact</b> 写进行动因果时间线 ——
-        出题器读这条线决定下一题。
+      <div class="note info" style="margin-bottom:8px">
+        一段会话 = 一次把这道题做到底：<b>P1</b> 追问到 spec 冻结 → <b>P2</b> 照 spec 交 finalCode →
+        <b>P3</b> 把 spec 与 code 逐条对账（drift / revision / bug）。所以这里发布的不是"一句话"，
+        是一道<b>固定的题目系统</b> —— 同一道题重跑才会在它自己名下累积成"第几轮收敛"的账。<br>
+        第一轮的 123 必须由人促成（这一框）；后面两条路：<b>人导入</b>（继续在这一框写）或
+        <b>自由学</b>（点顶部「▶ 启动 Voyager」——它拿背包里的上下文记忆自己找下一件事，不需要你再说话）。
       </div>
-      <div style="font-size:12px;color:var(--muted);margin-bottom:8px">
-        导入的问题归入<b>当前场景</b>的图谱（顶部场景栏切换；每个场景一张图，A=VLML Valorant 库）。
-        未命中先落本场景待审区 + 建一枚冷启动节点，并在后台<b>自动让 Voyager 自己学</b>
-        （拆分课程 → 补缺口写插件 → 取数 → 配方进技能库 + 解锁里程碑）。
-        学会了再导入同一句就是<b>命中且有答案</b>；相关问题会给出「➜ 新建场景并迁过去」。
+      <div class="imp-row" style="margin-top:0">
+        <input id="exTitle" placeholder="练习标题（留空则取题面首句）"
+          style="flex:1 1 260px;padding:7px 10px;border:1px solid var(--line);border-radius:var(--radius-sm);font:13px inherit">
+        <input id="exUnit" placeholder="单元（可选，如 Unit IV · Functions）"
+          style="flex:0 1 240px;padding:7px 10px;border:1px solid var(--line);border-radius:var(--radius-sm);font:13px inherit">
+        <select id="exLang" title="编辑器类型：决定 P2 交什么形态的 finalCode">
+          <option value="Python">Python</option>
+          <option value="SQL">SQL</option>
+          <option value="Markdown">Markdown / 数学证明</option>
+        </select>
       </div>
-      <div style="font-size:12px;color:var(--muted);margin-bottom:8px">
-        <b>收录判据</b>（不是"图谱里有没有同名维度"）：VLML 这次取数读到的表，
-        有没有被图谱里<b>表内覆盖的工具集</b>（46 个 SQL 洞察）覆盖到。
-        覆盖得到 → 收录，落法是<b>建边、不建节点</b>（伴学同款：材料映射不上
-        不为它新建知识点）；覆盖不到 → 如实不收，也不据此出题。
-      </div>
-      <textarea id="q" placeholder="例：Cloud9 的手枪局到底打得怎么样？这个结论置信度够吗？"></textarea>
+      <textarea id="q" placeholder="例：已知函数 f(x)=x^3+ax+1/4，g(x)=-ln x。（i）当 a 为何值时，x 轴为曲线 y=f(x) 的切线？（ii）讨论 h(x)=min{f(x),g(x)} 零点的个数。&#10;支持 Markdown 与 LaTeX：行内 $...$、块级 $$...$$"></textarea>
       <div class="imp-row">
-        <select id="topic"><option value="">自动匹配（按关键词归类）</option></select>
-        <button class="btn btn-primary" id="go">交给 Voyager 回答</button>
-        <button class="btn btn-secondary" id="btnRoute" title="只按双阈值判定这句话命中当前场景的哪个节点，不拉数据、不调模型">🔍 只判定命中</button>
+        <input type="file" id="exFile" multiple accept=".md,.txt,.csv,.xlsx,.json"
+          onchange="exAttach(this)" style="font-size:12px">
+        <span class="hint" id="exFileNote">.md / .txt 直接并入题面；表格类文件落进当前场景的库（学习者查得到）</span>
+      </div>
+      <div class="imp-row">
+        <button class="btn btn-secondary" id="btnRoute" style="white-space:nowrap"
+          title="让模型按这份题面拆出 spec-gate 维度与预置偏差；这一步会真跑一次模型（约半分钟）">🧩 生成设问骨架</button>
+        <button class="btn btn-primary" id="go" style="white-space:nowrap"
+          title="沿用刚生成的骨架直接开跑；没生成过就先拆一份">▶ 发布并开始学习</button>
         <button class="btn btn-secondary" id="clr">清空</button>
       </div>
-      <div class="hit" id="hit">归类结果会在这里显示。</div>
+      <div class="hit" id="hit">先写题面；点「生成设问骨架」可以先看这道题会被问成哪几个维度。</div>
       <div id="result"></div>
     </div>
-    ${consumeCurve(s)}
-    <h3>我的导入历史（${(s.imports||[]).length} 条）</h3>
-    <div class="legend">虚线框 = comparable: false，不参与比对，也不进掌握度 —— 只进因果时间线。</div>
-    <div id="implist"></div>
+    <h3 style="margin-top:14px">已发布的练习（${ex.length}）</h3>
+    <div style="display:flex;flex-wrap:wrap;gap:6px">${exChips}</div>
+    <div class="legend" style="margin-top:8px">这一个框就是全部入口：写 → 拆骨架 → 跑完 123。
+      没有场景、没有书单、没有单元规划 —— 只有这一局材料和它跑出来的背包。</div>
   </div>`;
+}
+
+/* 骨架预览（同构 New exercise 的 "Opus generates the spec-gate scaffolding"）：
+   返回 milestone + dimensions + expected_drifts，人先看清"这道题会被问成什么"，
+   再决定发布。后端会把这次拆的骨架落在同一个 req 上，发布时直接沿用 —— 
+   不出现「预览一份、学的是另一份」。 */
+let exSkel = null;      // {req_id, question, dims}
+let exBusy = false;
+
+function exRenderSkel(r){
+  const dims=(r.dimensions||[]).map((d,i)=>`<div style="margin:5px 0;font-size:12.5px">
+      <span class="chip grey">${i+1}</span> <b>${ESC(d.id||'')}</b>
+      <div style="margin-top:2px;color:#33443c">${ESC(d.question||'')}</div>
+      ${d.why?`<div class="hint">为什么问这个：${ESC(d.why)}</div>`:''}
+    </div>`).join('');
+  const drifts=(r.expected_drifts||[]).map(x=>
+    `<div style="font-size:12px;margin:3px 0"><span class="chip ${x.category==='bug'?'bad':(x.category==='revision'?'warn':'grey')}">${ESC(x.category||'')}</span>
+      ${ESC(x.pattern||'')}</div>`).join('');
+  return `<div class="note ${r.ok?'info':''}" style="margin-top:8px">
+    <b>${r.ok?'设问骨架已生成':'没拆出维度'}</b>
+    <span class="chip grey">req ${ESC(String(r.req_id||'').slice(-10))}</span>
+    <span class="chip grey">origin ${ESC(r.origin||'')}</span>
+    ${r.milestone&&r.milestone.name?`<span class="chip">里程碑：${ESC(r.milestone.name)}</span>`:''}
+    ${r.reason?`<div class="hint" style="margin-top:4px">${ESC(r.reason)}</div>`:''}
+    ${dims?`<div style="margin-top:8px">${dims}</div>`:''}
+    ${drifts?`<div style="margin-top:8px"><b style="font-size:12px">预置的常见偏差：</b>${drifts}</div>`:''}
+    ${r.material_note?`<div class="hint" style="margin-top:6px">材料：${ESC(r.material_note)}</div>`:''}
+    ${r.ok?`<div style="margin-top:8px;font-size:12px;color:var(--muted)">
+      这就是这道题 P1 会追问的几个维度。确认没问题 → 点「发布并开始学习」；
+      不满意可以先改题面再生成一次（会另起一份，旧的留着）。</div>`:''}
+  </div>`;
+}
+
+async function exPreview(){
+  const q=document.getElementById('q'); const hit=document.getElementById('hit');
+  const btn=document.getElementById('btnRoute'); if(!q) return;
+  const v=q.value.trim();
+  if(!v){ hit.innerHTML='<b>先写题面。</b>'; return; }
+  if(exBusy) return;
+  exBusy=true; if(btn){btn.disabled=true; btn.innerHTML='<span class="spin"></span>拆骨架…';}
+  hit.textContent='正在按这份题面拆 spec-gate 维度（一次模型调用，约半分钟）…';
+  document.getElementById('result').innerHTML='';
+  try{
+    const r=await fetch('/api/exercise/preview',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({question:v,
+        title:(document.getElementById('exTitle')||{}).value||'',
+        unit:(document.getElementById('exUnit')||{}).value||'',
+        language:(document.getElementById('exLang')||{}).value||''})}).then(x=>x.json());
+    if(r.error){ hit.innerHTML='<b>拆骨架失败：</b>'+ESC(r.error); return; }
+    exSkel={req_id:r.req_id, question:v, dims:(r.dimensions||[]).length};
+    document.getElementById('result').innerHTML=exRenderSkel(r);
+    hit.innerHTML=`骨架落在 <b>req ${ESC(String(r.req_id||'').slice(-10))}</b> 上；发布时直接沿用这一份。`;
+  }catch(e){ hit.innerHTML='<b>拆骨架失败：</b>'+ESC(String(e)); }
+  finally{ exBusy=false; if(btn){btn.disabled=false; btn.textContent='🧩 生成设问骨架';} }
+}
+
+async function exPublish(){
+  if(exBusy) return;
+  const q=document.getElementById('q'); const hit=document.getElementById('hit');
+  if(!q) return;
+  const v=q.value.trim();
+  if(!v){ hit.innerHTML='<b>先写题面。</b>'; return; }
+  const btn=document.getElementById('go');
+  const meta={title:(document.getElementById('exTitle')||{}).value||'',
+    unit:(document.getElementById('exUnit')||{}).value||'',
+    language:(document.getElementById('exLang')||{}).value||''};
+  exBusy=true; if(btn){btn.disabled=true; btn.innerHTML='<span class="spin"></span>已受理…';}
+  try{
+    // ★ 2026-11-15（用户：「导入出题这个，直接送去拆骨架送去学习，不要再过消费侧」）：
+    //   发布 = 拆骨架 → 学习，一条直线。没预览过就在这里**先拆**（同构助产士
+    //   New exercise 的 Publish：Opus 生成 spec-gate 脚手架，发布即开跑）。
+    //   拆完把骨架摆出来，再起学习 —— 人看到的维度就是 P1 会追问的那几个，
+    //   不存在"发出去的是一句话、学的是另一套维度"。
+    if(!(exSkel && exSkel.question===v && exSkel.req_id)){
+      hit.textContent='没预览过骨架 → 先拆一份（约半分钟），拆完直接开始学…';
+      const pv=await fetch('/api/exercise/preview',{method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({question:v, ...meta})}).then(x=>x.json());
+      if(pv.error){ hit.innerHTML='<b>拆骨架失败：</b>'+ESC(pv.error); return; }
+      exSkel={req_id:pv.req_id, question:v, dims:(pv.dimensions||[]).length};
+      document.getElementById('result').innerHTML=exRenderSkel(pv);
+    }
+    const payload={question:v, ...meta};
+    // 预览过就沿用那份 req（骨架、维度、账都在它名下）
+    if(exSkel && exSkel.req_id) payload.req_id=exSkel.req_id;
+    const r=await fetch('/api/learn/start',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(payload)}).then(x=>x.json());
+    if(r.error||r.ok===false){ hit.innerHTML='<b>发布失败：</b>'+ESC(r.error||''); return; }
+    hit.innerHTML=`<b>已发布，学习在后台跑。</b>${ESC(r.message||'')}
+      这道题会出现在「概览 · 练习」里，点开能看到 P1→P2→P3 的账。`;
+    // 标题/单元写进记录（发布时刻）；不阻塞
+    fetch('/api/exercise/publish-meta',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({question:v, title:payload.title, unit:payload.unit,
+        language:payload.language, req_id:payload.req_id||''})}).catch(()=>{});
+    q.value=''; exSkel=null;
+    setTimeout(load, 1200);
+  }catch(e){ hit.innerHTML='<b>发布失败：</b>'+ESC(String(e)); }
+  finally{ exBusy=false; if(btn){btn.disabled=false; btn.textContent='▶ 发布并开始学习';} }
+}
+
+/* 附件：.md/.txt 并入题面（人写的东西原样进设问材料）；
+   表格类（csv/xlsx/json）走场景库上传 —— 它们是**数据**，不是题面。 */
+function exAttach(inp){
+  const note=document.getElementById('exFileNote');
+  const q=document.getElementById('q');
+  const files=Array.from(inp.files||[]);
+  files.forEach(f=>{
+    const isText=/\.(md|txt)$/i.test(f.name);
+    if(isText){
+      const rd=new FileReader();
+      rd.onload=()=>{
+        q.value += `\n\n<!-- 附件：${f.name} -->\n` + String(rd.result||'').slice(0,8000);
+        if(note) note.textContent=`已并入题面：${f.name}`;
+      };
+      rd.readAsText(f);
+      return;
+    }
+    const rd=new FileReader();
+    rd.onload=()=>{
+      const b64=String(rd.result||'').split(',')[1]||'';
+      fetch('/api/upload',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({name:f.name,data_b64:b64})})
+        .then(x=>x.json()).then(d=>{
+          if(note) note.textContent = d.ok
+            ? `已落库：${f.name} → 表 ${d.table}（${d.rows} 行${d.visible?'，学习者查得到':'，当前库看不见'}）`
+            : `上传失败：${f.name} —— ${d.why||''}`;
+        }).catch(e=>{ if(note) note.textContent='上传失败：'+String(e); });
+    };
+    rd.readAsDataURL(f);
+  });
+  if(!files.length && note) note.textContent='没有选文件';
+}
+
+function gotoTab(id){
+  TAB=id; localStorage.setItem('mve_tab',TAB); load();
+}
+function gotoExercise(qid){
+  window.__exOpen=qid; TAB='overview'; localStorage.setItem('mve_tab','overview'); load();
 }
 
 /* 只判定命中（不执行）：双阈值判定这句话命中当前场景的哪个节点。
@@ -1058,63 +1668,185 @@ async function previewRoute(){
       : '→ <b>归入已有节点</b> '+ESC(r.node_id||'');
     // 判定基准：相关度是拿这句话和**当前场景的图谱节点文本**比的。把它显示出来，
     // 人才知道"相关度低"是问题不好还是归错了场景（2026-10-18 特斯拉问题触发）。
-    const basis=`<div class="hint" style="margin-top:4px">判定基准：Scene ${ESC(r.scene_id)} 的图谱 · `+
+    const basis=`<div class="hint" style="margin-top:4px">判定基准：这份材料的图谱 · `+
       `${ESC(r.scene_nodes==null?'?':r.scene_nodes)} 个节点`+
       (r.scene_sample&&r.scene_sample.length
         ? `（如：${r.scene_sample.map(ESC).join('、')}）` : '（空 —— 冷启动期）')+'</div>';
     const ood = r.out_of_domain ? `<div class="note warn" style="margin-top:6px">
-      <b>域外问题</b>：这句话和当前场景的图谱<b>没有任何文本重合</b>（相关度 ${ESC(r.max_score)}/100）。
-      它问的领域和 Scene ${ESC(r.scene_id)} 不是一回事 —— 相关度低不是"答错了"，是<b>归错了场景</b>。
-      <div style="margin-top:5px"><button class="btn btn-secondary" style="padding:4px 10px;font-size:12px"
-        data-migrate-q="${ESC(text)}">➜ 新建场景，并把这个问题导过去</button></div></div>`
-      : (r.scene_nodes===0 ? `<div class="note info" style="margin-top:6px">当前场景图谱还是空的（冷启动期）——
+      <b>域外问题</b>：这句话和当前材料<b>没有任何文本重合</b>（相关度 ${ESC(r.max_score)}/100）。
+      它问的领域和这份材料不是一回事 —— 相关度低不是"答错了"，是<b>没在这个材料里</b>。
+      <div style="margin-top:5px"><span class="hint">要学这个领域，直接导入对应材料再点「▶ 启动 Voyager」。</span></div>
+    </div>`
+      : (r.scene_nodes===0 ? `<div class="note info" style="margin-top:6px">图谱还是空的（冷启动期）——
         导入后会在这里落下第一个节点。</div>` : '');
     hit.innerHTML=`<div class="imp-row">${dec}<span class="hint">分数 ${ESC(r.max_score)} · 重复命中 ${ESC(r.chunk_hits)}（双阈值，不是人审、也不是答对）</span></div>
       <div style="font-size:12.5px;margin-top:4px">${act}</div>`+basis+ood;
   }catch(e){hit.innerHTML='<span class="muted">判定失败：'+ESC(String(e))+'</span>';}
 }
 
-/* 消费进步曲线 —— 进步与掌握度**在消费这条线上测**（用户 2026-10-13 定）。
-   为什么不是练习那条：练习不判分（VLML 的尺子不能进 Voyager 反馈环），
-   run_log 里的覆盖率恒为 None，画出来没有意义。消费才是交付 —— 人真的要一个答案，
-   这时用 VLML0 裁判独立跑一遍量出覆盖率，才是真实的进步。
-   1→n（2026-10-18）：曲线按场景隔离 —— 选 Scene B 只画 B 的导入历史
-   （A 的混进来会把"B 从零开始学"画成"接在 A 的尾声上"，Δ 掌握数虚高）。
-   点上标命中判定（双阈值，非人审）与判定结果，二次导入同一问题命中即可达证据。 */
+/* 【已停用 2026-11-14】下面这组 cohortCard/cohortBody/switchCohortQuestion 是
+   「概览 = 一张能力模块卡 + 下拉切题」那一版的渲染。现在概览是可点击的练习列表
+   （exList / exDetail），四象限搬进了每道题的详情页 —— 同一份数据（s.cohort
+   与 s.exercises 里都带 quad），但入口只有一个。函数留着只是因为
+   consumeCurve（同样已停用）还引用 traceCurveBody，整块一起删是下一步的事。
+   ── 原注释 ──
+   能力模块（Summary）—— 同构助产士 `CohortNarrativeOutput`
+   （`src_lib_opus_schemas.ts:391-398`）：
+     narrative / solution_techniques / common_drifts / strengths / difficulties / provisional
+   2026-11-14 用户：「把图上能力模块替掉消费线」。
+   四项全部来自已有账（Phase1 缺口 + Phase3 分歧 + 教师预置模式），
+   不打分、不新增判据；样本 <3 段会话时挂 Preliminary 徽标（原版同款规则）。 */
+function cohortCard(s){
+  const cg=s.cohort||[];
+  const curScene=(s.scene&&s.scene.id)||'A';
+  window.__cohort=cg;
+  if(!cg.length) return `<h3>能力模块 · Summary</h3>
+    <div class="empty">还没有已完成的会话。助产士的规矩：
+    至少一个会话跑过 Phase1/Phase3 才出 Summary —— 没有可汇总的过程，就不编内容。</div>`;
+  return `<h3>能力模块 · Summary（${cg.length} 道题）</h3>
+    <div class="legend">按题汇总：做法 / 常见偏差 / 强项 / 难点，全部从这题自己的缺口账与分歧账读出来。</div>
+    <div id="cohortBody">${cohortBody(cg,0)}</div>`;
+}
+function cohortBody(cg, idx){
+  const t=cg[idx]||cg[0];
+  if(!t) return '<div class="empty">无</div>';
+  const box=(en,zh,items)=>{
+    const body=(items&&items.length)
+      ? items.map(x=>`<div style="margin:4px 0;font-size:12.5px;line-height:1.5">${ESC(x)}</div>`).join('')
+      : '<div style="margin:4px 0;font-size:12.5px;color:var(--muted)">（暂无）</div>';
+    return `<div style="border:1px solid rgba(31,41,36,.12);border-radius:8px;padding:10px 12px;background:rgba(255,255,255,.5)">
+      <div style="font-size:10.5px;letter-spacing:.07em;color:var(--muted);text-transform:uppercase">${ESC(en)}</div>
+      <div style="margin-top:1px;font-size:12px;font-weight:600">${ESC(zh)}</div>
+      <div style="margin-top:5px">${body}</div></div>`;
+  };
+  const opts=cg.map((x,i)=>`<option value="${i}"${i===idx?' selected':''}>${ESC((x.question||'').slice(0,26))} · ${x.sessions} 段/${x.completed} 过</option>`).join('');
+  const pts=(t.points||[]).map(p=>({x:p.x,y:p.y,label:`第 ${p.x} 轮 · 剩余缺口 ${p.y}`}));
+  const maxV=Math.max(1,...(t.points||[]).map(p=>p.y));
+  return `<div class="imp-row" style="margin:6px 0">
+      <select id="cohortQ" onchange="switchCohortQuestion(this.value)">${opts}</select>
+      <span class="hint">${t.sessions} 段会话 · ${t.completed} 段通过 · 最近一段 ${t.rounds} 轮</span>
+      ${t.provisional?'<span class="chip warn">Preliminary · 样本不足 3 段</span>':'<span class="chip ok">样本 ≥3 段</span>'}
+      ${t.passed?'<span class="chip ok">最近一段通过</span>':'<span class="chip bad">最近一段未通过</span>'}
+      ${t.opens_now===0?'<span class="chip ok">缺口已清空</span>':(t.opens_now===null||t.opens_now===undefined?'':`<span class="chip warn">仍剩 ${t.opens_now} 个缺口</span>`)}
+    </div>
+    <div class="legend" style="margin:4px 0 8px"><b>${ESC(t.question)}</b><br>${ESC(t.narrative)}</div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px">
+      ${box('Solution techniques','做法',t.solution_techniques)}
+      ${box('Common drifts & errors','常见偏差与错误',t.common_drifts)}
+      ${box('Strengths','强项',t.strengths)}
+      ${box('Difficulties','难点',t.difficulties)}
+    </div>
+    ${pts.length?`<div class="legend" style="margin-top:10px">规格迭代（这题逐轮剩余缺口，越往下越接近学会）</div>
+      ${lineChart(pts,{color:'#059669',max:maxV,fmt:v=>Math.round(v)+' 个'})}`:''}
+    ${(t.intended&&t.intended.length)?`<details style="margin-top:8px"><summary class="legend">教师预置的模式（INSTRUCTOR-INTENDED PATTERNS · ${t.intended.length} 条）</summary>
+      ${t.intended.map(x=>`<div class="legend" style="margin:3px 0">· ${ESC(x)}</div>`).join('')}</details>`:''}`;
+}
+function switchCohortQuestion(i){
+  const body=document.getElementById('cohortBody');
+  if(!body) return;
+  body.innerHTML=cohortBody(window.__cohort||[], Number(i)||0);
+}
+/* 【已停用 2026-11-14】原「消费进步曲线」视图。概览已由 cohortCard（能力模块）接管；
+   这个函数保留只因 `switchCurveScene` / `/api/scene-curve` 还用它查旧账，不再被渲染。
+   ── 原注释 ──
+   概览页：题内缺口序列（主曲线）+ 消费判分明细（折叠区，审计用）。
+   2026-11-14 用户拍板：进步**不再**由消费线的累计掌握数定义 ——
+   那个数单调不减（答出来 +1、失败不减），记的是"做了多少题"不是"做得多好"；
+   且实测 coach_log 24 条里 mastered=True 0 条、coverage 全空，本来就没产出量。
+   现在的进步口径：同一道题逐轮剩余缺口在收敛（助产士 Phase1Iteration 原账）。 */
 function consumeCurve(s){
   const cc=s.consume_curve||[];
+  const tc=s.trace_curve||[];
   // 1→n：主面板数据 = 当前场景（build_state 已按场景过滤），曲线选择器
   // 默认落到当前场景；「全部场景」是对比视图，另走接口（见 switchCurveScene）。
   const curScene=(s.scene&&s.scene.id)||'A';
-  if(!cc.length) return `<h3>学习曲线 · 消费能力侧</h3>
-    <div class="empty">Scene ${ESC(curScene)} 还没有消费记录。在上面问一句话，Voyager 会用已积累的能力回答 ——
-    答完了这题就进它的能力库，掌握与进步从这里开始累计。</div>`;
-  window.__consumeCurveAll=cc;   // 场景筛选回「当前场景」时用，不再请求一次
-  const inData=[...new Set(cc.map(c=>c.root_scene||'A'))];
-  const known=window.__sceneList||[];
-  const all=[...new Set([...inData,...known])];
-  const opts=`<option value="${ESC(curScene)}" selected>Scene ${ESC(curScene)}（当前）</option>`+
-    all.filter(id=>id!==curScene).map(id=>`<option value="${ESC(id)}">Scene ${ESC(id)}</option>`).join('')+
-    `<option value="__all__">全部场景（对比用）</option>`;
-  return `<h3>学习曲线 · 消费能力侧（${cc.length} 次消费 · Scene ${ESC(curScene)}）</h3>
-    <div class="legend"><b>掌握 = 能力集合的增长</b>：人问一句 → Voyager 答完了 →
-    这题进它的能力库。纵轴是<b>累计会做的题有几道</b>，照原版 Voyager
-    <span class="mono">curriculum.py:135 len(completed_tasks)</span>。
-    <b>练习不计入</b>：练习线有意不判分，跑通只推进课程规划（"这题规划过了，
-    别再规划"），不算能力变大 —— 原版也是只在成功时 append
-    （<span class="mono">:339</span>），失败不计。</div>
-    <div class="imp-row" style="margin:6px 0">
-      <select id="curveScene" onchange="switchCurveScene(this.value)">${opts}</select>
-      <span class="hint">默认只看当前场景（顶部场景栏切换）；「全部场景」可把各场景曲线放在一张图上对比</span>
+  if(!cc.length&&!tc.length) return `<h3>学习曲线 · 题内缺口序列</h3>
+    <div class="empty">还没有题目轨迹。启动一次学习跑出
+    Phase1 追问，这题的缺口序列就从这里开始记 —— 进步看的是同一道题逐轮还剩几个缺口，
+    不再看"累计会做几道题"。</div>`;
+  window.__consumeCurveAll=cc;   // 单工作区：曲线只画本局，不再有场景对比
+  const tracePart = tc.length
+    ? `<div id="traceBody">${traceCurveBody(tc,0)}</div>`
+    : `<div class="empty">还没有题内轨迹（Phase1 一轮都没跑过）。</div>`;
+  const consumePart = cc.length
+    ? `<div id="curveBody">${consumeCurveBody(cc)}</div>`
+    : `<div class="empty">无消费记录。</div>`;
+  window.__traceCurve=tc;
+  return `<h3>学习曲线 · 题内缺口序列（${tc.length} 道有轨迹）</h3>
+    <div class="legend"><b>进步 = 同一道题逐轮剩余缺口在收敛</b>。横轴是这道题的追问轮次，
+    纵轴是<b>还剩几个维度没闭合</b> —— 线往下走才是学会。这是助产士的原账：
+    每交一次 spec 追加一条 <span class="mono">Phase1Iteration</span>
+    （<span class="mono">opus/schemas.ts:126</span>），带当轮全量
+    <span class="mono">gapsIdentified</span>。
+    <b>重跑过的题分段列</b>（run 1/2/…）：每段 = 原版一条会话的
+    <span class="mono">phase1.iterations</span>；<b>段起点继承上一段的累计已答集</b>
+    （原版 <span class="mono">instructorConfiguredDimensionsAddressed</span>，
+    <span class="mono">sessions.ts:264-266</span> 每轮并集写回、从不回退），
+    所以后一段更短 = 上次答到的这部分这次不用重走；两段逐轮相同 = 这段没比上段少走一步。</div>
+    ${tracePart}
+    <details style="margin-top:12px"><summary class="legend">附：消费侧判分明细（审计用，不再作进步度量）</summary>
+    ${consumePart}</details>`;
+}
+/* 题内缺口序列主体：主曲线（剩余缺口）+ 分段对比 + 缺口清单。
+   进步口径（2026-11-14 取代消费线）：同一道题逐轮剩余缺口在收敛。
+   重跑过的题按 run 分段并列 —— 每段是原版一条会话的 phase1.iterations，
+   段起点继承上一段的累计已答集（instructorConfiguredDimensionsAddressed，
+   每轮并集写回、从不回退）。所以段变短 = 记忆让同题收敛更快；逐轮相同 =
+   这段没比上段少走一步。不需要分数，也不靠人猜。 */
+function traceCurveBody(tc, idx){
+  const t=tc[idx]||tc[0];
+  if(!t) return '<div class="empty">无轨迹</div>';
+  const maxV=Math.max(1,...(t.points||[]).map(p=>p.y));
+  const pts=(t.points||[]).map(p=>({x:p.x,y:p.y,
+    label:`第 ${p.x} 轮 · 剩余缺口 ${p.y}${p.y===0?'（已闭合）':''}`}));
+  const d=t.delta;
+  const dTxt = d ? (
+      (d.rounds===0&&(d.first_pass_round===0||d.first_pass_round===null))
+      ? '<span class="chip warn">Δ 0 · 这段没比上段少走一步（已答集已跨段继承，仍为 0 就是真的没有变化）</span>'
+      : `<span class="chip ${d.rounds<0?'ok':'warn'}">Δ 轮数 ${d.rounds>0?'+':''}${d.rounds}</span>`+
+        (d.first_pass_round===null?'':`<span class="chip ${d.first_pass_round<0?'ok':'grey'}">Δ 首过轮 ${d.first_pass_round>0?'+':''}${d.first_pass_round}</span>`)
+    ) : '<span class="chip grey">只跑过一段，Δ 无从可比</span>';
+  const rows=t.runs.map(r=>{
+    const seq=(r.opens||[]).map(x=>`<span class="mono" style="font-weight:600">${x}</span>`).join(' → ')||'—';
+    return `<tr>
+      <td class="num">${r.run}</td>
+      <td>${seq}</td>
+      <td class="num">${r.rounds||0}</td>
+      <td class="num">${r.first_pass_round==null?'—':r.first_pass_round}</td>
+      <td>${r.passed?'<span class="chip ok">已通过</span>':'<span class="chip warn">未通过</span>'}</td>
+    </tr>`;
+  }).join('');
+  const stuck=(t.stuck||[]);
+  const qOpts=tc.map((x,i)=>`<option value="${i}"${i===idx?' selected':''}>${ESC((x.question||'').slice(0,26))} · ${x.n_runs} 段</option>`).join('');
+  return `<div class="imp-row" style="margin:6px 0">
+      <select id="traceQ" onchange="switchTraceQuestion(this.value)">${qOpts}</select>
+      <span class="hint">每道题一条轨迹；重跑过的按 run 分段，看"第 2 次是不是少走几轮"</span>
     </div>
-    <div id="curveBody">${consumeCurveBody(cc)}</div>`;
+    <div class="legend"><b>${ESC(t.question)}</b>
+      ${t.passed?'<span class="chip ok">最近一段已通过</span>':'<span class="chip warn">最近一段未通过</span>'}
+      <span class="chip grey">${t.rounds} 轮</span>
+      ${t.opens_now===0?'<span class="chip ok">缺口已清空</span>':`<span class="chip warn">仍剩 ${t.opens_now} 个缺口</span>`}
+      ${dTxt}</div>
+    ${lineChart(pts,{color:'#059669',max:maxV,fmt:v=>Math.round(v)+' 个'})}
+    <div class="legend" style="margin-top:2px">纵轴 = 剩余缺口数（越往下越接近学会）</div>
+    <table style="margin-top:8px"><thead><tr><th>重跑</th><th>逐轮剩余缺口</th><th>轮数</th><th>首过轮</th><th>结果</th></tr></thead>
+      <tbody>${rows}</tbody></table>
+    ${stuck.length?`<div class="legend" style="margin-top:6px">最近一轮仍未闭合：${stuck.map(x=>`<span class="chip warn">${ESC(x)}</span>`).join(' ')}</div>`:''}
+    ${t.monotonic?'':'<div class="legend"><span class="chip bad">不是单调收缩</span> 某轮缺口比上一轮更多 —— 追问在打转或维度定义有问题。</div>'}`;
+}
+function switchTraceQuestion(i){
+  const body=document.getElementById('traceBody');
+  if(!body) return;
+  body.innerHTML=traceCurveBody(window.__traceCurve||[], Number(i)||0);
 }
 /* 曲线主体（图表 + 摘要 + 比对明细）。场景切换只重渲这一块，
    不重渲整个面板 —— 与主面板其它页签同一套渲染函数复用，不另造第二份。 */
 function consumeCurveBody(cc){
-  if(!cc.length) return `<div class="empty">该场景还没有消费记录。去「人导入」问一句
-    （当前场景在顶部场景栏切换），答完了曲线就从这里开始长。</div>`;
-  // 主曲线 = **累计已掌握数**（能力集合在变大）。
+  if(!cc.length) return `<div class="empty">还没有消费记录。去「人导入」问一句，
+    答完了曲线就从这里开始长。</div>`;
+  // 【已降级为审计】主曲线 = 累计已掌握数（能力集合在变大）。
+  // 2026-11-14 起概览的进步主曲线是上面的缺口序列，这里保留只为核对
+  // "当初这条线记了什么"，不再作进步度量。
   //   y 轴画**绝对数**（会做的题有几道），不画百分比 —— 照原版 Voyager
   //   `curriculum.py:135 return len(self.completed_tasks)`。
   //   不画百分比是有理由的：一画百分比，读数就取决于"分母算哪几道题"
@@ -1152,7 +1884,7 @@ function consumeCurveBody(cc){
   const cmpRows=cc.map((c,i)=>`<tr>
       <td class="num">${c.i}</td>
       <td>${ESC(c.question)}
-        <div style="margin-top:2px"><span class="chip grey">Scene ${ESC(c.root_scene||'A')}</span> ${hitTag(c)} ${judTag(c)}</div></td>
+        <div style="margin-top:2px">${hitTag(c)} ${judTag(c)}</div></td>
       <td class="num">${ESC(c.rows||0)}</td>
       <td class="num">${ESC(c.referee_rows||0)}</td>
       <td class="num">${c.coverage===null||c.coverage===undefined?'—'
@@ -1195,54 +1927,41 @@ function switchCurveScene(sid){
   const body=document.getElementById('curveBody');
   if(!body) return;
   const allSid=(sid==='__all__')?'__all__':sid;
-  body.innerHTML='<span class="muted">取 '+(allSid==='__all__'?'全部场景':'Scene '+ESC(allSid))+' 的曲线…</span>';
+  body.innerHTML='<span class="muted">取 '+(allSid==='__all__'?'全部':'本局')+' 的曲线…</span>';
   fetch('/api/scene-curve?scene='+encodeURIComponent(allSid)).then(x=>x.json()).then(r=>{
     if(r.error){body.innerHTML='<span class="muted">'+ESC(r.error)+'</span>';return;}
     body.innerHTML=consumeCurveBody(r.curve||[]);
   }).catch(e=>{body.innerHTML='<span class="muted">取曲线失败：'+ESC(String(e))+'</span>';});
 }
 
-/* ---- 场景栏（1→n 可插拔）----
-   原 /scenes 独立页撤掉后的最小入口（去重，2026-10-18）：场景切换/新建 +
-   当前场景的 Δ 专属节点数、导入次数、曲线首末读数，全走已有 API
-   （/api/scenes、/api/scene/switch、/api/scene/create），不新增后端。 */
+/* ---- 背包行（2026-11-18）----
+   面板不再让人「选场景」：只有一个工作区，一个背包。
+   数据来自 /api/scenes 的 inventory / material（后端照 curriculum_auto 口径算），
+   这里只渲染，不新增取数逻辑。 */
 async function loadSceneBar(){
   try{
     const r=await fetch('/api/scenes').then(x=>x.json());
-    window.__sceneList=(r.scenes||[]).map(s=>s.id);
-    const sel=document.getElementById('sceneSel');
-    if(!sel) return;
-    const keep=sel.value;
-    sel.innerHTML=(r.scenes||[]).map(s=>{
-      const n=(r.exclusive_nodes||{})[s.id]||0;
-      const cs=(r.curve_summary||{})[s.id]||{};
-      return `<option value="${ESC(s.id)}"${s.id===r.current?' selected':''}>`+
-        `${ESC(s.name||s.id)}（${ESC(s.id)}）· 专属节点 ${n} · 导入 ${cs.imports||0} · 掌握 ${cs.mastered_last||0}</option>`;
-    }).join('');
-    if(keep&&[...sel.options].some(o=>o.value===keep)) sel.value=keep;
-    const cs=(r.curve_summary||{})[r.current]||{};
-    const fp=(r.fingerprint||{})[r.current]||{};
-    const gs=(r.graph_sparsity||{})[r.current], ec=(r.entity_catalog||{})[r.current];
-    document.getElementById('sceneHint').innerHTML=
-      `当前 <b>${ESC(r.current)}</b> · Δ 专属节点 <b>${(r.exclusive_nodes||{})[r.current]||0}</b> · `+
-      `导入 ${cs.imports||0} 次（高置信命中 ${cs.high||0} / 未命中 ${cs.rejected||0}）· `+
-      `曲线 ${cs.mastered_first||0}→${cs.mastered_last||0} 道`+
-      (cs.reachable?' <span class="chip ok">🔁 可达（同一问题二次导入命中）</span>':'')+
-      (gs==='seeding'?' <span class="chip warn">🌱 种子态</span>':'')+
-      (ec==='missing'?' <span class="chip bad">🟠 实体目录缺失</span>':'')+
-      (fp.state_hash?' <span class="chip grey">指纹 '+ESC(String(fp.state_hash).slice(0,8))+'</span>':'');
-    // 猫爪总开关（同构 neko 的 NekoClaw Master Switch）：
-    //   顶层总开关 → 关掉后下面所有能力组一律不可用（级联，同 masterRequired）
-    //   组开关     → 组内条目对模型不可见、也调不动（不删条目）
-    //   条目       → 悬停可见（组下有什么）
+    const inv=r.inventory||{used:0,cap:36,slots:[]};
+    const chip=document.getElementById('bagChip');
+    if(chip){
+      chip.className='chip '+(inv.used?'ok':'grey');
+      chip.textContent=`Inventory (${inv.used}/${inv.cap})`;
+      chip.title=(inv.slots&&inv.slots.length)
+        ? ('背包里这几格：\n'+inv.slots.join('\n'))
+        : '空背包：一次会话占一格；攒满 33 格归档一批';
+    }
+    const hint=document.getElementById('bagHint');
+    if(hint){
+      const m=String(r.material||'');
+      hint.innerHTML = m
+        ? `材料 <code>${ESC(m)}</code>`
+        : '材料：未设置（导入一个仓库文件夹就开始）';
+    }
+    // 猫爪总开关（同构 neko）：一组能力一个开关，关掉该组「对模型不可见、
+    // 也调不动」，拨回来即恢复（不删条目）。与「场景」无关，纯能力组。
     const gs2=(r.groups||{})[r.current]||[];
-    const back=(r.scene_backend||{})[r.current]||'';
     const box=document.getElementById('clawBox');
     if(box){
-      const bchip = back==='vlml' ? '<span class="chip grey">数据源 VLML 库</span>'
-                  : back==='local' ? '<span class="chip grey">数据源 本机</span>'
-                  : back==='scene' ? '<span class="chip grey">数据源 场景自带库</span>'
-                  : back==='missing' ? '<span class="chip bad">数据源路径不存在</span>' : '';
       const mOn = gs2.length ? !!gs2[0].master : true;
       const mchip = `<button class="chip ${mOn?'ok':'bad'}" style="cursor:pointer"
           title="猫爪总开关（NekoClaw Master Switch）&#10;关掉后下面的能力组全部不可用；拨回来即恢复"
@@ -1259,11 +1978,13 @@ async function loadSceneBar(){
            onclick="toggleGroup('${ESC(r.current)}','${ESC(g.group)}',${g.switch?'false':'true'})"
            >${mark} ${ESC(g.group)} · ${g.count}</button>`;
       }).join(' ');
-      box.innerHTML = bchip + mchip + (gs2.length?gchips
-        : '<span class="hint">这个场景还没有可执行动作条目</span>');
+      box.innerHTML = mchip + (gs2.length?gchips
+        : '<span class="hint">还没有可执行动作条目</span>');
     }
-  }catch(e){ /* 场景栏挂了不能拖垮主面板 */ }
+  }catch(e){ /* 背包行挂了不能拖垮主面板 */ }
 }
+
+
 /* 拨猫爪总开关：关掉整组 = 对模型不可见、也调不动（不删条目，拨回来即恢复）。 */
 function toggleGroup(sid,group,on){
   fetch('/api/actions/switch',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -1272,59 +1993,6 @@ function toggleGroup(sid,group,on){
     loadSceneBar();
   });
 }
-function switchScene(sid){
-  fetch('/api/scene/switch',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({scene_id:sid})}).then(x=>x.json()).then(r=>{
-    alert(r.ok?('已切换到场景 '+sid+'。之后的导入与学习曲线都按这个场景隔离。')
-              :('切换失败：'+(r.error||'')));
-    GRAPH=null;                       // 图谱缓存作废：每个场景一张图，重拉本场景的
-    // 曲线选择器跟着顶层场景走：人在曲线里手选过别的场景时，切顶层场景要
-    // 把那个手洗掉（否则顶栏已是 B、曲线还显示 A 的对比图）—— 由 render()
-    // 里的 __curveSceneReset 跳过控件值恢复，重新默认到新当前场景。
-    window.__curveSceneReset=true;
-    loadSceneBar();
-    load();
-  });
-}
-function createScene(){
-  const name=prompt('新场景名（如：我的学习场景）：');
-  if(!name) return;
-  const ds=prompt('专属数据源 duckdb 路径（留空 = 数据源就是本机：场景目录里的文件 + 本机只读原语）：')||'';
-  fetch('/api/scene/create',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({name:name,data_source:ds,description:''})}).then(x=>x.json()).then(r=>{
-    alert(r.ok?('已插入场景 '+r.scene_id+'：注册命名空间 + '+(r.action_count!=null?r.action_count:'?')+
-        ' 个可执行动作。不重启、不清库。')
-      :('插入被拒：'+(r.error||'')+'（可执行动作缺席的场景不许插入）'));
-    loadSceneBar();
-  });
-}
-
-/* 清本场景（2026-10-26）：彻底清掉当前场景的全部学习账后从零重学。
-   清单 = 课程两本账 + 追问骨架 + 当前锚点（ckpt 目录整删）+ 图谱节点/边
-   + 掌握库 + 运行/导入/消费日志 + 本场景学到的配方（skill_store 里
-   source_scene=本场景 的条目，逐条 delete_skill 连向量一起清）。
-   自动备份到 mve/_backup_*；数据源与场景注册不动，其它场景不受影响。 */
-function resetScene(){
-  const sel=document.getElementById('sceneSel');
-  const sid=(sel&&sel.value)||'A';
-  if(!confirm('清掉场景 '+sid+' 的全部学习账：\\n'
-    +'· 课程两本账 + 追问骨架 + 当前锚点（ckpt）\\n'
-    +'· 图谱节点/边、掌握库、运行/导入/消费日志\\n'
-    +'· 本场景学到的全部配方（技能库）\\n\\n'
-    +'自动备份到 mve/_backup_*；数据源与场景注册不动，其它场景不受影响。\\n'
-    +'清掉后从零重学。确定？')) return;
-  const b=document.getElementById('btnResetScene');
-  if(b){ b.disabled=true; b.textContent='清档中…'; }
-  fetch('/api/scene/reset',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({scene_id:sid})}).then(x=>x.json()).then(r=>{
-    if(!r.ok){ alert('清场景失败：'+(r.error||'未知')); return; }
-    uiEvent('reset_scene',{scene:sid},'已清场景（已备份）');
-    alert('场景 '+sid+' 已清干净（已备份）。可以 ▶ 重学了。');
-    location.reload();
-  }).catch(e=>alert('清场景失败：'+e))
-    .finally(()=>{ if(b){ b.disabled=false; b.textContent='🗑 清本场景'; } });
-}
-
 /* 判据中文名。以前这一列只有 VLML0 / rubric 两种，新后端的 `db_evidence`
    会被归到 "rubric"（≠referee 就走 else 分支）—— 那是**错的判据名字**，
    人看到会以为这一轮是 rubric 判的，其实是"有没有真的从 DB 取到数"。 */
@@ -1332,78 +2000,44 @@ const JUDGE_LABEL={db_evidence:'DB 取证', referee:'VLML0 裁判', rubric:'rubr
                    method_compare:'两边做法比对', none:'未判'};
 
 function pTrace(s){
-  if(!s.has_data) return `<div class="panel"><div class="empty">Scene ${ESC((s.scene||{}).id||'A')} 还没有轨迹数据。
-    （别的场景练过的轮次不混进来；要看去别的场景，用顶部场景栏切。）</div></div>`;
-
-  // 「编排轨迹」整块**条件渲染**：工具序列（trajectory）只由已冻结的旧后端写入，
-  // 新后端不落 run_log。线上 36 条记录里它恒为空 —— 以前这页是一整张
-  // 「未调用 / 无 / 无 / 无」的表，看着像"它一次工具都没调"，其实是无人在产。
-  const withTraj=s.series.filter(p=>(p.trajectory||[]).length);
-  const trajPanel = withTraj.length ? `<div class="panel">
-      <div class="panel__head"><h2>编排轨迹</h2><span class="hint">「学会编排」的直接证据</span></div>
-      <table><thead><tr><th>#</th><th>本轮调用的工具序列</th><th>已覆盖评分点</th><th>缺失</th><th>base 未过闸</th></tr></thead>
-        <tbody>${s.series.map(p=>`
-          <tr><td class="num">${p.i}</td>
-            <td>${(p.trajectory||[]).length?(p.trajectory||[]).map(t=>`<span class="tool">${ESC(t)}</span>`).join(''):'<span class="chip grey">未调用</span>'}</td>
-            <td>${(p.covered||[]).length?chips(p.covered,'ok'):'<span class="chip grey">无</span>'}</td>
-            <td>${(p.missing||[]).length?chips(p.missing,'bad'):'<span class="chip grey">无</span>'}</td>
-            <td>${(p.rejected||[]).length?chips(p.rejected,'warn'):'<span class="chip grey">无</span>'}</td></tr>`).join('')}</tbody></table>
-    </div>`
-    : `<div class="panel"><div class="panel__head"><h2>编排轨迹</h2></div>
-        <div class="empty">新后端<b>不把工具序列落进 run_log</b> —— 这一页属于已冻结的旧后端
-        （mve/run_mve.py）。要看这一轮调了几次工具、成功几次、取到几行，
-        去「运行日志」页顶的<b>循环心跳</b>：那是新后端每轮如实写下的。</div></div>`;
-
-  // 轮次明细：删掉「事实数 / flags / 幻觉拦截」三列（线上恒空，只由旧后端写），
-  // 「覆盖率 / 得分」合并成一列并说明练习线有意不判分（否则两列全是 "—"）。
-  const rows=s.series.map(p=>`
-    <tr><td class="num">${p.i}</td><td class="mono">${ESC(p.mode)}</td><td class="num">${p.round}</td>
-      <td>${p.done?'<span class="chip ok">✓</span>':'<span class="chip bad">✗</span>'}</td>
-      <td>${p.success?'<span class="chip ok">✓</span>':'<span class="chip bad">✗</span>'}</td>
-      <td><b>${ESC(p.verdict)}</b></td>
-      <td class="num">${p.coverage===null?'<span class="hint">练习线不判分</span>':(p.coverage*100).toFixed(0)+'%'}</td>
-      <td class="mono">${ESC(p.evidence)}</td>
-      <td>${ESC(JUDGE_LABEL[p.judge]||p.judge||'—')}</td>
-      <td>${p.no_tool_calls?'<span class="chip bad">无工具调用</span>':'<span class="chip grey">—</span>'}</td>
-      <td class="mono" style="font-size:12px">${ESC(p.topic_id||'')}</td></tr>`).join('');
-
-  // 叙事洞察同样条件渲染：叙事由消费线产出，练习线不产。
-  const withStory=s.series.filter(p=>p.narrative);
-  const storyPanel = withStory.length ? `<div class="panel">
-      <div class="panel__head"><h2>叙事洞察</h2>
-        <span class="hint">VLML README:97 —— 指标与证据由工具出，洞察由 LLM 出</span></div>
-      ${withStory.slice(-2).map(p=>`
-        <div class="nocmp">
-          <div class="nocmp-tag">不参与比对 · comparable: false</div>
-          <div class="nocmp-body">${ESC(p.narrative)}</div>
-          ${(p.insights||[]).length?`<div class="nocmp-sub"><b>洞察：</b><ul>${p.insights.map(i=>`<li>${ESC(i)}</li>`).join('')}</ul></div>`:''}
-          ${(p.caveats||[]).length?`<div class="nocmp-sub"><b>数据局限：</b>${p.caveats.map(c=>ESC(c)).join('；')}</div>`:''}
-          <div class="nocmp-sub">第 ${p.i} 次作答 · 基于 ${p.narrative_based_on||0} 条<b>已通过裁判核对</b>的事实</div>
-        </div>`).join('')}
-    </div>`
-    : `<div class="panel"><div class="panel__head"><h2>叙事洞察</h2></div>
-        <div class="empty">叙事由<b>消费线</b>产出（人问一句 → 比对做法 → LLM 出叙事洞察），
-        练习线只管取数、不产叙事。去「人导入」页问一句话，这里才会长出内容。</div></div>`;
-
-  return `${trajPanel}
-    <div class="panel">
-      <div class="panel__head"><h2>轮次明细</h2>
-        <span class="hint">done = 有没有真的从 DB 取到数；判分只在消费线 / 考核线</span></div>
-      <table><thead><tr><th>#</th><th>模式</th><th>轮</th><th>done</th><th>success</th><th>verdict</th>
-        <th>判分</th><th>证据状态</th><th>判据</th><th>工具</th><th>知识点</th></tr></thead>
-        <tbody>${rows}</tbody></table>
-    </div>
-    ${storyPanel}`;
+  const tr=s.trace||[];
+  if(!tr.length) return `<div class="panel"><div class="empty">
+    学习轨迹账（learn_trace）还没有行 —— 学习循环跑完一轮 learn()，这里就有：
+    Phase1 spec 冻结 / Phase2 finalCode 交付 / 取数真行数 / 里程碑闭合与点亮 / 证据门。
+    旧账 run_log 已退役（它按 critic 门记账，里程碑点亮了它还记 failed，全是假 ✗）。</div></div>`;
+  const rows=tr.slice().reverse().map((p,i)=>{
+    const ms=p.ms_total?`<span class="chip ${p.ms_achieved?'ok':'grey'}">${p.ms_closed}/${p.ms_total}${p.ms_achieved?' ✅':''}</span>`:'<span class="chip grey">—</span>';
+    return `<tr>
+      <td class="num">${tr.length-i}</td>
+      <td class="mono" style="font-size:12px">${ESC((p.question||'').slice(0,52))}</td>
+      <td>${p.phase1_passed?'<span class="chip ok">冻结</span>':'<span class="chip bad">未冻结</span>'}</td>
+      <td>${p.phase2_submitted?'<span class="chip ok">已交</span>':'<span class="chip bad">未交</span>'}</td>
+      <td class="num">${p.fetch_calls||0}</td>
+      <td>${p.fetch_ok?`<span class="chip ok">真取到 ${p.fetch_rows||0} 行</span>`:'<span class="chip bad">0</span>'}</td>
+      <td>${ms}</td>
+      <td>${(p.ms_achieved||p.lit)?'<span class="chip ok">已点亮</span>':'<span class="chip grey">—</span>'}</td>
+      <td>${(p.gate_addressed>0&&p.gate_open===0)?'<span class="chip ok">门过</span>':`<span class="chip bad">开 ${p.gate_open||0}</span>`}</td>
+      <td><b>${ESC(p.status||'')}</b></td>
+      <td style="font-size:12px;opacity:.7">${ESC((p.why||'').slice(0,60))}</td></tr>`;
+  }).join('');
+  return `<div class="panel">
+    <div class="panel__head"><h2>学习轨迹</h2>
+      <span class="hint">MVE 现账（learn_trace）：一次 learn() 一行 —— Phase1 / Phase2 / 取数 / 里程碑 / 证据门，不再是原版 Voyager 的 coverage/score</span></div>
+    <table><thead><tr><th>#</th><th>题面</th><th>Phase1</th><th>Phase2</th><th>取数</th><th>真取到</th><th>里程碑</th><th>点亮</th><th>证据门</th><th>status</th><th>为什么</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
 }
 
 function pSkill(s){
   const st=s.skill_stats||{};
   // 复用健康度判据（与原溯源视图同一套规则，去重后并入技能卡）：
   //   hits>=2 且有效率 <0.5 → stale；hits==0 → unused；否则 ok。
+  // 2026-11-18 换尺：分母用 runs（注入后真进了执行的轮数），不用 hits
+  // （开题注入就 +1，Phase1 就死的轮永远取不到数，会把所有配方拖成"失效"）。
   const health=x=>{
-    const hits=+x.hits||0, ok=+x.ok||0;
-    if(hits>=2&&ok/hits<0.5) return '<span class="chip bad">🔴 失效（命中多、有效少）</span>';
+    const hits=+x.hits||0, ok=+x.ok||0, runs=+x.runs||0;
     if(hits===0) return '<span class="chip grey">⚪ 未验证</span>';
+    if(runs<2) return `<span class="chip grey" title="注入 ${hits} 次里只有 ${runs} 次真进了执行，样本不足不下判">⚪ 样本不足</span>`;
+    if(ok/runs<0.5) return '<span class="chip bad">🔴 失效（进了执行没取到数）</span>';
     return '<span class="chip ok">🟢 正常复用</span>';};
   const cards=(s.skill_detail||[]).map(x=>`
     <div class="taskcard" style="margin-top:8px">
@@ -1411,14 +2045,14 @@ function pSkill(s){
       <div class="tm"><span class="chip grey" title="技能名（消费索引键的一部分）">${ESC(x.name||'—')}</span>
         <span class="chip grey" title="精确索引键：会话 topic::技能名 —— 消费按它直取">${ESC(x.key||'')}</span>
         <span class="chip grey">${ESC(x.topic||'—')}</span>
-        <span class="chip grey">Scene ${ESC(x.source_scene||'default')}</span>
         ${x.import_id?`<span class="chip grey" title="这次人导入长的技能">来自批次 ${ESC(x.import_id)}</span>`:''}
         ${x.milestone?`<span class="chip grey">里程碑 ${ESC(x.milestone)}${x.dimension?' · '+ESC(x.dimension):''}</span>`:''}
-        <span class="chip grey">命中 ${x.hits}</span>
-        <span class="chip ${x.ok>0?'ok':'grey'}">有效 ${x.ok}</span>
-        ${x.hits>0
-          ? `<span class="chip ${x.ok>0?'ok':'bad'}">有效率 ${Math.min(100,Math.round(100*x.ok/x.hits))}%</span>`
-          : '<span class="chip dim">还没被用过</span>'}
+        <span class="chip grey" title="被检索注入 prompt 的轮数（开题即计，不管后来死在哪）">注入 ${x.hits}</span>
+        <span class="chip grey" title="注入后真的进入执行（Phase2 交付 / 真调过取数工具）的轮数 —— 真取到率的分母">进执行 ${x.runs||0}</span>
+        <span class="chip ${x.ok>0?'ok':'grey'}" title="进入执行且这轮真取到数的轮数">真取到 ${x.ok}</span>
+        ${x.runs>0
+          ? `<span class="chip ${x.ok>0?'ok':'bad'}">真取到率 ${Math.min(100,Math.round(100*x.ok/x.runs))}%</span>`
+          : '<span class="chip dim">还没进过执行</span>'}
         ${health(x)}
         ${x.versions>1?`<span class="chip warn">已覆盖 ${x.versions} 版</span>`:''}
         <button class="btn btn-danger" style="padding:1px 8px;font-size:12px;margin-left:6px"
@@ -1426,12 +2060,8 @@ function pSkill(s){
           title="复核发现错账（假阳性/冗余）时单条清除：本体+向量+结晶一并，删动作记审计事件，不可恢复">清账</button></div>
       ${x.code?`<details data-k="skill:${ESC(x.key)}:code" style="margin-top:4px"><summary style="cursor:pointer;font-size:12px;opacity:.75">配方（code，原样入库的取数做法）</summary><pre style="white-space:pre-wrap;background:rgba(127,127,127,.08);padding:6px;border-radius:6px;font-size:12px;max-height:240px;overflow:auto">${ESC(x.code)}</pre></details>`:''}
     </div>`).join('');
-  // 按场景分组（原溯源页的分组计数，并入本页 legend）
-  const byScene={};
-  (s.skill_detail||[]).forEach(x=>{const k=x.source_scene||'default';byScene[k]=(byScene[k]||0)+1;});
-  const sceneLine=Object.keys(byScene).length
-    ? `<div class="legend">按场景归属：${Object.entries(byScene).map(([k,v])=>`<span class="chip grey">${ESC(k)} = ${v}</span>`).join(' ')}
-       <span class="hint">Scene 标签只标冷启动后新入库的技能；字段引入前入库的记 default。</span></div>` : '';
+  // 2026-11-18：不再按场景分组（只有一个工作区，一份配方库）。
+  const sceneLine = `<div class="legend"><span class="hint">同一份材料里攒下的配方，跨会话复用；不区分场景。</span></div>`;
   const c=s.causal||{};
   const kc={control:'ok',attempt:'',referee:'grey',narrative:'grey'};
   const mc=s.mc_thinking||{};
@@ -1439,7 +2069,7 @@ function pSkill(s){
     <div class="note info" style="margin-top:10px">
       🧠 <b>MC 思路学习入库：${mc.count} 条</b>
       <span class="hint">（topic=mc-thinking，MVE 标准练习循环运行期可被检索）</span>
-      <ul style="margin:6px 0 0 18px;padding:0">${(mc.items||[]).map(x=>`<li><b>${ESC(x.name)}</b> · 命中 ${x.hits} · 有效 ${x.ok}${x.versions>1?` · 已覆盖 ${x.versions} 版`:''}</li>`).join('')}</ul>
+      <ul style="margin:6px 0 0 18px;padding:0">${(mc.items||[]).map(x=>`<li><b>${ESC(x.name)}</b> · 注入 ${x.hits} · 真取到 ${x.ok}${x.versions>1?` · 已覆盖 ${x.versions} 版`:''}</li>`).join('')}</ul>
       ${mc.skill_md?`<div class="hint">SKILL.md：${ESC(mc.skill_md)}（OpenClaw 考场直接注入）</div>`:''}
     </div>` : '';
   const tl=(c.rows||[]).length?`<div class="timeline">${(c.rows||[]).slice().reverse().map(r=>`
@@ -1447,14 +2077,14 @@ function pSkill(s){
         <span class="kd"><span class="chip ${kc[r.kind]||'grey'}">${ESC(r.kind_label)}</span></span>
         <span>${ESC(r.summary)}</span>
         <span class="ts">${ESC(String(r.ts||'').replace('T',' ').slice(5,19))}</span></div>`).join('')}</div>`
-    :`<div class="empty">Scene ${ESC((s.scene||{}).id||'A')} 的时间线还是空的 ——
+    :`<div class="empty">时间线还是空的 ——
       人导入一个问题（哪怕没取到数）就会在这里落下一条 control 事实。</div>`;
   return `<div class="panel">
       <div class="panel__head"><h2>技能库</h2>
-        <span class="hint">照原版 voyager.py:195/199：每轮<b>先检索</b>再写 SQL；按有效性排序</span></div>
-      <div class="legend"><b>命中</b> = 被检索注入过几次 prompt · <b>有效</b> = 注入后这轮判成功几次 ·
-        <b>命中涨、有效不涨</b> = 注入了但没帮上，它会在检索排序里自然沉底。
-        有效率高 = 这条经验真在被复用。
+        <span class="hint">每轮<b>先检索</b>再执行（retrieve → rollout）；按真取到率排序</span></div>
+      <div class="legend"><b>注入</b> = 被检索注入过几次 prompt · <b>真取到</b> = 注入后这轮真的取到数/真算过几次
+        （2026-11-18 换尺：不再拿 critic 的证据门当技能的尺，与里程碑点亮的 fetched 口径同一条）·
+        <b>注入涨、真取到不涨</b> = 注入了但没帮上，检索排序里自然沉底（命中加成已删，失败配方不再霸榜）。
       </div>
       <div class="legend">条目 <b>${st.skills||0}</b> · 累计写入 <b>${st.writes||0}</b> 次
         （覆盖 ${st.rewrites||0} · 丢弃 ${st.skipped||0}）·
@@ -1524,26 +2154,35 @@ function pSessions(s){
       return `<div class="tl"><span class="seq">${ESC(ts(e.at))}</span>
         <span>${ESC(what)}</span></div>`;
     }).join('');
-    const sk=(x.skills||[]).map(z=>`<li><span class="mono" style="font-size:12px">${ESC(z.key)}</span>
-        ${z.dimension?`<span class="chip grey">${ESC(z.dimension)}</span>`:''}
+    const _skillRow=z=>`<li><span class="mono" style="font-size:12px">${ESC(z.key)}</span>
+        ${z.dimension?`<span class="chip grey">维度 ${ESC(z.dimension)}</span>`:'<span class="chip ok">会话级</span>'}
         <span class="chip grey">命中 ${z.hits}</span>
-        <span class="chip ${z.ok>0?'ok':'grey'}">有效 ${z.ok}</span></li>`).join('');
+        <span class="chip ${z.ok>0?'ok':'grey'}">有效 ${z.ok}</span>
+        ${z.versions>1?`<span class="chip grey" title="这条技能被重写过几次（版本数）">v${z.versions}</span>`:''}
+        ${z.sessions>1?`<span class="chip warn" title="这条技能被多个会话学过（会话↔技能是多对多）；本页按会话各列一次">${z.sessions} 个会话学过</span>`:''}
+        ${(!z.dimension&&z.question)?`<span class="hint">${ESC(String(z.question).slice(0,60))}</span>`:''}
+        ${z.code?`<details data-k="skill:${ESC(x.req_id)}:${ESC(z.key)}" style="margin-top:2px"><summary style="cursor:pointer;font-size:12px;opacity:.75">技能本体（跑通的那段程序/SQL）</summary><pre style="white-space:pre-wrap;background:rgba(127,127,127,.08);padding:6px;border-radius:6px;font-size:12px;max-height:260px;overflow:auto">${ESC(z.code)}</pre></details>`:''}
+      </li>`;
+    const _taskSk=(x.skills||[]).filter(z=>!z.dimension);
+    const _fragSk=(x.skills||[]).filter(z=>z.dimension);
     return `<details class="nocmp" data-k="sess:${ESC(x.req_id)}" style="margin-top:8px">
       <summary class="th">${ESC(x.question||x.req_id)}</summary>
       <div class="tm">
         <span class="chip grey mono">${ESC(x.req_id)}</span>
         <span class="chip ${ph[0]}">${ph[1]}</span>
-        ${total?`<span class="chip ${allClosed?'ok':'warn'}">维度 ${closed}/${total}</span>`:''}
         ${vkeys.length?`<span class="chip ok">已验答案 ${vkeys.length} 条</span>`:''}
-        ${(x.rounds&&x.rounds.rounds)?`<span class="chip ${((x.rounds.zero_rounds||0)>=x.rounds.rounds)?'bad':'grey'}" title="整题层重试账：零闭合轮 = 这一轮一条维度都没关掉">里程碑 ${x.rounds.rounds} 轮（零闭合 ${x.rounds.zero_rounds||0} · 失败 ${x.rounds.fail_rounds||0}）</span>`:''}
+        ${(x.rounds&&x.rounds.rounds)?`<span class="chip grey" title="整题层重试账">学习 ${x.rounds.rounds} 轮</span>`:''}
         ${x.is_target?'<span class="chip warn" title="消费侧立的学习锚点：学习侧下一轮优先攻这句">当前锚点</span>':''}
         ${x.archived?'<span class="chip ok">已归档</span>':''}
         ${(x.known_questions||[]).length>1?`<span class="chip grey">${x.known_questions.length} 种问法</span>`:''}
       </div>
       ${x.has_session?'':`<div class="hint" style="margin-top:6px">${ESC(x.why||'还没有会话记录')}</div>`}
       ${dims?`<ul style="margin:6px 0 0 18px;padding:0">${dims}</ul>`:''}
-      ${sk?`<div class="hint" style="margin-top:6px">这个会话攒下的技能（${(x.skills||[]).length} 条）</div>
-        <ul style="margin:4px 0 0 18px;padding:0">${sk}</ul>`
+      ${(x.skills||[]).length?`<div class="hint" style="margin-top:6px">这个会话学成的技能（${(x.skills||[]).length} 条：会话级 ${_taskSk.length} · 维度配方 ${_fragSk.length}）</div>
+        ${_taskSk.length?`<div class="hint" style="margin-top:2px;opacity:.8">会话级（task 级：一次会话沉淀一条，整体可重放；同题再派会重写同一条）</div>
+          <ul style="margin:4px 0 0 18px;padding:0">${_taskSk.map(_skillRow).join('')}</ul>`:''}
+        ${_fragSk.length?`<div class="hint" style="margin-top:4px;opacity:.8">维度配方（会话的构件：每维一条，供单点召回/组合）</div>
+          <ul style="margin:4px 0 0 18px;padding:0">${_fragSk.map(_skillRow).join('')}</ul>`:''}`
         :'<div class="hint" style="margin-top:6px">这个会话还没有关联技能（技能写入时还没有需求身份 → 不按标题猜）</div>'}
       ${evs?`<div class="hint" style="margin-top:6px">会话事件流（append-only）</div><div class="timeline">${evs}</div>`:''}
     </details>`;
@@ -1750,7 +2389,117 @@ async function loadGraph(force){
 const REL={produced_by:['#2f7d5f','产出','实线'],derived_from:['#8a94a6','由表算出','虚线'],
            confusable:['#c2703a','易混','虚线'],co_occurs:['#b9c2ce','同题共现','虚线'],
            procedure_step:['#6d5bd0','编排顺序','实线']};
+/* 课程图谱：书 → 单元 → 题（2026-11-14）。
+   P 的 648 个单元全画出来是一张目录墙，看不出自己学到哪；只画当前这本书，
+   进度靠颜色分辨（黄=当前关 / 绿=已学 / 灰=跳过 / 白=未学）。 */
+function renderCourse(g){
+  const c=g.course||{}, sid=g.scene_id||'?';
+  const units=c.units||[];
+  const banner=`<div class="note info" style="margin-bottom:8px">
+    <b>课程图谱</b> · 《${ESC(c.book||'—')}》 ·
+    本书 ${units.length} 个单元 · 全书 ${c.unit_total==null?'—':c.unit_total} 个单元
+    （已学 ${c.unit_done==null?0:c.unit_done} · 跳过 ${c.unit_skipped==null?0:c.unit_skipped}）
+    <span class="hint">（只画当前这本书；全书进度看「进度」页）</span></div>`;
+  if(!units.length) return banner+`<div class="empty">这本书还没有单元</div>`;
+  const NW=248, NH=26, ROW=38, PADY=36, BX=36, UX=316, EX=636, EW=186;
+  const H=PADY*2+units.length*ROW, W=EX+EW+36;
+  const posU={}, posE={};
+  units.forEach((u,i)=>{ posU[u.id]={x:UX,y:PADY+i*ROW+ROW/2}; });
+  units.forEach(u=>{ const j=(u.exercises||[]);
+    j.forEach((e,k)=>{ posE[e.id]={x:EX,y:posU[u.id].y+(k-(j.length-1)/2)*30}; }); });
+  const bookY=H/2-26;
+  const head=(x,w,t)=>`<text x="${x+w/2}" y="${PADY-14}" font-size="11" font-weight="700"
+      fill="#6b7686" text-anchor="middle">${t}</text>`;
+  const es=[];
+  es.push(`<path d="M${BX+NW},${bookY+26} C${BX+NW+50},${bookY+26} ${UX-50},${PADY+ROW/2} ${UX},${PADY+ROW/2}"
+     fill="none" stroke="#48679c" stroke-width="1.4" opacity=".6"/>`);
+  units.forEach((u,i)=>{
+    if(i<units.length-1){
+      const a=posU[u.id], b=posU[units[i+1].id];
+      es.push(`<path d="M${a.x+NW/2},${a.y+NH/2} L${b.x+NW/2},${b.y-NH/2}"
+        fill="none" stroke="#d5dbe3" stroke-width="1.1" stroke-dasharray="3 3"/>`);
+    }
+    (u.exercises||[]).forEach(e=>{
+      const a=posU[u.id], b=posE[e.id];
+      es.push(`<path d="M${a.x+NW},${a.y} C${a.x+NW+50},${a.y} ${b.x-50},${b.y} ${b.x},${b.y}"
+        fill="none" stroke="#2f7d5f" stroke-width="1.3" opacity=".7"/>`);
+    });
+  });
+  const ns=units.map(u=>{
+    const p=posU[u.id];
+    let fill='#fff', stroke='#b9c2ce', sw=1.2, mark='';
+    if(u.current){ fill='#fff4cc'; stroke='#d9a900'; sw=2.2; mark='  ← 当前关'; }
+    else if(u.done){ fill='#e8f2ee'; stroke='#2f7d5f'; }
+    else if(u.skipped){ fill='#f4f5f7'; stroke='#cfd5dd'; }
+    const full=String(u.label||u.id), txt=full.length>26?full.slice(0,25)+'…':full;
+    const st=u.done?'已学完':(u.skipped?'已跳过':(u.current?'当前关':'未学'));
+    return `<g><rect x="${p.x}" y="${p.y-NH/2}" width="${NW}" height="${NH}" rx="6"
+      fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>
+      <text x="${p.x+10}" y="${p.y+4}" font-size="11" fill="#22303a">${ESC(txt)}${mark}</text>
+      <title>${ESC(u.id)}
+${ESC(full)}
+状态：${st} · 已学 ${u.learned||0}/${u.need||1} 道</title></g>`;
+  }).join('');
+  const ens=units.flatMap(u=>(u.exercises||[]).map(e=>{
+    const p=posE[e.id];
+    return `<g><rect x="${p.x}" y="${p.y-12}" width="${EW}" height="24" rx="5"
+      fill="#e8f2ee" stroke="#2f7d5f"/><text x="${p.x+8}" y="${p.y+4}" font-size="10"
+      fill="#22303a">${ESC(String(e.label||e.id).slice(0,24))}</text>
+      <title>${ESC(e.id)}
+${ESC(e.label||'')}</title></g>`;
+  })).join('');
+  const bookNode=`<g><rect x="${BX}" y="${bookY}" width="${NW}" height="52" rx="7"
+    fill="#eef2f8" stroke="#48679c" stroke-width="1.5"/>
+    <text x="${BX+10}" y="${bookY+21}" font-size="11" font-weight="700"
+      fill="#22303a">${ESC(String(c.book||'').slice(0,24))}</text>
+    <text x="${BX+10}" y="${bookY+39}" font-size="10" fill="#6b7686">
+      本书 ${units.length} 单元 · 已学 ${units.filter(u=>u.done).length}</text></g>`;
+  return banner+`<div class="panel__head"><h2>书 → 单元 → 题</h2>
+      <span class="hint">黄=当前关，绿=已学，灰=跳过</span></div>
+    <svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px;background:#fff;border-radius:8px">
+      ${head(UX,NW,'单元（本书）')}${head(EX,EW,'已学的题')}
+      ${es.join('')}${bookNode}${ns}${ens}</svg>`;
+}
+
+/* ---------------- 导入的题（req 节点）：将做 / 已做 ----------------
+   已做排前面（同构猫娘伴学：先看见做完的，进步可见）。
+   「出这道」= 人靠图谱影响出题的入口：点一下，题面进「新建练习」输入框，
+   直接送去拆骨架、送去学习。 */
+function graphReqHtml(g){
+  const reqs=g.req_nodes||[];
+  if(!reqs.length) return '';
+  const done=g.req_done||0;
+  const rows=reqs.map(r=>{
+    const isDone=r.status==='verified';
+    return `<div class="imp-row" style="margin:3px 0;gap:8px">
+      <span class="chip ${isDone?'ok':'grey'}">${isDone?'✓ 已做':'○ 将做'}</span>
+      <span style="font-size:13px;flex:1">${ESC(r.question||r.label)}</span>
+      ${isDone&&r.solved_at?`<span class="hint">${ESC(String(r.solved_at).replace('T',' '))} 过</span>`
+        :`<button class="btn btn-secondary" style="padding:2px 9px;font-size:12px"
+           data-req-pick="${ESC(r.id)}">出这道</button>`}
+    </div>`;
+  }).join('');
+  return `<div class="panel" style="margin-top:10px">
+    <div class="panel__head"><h3>📝 题 · 图谱里的导入题</h3>
+      <span class="hint">已做 ${done} / ${reqs.length}（已做排前面；Phase2 过关才把「将做」翻成「已做」）</span></div>
+    ${rows}
+    <div class="legend">这就是「人写图谱影响出题」：出题时题写进图谱，
+      图谱里就有这份将做清单；点「出这道」把它送回出题口。</div>
+  </div>`;
+}
+async function reqPick(id){
+  const r=((GRAPH||{}).req_nodes||[]).find(x=>x.id===id);
+  const q=document.getElementById('q');
+  if(!r||!q) return;
+  q.value=r.question||r.label||'';
+  try{ q.scrollIntoView({behavior:'smooth',block:'center'}); }catch(e){}
+  if(typeof exPreview==='function') exPreview();
+}
+
 function renderGraph(g){
+  // 课程场景（书 → 单元 → 题）走专用视图：它的节点是 topic/book/exercise，
+  // 不是表/工具/维度，硬塞进三列布局只会得到一张空图。
+  if(g.course && (g.course.units||[]).length) return renderCourse(g);
   if(g.empty) return `<div class="empty">${ESC(g.error||'图谱为空')}</div>`;
   const nodes=g.nodes||[], edges=g.edges||[];
   // 1→n：当前场景的图谱横幅（2026-10-18）。每个场景一张图 —— A 的 360 个
@@ -1759,10 +2508,11 @@ function renderGraph(g){
   const sceneId=g.scene_id||'A';
   const sceneSpecific=g.scene_specific_nodes;
   const sceneBanner=`<div class="note info" style="margin-bottom:8px">
-    <b>当前场景 Scene ${ESC(sceneId)} 的图谱</b> ·
+    <b>这份材料的图谱</b> ·
     ${sceneSpecific==null?'—':sceneSpecific+' 个专属节点'} · ${edges.length} 条边
     <span class="hint">（全库图谱共 ${g.total_nodes==null?'—':g.total_nodes} 个节点；
     <b>其它场景的节点不画在这里</b> —— 场景间按命名空间隔离，切场景看各自的图）</span></div>`;
+  const reqHtml=graphReqHtml(g);
   const byId={}; nodes.forEach(n=>byId[n.id]=n);
   // 收集要画的节点（规则见下方 forEach 注释）：维度（含孤立）必画；
   // 工具/表只有连边才画（避免 machinery 把图变乱）。
@@ -1785,11 +2535,11 @@ function renderGraph(g){
   if(!cols.dimension.length && !cols.tool.length && !cols.table.length){
     // 场景图谱为空（只有场景根节点）= 冷启动期：说清楚"这是正常的、下一步干嘛"，
     // 不要报"图谱里还没有连上边的维度"那种像故障的文案。
-    if(sceneSpecific===0) return sceneBanner+`<div class="empty">
-      Scene ${ESC(sceneId)} 的图谱还是<b>空的</b>（冷启动期只有场景根节点）。
+    if(sceneSpecific===0) return sceneBanner+reqHtml+`<div class="empty">
+      图谱还是<b>空的</b>（冷启动期只有根节点）。
       <br>去「人导入」问一个<b>属于这个场景</b>的问题：未命中会先落待审区，
       解题成功后第一个节点就挂上来，Δ 专属节点 0 → 1。</div>`;
-    return sceneBanner+`<div class="empty">这个场景还没有可画的节点</div>`;
+    return sceneBanner+reqHtml+`<div class="empty">这个场景还没有可画的节点</div>`;
   }
 
   // 待审候选条：运行期题带来的新维度名**不占节点位**（照伴学：运行期新建的
@@ -1855,7 +2605,7 @@ ${ESC(REL[e.relation]&&REL[e.relation][1]||e.relation)}${e.origin==='observed'?'
         +'text-anchor="end">练习中</text>':''}
       <title>${ESC(n.label||id)}
 类型：${ESC(n.kind)}
-连边：${deg}${n.detail&&n.detail.topic_id?'\n题：'+ESC(n.detail.topic_id):''}${n.detail&&n.detail.required_by?'\n被题要求：'+ESC((n.detail.required_by).join('、')):''}${n.kind==='dimension'?'\n点击设为练习范围':''}${tip}</title></g>`;
+连边：${deg}${n.detail&&n.detail.topic_id?'\n题：'+ESC(n.detail.topic_id):''}${n.detail&&n.detail.required_by?'\n被题要求：'+ESC((n.detail.required_by).join('、')):''}${tip}</title></g>`;
   }).join('');
 
   // 下方位清单：照伴学 relation_groups —— 图看结构，清单看内容
@@ -1890,7 +2640,7 @@ ${ESC(REL[e.relation]&&REL[e.relation][1]||e.relation)}${e.origin==='observed'?'
   }).join('');
 
   const sm=g.summary||{};
-  return scopeBarHtml() + sceneBanner + pendHtml + `<div class="panel__head"><h2>维度 → 工具 → 表 · Scene ${ESC(sceneId)}</h2>
+  return sceneBanner + reqHtml + pendHtml + `<div class="panel__head"><h2>维度 → 工具 → 表</h2>
       <span class="hint">${sm.dimensions||0} 维度 · ${sm.tools||0} 工具 · ${sm.tables||0} 表 · ${sm.edges||0} 边（本场景）</span></div>
     <svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px;background:#fff;border-radius:8px">
       ${colTitle}${es}${ns}
@@ -1903,7 +2653,7 @@ ${ESC(REL[e.relation]&&REL[e.relation][1]||e.relation)}${e.origin==='observed'?'
       （origin=observed，学习回写时落的 produced_by 边）。
       冷启动期新建的维度（淡黄虚线框）即使还没连边也会画出来 —— 它是问题"插进场景"的
       可见证明（证据数=1、待验证）；VLML 那些没被任何题用到的工具仍不画（避免图变乱）。
-      <br><b>点任意维度</b>（或下表按钮）把它设成练习范围，出题器就只在这范围里出题。</div>
+      <br><b>点任意维度</b>看它对应哪些工具与表。</div>
     <table class="tbl" style="margin-top:12px">
       <thead><tr><th>知识点（维度）</th><th>阶段·工具集梯度</th><th>学科·实体域</th>
         <th>章节·主题域</th><th>由谁产出</th><th>易混</th><th>练习</th></tr></thead>
@@ -1970,36 +2720,6 @@ function subjectHtml(g){
     </div>${un}</div>`;
 }
 
-/* 图谱页顶部的练习范围条：照伴学 i18n
-   ui.knowledge.practice_topic =「练习此知识点」
-   ui.practice.next_step.choose_scope =「选择练习范围」 */
-function scopeBarHtml(){
-  const sc=window.__scope||{active:false};
-  if(sc.active){
-    return `<div class="scopebar" style="margin:0 0 14px">
-      <span class="lbl">练习范围</span>
-      <span class="chip ok">${ESC(sc.label)}</span>
-      <span class="chip grey">${ESC((sc.topics||[]).join('、'))}</span>
-      <button class="btn btn-primary" data-scope-practice="1"
-        style="padding:6px 14px;font-size:13px">▶ 按此范围练习</button>
-      <button class="btn btn-secondary" data-scope-clear="1"
-        style="padding:6px 12px;font-size:13px">清除范围</button>
-      <span class="hint">${ESC(sc.point||'')}</span>
-    </div>`;
-  }
-  if(sc.invalidated){
-    return `<div class="scopebar" style="margin:0 0 14px">
-      <span class="lbl">练习范围</span>
-      <span class="chip warn">已失效</span><span class="chip grey">${ESC(sc.label||'')}</span>
-      <span class="hint">${ESC(sc.reason||'')} —— 请重新点一个维度</span>
-    </div>`;
-  }
-  return `<div class="scopebar" style="margin:0 0 14px">
-    <span class="lbl">练习范围</span>
-    <span class="chip grey">未设置 · 出题器自选</span>
-    <span class="hint">点图上任意维度或下表「练习此知识点」，驾驶舱就只在这个范围里出题</span>
-  </div>`;
-}
 function pGraph(s){
   const id='graphBody';
   loadGraph().then(g=>{ const el=document.getElementById(id); if(el) el.innerHTML=renderGraph(g); });
@@ -2074,6 +2794,8 @@ async function delSubject(id){
 document.addEventListener('click',e=>{
   const s=e.target.closest('[data-scope-set]');
   if(s){ setScope(s.dataset.scopeSet); return; }
+  const rp=e.target.closest('[data-req-pick]');
+  if(rp){ reqPick(rp.dataset.reqPick); return; }
   if(e.target.closest('[data-scope-clear]')){ clearScope(); return; }
   if(e.target.closest('[data-scope-practice]')){ pilotStart(); return; }
   if(e.target.closest('[data-subject-add]')){ addSubject(); return; }
@@ -2082,7 +2804,6 @@ document.addEventListener('click',e=>{
   if(sd){ delSubject(sd.dataset.subjectDel); return; }
   // 域外问题一键迁场（新建场景 → 切换 → 重新导入同一个问题）
   const mq=e.target.closest('[data-migrate-q]');
-  if(mq){ migrateToNewScene(mq.dataset.migrateQ||''); return; }
 });
 
 /* ---------------- 自适应练习（伴学出题/图谱移植） ---------------- */
@@ -2184,7 +2905,59 @@ function oqReveal(){
   if(g){ g.style.display='block'; g.innerHTML=window.__oqGradeHTML; }
 }
 
-const PANELS={overview:pOverview,practice:pPractice,import:pImport,trace:pTrace,skill:pSkill,graph:pGraph,voyager:pVoyager,adaptive:pAdaptive,console:pConsole};
+/* ---------------- 进度问答（人问，讲解员只转述账面） ---------------- */
+const PCHAT_LOG = window.__PCHAT_LOG || (window.__PCHAT_LOG = []);
+function pChat(s){
+  const hist = PCHAT_LOG.map(m => m.pending
+    ? `<div class="card" style="margin-top:8px"><b>问：${ESC(m.q)}</b><div style="margin-top:4px;opacity:.6">讲解员正在读账…</div></div>`
+    : (m.err
+      ? `<div class="card" style="margin-top:8px"><b>问：${ESC(m.q)}</b><div style="margin-top:4px;color:#c0392b">答不上：${ESC(m.err)}</div></div>`
+      : `<div class="card" style="margin-top:8px"><b>问：${ESC(m.q)}</b><div style="margin-top:4px;white-space:pre-wrap">${ESC(m.a)}</div><div style="margin-top:6px"><details data-k="pchat${m.ts}"><summary style="font-size:12px;opacity:.6">这轮读的账</summary><pre style="font-size:11px;white-space:pre-wrap">${ESC(m.ctx||'')}</pre></details></div></div>`)
+  ).join('');
+  const busy = PCHAT_LOG.length && PCHAT_LOG[PCHAT_LOG.length-1].pending;
+  return `<div class="card">
+    <h3>💬 进度问答</h3>
+    <p style="opacity:.7;font-size:13px">问「现在学到哪了/学得怎么样/卡在哪」。讲解员只转述服务端账面（循环 / 背包 / 课程账 / 里程碑 / chat 游程 / 技能库 / 运行日志），不推断、不评分、不写账。</p>
+    <div style="display:flex;gap:8px;margin-top:8px">
+      <textarea id="pchatQ" rows="2" style="flex:1" placeholder="例如：现在学到哪了？卡在哪？"></textarea>
+      <button class="btn" id="pchatGo" ${busy?'disabled':''} onclick="askProgress()">${busy?'读账中…':'问一句'}</button>
+    </div>
+    <div id="pchatOut">${hist || '<div style="opacity:.5;font-size:13px;margin-top:8px">还没有问过。</div>'}</div>
+  </div>`;
+}
+async function askProgress(){
+  const ta=document.getElementById('pchatQ'); if(!ta) return;
+  const q=ta.value.trim(); if(!q) return;
+  ta.value='';
+  PCHAT_LOG.push({q, pending:true, ts:Date.now()});
+  uiEvent('pchat_ask', {问题:q.slice(0,120)}, '已受理');
+  await load();
+  try{
+    // ⚠️ 非 JSON 响应必须兜住（2026-11-18 实测）：面板重启 / nginx 504 时
+    //   response body 是空或 HTML，直接 r.json() 会抛
+    //   "Unexpected end of JSON input"，人只看到一句 JS 报错。
+    const ctl=new AbortController(); const tmr=setTimeout(()=>ctl.abort(),55000);
+    let r, txt='';
+    try{
+      r=await fetch('/api/progress-chat',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({question:q}), signal:ctl.signal});
+      txt=await r.text();
+    } finally { clearTimeout(tmr); }
+    let d=null;
+    try{ d=JSON.parse(txt); }catch(_){ d=null; }
+    const m=PCHAT_LOG[PCHAT_LOG.length-1];
+    if(d && d.ok){ m.a=d.answer; m.ctx=d.context; }
+    else if(d && d.error){ m.err=d.error; }
+    else { m.err=(r&&r.status)?('后端返回 '+r.status+'，不是 JSON（面板可能正在重启/网关超时）—— 稍后再问一次'):'没拿到响应（超时或面板正在重启）—— 稍后再问一次'; }
+    m.pending=false;
+  }catch(e){
+    const m=PCHAT_LOG[PCHAT_LOG.length-1]; m.pending=false;
+    m.err=(e && e.name==='AbortError')?'等了 55 秒还没答（后端超时）—— 稍后再问一次':String(e);
+  }
+  uiEvent('pchat_ask', {问题:q.slice(0,120)}, '已回答');
+  await load();
+}
+const PANELS={overview:pOverview,practice:pPractice,import:pImport,trace:pTrace,skill:pSkill,graph:pGraph,voyager:pVoyager,adaptive:pAdaptive,console:pConsole,pchat:pChat};
 
 /* 单条清账：技能·因果页每张卡的「清账」按钮（事件委托，重渲染不丢绑定） */
 document.addEventListener('click', async ev=>{
@@ -2222,29 +2995,12 @@ function fillTopics(s){
   sel.value=keep; sel.dataset.loaded='1'; sel.dataset.taskn=String(n);
 }
 
-function importsList(s){
-  const imps=s.imports||[];
-  if(!imps.length) return `<div class="empty">Scene ${ESC((s.scene||{}).id||'A')} 还没有人工导入过。
-    在上面问一句话（会按当前场景的图谱判定命中），Voyager 会用已积累的能力回答。</div>`;
-  return imps.slice().reverse().map(im=>`
-    <div class="nocmp" style="margin-top:8px">
-      <div class="nocmp-tag">不参与掌握度评价 · validated_target: false</div>
-      <div class="nocmp-sub" style="margin-top:0;font-size:12px">
-        ${ESC(String(im.ts||'').replace('T',' '))}
-        ${im.topic_id?`<span class="chip">${ESC(im.topic_id)}</span>`:'<span class="chip bad">未归入任何题</span>'}
-        ${im.topic_hit?`<span class="chip grey">命中「${ESC(im.topic_hit)}」</span>`:''}
-        ${im.skills_grown?`<span class="chip ok" title="按 blueprint.import_id 反查（派生索引，不另记账）">这批长出 ${im.skills_grown} 条技能</span>`:''}
-        ${(im.trajectory||[]).length?`<span class="chip grey">编排：${(im.trajectory||[]).map(t=>ESC(t)).join(' → ')}</span>`:'<span class="chip bad">未取到数据</span>'}
-        ${graphLinkChips(im.graph_link)}
-        <span class="chip grey">${im.facts_count} 条事实</span>
-      </div>
-      <div class="nocmp-body" style="margin-top:6px;font-size:13px">${ESC(im.question)}</div>
-      ${im.narrative?`<div class="nocmp-sub">${ESC(im.narrative)}</div>`:''}
-      ${(im.insights||[]).length?`<div class="nocmp-sub"><b>洞察：</b><ul>${im.insights.map(i=>`<li>${ESC(i)}</li>`).join('')}</ul></div>`:''}
-      ${(im.caveats||[]).length?`<div class="nocmp-sub"><b>数据局限：</b>${im.caveats.map(c=>ESC(c)).join('；')}</div>`:''}
-      ${consumeBlock(im)}
-    </div>`).join('');
-}
+/* 【2026-11-15 删除】`importsList()` 原样搬在这里 —— 它是**消费侧**的账
+   （人导入 → Voyager 回答 → 命中哪题 / 长出几条技能 / 两边做法比对），
+   挂在「新建练习」页底下。用户拍板：「导入出题这个，直接送去拆骨架送去学习，
+   不要再过消费侧」—— 这道页只留 Exercise 的循环，消费历史不再出现在这里。
+   消费侧自己的入口（驾驶舱 / 跑分）照旧，不受影响。 */
+
 
 /* 消费记录的专属块：回答 + 用了能力还是现做 + 掌握 + **两边做法的比对**。
    ⚠️ 必须显示在**历史里**，不能只放在提交回执：消费走后台执行（全链路 1～3 分钟），
@@ -2295,7 +3051,7 @@ function consumeBlock(im){
       ${(im.mcp_exposed||[]).length
         ? `<span class="chip grey">远端工具 ${(im.mcp_exposed||[]).length} 个</span>`
         : (im.mcp_note?`<span class="chip warn" title="${ESC(im.mcp_note)}">远端工具 0 个</span>`:'')}
-      ${im.root_scene?`<span class="chip grey">Scene ${ESC(im.root_scene)}</span>`:''}
+
       ${im.scene_kind==='local'?'<span class="chip grey">本机数据源</span>'
         :im.scene_kind==='scene'?'<span class="chip grey">场景自带库</span>':''}
       ${im.route_decision==='HIGH_CONFIDENCE'?'<span class="chip ok">高置信命中</span>'
@@ -2330,35 +3086,14 @@ function outOfDomainNote(im){
   const noHit = im.route_decision==='REJECTED' && score<10 && !rows;
   if(!(emptyFetch||noHit)) return '';
   return `<div class="note warn" style="margin-top:6px">
-    <b>这个问题大概率不属于当前场景。</b>Scene ${ESC(im.root_scene||'A')} 的图谱里没有和它对得上的节点
-    （相关度 ${score}/100，双阈值要 ≥10 才中置信、≥40 才高置信），当前场景的数据源里也取不到数（${rows} 行）。
-    它问的领域和这张图谱不是一回事 —— <b>相关度低不是"答错了"，是"归错了场景"</b>。
-    <div style="margin-top:5px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-      <button class="btn btn-secondary" style="padding:4px 10px;font-size:12px"
-        data-migrate-q="${ESC(im.question||'')}">➜ 新建场景，并把这个问题导过去</button>
-      <span class="hint">新场景 = 独立图谱（节点从 0 长起）+ 独立待审区 + 独立学习曲线；
-      数据源默认就是本机（场景目录 scene_data/&lt;场景&gt;/ 里的文件 + 只读原语）；要接真库在建场景时填 duckdb 路径。</span>
+    <b>这个问题和当前材料对不上。</b>这局材料的图谱里没有和它对得上的节点
+    （相关度 ${score}/100，双阈值要 ≥10 才中置信、≥40 才高置信），当前数据源里也取不到数（${rows} 行）。
+    它问的领域和这份材料不是一回事 —— <b>相关度低不是"答错了"，是"没在这个材料里"</b>。
+    <div style="margin-top:5px">
+      <span class="hint">要学这个领域，直接导入对应材料（仓库文件夹 / 文件）再点「▶ 启动 Voyager」——
+      一次只服务一个工作区，不需要新建场景。</span>
     </div></div>`;
 }
-async function migrateToNewScene(q){
-  if(!q) return;
-  const ds=prompt('新场景的数据源 duckdb 路径（留空 = 数据源就是本机）：')||'';
-  const name='域外导入 · '+String(q).slice(0,16);
-  let c;
-  try{
-    c=await fetch('/api/scene/create',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({name:name,data_source:ds,description:'由域外问题一键新建：'+String(q).slice(0,80)})}).then(r=>r.json());
-  }catch(e){ alert('新建场景失败：'+e); return; }
-  if(!c.ok){ alert('插入被拒：'+(c.error||'')+'（可执行动作缺席的场景不许插入）'); return; }
-  await fetch('/api/scene/switch',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({scene_id:c.scene_id})}).catch(()=>{});
-  const r=await fetch('/api/coach',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({question:q,mode:'voyager'})}).then(x=>x.json()).catch(()=>({}));
-  alert('已新建并切换到 Scene '+c.scene_id+'（独立图谱，Δ 专属节点从 0 开始长）。\n'
-    +'原问题已在新场景重新提交'+(r.accepted?'（后台跑 1~3 分钟，结果进导入历史与曲线）':'(未能受理：'+(r.error||'')+')')+'。');
-  GRAPH=null; loadSceneBar(); load();
-}
-
 /* 人导入在图谱侧落了什么 —— 收录判据是「VLML 能不能用表内覆盖的工具集
    完成这个工作」，收录的落法是**建边、不建节点**。这一行让它在面板上可查，
    而不是只在终端日志里出现一次。 */
@@ -2381,10 +3116,14 @@ function learnBar(s){
   let ev='';
   if(R){
     const cn=R.counts||{}, fo=R.forged||{}, ex=R.execution||{};
+    /* 用户 2026-11-12 口径：只摆两个**可预见**的闭合点。
+       维度条数是动态的（同一句话换个问法就变），不能拿来当进度。 */
     const chips=[
-      `<span class="chip grey">拆分 ${ESC(R.subgoals||0)} 个 · ${ESC(R.plan_origin||'—')}</span>`,
-      `<span class="chip ${(cn.unreachable||0)>0?'bad':(fo.forged?'warn':'ok')}">补缺口 ${ESC(fo.forged||0)} 个` +
-        ((cn.unreachable||0)>0?`｜硬不可达 ${ESC(cn.unreachable)}`:'') + '</span>',
+      `<span class="chip ${R.phase1_passed?'ok':'grey'}">Phase1 ${R.phase1_passed?'spec 已冻结':'未冻结'}</span>`,
+      `<span class="chip ${R.phase2_verified?'ok':(R.phase2_submitted?'warn':'grey')}">`
+        + (R.phase2_verified?'Phase2 与 spec 一致'
+            :(R.phase2_submitted?'Phase2 已交 · 仍有对不上的':'Phase2 未交'))
+        + (R.phase2_rounds>1?`（改了 ${ESC(R.phase2_rounds)} 轮）`:'') + `</span>`,
       `<span class="chip ${ex.ok?'ok':'bad'}">取数 ${ESC(ex.rows||0)} 行` +
         `｜真调用 ${ESC(ex.real_calls||0)}/${ESC(ex.calls||0)}</span>`,
       `<span class="chip ${R.skill?'ok':'grey'}">技能 ${R.skill?ESC(R.skill):'未结晶'}</span>`,
@@ -2402,11 +3141,12 @@ function learnBar(s){
     ${running?`<span class="chip grey">已跑 ${ESC(s.learn_elapsed)} 秒</span>`:
       (st?`<span class="chip ${st==='learned'?'ok':(st==='no_data'?'warn':'bad')}">${ESC(st)}</span>`:'')}
     <div style="font-size:12px;color:var(--muted);margin-top:4px">
-      学习由你在驾驶舱点「<b>▶ 启动 Voyager</b>」触发（2026-10-19 改：导入未命中
-      <b>不再自动后台学</b> —— 自动抢跑的轮次运行日志里一条都不落）。每一轮：
-      拆分课程（子目标有抓手）→ 缺口<b>写插件</b>补上 → 真取数 → 配方进技能库 +
-      解锁里程碑（解锁后不再重复出题），<b>每轮落一行 run_log（轨迹页可见）</b>。
-      失败照实报：没取到数就不写技能库、不解锁。
+      点「▶ 发布并开始学习」就开跑，不走消费侧（不先派给 Voyager「答一遍」）。
+      每一遍：拆骨架 → <b>Phase1</b> 追问到 spec 冻结 → <b>Phase2</b> 交出可跑的
+      finalCode（跑不通或与 spec 对不上就<b>带着评论重写</b>，最多 3 轮）→
+      <b>Phase3</b> 对账两端、逐条解释、修对不上的地方 → 配方进技能库 +
+      解锁里程碑，<b>每轮落一行 run_log（轨迹页可见）</b>。
+      失败照实报：没过关就不写技能库、不解锁，但提交物照样进 Phase3 解释。
     </div>${ev}</div>`;
 }
 
@@ -2581,6 +3321,11 @@ function preview(){
     }).catch(()=>{});
 }
 
+/* 【已停用 2026-11-14】原「交给 Voyager 回答」＝消费线入口。
+   用户拍板：进步改由**题内缺口序列**观测（同构助产士），人导入页改为
+   New exercise（写题面 → 拆骨架 → 发布）。这条通路（/api/coach → consume）
+   的按钮已解绑；函数留着只因为 renderImportResult / 埋点文案还引用它，
+   删掉会连带断掉「导入历史」那段渲染。 */
 let busy=false;
 async function submitImport(){
   if(busy) return;
@@ -2632,7 +3377,7 @@ async function submitImport(){
    用户要求导出的 md「一定要具体到界面交互（按了什么键，然后选了什么难度）」。
    所以每一次按键、每一个下拉选择都落盘成 ui_events.jsonl，导出时排在最前。 */
 const TAB_LABEL = {overview:'概览', practice:'练习', import:'人导入',
-                   trace:'轨迹', skill:'技能·因果', graph:'知识图谱', voyager:'MC 真实学习', adaptive:'自适应练习', console:'运行日志'};
+                   trace:'轨迹', skill:'技能·因果', graph:'知识图谱', voyager:'MC 真实学习', adaptive:'自适应练习', console:'运行日志', pchat:'进度问答'};
 function uiEvent(kind, detail, result){
   try{
     fetch('/api/ui-event',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -2869,20 +3614,23 @@ function render(s){
     // 人手选过别的场景/「全部场景」→ 现取一次，别让身子和脑袋不一致。
     const cs3=document.getElementById('curveScene');
     if(cs3 && cs3.value && cs3.value!==((s.scene||{}).id)) switchCurveScene(cs3.value);
-    const il=document.getElementById('implist');
-    if(il) il.innerHTML=importsList(s);
 
-    const go=document.getElementById('go'); if(go) go.onclick=submitImport;
-    const br=document.getElementById('btnRoute'); if(br) br.onclick=previewRoute;
+    // New exercise 的两个动作：先拆骨架（可审），再发布（沿用那份骨架）。
+    // 旧的「交给 Voyager 回答」= 消费线，2026-11-14 起由练习账取代，
+    // submitImport 保留但不再绑定按钮（见其注释）。
+    const go=document.getElementById('go'); if(go) go.onclick=exPublish;
+    const br=document.getElementById('btnRoute'); if(br) br.onclick=exPreview;
     const clr=document.getElementById('clr'); if(clr) clr.onclick=()=>{
-      document.getElementById('q').value='';
-      document.getElementById('result').innerHTML='';
-      document.getElementById('hit').textContent='归类结果会在这里显示。';
+      ['q','exTitle','exUnit'].forEach(id=>{const n=document.getElementById(id); if(n) n.value='';});
+      const r0=document.getElementById('result'); if(r0) r0.innerHTML='';
+      const h0=document.getElementById('hit');
+      if(h0) h0.textContent='先写题面；点「生成设问骨架」可以先看这道题会被问成哪几个维度。';
+      exSkel=null;
     };
     const qq=document.getElementById('q');
     if(qq){
-      qq.addEventListener('input',()=>{clearTimeout(pvTimer);pvTimer=setTimeout(preview,350);});
-      qq.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter')submitImport();});
+      // 打字时**不**再自动跑归类（那是旧消费线的 /api/preview）；骨架要人显式点。
+      qq.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter')exPublish();});
     }
   }
   const cl=document.getElementById('clearLog'); if(cl) cl.onclick=async()=>{
@@ -2994,10 +3742,13 @@ async function exportMd(){
   finally{ b.disabled=false; b.textContent=old; }
 }
 
+let lastRev='';
 async function load(){
   try{
     const r=await fetch('/api/state?t='+Date.now());
-    render(await r.json());
+    const d=await r.json();
+    if(d.rev) lastRev=d.rev;
+    render(d);
   }catch(e){
     document.getElementById('stage').innerHTML='<div class="panel"><div class="empty">加载失败：'+ESC(e)+'</div></div>';
   }
@@ -3005,6 +3756,9 @@ async function load(){
 
 document.getElementById('nav').addEventListener('click',e=>{
   const b=e.target.closest('[data-tab]'); if(!b) return;
+  // 2026-11-18 导出治理：点在**当前**分区上不算一次交互——
+  // 卡顿期连点会把 ui_events 灌成几十条同样的 tab_switch，导出全是噪音。
+  if(b.dataset.tab===TAB) return;
   const from=TAB; TAB=b.dataset.tab; localStorage.setItem('mve_tab',TAB);
   uiEvent('tab_switch',{从: TAB_LABEL[from]||from, 切到: TAB_LABEL[TAB]||TAB}, '');
   load();
@@ -3012,10 +3766,18 @@ document.getElementById('nav').addEventListener('click',e=>{
 document.getElementById('runStart').onclick=pilotStart;
 document.getElementById('mcLearn').onclick=mcLearnThenRun;
 document.getElementById('runStop').onclick=pilotStop;
-document.getElementById('btnNewScene').onclick=createScene;
 
 load();
-setInterval(load, 4000);
+// 2026-11-18 卡顿治理：轮询改轻量 rev 探测——指纹没变不拉全量；
+// 任务在跑（busy）或指纹变了才 load()（动作后按钮自带的 await load() 不变）。
+async function poll(){
+  try{
+    const r=await fetch('/api/rev?t='+Date.now());
+    const d=await r.json();
+    if(d.busy || d.rev!==lastRev){ lastRev=d.rev; load(); }
+  }catch(e){}
+}
+setInterval(poll, 3000);
 loadSceneBar();                       // 场景栏：一次性拉齐 + 之后 8s 跟一次（与 /api/scenes 同频）
 setInterval(loadSceneBar, 8000);
 </script>
@@ -3039,7 +3801,10 @@ COACH_JOB: dict = {"running": False, "question": "", "started_at": 0.0, "error":
 # 和 COACH_JOB 同一个模式：立即受理 → 后台线程 → 结果进 learn_orchestrate
 # 的 _LAST + causal_timeline（面板时间线页签可见），前端轮询本状态。
 LEARN_JOB: dict = {"running": False, "question": "", "started_at": 0.0,
-                   "error": "", "last_status": ""}
+                   "error": "", "last_status": "",
+                   # 重做时记下"背包清了什么"（reset_practice_state 的返回），
+                   # 面板据此告诉人"这一遍是从零开始的，不是接着上一遍"。
+                   "redo": None}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -3048,6 +3813,21 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def _send(self, code: int, body: bytes, ctype: str) -> None:
+        # 2026-11-18：面板自身 gzip。8443 走 neko-gateway(docker) 不经
+        # nginx，此前只有 80 入口有压缩 —— 人到 VPS 链路 ~50KB/s，
+        # /api/state 1MB 裸传 20 秒。在源头压，哪个入口进来都生效。
+        # 全部响应都是整包 Content-Length（无活流式端点），就地压安全。
+        if len(body) > 1024 and "gzip" in (self.headers.get("Accept-Encoding") or "").lower():
+            import gzip as _gz
+            body = _gz.compress(body, 5)
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -3068,239 +3848,18 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return {}
 
-    # ---- OpenAI 兼容层（2026-10-28，完全照 DeepSeek R1 客户端的协议面）----
-    # 为什么走 OpenAI 协议：DeepSeek 客户端、LobeChat、NextChat、猫娘、任何
-    # SDK 都认这一套（DeepSeek 开放平台本身就是 OpenAI 兼容）。MVE 只要把
-    # 「学习能力」包装成一个 model，外部就不再需要知道场景/技能/守卫的存在。
-    #   model 名选场景：mve（当前场景）/ mve:B / mve:C / 直接 B
-    #   端点：{base}/v1/models、{base}/v1/chat/completions
-    # 与 R1 逐项对位（这是"照抄"的部分，不是自创）：
-    #   delta.reasoning_content —— DeepSeek 官方 API 的思考通道名，原样照用；
-    #       MVE 里填的是**执行轨迹**（命中哪条技能、回填出的 SQL、实查几行、
-    #       核对结论、判定），与 R1 的 <think> 是同一个位置：过程收进去、
-    #       用户只看可验证结论。
-    #   stream=true —— SSE 逐字下发（R1 客户端就是这么渲染的）。
-    #   其它字段：id/object/created/model/choices/usage/finish_reason 齐套。
-    # 安全：设了环境变量 MVE_API_KEY 就要求 Bearer 认证（8443 在公网上）。
-    def _openai_models(self) -> None:
-        models = []
-        samples = _samples_by_scene()
-        try:
-            import scenes as _sc3
-            for it in (_sc3.list_scenes() or []):
-                sid = str((it or {}).get("id") or "")
-                if sid:
-                    models.append({
-                        "id": f"mve:{sid}", "object": "model",
-                        "owned_by": "mve",
-                        "description": str((it or {}).get("name") or "")[:60],
-                        "samples": samples.get(sid, []),
-                    })
-        except Exception:
-            pass
-        models.append({"id": "mve", "object": "model", "owned_by": "mve",
-                       "description": "MVE 学习能力（当前场景）",
-                       "samples": []})
-        self._json(200, {"object": "list", "data": models})
-
-    def _openai_chat(self, payload: dict) -> None:
-        key = os.environ.get("MVE_API_KEY", "").strip()
-        if key:
-            auth = str(self.headers.get("Authorization") or "").strip()
-            if auth != f"Bearer {key}":
-                self._json(401, {"error": {"message": "invalid api key",
-                                           "type": "invalid_request_error"}})
-                return
-        msgs = payload.get("messages") or []
-        q = ""
-        for m in reversed(msgs if isinstance(msgs, list) else []):
-            if isinstance(m, dict) and str(m.get("role")) == "user":
-                c = m.get("content")
-                if isinstance(c, list):
-                    c = " ".join(str(x.get("text") or "") for x in c
-                                 if isinstance(x, dict))
-                q = str(c or "").strip()
-                break
-        if not q:
-            self._json(400, {"error": {"message": "messages 里没有 user 内容",
-                                       "type": "invalid_request_error"}})
-            return
-        # 对话记忆（2026-10-29 用户实测指出失忆的怪）：历史不再扔掉 ——
-        # 传给消费侧做指代消解（「这家公司」→ 历史里指的对象）。
-        # 只取最后一条 user **之前**的消息：那条 user 就是本次的 q。
-        _hist: list[dict[str, str]] = []
-        _last_u = -1
-        for _i, _m in enumerate(msgs if isinstance(msgs, list) else []):
-            if isinstance(_m, dict) and str(_m.get("role")) == "user":
-                _last_u = _i
-        for _m in (msgs if isinstance(msgs, list) else [])[:max(_last_u, 0)]:
-            if not isinstance(_m, dict):
-                continue
-            _role = str(_m.get("role") or "")
-            if _role not in ("user", "assistant"):
-                continue
-            _c = _m.get("content")
-            if isinstance(_c, list):
-                _c = " ".join(str(x.get("text") or "") for x in _c
-                              if isinstance(x, dict))
-            _c = str(_c or "").strip()
-            if _c:
-                _hist.append({"role": _role, "content": _c})
-        model = str(payload.get("model") or "mve").strip()
-        sid = model.split(":", 1)[1].strip().upper() if ":" in model else (
-            model.upper() if model.upper() in ("A", "B", "C", "D", "E", "F") else "")
-        prev = ""
-        try:
-            import scenes as _sc4
-            prev = str(_sc4.current_scene_id() or "A")
-        except Exception:
-            sid = ""
-        # 对话页联网开关（DeepSeek 同构，2026-10-29）：payload.web=false →
-        # 规划里的 web 步不执行；缺省 None = 按规划执行（CLI/旧客户端）。
-        _web = payload.get("web")
-        _web = bool(_web) if isinstance(_web, bool) else None
-        if payload.get("stream"):
-            self._openai_stream(q, model, sid, prev, web_allowed=_web,
-                                history=_hist)
-            return
-        res = self._mve_ask(q, sid, prev, web_allowed=_web, history=_hist)
-        content, reasoning, x = _openai_answer(res, sid, prev)
-        now = int(time.time())
-        self._json(200, {
-            "id": f"chatcmpl-mve-{now}",
-            "object": "chat.completion",
-            "created": now,
-            "model": model,
-            "choices": [{"index": 0, "finish_reason": "stop",
-                         "message": {"role": "assistant", "content": content,
-                                     # R1 同名字段：思考过程与最终答案分开送。
-                                     "reasoning_content": reasoning}}],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0,
-                      "total_tokens": 0},
-            # 非标准扩展字段：自动识别它的客户端零成本忽略；人和脚本可对账。
-            "x_mve": x,
-        })
-
-    # ---- SSE（R1 客户端就是靠它把答案"打"出来的）----
-    def _sse_headers(self) -> None:
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache, no-transform")
-        self.send_header("Connection", "keep-alive")
-        self.send_header("X-Accel-Buffering", "no")
-        self.send_header("Transfer-Encoding", "chunked")
-        self.end_headers()
-
-    def _chunk(self, data: bytes) -> None:
-        """HTTP/1.1 分块编码：不先算总长度，边算边发（SSE 必须这样）。"""
-        self.wfile.write(("%x\r\n" % len(data)).encode("ascii") + data + b"\r\n")
-        self.wfile.flush()
-
-    def _chunk_end(self) -> None:
-        self.wfile.write(b"0\r\n\r\n")
-        self.wfile.flush()
-
-    def _sse_comment(self, text: str) -> None:
-        self._chunk((": " + text + "\n\n").encode("utf-8"))
-
-    def _sse_delta(self, rid: str, model: str, *, role: str = "",
-                   reasoning_content: str = "", content: str = "",
-                   finish: str = "", x: dict | None = None) -> None:
-        delta: dict[str, Any] = {}
-        if role:
-            delta["role"] = role
-        if reasoning_content:
-            delta["reasoning_content"] = reasoning_content
-        if content:
-            delta["content"] = content
-        obj: dict[str, Any] = {
-            "id": rid, "object": "chat.completion.chunk",
-            "created": int(time.time()), "model": model,
-            "choices": [{"index": 0, "delta": delta,
-                         "finish_reason": finish or None}],
-        }
-        if x:
-            obj["x_mve"] = x
-        self._chunk(("data: " + json.dumps(obj, ensure_ascii=False) + "\n\n")
-                    .encode("utf-8"))
-
-    def _openai_stream(self, q: str, model: str, sid: str, prev: str,
-                       web_allowed: bool | None = None,
-                       history: list[dict[str, str]] | None = None) -> None:
-        """先心跳、后逐字：消费要 20~60 秒，干等会让客户端超时判死。"""
-        import threading
-        box: dict[str, Any] = {}
-
-        def _work() -> None:
-            box["res"] = self._mve_ask(q, sid, prev, web_allowed=web_allowed,
-                                       history=history)
-
-        th = threading.Thread(target=_work, daemon=True)
-        th.start()
-        rid = f"chatcmpl-mve-{int(time.time())}"
-        try:
-            self._sse_headers()
-            self._sse_delta(rid, model, role="assistant")
-            while th.is_alive():
-                self._sse_comment("keep-alive")
-                th.join(5)
-            res = box.get("res") or {}
-            content, reasoning, x = _openai_answer(res, sid, prev)
-            for piece in _split_chunks(reasoning, 26):
-                self._sse_delta(rid, model, reasoning_content=piece)
-                time.sleep(0.012)
-            for piece in _split_chunks(content, 16):
-                self._sse_delta(rid, model, content=piece)
-                time.sleep(0.012)
-            self._sse_delta(rid, model, finish="stop", x=x)
-            self._chunk(b"data: [DONE]\n\n")
-            self._chunk_end()
-        except (BrokenPipeError, ConnectionResetError):
-            # 人点了「停止生成」——消费线程自己跑完落账，这里只是不再写。
-            pass
-
-    def _mve_ask(self, q: str, sid: str, prev: str,
-                 web_allowed: bool | None = None,
-                 history: list[dict[str, str]] | None = None) -> dict:
-        """跑一次消费并还原场景。返回 consume() 的结果（异常也包成结果）。"""
-        try:
-            import scenes as _sc
-            if sid and sid != prev:
-                _sc.switch_scene(sid)
-        except Exception:
-            pass
-        try:
-            import asyncio as _aio
-            # 与面板 /api/coach 同一条消费通路：consume()（技能库重放 +
-            # 工具线兜底 + 叙述对账）。⚠️ 别接 coach.explain——那是 VLML
-            # 老路（不经场景 duckdb，实测在场景 B 里查 A 的库）。
-            from pathlib import Path as _Path2
-            _root2 = str(_Path2(__file__).resolve().parents[1])
-            if _root2 not in sys.path:
-                sys.path.insert(0, _root2)
-            import voyager_vlml.consume as _consume2
-            return _aio.run(_consume2.consume(q, web_allowed=web_allowed,
-                                              history=history))
-        except Exception as e:
-            return {"ok": False, "answer": "",
-                    "errors": [f"{type(e).__name__}: {e}"]}
-        finally:
-            try:
-                import scenes as _sc5
-                if prev and sid and sid != prev:
-                    _sc5.switch_scene(prev)
-            except Exception:
-                pass
-
+    # ---- OpenAI 兼容层已整体删除（2026-11-18 用户指令）----
+    # 原 2026-10-28 那套（/v1/models、/v1/chat/completions、SSE 逐字下发、
+    # _openai_chat/_openai_stream/_mve_ask/_openai_answer + 对话页
+    # chat_page.py）是把「学习能力」包装成 OpenAI model 给外部客户端消费。
+    # 现在**人的入口只剩「开始学」一句话**（/api/coach 拆骨架正线）；
+    # chat 只保留两处内部通道：phase2_chat（学生内问，喂 r_site）与
+    # progress_chat（人的进度问答，只读转述，零写账）。
     def do_GET(self) -> None:  # noqa: N802
         path = _strip_prefix(self.path.split("?")[0])
-        if path in ("/v1/models", "/models"):
-            self._openai_models()
-            return
-        if path in ("/chat", "/chat.html"):
-            # 对话页：把 OpenAI 兼容端点包成能直接用的界面（零安装消费）。
-            self._send(200, _chat_html().encode("utf-8"), "text/html; charset=utf-8")
-            return
+        # 2026-11-18 用户指令：旧「对话页」（人导入消费线的 R1 形态页）与
+        # OpenAI 兼容消费端点（/v1/models、/v1/chat/completions）整体删除 ——
+        # 人的入口只剩「开始学」一句话（/api/coach 拆骨架正线）。
         if path in ("/", "/index.html"):
             body = _html().encode("utf-8")
             ctype = "text/html; charset=utf-8"
@@ -3322,6 +3881,11 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._json(500, {"error": f"{type(e).__name__}: {e}"[:200]})
                 return
+        elif path == "/api/rev":
+            # 轻量轮询（2026-11-18 卡顿治理）：指纹没变前端就不拉全量 state。
+            busy = bool(COACH_JOB["running"] or LEARN_JOB["running"])
+            self._json(200, {"rev": panel_data.state_rev(), "busy": busy})
+            return
         elif path == "/api/state":
             import time as _t
             # 消费通路在后台跑（要 1～3 分钟），前端靠 4 秒轮询看它跑没跑完。
@@ -3332,6 +3896,7 @@ class Handler(BaseHTTPRequestHandler):
             st["coach_elapsed"] = (int(_t.time() - COACH_JOB["started_at"])
                                    if COACH_JOB["running"] else 0)
             st["coach_error"] = str(COACH_JOB["error"] or "")
+            st["rev"] = panel_data.state_rev()
             # 学习闭环（learn_orchestrate）：后台学的状态 + 最近结果摘要。
             st["learn_running"] = bool(LEARN_JOB["running"])
             st["learn_question"] = str(LEARN_JOB["question"] or "")[:80]
@@ -3350,11 +3915,19 @@ class Handler(BaseHTTPRequestHandler):
                      "status": str(r.get("status") or ""),
                      "scene_id": str(r.get("scene_id") or ""),
                      "why": str(r.get("why") or "")[:120],
-                     "subgoals": len((r.get("plan") or {}).get("subgoals") or []),
-                     "plan_origin": str((r.get("plan") or {}).get("origin") or ""),
-                     "counts": (r.get("plan") or {}).get("counts") or {},
-                     "forged": ((r.get("forged") or {}).get("counts") or {}),
-                     "grabs_offered": r.get("grabs_offered"),
+                     # 用户 2026-11-12 口径：只报两个**可预见**的闭合点，
+                     # 不再报「拆分几个 / 闭合几维」——维度条数是动态的。
+                     "phase1_passed": bool((r.get("spec_outcome") or {})
+                                           .get("phase1_passed")),
+                     "phase2_submitted": bool((r.get("spec_outcome") or {})
+                                              .get("phase2_submitted")),
+                     # 「交了」和「过关」不是一回事：原版学生随时能提交，
+                     # 没过关的提交要走 Phase3 逐条解释（用户 2026-11-12）。
+                     "phase2_verified": bool((r.get("spec_outcome") or {})
+                                             .get("phase2_verified")),
+                     "phase2_rounds": int((r.get("spec_outcome") or {})
+                                          .get("phase2_rounds") or 0),
+                     "phase_nodes": list(r.get("phase_nodes") or []),
                      "execution": {k: (r.get("execution") or {}).get(k)
                                    for k in ("ok", "sql", "calls", "real_calls",
                                              "rows")},
@@ -3402,14 +3975,6 @@ class Handler(BaseHTTPRequestHandler):
         """
         path = _strip_prefix(self.path.split("?")[0])
         payload = self._payload()
-
-        # OpenAI 兼容（DeepSeek 客户端式消费）：模型列表 + 作答
-        if path in ("/v1/models", "/models"):
-            self._openai_models()
-            return
-        if path in ("/v1/chat/completions", "/chat/completions"):
-            self._openai_chat(payload)
-            return
 
         # ---- 外置上传模块（R1 客户端式的「把文件交给它」）----
         # 2026-10-28 用户拍板：「不能这样写死守卫解决，而是做 r1 客户端的
@@ -3704,6 +4269,95 @@ class Handler(BaseHTTPRequestHandler):
                                         "不用盯着等。"})
             return
 
+        if path == "/api/exercise/preview":
+            # 同构助产士 Instructor · New exercise：
+            #   写题面 → Opus 生成 spec-gate 骨架（维度 + 预置偏差）→ 人审 → 发布。
+            # MVE 的对应物：先登记一份练习（req），拆骨架**落在这一份的账上**
+            # （req_<id>.json），发布时沿用同一个 req —— 不重新登记，
+            # 否则预览看到的维度与发布后学的那份不是同一份（原版 Exercise 是
+            # 一次发布一份，不是预览一份、上线另一份）。
+            q = str(payload.get("question") or "").strip()
+            if not q:
+                self._json(400, {"ok": False, "error": "题面不能为空"})
+                return
+            try:
+                import time as _time
+                import scenes as _sc
+                import req_registry as _rr
+                import maieutic_scaffold as _ms
+                sid = str(payload.get("scene_id") or "").strip() \
+                    or str(_sc.current_scene_id() or "A")
+                rid = str(_rr.register(sid, q, force_new=True).get("req_id") or "")
+                if rid:
+                    try:
+                        _rr.ensure_req_node(sid, q, rid)
+                    except Exception:
+                        pass
+                r = _ms.scaffold(q, sid, req_id=rid)
+                _ms.save_exercise_meta(sid, q, {
+                    "title": str(payload.get("title") or ""),
+                    "unit": str(payload.get("unit") or ""),
+                    "target_language": str(payload.get("language") or ""),
+                    "authored_at": _time.strftime("%Y-%m-%dT%H:%M:%S"),
+                })
+                self._json(200, {
+                    "ok": bool(r.get("dimensions")),
+                    "req_id": rid, "scene_id": sid,
+                    "dimensions": r.get("dimensions") or [],
+                    "milestone": r.get("milestone") or {},
+                    "expected_drifts": r.get("expected_drifts") or [],
+                    "material_note": str(r.get("material_note") or ""),
+                    "origin": str(r.get("origin") or ""),
+                    "reason": str(r.get("reason") or ""),
+                })
+            except Exception as e:
+                self._json(500, {"ok": False,
+                                 "error": f"{type(e).__name__}: {e}"[:300]})
+            return
+
+        if path == "/api/exercise/publish-meta":
+            # 发布时把教师侧的元信息写进这道练习的账（原版 publishedAt 的形状）：
+            # 标题 / 单元 / 编辑器类型 / 发布时刻。缺了它，卡片只能拿题面头几十
+            # 个字当名字，也没法按单元分组。
+            try:
+                import time as _t5
+                import scenes as _sc6
+                import maieutic_scaffold as _ms6
+                q = str(payload.get("question") or "").strip()
+                if not q:
+                    self._json(400, {"ok": False, "error": "题面为空"})
+                    return
+                sid = str(payload.get("scene_id") or "").strip() \
+                    or str(_sc6.current_scene_id() or "A")
+                _ms6.save_exercise_meta(sid, q, {
+                    "title": str(payload.get("title") or ""),
+                    "unit": str(payload.get("unit") or ""),
+                    "target_language": str(payload.get("language") or ""),
+                    "published_at": _t5.strftime("%Y-%m-%dT%H:%M:%S"),
+                })
+                self._json(200, {"ok": True, "scene_id": sid,
+                                 "exercise": _ms6.load_exercise_meta(sid, q)})
+            except Exception as e:
+                self._json(500, {"ok": False,
+                                 "error": f"{type(e).__name__}: {e}"[:300]})
+            return
+
+        if path == "/api/learn/propose":
+            # 自由学选题（用户 2026-11-15「将做的做完，接着做图谱上书的」）。
+            # 口径只有**一份实现** → graph_books.next_task：驾驶舱「▶ 启动
+            # Voyager」在非 VLML 场景（P/N/H…）走的也是它（scene_learn.py
+            # 队列空了就调它）。面板上不再有独立的「自由学」按钮 ——
+            # 用户原话「我点这个按钮其实就是自由学呀，不用多做一个按钮」。
+            # 这个接口留作 CLI / 其它入口复用同一条口径。
+            try:
+                import scenes as _scp
+                import graph_books as _gb
+                self._json(200, _gb.next_task(str(_scp.current_scene_id() or "A")))
+            except Exception as e:
+                self._json(500, {"ok": False,
+                                 "error": f"{type(e).__name__}: {e}"[:300]})
+            return
+
         if path == "/api/learn/start":
             # 启动学习闭环（用户 2026-10-19 指令的环）：拆分 → 补缺口 →
             # 写插件 → 执行取数 → 入库 → 结晶。分钟级 → 后台线程，立即受理。
@@ -3711,6 +4365,10 @@ class Handler(BaseHTTPRequestHandler):
             if not q:
                 self._json(400, {"ok": False, "error": "问题是空的"})
                 return
+            # 发布路径：New exercise 预览时已经登记并拆好骨架，发布要**沿用
+            # 同一个 req**（否则面板上会出现两道同名练习，一道只有骨架、
+            # 一道才有会话）。不带时仍是旧行为：每次点都新登记一份。
+            _pub_req_in = str(payload.get("req_id") or "").strip()
             if LEARN_JOB["running"]:
                 self._json(200, {"ok": False, "busy": True,
                                  "error": (f"上一轮学习还在跑（{LEARN_JOB['question'][:40]}…，"
@@ -3735,13 +4393,68 @@ class Handler(BaseHTTPRequestHandler):
                         import scenes as _sc0
                         import req_registry as _rr0
                         _sid0 = str(_sc0.current_scene_id() or "A")
-                        _pub_req = str(_rr0.register(
-                            _sid0, q, force_new=True).get("req_id") or "")
+                        # 导入题面即定位：题面不自带单元 id，由内容认。
+                        # 认到的单元就是这一轮的起点，规划层从这儿往下排。
+                        try:
+                            import graph_books as _gb0
+                            _hit0 = (_gb0.locate(_sid0, q).get("candidates")
+                                     or [])
+                            if (_hit0 and float(_hit0[0].get("score") or 0)
+                                    >= 0.45):
+                                _gb0.set_anchor(_sid0, str(_hit0[0]["unit"]))
+                                LEARN_JOB["anchor"] = _hit0[0]
+                        except Exception:
+                            pass
+                        # ★ 发布路径：前端带 req_id 来 = 已经预览过骨架，
+                        #   必须沿用那一份（否则「预览看到的维度」和「学的维度」
+                        #   是两份骨架，账也对不上）。不带才新登记一份。
+                        _want = str(payload.get("req_id") or "").strip()
+                        if _want and _rr0.get(_sid0, _want):
+                            _pub_req = _want
+                        else:
+                            _pub_req = str(_rr0.register(
+                                _sid0, q, force_new=True).get("req_id") or "")
                         if _pub_req:
                             _rr0.ensure_req_node(_sid0, q, _pub_req)
+                        # 发布即写元信息（标题 / 单元 / 编辑器类型 / 发布时刻）：
+                        # 不依赖前端再补一刀 —— 命令行/脚本发布也要有名字，
+                        # 否则卡片永远只能显示题面头几十个字。
+                        try:
+                            import maieutic_scaffold as _ms0
+                            import time as _t0
+                            _ms0.save_exercise_meta(_sid0, q, {
+                                "title": str(payload.get("title") or ""),
+                                "unit": str(payload.get("unit") or ""),
+                                "target_language": str(payload.get("language") or ""),
+                                "published_at": _t0.strftime("%Y-%m-%dT%H:%M:%S"),
+                            })
+                        except Exception:
+                            pass
                     except Exception:
                         _pub_req = ""
-                    r = asyncio.run(_lo.start_learning(q, req_id=_pub_req))
+                    # ★ 重做（2026-11-15 用户口径「出题—学习—做出来—自由学习—
+                    #   做以前出过的题—做得更好—指标更好」）：
+                    #   账本留在册，背包清成"没学过"。必须放在 start_learning
+                    #   **之前** —— 它一进来就读 progress / phase1.addressed，
+                    #   清晚了这一轮已经按"上一遍学过"的现状跑完，首轮就报
+                    #   "全答到了"，delta 恒为 0（等于没重做）。
+                    if bool(payload.get("redo")):
+                        try:
+                            import scenes as _sc1
+                            import maieutic_scaffold as _ms1
+                            _rno = payload.get("round")
+                            LEARN_JOB["redo"] = _ms1.reset_practice_state(
+                                str(_sc1.current_scene_id() or "A"), q,
+                                req_id=str(payload.get("req_id") or ""),
+                                reason=(f"第 {_rno} 遍" if _rno else "重做"))
+                        except Exception as _e0:
+                            LEARN_JOB["redo"] = {
+                                "ok": False,
+                                "why": f"{type(_e0).__name__}: {_e0}"[:200]}
+                    # fresh=True（重做）→ Phase2 不带本题上一遍那份代码起步。
+                    # 技能库照旧检索（跨遍的长期能力就该留着），清的只是"底稿"。
+                    r = asyncio.run(_lo.start_learning(
+                        q, req_id=_pub_req, fresh=bool(payload.get("redo"))))
                     LEARN_JOB["last_status"] = str(r.get("status") or "")
                     if r.get("status") in ("failed",):
                         LEARN_JOB["error"] = str(r.get("why") or "")[:300]
@@ -4073,6 +4786,18 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(500, {"ok": False, "error": f"{type(e).__name__}: {e}"[:300]})
             return
 
+        if path == "/api/progress-chat":
+            # 人的进度问答（2026-11-18）：progress_chat 只读转述账面，零写账。
+            # 不碰 phase2 账本（红线 C3/C4），不做判定。
+            try:
+                import progress_chat as _pcx
+                _sid = str(payload.get("scene_id") or "").strip() or "S"
+                self._json(200, _pcx.ask(_sid, str(payload.get("question") or "")))
+            except Exception as e:
+                self._json(500, {"ok": False,
+                                 "error": f"{type(e).__name__}: {e}"[:300]})
+            return
+
         if path == "/api/pilot/start":
             # topic 一律留空：选题权在练习范围（或出题器）手里，不在驾驶舱键钮手里。
             # 面板上因此没有难度 / 选题下拉，只剩开始 / 停止。
@@ -4281,117 +5006,6 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: Any) -> None:  # 静音默认访问日志
         pass
 
-
-def _split_chunks(text: str, size: int):
-    """按长度切片（SSE 逐字下发用）。"""
-    t = str(text or "")
-    for i in range(0, len(t), size):
-        yield t[i:i + size]
-
-
-def _openai_answer(res: dict, sid: str, prev: str) -> tuple[str, str, dict]:
-    """把 consume() 的结果翻成 OpenAI 响应的三件套：content / reasoning / x_mve。
-
-    reasoning 走 reasoning_content 通道（DeepSeek R1 的字段名）——
-    MVE 没有"思维链"，但有**执行轨迹**：命中哪条技能、回填的 SQL、实查几行、
-    核对结论、判定。这是同一位置的东西：过程收进去，答案只留可验证的结论。
-    """
-    import chat_page as _cp
-    ans = str(res.get("answer") or "").strip()
-    if not ans:
-        # 句句有回复 + 判官可见（用户 2026-10-28：判官可以看到局限性）：
-        # 没答出来时把判官结论 / 局限 / 学习状态原样交代，不写"见判定披露"
-        # 这种让人再去别处查的话。
-        why = "；".join(str(x) for x in (res.get("errors") or [])[:2])
-        bits = ["（MVE 这轮没答出来 —— 不编数。"]
-        if res.get("critic_note"):
-            bits.append(f"判官结论：{str(res['critic_note'])[:220]}")
-        elif why:
-            bits.append(f"原因：{why[:160]}")
-        if res.get("learn_kicked"):
-            bits.append("已自动拉起后台学习，学完再问同一句即可复用。")
-        else:
-            bits.append("可到面板查看判定明细。")
-        bits.append("）")
-        ans = " ".join(bits)
-    # 披露进正文：OpenAI 客户端只看 content，可验证性必须随答案走。
-    tail = [f"场景 {sid or prev or 'A'}",
-            f"判定 {res.get('judgment_result') or '—'}"]
-    if res.get("learn_kicked"):
-        tail.append("已派学习")
-    if res.get("inference_used"):
-        tail.append("模型推断")
-    if res.get("used_skills"):
-        tail.append("复用技能 " + "、".join(
-            str(x.get("name") or "") for x in res["used_skills"][:4]))
-    if res.get("tool_line_used"):
-        tail.append("工具线（联网 claim）")
-    else:
-        # 走了联网但没答成（如 grounded=false）也要在正文披露，否则会被
-        # 读成「没触发联网」（2026-10-29 用户实测误解）。
-        _tln = str(res.get("tool_line_note") or "").strip()
-        if _tln:
-            tail.append("联网已查：" + _tln[:60])
-    content = ans + "\n\n—— MVE｜" + "｜".join(tail)
-
-    scene_id = sid or prev or "A"
-    label = ""
-    try:
-        import scenes as _sc
-        for it in (_sc.list_scenes() or []):
-            if str((it or {}).get("id") or "") == scene_id:
-                label = str((it or {}).get("name") or "")
-    except Exception:
-        pass
-    reasoning = _cp.reasoning_text(res, scene_id=scene_id, scene_label=label)
-    skill = ""
-    if res.get("used_skills"):
-        skill = "、".join(str(x.get("name") or "") for x in res["used_skills"][:3])
-    x_mve = {"judgment_result": res.get("judgment_result"),
-             "mastered": bool(res.get("mastered")),
-             "scope_line": res.get("scope_line"),
-             "tool_line_used": bool(res.get("tool_line_used")),
-             "inference_used": bool(res.get("inference_used")),
-             "learn_kicked": bool(res.get("learn_kicked")),
-             "scene": sid or prev,
-             "topic_id": res.get("topic_id"),
-             "skill": skill}
-    return content, reasoning, x_mve
-
-
-def _samples_by_scene(limit: int = 3) -> dict[str, list[str]]:
-    """各场景「最近问过且答得出来」的问题，给对话页当示例。
-
-    ⚠️ 不硬编码题面：示例必须来自真实消费账（coach_log 里判定 written 的），
-    否则页面就会教用户问一些这套库根本答不出的题。
-    """
-    out: dict[str, list[str]] = {}
-    try:
-        import scenes as _sc
-        for it in (_sc.list_scenes() or []):
-            sid = str((it or {}).get("id") or "")
-            if not sid:
-                continue
-            qs: list[str] = []
-            for rec in reversed(panel_data._human_imports(80, sid)):
-                q = str(rec.get("question") or "").strip()
-                if not q or q in qs:
-                    continue
-                if str(rec.get("judgment_result") or "") != "written":
-                    continue
-                qs.append(q[:80])
-                if len(qs) >= limit:
-                    break
-            out[sid] = qs
-    except Exception:
-        pass
-    return out
-
-
-def _chat_html() -> str:
-    """对话页：完全照 DeepSeek R1 客户端的形态（页面本体在 chat_page.py）。"""
-    import chat_page as _cp
-    return _cp.render(PREFIX)
 
 def main() -> None:
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
