@@ -26,6 +26,11 @@ ROOT = Path(__file__).resolve().parent
 
 # ---------------------------------------------------------------- 状态采集
 def _pilot_state() -> str:
+    # 2026-11-19 补：缺 pilot_state.json 是正常停机态（pilot.py:115-120 的
+    # 口径就是 running=False + "从未启动过"），不是"拿不到"—— 清库/新装后
+    # AI 读账不该报 FileNotFoundError 吓人。
+    if not (ROOT / "pilot_state.json").exists():
+        return "循环状态：未运行（从未启动过）"
     try:
         d = json.loads((ROOT / "pilot_state.json").read_text("utf-8"))
         return (f"循环状态：{'运行中' if d.get('running') else '已停止'}"
