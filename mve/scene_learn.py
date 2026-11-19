@@ -254,6 +254,98 @@ def _log_learning_detail(r: dict[str, Any]) -> None:
                 if _open else "（闭合 → 判完成）"))
 
 
+# ── 种子闭合验收（2026-11-19 用户口径）───────────────────────────────
+# 「在第一个人导入的种子 progress 闭合后，agent 的所有产出物经过 chat，
+#  chat 判定这段对话属不属于 phase 产物；判定成功才分配可推进性；
+#  推不动了就同构原 voyager 重试人导入的种子（mc 任务）。」
+#
+# 为什么读账本而不是再调一次 chat：原版 chat 卡 phase==2（route.ts:37-42 /
+# phase2_chat.py:185-188），种子闭合时 phase 已到 3/4，再调必被 409 拒。
+# 而账本（opusExchanges）里已经记着种子那几轮「产出物经过 chat」的结果 ——
+# mode 是 chat 判的（schema 强制二值），r_site 是它的游程读数。
+# 所以这次验收 **0 次新增 LLM 调用**。
+SEED_RETRY_MAX = 4          # 原版 action_agent_task_max_retries（voyager.py:30）
+
+
+def _seed_verdict_on_close(scene: str, question: str, cur,
+                           max_retries: int) -> str:
+    """种子 progress 闭合后的验收：chat 判「这段产出属不属于 phase 产物」。
+
+    返回 "passable" / "no_sample" / "stuck_final"。
+    推不动 → 原地重做种子，封顶 SEED_RETRY_MAX 次（原版 rollout 语义）。
+    """
+    import curriculum_auto as _ca
+    q = str(question or "")
+
+    # 种子 = 人给的第 0 题（原版 manual 的 input，curriculum.py:322-330）。
+    # 第一次闭合时若种子账还空（人导入未经出题闸门的旧路径），补记一次。
+    if not str(getattr(cur, "seed_task", "") or ""):
+        cur.seed_task = q
+        cur._save()
+
+    def _judge():
+        try:
+            n = len(cur.chat_exchanges() or [])
+        except Exception:
+            n = 0
+        try:
+            r = int(cur.r_site)
+        except Exception:
+            r = 0
+        if n <= 0:
+            return "no_sample", r, n      # 一次过、没问过 chat → 无从判定
+        if r >= _ca.CHAT_PASS_K:
+            return "passable", r, n
+        return "stuck", r, n
+
+    verdict, r, n = _judge()
+    _log(f"[场景学习] 种子闭合验收 → chat 样本 {n} 条 / r_site={r}"
+         f"（阈值 {_ca.CHAT_PASS_K}）→ {verdict}")
+    if verdict != "stuck":
+        cur.seed_verdict = verdict
+        cur._save()
+        return verdict
+
+    # 推不动：原地重做（原版 rollout 封顶 4 次；是重做同一条，不是换题 ——
+    # inference 的 while progress < len(sub_goals) 里失败不推进 progress，
+    # 下一轮拿到的还是这一条）
+    prev_n = n
+    while int(getattr(cur, "seed_retry_streak", 0) or 0) < SEED_RETRY_MAX:
+        cur.seed_retry_streak = int(getattr(cur, "seed_retry_streak", 0) or 0) + 1
+        cur._save()
+        _log(f"[场景学习] 种子没在推进产物（r_site={r} < {_ca.CHAT_PASS_K}）"
+             f" → 重做第 {cur.seed_retry_streak}/{SEED_RETRY_MAX} 次"
+             "（原版 rollout 原地重试）")
+        try:
+            _run_one(q, scene, max_retries=max_retries,
+                     critique="上一轮对话没有推进承诺（chat 判定在换落点）；"
+                              "重做时先把承诺重新落实成可验证的行为",
+                     milestone_retry=True)
+        except Exception as e:
+            _log(f"[场景学习] 种子重做异常：{type(e).__name__}: {e}")
+            break
+        verdict, r, n = _judge()
+        if n <= prev_n:
+            _log("[场景学习] 重做后没有新的 chat 样本 → 停止重试"
+                 "（无从判定就不烧，也不误判）")
+            cur.seed_verdict = "no_sample"
+            cur._save()
+            return "no_sample"
+        prev_n = n
+        if verdict == "passable":
+            _log(f"[场景学习] 种子重做后 chat 判定可推进（r_site={r}）→ 验收通过")
+            cur.seed_verdict = "passable"
+            cur._save()
+            return "passable"
+
+    cur.seed_verdict = "stuck_final"
+    cur._save()
+    _log(f"[场景学习] ★ 停机信号：种子重做 {cur.seed_retry_streak} 次后 chat 仍判"
+         f"「没有推进 phase 产物」（r_site={r}，阈值 {_ca.CHAT_PASS_K}）"
+         "—— 交人回看分段 session；循环按原版继续（不硬停）。")
+    return "stuck_final"
+
+
 def _light_up_milestone(scene: str, question: str, db_path: str,
                         max_retries: int) -> bool:
     """phase-3（天授 test/watch 同构）：里程碑前置维度全闭合后，**重试里程碑本身**
@@ -612,6 +704,20 @@ def main() -> int:
                                 _lt2.mark_lit(scene, _tgt)
                             except Exception:
                                 pass
+                            # ★ 2026-11-19：种子 progress 闭合 → 验收。
+                            #   chat 判「这段产出属不属于 phase 产物」= 可推进性，
+                            #   0 次新增调用（读 opusExchanges 账本，mode 是 chat
+                            #   判的）。推不动 → 原地重做种子，封顶 4 次。
+                            #   只在种子闭合这一次做：容量事件（背包满）不参与。
+                            _seed_q = str(getattr(cur, "seed_task", "") or "")
+                            if (not str(getattr(cur, "seed_verdict", "") or "")
+                                    and (not _seed_q or _seed_q == str(_tgt))):
+                                try:
+                                    _seed_verdict_on_close(scene, _tgt, cur,
+                                                           max_retries)
+                                except Exception as _e:
+                                    _log("[场景学习] 种子验收失败（不拦循环）："
+                                         f"{_e.__class__.__name__}: {_e}")
                         # 未成功：不解锁；失败计数/换题由 _light_up_milestone
                         # 内部按原版处置（挂冷却），本轮落到下面的自由出题。
                 # 成功或已点亮 → 落到下面的自由出题
@@ -691,33 +797,10 @@ def main() -> int:
                         "（工作区没数据 / LLM 不可用 / 连续 5 次解析失败）")
                      + " —— 如实退出，不硬凑。")
                 break
-        # ---- 存箱批的种子结论判定（原版 voyager.inference :403-434 同构）----
-        # 档 C 归档一批后，携带这批自由学攒下的经验（技能库检索注入、归题的
-        # 追问历史都走现有通路）对种子（人给的第 0 题）重跑一次，判定这一批
-        # 「学到什么程度」。判定照 update_exploration_progress 记账（唯一
-        # 提交点）；未过照原版 inference 语义不判死，游程 +1，下轮回攻。
-        if cur.pending_verdict:
-            cur.pending_verdict = False
-            cur._save()
-            if cur.seed_task:
-                _log("\n[场景学习] 背包满已归档 → 种子结论判定（原版 "
-                     f"inference 同构）：携带本批经验重跑「{cur.seed_task[:60]}」")
-                try:
-                    _info_v = _run_one(cur.seed_task, scene,
-                                       max_retries=max_retries,
-                                       context="（存箱批种子结论判定："
-                                               "携带自由学经验重跑）")
-                    cur.update_exploration_progress(_info_v)
-                    _log("[场景学习] 种子结论判定 → "
-                         + ("✅ 通过（同一题多了一行轨迹，可与首过轮次对比）"
-                            if _info_v.get("success") else
-                            "❌ 未过（原版 inference 语义：不判死，游程 +1）"))
-                except Exception as _e:
-                    _log(f"[场景学习] 种子结论判定失败（不拦循环）："
-                         f"{type(_e).__name__}: {_e}")
-            else:
-                _log("[场景学习] 背包满已归档，但本场景没有种子账（seed_task "
-                     "空）—— 无可判定对象，跳过结论判定。")
+        # 2026-11-19 撤：这里原来有一段「存箱批 → 重跑种子」的判定消费块，
+        # 已删除。原因：容量事件（背包满 33）与验收语义无关，且与「种子闭合处
+        # 验收 + 封顶重试」形成两个触发点 —— 同一件事两条路，迟早互相踩。
+        # 存箱现在只归档；种子验收归 _light_up_milestone。
         tried_this_run.add(task)
         # 重试题把上次的失败评语带回去当 critique 初值（原版把 critique 拼进
         # 下一次 rollout 的同一条通路）。

@@ -509,9 +509,17 @@ class CurriculumAgent:
         # 游程会在每次出题时被反复封格（实测：slots 涨、r_site 不降 → 每轮封一格）。
         # 记「封点」而不是删 exchange：exchange 是 append-only（route.ts:85）。
         self.sealed_marks: dict[str, int] = {}
-        # 种子（人给的第 0 题）与存箱批结论判定标志（2026-11-18）。
+        # 种子（人给的第 0 题）：只记账，不挂任何触发。2026-11-19 撤掉
+        # pending_verdict —— 验收归种子闭合处，容量事件不承担判定职责。
         self.seed_task: str = ""
-        self.pending_verdict: bool = False
+        # 种子闭合验收（2026-11-19）：种子 progress 闭合时由 chat 账本判一次
+        # 「这段产出属不属于 phase 产物」（可推进性 r_site）。
+        #   ""          未判定
+        #   no_sample   一次过、没问过 chat → 无从判定（不误判、不重做）
+        #   passable    r_site >= CHAT_PASS_K → 分配可推进性
+        #   stuck_final 重做 SEED_RETRY_MAX 次仍推不动 → 停机信号（交人）
+        self.seed_verdict: str = ""
+        self.seed_retry_streak: int = 0
         # progress==0 游程（原版 skip：失败不推进 progress 只换题，:342-344；
         # 连续 FAIL_STREAK_STOP 次 → scene_learn 主循环兜底停）。
         self.fail_streak: int = 0
@@ -550,7 +558,8 @@ class CurriculumAgent:
                 self.sealed_marks = {str(k): int(v or 0)
                                      for k, v in (inv.get("sealed") or {}).items()}
                 self.seed_task = str(inv.get("seed_task") or "")
-                self.pending_verdict = bool(inv.get("pending_verdict") or False)
+                self.seed_verdict = str(inv.get("seed_verdict") or "")
+                self.seed_retry_streak = int(inv.get("seed_retry_streak") or 0)
                 self.fail_streak = int(inv.get("fail_streak") or 0)
         except Exception:
             pass
@@ -586,7 +595,8 @@ class CurriculumAgent:
                         "chests": self.chests,
                         "sealed": self.sealed_marks,
                         "seed_task": self.seed_task,
-                        "pending_verdict": self.pending_verdict,
+                        "seed_verdict": self.seed_verdict,
+                        "seed_retry_streak": self.seed_retry_streak,
                         "fail_streak": self.fail_streak},
                        ensure_ascii=False, indent=2), "utf-8")
 
@@ -1078,12 +1088,9 @@ class CurriculumAgent:
             self._escalate()
             _log_band("档C", f"背包满（{_used}/{INV_CAP}）→ 存箱第 "
                              f"{len(self.chests)} 批，背包清空继续")
-            # 归档批的结论判定交给主循环（scene_learn）：原版存箱后继续跑
-            # 不停机，但 MVE 把「这一批学到什么程度」绑在存箱事件上 —— 携带
-            # 本批经验对种子重跑一次（原版 voyager.inference :403-434 同构）。
-            # 只置标志：rollout 属于 learn 循环层，课程层不执行。
-            self.pending_verdict = True
-            self._save()
+            # 2026-11-19 撤：存箱退回**纯容量动作**（原版 :251-279 只是把满包
+            # 挪进 chest、继续在同一世界挖）。把种子验收绑在容量事件上是写死
+            # 条件 —— 容量只负责腾地方，验收归种子闭合处。
         # ---- 档 B：chat 游程满 → 这一段成形，存包一格继续 ----
         # 2026-11-18：人看不到 chat（它是内部传感器），但它的 mode 游程在内部
         # 决定「什么时候收这一格」。之前这里只是返回一个标签，没有任何动作。
