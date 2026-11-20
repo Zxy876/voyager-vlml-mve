@@ -142,52 +142,11 @@ class SceneDBEnv:
         for t, cs in list(cols.items())[:max_tables]:
             n = counts.get(t, 0)
             head = f"- {t}（{n} 行）" + ("：⚠️ 空表，别查它" if n == 0 else "")
-            # ---- pivot 宽表折叠（2026-11-08）----
-            # 实查 L 场景 web_facts：908 列，前 900 多列是「平台名 / 平台名 http
-            # 状态码」成对出现的稀疏列（每行只有一个平台有值），真正通用的列
-            # （item/source_url/正文/来源）排在最后。旧实现只给 `cs[:20]` →
-            # 模型**根本看不见 `正文`**，于是拿平台宽列拼 SQL，写出
-            # `GitHub http 状态码` 这种裸标识符（Parser Error at "http"）和
-            # 库里不存在的 `Twitter http 状态码`（Binder Error）—— 两轮组合
-            # 全败，重问已闭合的题必然 fetched_empty（2026-11-07 实测）。
-            # 判据是确定性的：若列 X 与「X + 分隔符 + 后缀」同时存在，这组列
-            # 就是 pivot 出来的稀疏维度，折叠成一句说明；其余列（真正的字段）
-            # 全量列出 —— 与具体平台名/后缀无关，不写死任何业务词。
-            cset = set(cs)
-            pivot_child: dict[str, str] = {}
-            for c in cs:
-                # 父名必须是**另一个已存在的列**，且 c = 父名 + 分隔符 + 后缀
-                # （`1337x http 状态码` 的父是 `1337x`；不能反过来 rsplit，
-                #   那样父名会变成 `1337x http`，一个都不成组 —— 实测过）。
-                for d in cset:
-                    if d == c or not c.startswith(d):
-                        continue
-                    if c[len(d):len(d) + 1] in (" ", "_", "/", "-"):
-                        pivot_child[c] = d
-                        break
-            pivot_base = set(pivot_child.values())
-            folded = set(pivot_child) | pivot_base
-            rest = [c for c in cs if c not in folded]
-            if not rest:                     # 整表都是成对列 → 至少保住前几列
-                rest = cs[:max_cols]
-                folded = set(cs) - set(rest)
-            # 折叠后剩下的才是**真正的字段**（item/source_url/正文/来源…），
-            # 全量给；只有真的还很宽（>120 列）才截断。
-            shown = rest if len(rest) <= 120 else rest[:max(max_cols, 24)]
-            line = head + "：" + "，".join(shown)
-            if len(rest) > len(shown):
-                line += "…"
-            if folded:
-                _ex = sorted(pivot_base)[:3]
-                line += (f"（另有 {len(pivot_base)} 组互斥稀疏列："
-                         f"「{'/'.join(_ex)}」各配一列「… + 后缀」状态列；"
-                         f"一行里同组只有一列有值 —— 它们不是可加的维度，"
-                         f"要平台清单请对本表的文本列做解析或 SELECT DISTINCT，"
-                         f"**不要假设每个 X 都有 X+后缀 那一列**）")
-            lines.append(line)
+            lines.append(head + "：" + "，".join(cs[:max_cols])
+                         + ("…" if len(cs) > max_cols else ""))
             # 低基数字符串/布尔列：把实查 distinct 值列出来，模型照着写字面量
             # （dept 取值是「技术」不是「技术部」，month 是「2026-09」不是「2023-09」）。
-            for c in shown:
+            for c in cs[:max_cols]:
                 dt = types.get(f"{t}.{c}", "")
                 if dt not in ("VARCHAR", "TEXT", "STRING", "BOOLEAN"):
                     continue

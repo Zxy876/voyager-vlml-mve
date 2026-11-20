@@ -3243,11 +3243,8 @@ class Handler(BaseHTTPRequestHandler):
             body = json.dumps(st, ensure_ascii=False, default=str).encode("utf-8")
             ctype = "application/json; charset=utf-8"
         elif path == "/api/revisit":
-            # 对话页轮询：回访结果（只给当前场景、拉走即标记已送达）。
-            # ⚠️ 2026-11-08 用户拍板「人触发回到纯人工，不再回访」后，
-            # 队列已无写入方（learn_orchestrate 收尾不再挂信号、
-            # consume 不再 mark_pending），这里恒返回空 —— 端点保留是为了
-            # 旧客户端不报错，队列里若有历史残留仍可拉走。
+            # 对话页轮询：学习完成后自动回访的结果（只给当前场景、
+            # 拉走即标记已送达 —— 同一气泡不会反复弹）。
             try:
                 import revisit as _rv
                 import scenes as _sc9
@@ -3616,19 +3613,18 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     import asyncio
                     import learn_orchestrate as _lo
-                    # 人启动学习=「我要学会这句」→ **先**立里程碑锚点，再拆骨架。
-                    # 骨架与进度都按 exercise 归（maieutic_scaffold._exercise_key）：
-                    # 锚点立晚了，这句会被归到上一个 exercise，维度全记到别人账上。
+                    r = asyncio.run(_lo.start_learning(q))
+                    LEARN_JOB["last_status"] = str(r.get("status") or "")
+                    if r.get("status") in ("failed",):
+                        LEARN_JOB["error"] = str(r.get("why") or "")[:300]
+                    # 人启动学习=「我要学会这句」→ 设为该场景当前里程碑锚点，
+                    # 驾驶舱从此优先闭合它的未闭合维度（见 scene_learn.py）。
                     try:
                         import scenes as _sc
                         import maieutic_scaffold as _ms
                         _ms.set_current_target(str(_sc.current_scene_id() or "A"), q)
                     except Exception:
                         pass
-                    r = asyncio.run(_lo.start_learning(q))
-                    LEARN_JOB["last_status"] = str(r.get("status") or "")
-                    if r.get("status") in ("failed",):
-                        LEARN_JOB["error"] = str(r.get("why") or "")[:300]
                 except Exception as e:
                     LEARN_JOB["error"] = f"{type(e).__name__}: {e}"[:300]
                 finally:

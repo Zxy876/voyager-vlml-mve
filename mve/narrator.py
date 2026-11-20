@@ -212,12 +212,6 @@ def _json_slices(data: Any) -> list[str]:
                                                        _MAX_ITEM_CHARS)] or [text]
 
 
-    for i, chunk in enumerate(_json_slices(data), start=1):
-        items.append({"n": i, "title": "", "url": "",
-                      "body": clean_text(chunk, max_chars=_MAX_ITEM_CHARS)})
-    return items
-
-
 def _as_items(data: Any) -> list[dict[str, Any]]:
     """把任意取数结果整理成带编号的参考资料条目（编号由**程序**定，不是模型）。"""
     items: list[dict[str, Any]] = []
@@ -232,53 +226,6 @@ def _as_items(data: Any) -> list[dict[str, Any]]:
                                    or hit.get("text") or "", max_chars=_MAX_ITEM_CHARS),
             })
         return items
-    # 表状结果（{"columns":[…], "rows":[[…], …]}）：整题复盘的答案动辄几百行，
-    # 走 `_json_slices` 只切出前 1200 字符 —— 叙事层**根本看不见数据**，只能
-    # 降级平铺（2026-11-08 L 场景实测）。改为按**分组列**建条目：找到 distinct
-    # 值 2..12 的列（整题 SQL 的「单元」列、分组列都是这个形状），每组一条，
-    # body = 程序生成的组摘要（行数由程序数、示例行原样摘录）。行数因此可核
-    # （verify_answer_numbers 把这些 body 也当证据源），叙述引用 [编号] 回指。
-    if (isinstance(data, dict) and isinstance(data.get("rows"), list)
-            and isinstance(data.get("columns"), list)):
-        cols = [str(c) for c in (data.get("columns") or [])[:12]]
-        rows = [r for r in (data.get("rows") or [])
-                if isinstance(r, (list, tuple))]
-        if cols and rows and len(rows) > _MAX_ITEMS:
-            gcol = -1
-            for ci in range(len(cols)):
-                vals = {str(r[ci]) for r in rows if ci < len(r)}
-                if 2 <= len(vals) <= 12:
-                    gcol = ci
-                    break
-            if gcol >= 0:
-                groups: dict[str, list] = {}
-                for r in rows:
-                    groups.setdefault(
-                        str(r[gcol]) if gcol < len(r) else "", []).append(r)
-                for i, val in enumerate(sorted(groups), start=1):
-                    if i > _MAX_ITEMS:
-                        break
-                    grp = groups[val]
-                    parts = []
-                    for r in grp[:3]:
-                        cell = "；".join(
-                            f"{cols[ci]}={r[ci]}"
-                            for ci in range(min(len(cols), len(r)))
-                            if str(r[ci]).strip())
-                        parts.append(cell[:_MAX_ITEM_CHARS])
-                    body = (f"共 {len(grp)} 行。示例："
-                            + " ｜ ".join(parts))
-                    items.append({"n": i, "title": clean_text(val, max_chars=120),
-                                  "url": "",
-                                  "body": clean_text(body,
-                                                     max_chars=_MAX_ITEM_CHARS)})
-                if len(groups) > _MAX_ITEMS:
-                    items.append({"n": _MAX_ITEMS + 1, "title": "（其余组）",
-                                  "url": "",
-                                  "body": f"还有 {len(groups) - _MAX_ITEMS} "
-                                          f"组未列出"})
-                if items:
-                    return items
     for i, chunk in enumerate(_json_slices(data), start=1):
         items.append({"n": i, "title": "", "url": "",
                       "body": clean_text(chunk, max_chars=_MAX_ITEM_CHARS)})
@@ -356,11 +303,7 @@ def narrate_answer(question: str, data: Any, *, note: str = "") -> dict[str, Any
     msgs = [{"role": "system", "content": ANSWER_SYSTEM},
             {"role": "user", "content": prompt}]
     try:
-        # thinking="disabled"（2026-11-08）：glm-4.6 思考模型不关思考，800 个
-        # token 会被 reasoning 吃光/泄漏成正文（实测 narrative_ok=false，
-        # why="叙事模型没给出可用的 JSON：1. **分析人的问题**…"）—— 叙事
-        # 只做"看数说话"，不需要思考链。与 chat_json 的默认同款。
-        raw = chat(msgs, temperature=0.3, max_tokens=800, thinking="disabled")
+        raw = chat(msgs, temperature=0.3, max_tokens=800)
     except Exception as e:
         out["why"] = f"叙事模型调用失败：{type(e).__name__}: {e}"
         return out
@@ -384,7 +327,7 @@ def narrate_answer(question: str, data: Any, *, note: str = "") -> dict[str, Any
                      "content": (f"这段回答里一个来源编号都没有，人没法核。重写："
                                  f"每个结论句末尾用 [编号] 标出来源，编号只能取 "
                                  f"1..{len(items)}；其余规则不变。只输出 JSON。")},
-                ], temperature=0.3, max_tokens=800, thinking="disabled")
+                ], temperature=0.3, max_tokens=800)
             p2 = _extract_json(str(raw2 or ""))
             a2 = str(p2.get("answer") or "").strip()
             if a2 and re.findall(r"\[(\d+)\]", a2):
@@ -564,19 +507,6 @@ def verify_answer_numbers(answer: str, data: Any, *,
     acc: list[float] = []
     money: list[float] = []
     _collect_evidence(data, acc, money)
-    # `_as_items` 程序生成的组摘要（行数、示例行都由程序写出）也算证据：
-    # 叙述引用「共 128 行」要能逐字对上，编出来的行数照样拒（2026-11-08，
-    # 表状结果按组建条目后行数才第一次可讲）。
-    try:
-        for _it in _as_items(data):
-            for _m in re.findall(r"\d[\d,]*(?:\.\d+)?",
-                                 str(_it.get("body") or ""))[:20]:
-                try:
-                    acc.append(float(_m.replace(",", "")))
-                except ValueError:
-                    pass
-    except Exception:
-        pass
     missing: list[str] = []
     for raw in found[:40]:
         try:

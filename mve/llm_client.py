@@ -46,25 +46,15 @@ def chat(
     timeout: float = 90.0,
     model: str = "",
     retries: int = 3,
-    thinking: str = "",
 ) -> str:
     """带退避重试的 chat。
 
     为什么必须重试：裁判（VLML0）和 Voyager 是并发打的，实测会撞上限流/超时，
     表现为「模型规划返回空 → 一次工具都没调 → 判无证据」。
     不重试的话，这种间歇故障会被误读成「Voyager 没学会」——那是假阴性。
-
-    `thinking`="disabled" 关掉 glm-4.5/4.6 的思考段（要结构化输出时必须关，
-    否则思考吃完 max_tokens、正文落到 reasoning_content，见下方兜底处的注释）。
     """
     if not API_KEY:
         raise LLMError("缺少 ZHIPU_API_KEY（写到 mve/.env）")
-
-    _m = model or MODEL
-    _think = ({"thinking": {"type": "disabled"}}
-              if str(thinking).strip().lower() == "disabled"
-              and str(_m).startswith(("glm-4.5", "glm-4.6", "glm-5"))
-              else {})
 
     last = ""
     for attempt in range(retries):
@@ -73,9 +63,8 @@ def chat(
                 f"{BASE_URL}/chat/completions",
                 headers={"Authorization": f"Bearer {API_KEY}",
                          "Content-Type": "application/json"},
-                json={"model": _m, "messages": messages,
-                      "temperature": temperature, "max_tokens": max_tokens,
-                      **_think},
+                json={"model": model or MODEL, "messages": messages,
+                      "temperature": temperature, "max_tokens": max_tokens},
                 timeout=timeout,
             )
             if r.status_code in (429, 500, 502, 503, 504):
@@ -106,12 +95,7 @@ def chat(
 
 
 def chat_json(messages: list[dict[str, str]], **kw) -> dict:
-    """要求模型输出 JSON 对象；解析失败返回 {}（调用方负责降级）。
-
-    默认关思考：要的是 JSON，思考段只会把 max_tokens 吃光、把正文挤到
-    reasoning_content（散文）→ 解析恒失败。
-    """
-    kw.setdefault("thinking", "disabled")
+    """要求模型输出 JSON 对象；解析失败返回 {}（调用方负责降级）。"""
     text = chat(messages, **kw)
     # 容忍 ```json ... ``` 包裹
     m = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.S)
