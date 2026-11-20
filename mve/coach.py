@@ -221,6 +221,11 @@ def _log_import(result: dict[str, Any]) -> None:
         "plan_routes": (result.get("plan_routes")
                         if isinstance(result.get("plan_routes"), dict) else {}),
         "plan_why": str(result.get("plan_why") or "")[:200],
+        # 消费侧课程规划（原版 inference 的 task / sub_goals 同构物，2026-11-07）：
+        # 这次挑战的是哪个里程碑、拆成哪些单元、每个单元认领到哪条已学技能。
+        # ⚠️ 白名单惯犯第 9 次预防：consume 里写了不透传 = coach_log 永远 null。
+        "consume_goal": (result.get("consume_goal")
+                         if isinstance(result.get("consume_goal"), dict) else None),
         # inference 兜底（句句有回复，2026-10-28）：模型推断层用没用。
         # ⚠️ 白名单惯犯第 7 次预防：consume 里写了不透传 = coach_log 永远空。
         "inference_used": bool(result.get("inference_used")),
@@ -273,6 +278,16 @@ def _log_import(result: dict[str, Any]) -> None:
         # 合成，但 reuse_errors 不在白名单里，日志里是 null，无法判断是超时
         # 还是配方失效。**第五次**踩同一个坑，加字段必须同步这里。
         "reuse_errors": [str(x)[:200] for x in (result.get("reuse_errors") or [])][:6],
+        # 现做 vs 技能的逐条分歧（助产士 Phase 3 intent-diff 同构）：
+        # bug/drift/revision + 该走哪一步。**必须落盘** —— 面板要能一眼看出
+        # 这一轮是「写法机械失败（bug，重写即可）」还是「这条单元确实没做法
+        # （drift，得回学习侧补）」，否则又回到一堆错误串里靠人猜。
+        "divergences": [
+            {"id": str(d.get("divergence_id") or "")[:40],
+             "kind": str(d.get("kind") or "")[:12],
+             "action": str(d.get("action") or "")[:12],
+             "why": str(d.get("why") or "")[:200]}
+            for d in (result.get("divergences") or [])][:8],
         # 这次能用上几个远端工具（能力来源接没接上，面板要看得见）
         "mcp_exposed": list((result.get("mcp_tools") or {}).get("exposed") or [])[:12],
         "mcp_note": str((result.get("mcp_tools") or {}).get("error")
