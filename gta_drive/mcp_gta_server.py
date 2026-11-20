@@ -199,7 +199,8 @@ def gta_get_obs() -> dict:
     if obs.get("events"):
         out["events"] = obs["events"]     # 自上一条 obs 以来真实发生的游戏事件
     for k in ("health_engine", "nearby_vehicles", "running", "on_foot",
-              "in_vehicle_model"):
+              "in_vehicle_model", "mission_active", "mission_target",
+              "mission_dist_m"):
         if k in obs:
             out[k] = obs[k]
     return out
@@ -225,11 +226,13 @@ def gta_handback() -> dict:
 
 
 def gta_wait_arrive(radius: float = ARRIVE_M_DEFAULT,
-                    timeout: float = 180.0) -> dict:
-    """阻塞等环境判定：到达路点 radius 米内 = success（判据不经 LLM）。
+                    timeout: float = 180.0, target: str = "waypoint") -> dict:
+    """阻塞等环境判定：到达路点/任务目标 radius 米内 = success（判据不经 LLM）。
 
     Phase2 代码「真的在 GTA 环境里跑过」的验收原语：返回 verdict / min_dist /
     ticks / elapsed，与 mve_gta_env.run_episode 的返回同口径。
+    target="waypoint"（默认）= 玩家手动路点；target="mission" = 任务目标 blip
+    （剧情任务的开车部分用这个，无路点也可判）。
     """
     BRIDGE.ensure_connected()
     timeout = min(max(float(timeout), 5.0), WAIT_MAX_SEC)
@@ -244,7 +247,7 @@ def gta_wait_arrive(radius: float = ARRIVE_M_DEFAULT,
             break
         if time.time() - t0 > timeout:
             verdict = "failed"
-            reason = f"超时（{timeout:.0f}s 未到达路点）"
+            reason = f"超时（{timeout:.0f}s 未到达目标）"
             break
         obs = BRIDGE.snapshot()
         if obs.get("ts") == last_ts:
@@ -255,9 +258,15 @@ def gta_wait_arrive(radius: float = ARRIVE_M_DEFAULT,
             if len(seen_events) < 50:
                 seen_events.append(ev)
         wp, pos = obs.get("waypoint"), obs.get("pos")
-        if not wp:
+        if target == "mission":
+            wp = obs.get("mission_target")
+            if not wp:
+                verdict = "failed"
+                reason = "没有任务目标（当前没有进行中的任务或目标不在雷达上）"
+                break
+        elif not wp:
             verdict = "failed"
-            reason = "没有路点（玩家需在地图设一个路点）"
+            reason = "没有路点（玩家需在地图设一个路点，或 target=mission 用任务目标）"
             break
         d = dist2d(pos or [0, 0], wp)
         min_d = min(min_d, d)
@@ -292,10 +301,12 @@ TOOLS: list[dict] = [
      "inputSchema": {"type": "object", "properties": {}, "required": []}},
     {"name": "gta_get_obs",
      "description": ("取 GTA 里玩家车辆的最新状态：车速（m/s 与 km/h）、坐标 pos、"
-                     "朝向 heading、玩家在地图上设的路点 waypoint 及直线距离，"
+                     "朝向 heading、玩家在地图上设的路点 waypoint 及直线距离、"
+                     "任务面（mission_active / mission_target / mission_dist_m："
+                     "当前剧情任务的开车目标），"
                      "以及 events——游戏里真实发生的事件（ped_hit 撞人 / "
                      "vehicle_damage 碰撞 / wanted 被警察通缉 / rolled_over 翻车 / "
-                     "vehicle_on_fire / engine_dead / died / busted 等）。"
+                     "cutscene_start 任务演出 / auto_handback 自动交还等）。"
                      "写驾驶策略前先取它看清楚环境；events 是环境反馈，"
                      "撞了东西/被追了要据此调整策略。"),
      "inputSchema": {"type": "object", "properties": {}, "required": []}},
@@ -320,13 +331,16 @@ TOOLS: list[dict] = [
      "description": "把车辆控制权交还玩家（结束自动驾驶）。",
      "inputSchema": {"type": "object", "properties": {}, "required": []}},
     {"name": "gta_wait_arrive",
-     "description": ("阻塞等待环境判定「车是否到达路点」：radius 米内 = success，"
-                     "超时/无路点/断连 = failed。这是 GTA 场景的**验收判据**，"
-                     "由环境规则判定、不经 LLM —— 驾驶任务完成与否以它的 verdict "
-                     "为准，不要自己拿距离估断。"),
+     "description": ("阻塞等待环境判定「车是否到达目标」：radius 米内 = success，"
+                     "超时/无目标/断连 = failed。target 默认 \"waypoint\"（玩家手动"
+                     "路点）；\"mission\"= 任务目标 blip（剧情任务的开车部分用这个）。"
+                     "这是 GTA 场景的**验收判据**，由环境规则判定、不经 LLM —— "
+                     "驾驶任务完成与否以它的 verdict 为准，不要自己拿距离估断。"),
      "inputSchema": {"type": "object", "properties": {
          "radius": {"type": "number", "description": "到达半径米数，默认 5"},
          "timeout": {"type": "number", "description": "等待上限秒数，默认 180，最大 600"},
+         "target": {"type": "string", "enum": ["waypoint", "mission"],
+                    "description": "判定目标：waypoint=手动路点，mission=任务目标 blip"},
      }, "required": []}},
 ]
 
@@ -340,7 +354,8 @@ _DISPATCH = {
     "gta_stop": lambda a: gta_stop(),
     "gta_handback": lambda a: gta_handback(),
     "gta_wait_arrive": lambda a: gta_wait_arrive(
-        a.get("radius", ARRIVE_M_DEFAULT), a.get("timeout", 180.0)),
+        a.get("radius", ARRIVE_M_DEFAULT), a.get("timeout", 180.0),
+        a.get("target", "waypoint")),
 }
 
 # ---------------------------------------------------------------------------

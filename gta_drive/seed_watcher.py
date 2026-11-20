@@ -67,7 +67,13 @@ def main() -> int:
 
     last_seeded_wp = None
     while True:
-        obs = client.recv_obs()
+        try:
+            obs = client.recv_obs()
+        except TimeoutError:
+            # obs 暂时停流不算断线：GTA 开地图/暂停菜单时 OnTick 停转，
+            # obs 会静默十几秒——安静等下一帧，不崩不重连
+            time.sleep(0.5)
+            continue
         if obs is None:
             print("[seed] 桥断开，30s 后重连", flush=True)
             time.sleep(30.0)
@@ -81,15 +87,27 @@ def main() -> int:
         if obs.get("on_foot"):
             continue                              # 没上车，不算驾驶种子
         wp = obs.get("waypoint")
+        source = "waypoint"
+        if not wp and obs.get("mission_active") and obs.get("mission_target"):
+            # 没手动路点但在剧情任务里：任务的开车目标本身就是种子
+            #（cutscene 演出时插件已自动交还控制，不打架）
+            wp = obs.get("mission_target")
+            source = "mission"
         if not wp:
-            continue                              # 没设路点
+            continue                              # 既无路点也无任务目标
         pos = obs.get("pos") or [0, 0]
         if last_seeded_wp is not None and \
                 dist2d(pos, last_seeded_wp) <= NEW_SEED_M and \
                 dist2d(wp, last_seeded_wp) <= NEW_SEED_M:
             continue                              # 还是上一个种子附近
-        question = (f"让车自动开到地图路点 ({wp[0]:.0f}, {wp[1]:.0f}) 并停稳，"
-                    f"当前在 ({pos[0]:.0f}, {pos[1]:.0f})")
+        if source == "mission":
+            question = (f"完成当前任务的开车部分：把车自动开到任务目标 "
+                        f"({wp[0]:.0f}, {wp[1]:.0f}) 并停稳，"
+                        f"当前在 ({pos[0]:.0f}, {pos[1]:.0f})，"
+                        f"到达后用 gta_wait_arrive target=mission 验收")
+        else:
+            question = (f"让车自动开到地图路点 ({wp[0]:.0f}, {wp[1]:.0f}) 并停稳，"
+                        f"当前在 ({pos[0]:.0f}, {pos[1]:.0f})")
         print(f"[seed] ★ 种子：{question}", flush=True)
         last_seeded_wp = list(wp)
         if a.dry_run:

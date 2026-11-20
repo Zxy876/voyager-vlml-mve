@@ -49,6 +49,10 @@ public class MVEBridge : Script
     bool _wasOnFoot = true;               // 上次是否步行（上/下车）
     bool _wasDead = false;                // 上次是否死亡
     bool _wasUpsideDown = false;          // 上次是否翻车
+    bool _wasCutscene = false;            // 上次是否在过场演出（任务演出期间交还控制）
+    bool _missionActive = false;          // 任务面：当前有任务目标 blip
+    float[] _missionTarget = null;        // 任务目标坐标（黄色 Standard blip，最近一个）
+    float _missionDist = -1f;             // 与任务目标的直线距离
     int _lastEventTick = 0;               // 行人扫描节流（重活放 10Hz）
 
     void Ev(string json)                  // 事件入缓冲（封顶防刷屏）
@@ -90,9 +94,26 @@ public class MVEBridge : Script
         }
         else
             _lastVehHealth = -1f;
+
+        // 任务过场演出：插件不该在演出里开车，出现即自动交还玩家
+        bool cs = Game.IsCutscenePlaying;
+        if (cs && !_wasCutscene)
+        {
+            Ev("{\"e\":\"cutscene_start\"}");
+            if (_running)
+            {
+                GiveBackControl();
+                _running = false;
+                Ev("{\"e\":\"auto_handback\",\"reason\":\"cutscene\"}");
+                Notification("MVE 自动驾驶：任务演出，已交还玩家");
+            }
+        }
+        else if (!cs && _wasCutscene)
+            Ev("{\"e\":\"cutscene_end\"}");
+        _wasCutscene = cs;
     }
 
-    // 10Hz 节流的重探测（行人碰撞/翻车/着火）
+    // 10Hz 节流的重探测（行人碰撞/翻车/着火/任务目标 blip）
     void DetectSlow(Ped p, Vehicle v)
     {
         if (v != null && v.Exists())
@@ -125,6 +146,25 @@ public class MVEBridge : Script
         }
         else
             _wasUpsideDown = false;
+
+        // 任务目标解包：任务几乎都把开车目标挂在雷达 blip 上。
+        // 只认 Standard(1) + Yellow(3) 的任务标记（自由模式地图上常驻的
+        // 商店/车库/服务图标是专用 sprite，不会误报；玩家手动路点是
+        // Waypoint(4)，另有 waypoint 字段，不在这里混）。取距玩家最近一个。
+        Blip mission = null; float bestD = float.MaxValue;
+        foreach (Blip b in World.GetAllBlips())
+        {
+            if (!b.Exists()) continue;
+            int sp = (int)b.Sprite;
+            if (sp == 4) continue;                    // Waypoint：玩家手动路点
+            if (sp != 1) continue;                    // Standard：任务类标记
+            if ((int)b.Color != 3) continue;          // Yellow：任务目标色
+            float d = p.Position.DistanceTo(b.Position);
+            if (d < bestD) { bestD = d; mission = b; }
+        }
+        _missionActive = mission != null;
+        _missionTarget = mission != null ? V(mission.Position) : null;
+        _missionDist = mission != null ? bestD : -1f;
     }
 
     static float NormalizeAngle(float a)   // 归一到 [-180,180]
@@ -228,6 +268,13 @@ public class MVEBridge : Script
         }
         else
             sb.Append(",\"waypoint\":null");
+
+        // ── 任务面：目标来自任务 blip（DetectSlow 10Hz 刷新）──
+        sb.Append(",\"mission_active\":").Append(_missionActive ? "true" : "false");
+        if (_missionTarget != null)
+            sb.Append(",\"mission_target\":[").Append(F(_missionTarget[0])).Append(',')
+              .Append(F(_missionTarget[1])).Append(',').Append(F(_missionTarget[2])).Append(']')
+              .Append(",\"mission_dist_m\":").Append(F(_missionDist));
 
         // ── events：自上一条 obs 以来真实发生的事件，带走并清空 ──
         sb.Append(",\"events\":[");
