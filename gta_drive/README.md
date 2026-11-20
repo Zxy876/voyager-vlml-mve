@@ -4,6 +4,25 @@
 代码接管车辆；玩家任务不受影响（任务里开到目的地也由 MVE 接管完成）。
 **整个环境就是 MVE 的一个场景：obs → 学生代码 → 受控执行 → 环境判据。**
 
+## 双机架构（本线实际部署形态）
+
+```
+Windows 机（游戏机）                      Mac mini（学习机，这台）
+├─ GTA V 剧情模式                         ├─ MVE-GTA-Drive 仓库
+├─ ScriptHookV + ScriptHookVDotNet        ├─ mve/.env（智谱 API key）
+├─ scripts/MVEBridge.cs  ← 监听 0.0.0.0:9777
+└─ 玩家：上车/设路点/按 F9                 └─ python run_first_automation.py --host <Windows机IP>
+                    └────── 局域网 TCP 9777（obs →，← action）──────┘
+```
+
+Windows 防火墙放行（管理员 PowerShell/CMD 跑一次）：
+
+```
+netsh advfirewall firewall add rule name="MVEBridge" dir=in action=allow protocol=TCP localport=9777
+```
+
+Windows 机 IP 用 `ipconfig` 查（IPv4 地址）。
+
 ## 硬前提（先说清，免得白折腾）
 
 | 事项 | 结论 |
@@ -41,13 +60,12 @@ Enhanced / GTA Online 独立版——但那上面跑不了本系统，只是能�
    `plugin/INSTALL.md` 的说明编译成 dll 再放）。
 5. 启动剧情模式，画面右上角应看到「MVEBridge 启动」提示。
 
-## 第三步：跑第一个自动化（MVE 输出的）
+## 第三步：跑第一个自动化（MVE 输出的，Mac mini 上执行）
 
 ```
-游戏内：上车 → 地图上设一个路点 → 按 F9（激活桥）
-电脑上：cd gta_drive
-        pip install httpx
-        python run_first_automation.py
+游戏内（Windows 机）：上车 → 地图上设一个路点 → 按 F9（激活桥）
+Mac mini：           cd /Users/zhangbing/WorkBuddy/MVE-GTA-Drive/gta_drive
+                     python run_first_automation.py --host <Windows机IP>
 ```
 
 发生的事：

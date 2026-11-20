@@ -1,20 +1,24 @@
 // MVEBridge.cs — MVE 自动驾驶线 · GTA V 桥接插件（ScriptHookVDotNet v3）
 //
-// 作用：游戏内起一个本地 TCP 服务（127.0.0.1:9777），
-//   - 每秒 ~10Hz 向外发一行 JSON 观测（obs）：车速/位置/朝向/路点/附近车辆
-//   - 接收一行 JSON 动作（action）：drive_to / cruise / stop
+// 作用：游戏内起一个 TCP 服务（默认监听所有网卡，供局域网里的 Mac mini 连），
+//   - 每秒 ~10Hz 向外发一行 JSON 观测（obs）：车速/位置/朝向/路点/发动机健康
+//   - 接收一行 JSON 动作（action）：drive_to / cruise / stop / handback
 // 玩家侧完全不受影响：不按键时插件零干预；F9 激活后也只是"驾驶任务"，
 // 下车、按 W/A/S/D 或再按 F9 即交还控制权。
 //
-// 安装：编译为 MVEBridge.dll 放进 GTA V 目录 scripts/（SHVDN v3 nightly）。
+// 零依赖：不用 System.Web.Extensions（SHVDN 运行时编译 .cs 不一定引用它），
+// JSON 全部手工拼/正则解析——本插件的 obs/action 格式固定，够用且更稳。
+//
+// 安装：把本文件放进 GTA V 目录 scripts/（SHVDN v3 nightly 自动编译 .cs）。
 // 仅限剧情模式！联机会被判定作弊封号。
+// 安全：监听 0.0.0.0 意味着局域网内任何机器可连；家用网可接受，
+// 公网/共享网络请改成 IPAddress.Loopback + 端口转发。
 
 using System;
-using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
-using System.Web.Script.Serialization;
+using System.Text.RegularExpressions;
 using System.Windows.Forms;
 using GTA;
 using GTA.Math;
@@ -30,24 +34,23 @@ public class MVEBridge : Script
     TcpListener _listener;
     TcpClient _client;
     NetworkStream _stream;
-    JavaScriptSerializer _json = new JavaScriptSerializer();
     bool _running = false;                // MVE 是否在接管驾驶
     int _lastObs = 0;
 
     public MVEBridge()
     {
-        // TCP 服务随游戏启动常驻；是否接管驾驶由 F9 决定
         try
         {
-            _listener = new TcpListener(IPAddress.Loopback, PORT);
+            _listener = new TcpListener(IPAddress.Any, PORT);   // 局域网可达（Mac mini 连这里）
             _listener.Start();
             Tick += OnTick;
             KeyDown += OnKeyDown;
             Aborted += (s, e) => Cleanup();
+            Notification("MVEBridge ON  port " + PORT);
         }
         catch (Exception ex)
         {
-            Notification("MVEBridge 启动失败: " + ex.Message);
+            Notification("MVEBridge FAIL: " + ex.Message);
         }
     }
 
@@ -83,61 +86,95 @@ public class MVEBridge : Script
         // ── 收动作（非阻塞，一次读一行）──
         string line = ReadLine();
         if (line != null && _running)
-        {
-            try { ApplyAction(_json.Deserialize<ScriptAction>(line)); }
-            catch (Exception ex) { SendLine("{\"err\":\"" + ex.Message + "\"}"); }
-        }
+            ApplyAction(line);
     }
 
-    // ── 观测构造 ──
+    // ── 观测构造（手工拼 JSON，格式固定）──
     string BuildObs()
     {
-        var o = new Obs();
-        o.ts = Game.GameTime;
-        o.running = _running;
+        var sb = new StringBuilder(256);
         Ped p = Game.Player.Character;
-        o.on_foot = !p.IsInVehicle();
         Vehicle v = p.CurrentVehicle;
+        float[] pos; float speed; float heading; float eng; string model;
         if (v != null && v.Exists())
         {
-            o.speed = v.Speed;                       // m/s
-            o.pos = V(v.Position);
-            o.heading = v.Heading;
-            o.health_engine = v.EngineHealth;
-            o.in_vehicle_model = v.LocalizedName;
+            pos = V(v.Position); speed = v.Speed; heading = v.Heading;
+            eng = v.EngineHealth; model = v.LocalizedName ?? "";
         }
         else
         {
-            o.speed = 0f;
-            o.pos = V(p.Position);
-            o.heading = p.Heading;
+            pos = V(p.Position); speed = 0f; heading = p.Heading;
+            eng = 0f; model = "";
         }
+        sb.Append("{\"ts\":").Append(Game.GameTime)
+          .Append(",\"running\":").Append(_running ? "true" : "false")
+          .Append(",\"on_foot\":").Append(v == null ? "true" : "false")
+          .Append(",\"speed\":").Append(F(speed))
+          .Append(",\"pos\":[").Append(F(pos[0])).Append(',').Append(F(pos[1]))
+          .Append(',').Append(F(pos[2])).Append(']')
+          .Append(",\"heading\":").Append(F(heading))
+          .Append(",\"health_engine\":").Append(F(eng))
+          .Append(",\"in_vehicle_model\":\"").Append(Escape(model)).Append('"');
         if (Game.IsWaypointActive)
-            o.waypoint = V(World.WaypointPosition);
+        {
+            float[] wp = V(World.WaypointPosition);
+            sb.Append(",\"waypoint\":[").Append(F(wp[0])).Append(',')
+              .Append(F(wp[1])).Append(',').Append(F(wp[2])).Append(']');
+        }
         else
-            o.waypoint = null;
-
-        return _json.Serialize(o);
+            sb.Append(",\"waypoint\":null");
+        sb.Append('}');
+        return sb.ToString();
     }
 
     static float[] V(Vector3 v3) { return new[] { v3.X, v3.Y, v3.Z }; }
 
+    // 浮点 → 不变区域固定格式（避免区域设置把 . 写成 ,）
+    static string F(float f) { return f.ToString("0.##",
+        System.Globalization.CultureInfo.InvariantCulture); }
+
+    static string Escape(string s)
+    {
+        return s.Replace("\\", "\\\\").Replace("\"", "\\\"")
+                .Replace("\n", " ").Replace("\r", " ");
+    }
+
+    // ── 动作解析（正则取键，格式：{"t":"drive_to","x":..,"y":..,...}）──
+    static string Grab(string json, string key)
+    {
+        Match m = Regex.Match(json, "\"" + key + "\"\\s*:\\s*(-?[0-9.]+|true|false|\"[^\"]*\")");
+        return m.Success ? m.Groups[1].Value : null;
+    }
+    static float Num(string json, string key, float dflt)
+    {
+        string s = Grab(json, key);
+        float v;
+        return (s != null && float.TryParse(s, System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out v)) ? v : dflt;
+    }
+
     // ── 动作应用（SHVDN TaskInvoker 高层 API，不用裸 native）──
-    void ApplyAction(ScriptAction a)
+    void ApplyAction(string line)
     {
         Ped p = Game.Player.Character;
         Vehicle v = p.CurrentVehicle;
-        if (v == null || !v.Exists()) { SendLine("{\"err\":\"not_in_vehicle\"}"); return; }
+        string t = Grab(line, "t");
+        if (t != null && t.Length >= 2) t = t.Substring(1, t.Length - 2);  // 去引号
 
-        switch ((a.t ?? "").ToLower())
+        if (v == null || !v.Exists())
+        { SendLine("{\"err\":\"not_in_vehicle\"}"); return; }
+
+        switch ((t ?? "").ToLower())
         {
             case "drive_to":   // 开到坐标：MVE 主动作
-                float sp = a.speed <= 0 ? 20f : a.speed;         // 默认 ~72km/h
-                var style = (DrivingStyle)(a.style == 0 ? (int)DrivingStyle.Normal : a.style);
-                p.Task.DriveTo(v, new Vector3(a.x, a.y, a.z), 3f, sp, style);
+                float sp = Num(line, "speed", 20f);              // 默认 ~72km/h
+                float st = Num(line, "style", 1f);
+                var style = (DrivingStyle)(st < 1 ? 1 : (int)st);
+                p.Task.DriveTo(v, new Vector3(Num(line, "x", 0f), Num(line, "y", 0f),
+                                              Num(line, "z", 0f)), 3f, sp, style);
                 break;
             case "cruise":     // 沿路巡航
-                p.Task.CruiseWithVehicle(v, a.speed <= 0 ? 15f : a.speed, DrivingStyle.Normal);
+                p.Task.CruiseWithVehicle(v, Num(line, "speed", 15f), DrivingStyle.Normal);
                 break;
             case "stop":       // 停车
                 p.Task.ClearAll();
@@ -215,27 +252,5 @@ public class MVEBridge : Script
         Function.Call(Hash._SET_NOTIFICATION_TEXT_ENTRY_2, "STRING");
         Function.Call(Hash._ADD_TEXT_COMPONENT_STRING, msg);
         Function.Call(Hash._DRAW_NOTIFICATION_4, false, true);
-    }
-
-    // ── JSON 载体 ──
-    class Obs
-    {
-        public long ts;
-        public bool running;
-        public bool on_foot;
-        public float speed;
-        public float[] pos;
-        public float heading;
-        public float health_engine;
-        public string in_vehicle_model;
-        public float[] waypoint;
-    }
-
-    class ScriptAction
-    {
-        public string t;      // drive_to | cruise | stop | handback
-        public float x, y, z;
-        public float speed;
-        public int style;     // 1=Normal 2=IgnoreLights 3=Rushed 4=AvoidObstacles
     }
 }
