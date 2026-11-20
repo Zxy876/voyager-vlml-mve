@@ -343,6 +343,14 @@ def register_builtin_actions(scene_id: str) -> dict[str, Any]:
 
     返回 `{"added": int, "tools": [...], "reason": "为什么拿不到"}`。
     """
+    if str(scene_id) == "G":
+        # GTA 自动驾驶场景（2026-11-21）：vlml 报告工具是电竞数据域的抓手，
+        # 对 G 是跨场景污染 —— 重启 restore 丢掉 mcp_gta_* 闭包条目后，这里
+        # 会把 match_* 塞进 G，可达性依据全变成对局报告（假可达）。G 的抓手
+        # 是学习循环第③步现注的 mcp_gta_* + available_grabs 现绑的本机原语，
+        # 不需要也不该有 builtin。
+        return {"added": 0, "tools": [],
+                "reason": "场景 G（GTA 自动驾驶）：builtin 电竞工具不适用"}
     try:
         import action_code
     except Exception as e:

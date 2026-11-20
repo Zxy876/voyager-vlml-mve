@@ -159,6 +159,13 @@ def _restore_action_registry(verbose: bool = False) -> dict[str, int]:
             sid = str(s.get("id") or "")
             if not sid or actions.entry_count(sid) > 0:
                 continue
+            if sid == "G":
+                # GTA 自动驾驶场景（2026-11-21）：mcp_gta_* 的 impl 是闭包，
+                # 重启 restore 解析不了 → 这里会把 builtin 的 vlml 电竞报告
+                # 工具塞进 G，可达性依据全变成 match_*（假可达）。G 的抓手
+                # 是学习循环第③步现注的 mcp_gta_* + 本机原语，跳过 builtin。
+                # （register_builtin_actions 入口也有一道同款防线，双保险）
+                continue
             reg = actions.register_builtin_actions(sid)
             if verbose:
                 print(f"[动作自检] {sid}: 反射注册 {reg.get('added')} 个原语"

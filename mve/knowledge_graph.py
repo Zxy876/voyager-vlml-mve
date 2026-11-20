@@ -1502,7 +1502,20 @@ def build(*, observe: bool = False, with_schema: bool = True) -> KnowledgeGraph:
     if with_schema:
         try:
             import vlml_schema
-            schema = asyncio.run(vlml_schema.discover())
+            try:
+                asyncio.get_running_loop()
+                # build() 是同步函数，可能从 async 上下文（面板学习循环）调进
+                # 来 —— 这里已有 running loop，asyncio.run() 必抛 RuntimeError
+                # （2026-11-21 04:33 面板实测：结构发现每次失败退回文件解析，
+                # RuntimeWarning: coroutine 'discover' was never awaited）。
+                # 挪到子线程自带的新循环里跑，结果一样、不炸循环。
+                import concurrent.futures as _cf
+                with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+                    schema = _ex.submit(
+                        lambda: asyncio.run(vlml_schema.discover())).result()
+            except RuntimeError:
+                # 没有 running loop（脚本/旧路径）：原样 asyncio.run
+                schema = asyncio.run(vlml_schema.discover())
         except Exception as e:                      # 连不上库就退回文件解析
             print(f"（VLML 结构发现失败，退回文件解析：{type(e).__name__}: {e}）")
             schema = {}
