@@ -9,9 +9,14 @@ import time
 
 
 class GtaClient:
-    def __init__(self, host="127.0.0.1", port=9777, timeout=5.0):
+    def __init__(self, host="127.0.0.1", port=9777, timeout=5.0,
+                 handshake: str = ""):
+        """handshake 非空时作为首行发出（走 VPS 中继时填 "MVE"）；
+        直连游戏插件时留空（插件不要求握手）。"""
         self.sock = socket.create_connection((host, port), timeout=timeout)
         self.sock.settimeout(timeout)
+        if handshake:
+            self.sock.sendall((handshake + "\n").encode("utf-8"))
         self._buf = b""
 
     # ── 收 ──

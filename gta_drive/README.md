@@ -4,24 +4,22 @@
 代码接管车辆；玩家任务不受影响（任务里开到目的地也由 MVE 接管完成）。
 **整个环境就是 MVE 的一个场景：obs → 学生代码 → 受控执行 → 环境判据。**
 
-## 双机架构（本线实际部署形态）
+## 双机架构（实际部署：经 VPS 中继，游戏机只出不进）
 
 ```
-Windows 机（游戏机）                      Mac mini（学习机，这台）
-├─ GTA V 剧情模式                         ├─ MVE-GTA-Drive 仓库
-├─ ScriptHookV + ScriptHookVDotNet        ├─ mve/.env（智谱 API key）
-├─ scripts/MVEBridge.cs  ← 监听 0.0.0.0:9777
-└─ 玩家：上车/设路点/按 F9                 └─ python run_first_automation.py --host <Windows机IP>
-                    └────── 局域网 TCP 9777（obs →，← action）──────┘
+Windows 机（游戏机）                 VPS 43.161.203.50                    Mac mini（这台）
+├─ GTA V 剧情模式                    ├─ gta_relay.py（systemd 服务         ├─ MVE-GTA-Drive 仓库
+├─ SHV + SHVDN                       │   mve-bridge-relay，监听 9778）     ├─ ssh -N -L 9778:… 隧道
+├─ scripts/MVEBridge.cs (:9777)      └─ GAME/MVE 两角色配对→纯字节透传     └─ run_first_automation.py
+└─ py win_forwarder.py --relay 127.0.0.1:19778 ──ssh隧道──┘      └──ssh隧道── Mac 连 127.0.0.1:9778
 ```
 
-Windows 防火墙放行（管理员 PowerShell/CMD 跑一次）：
-
-```
-netsh advfirewall firewall add rule name="MVEBridge" dir=in action=allow protocol=TCP localport=9777
-```
-
-Windows 机 IP 用 `ipconfig` 查（IPv4 地址）。
+- 云安全组只开了 22/80，9778 不对外——两侧都走 **SSH 隧道**进城。Windows 用
+  专用受限密钥 `gta_win`（authorized_keys 带 `restrict,command=/bin/false,permitopen=127.0.0.1:9778`，
+  只能建 9778 的转发，不能登 shell）。
+- 直连备选：两机同局域网时可跳过 VPS，`run_first_automation.py --host <Windows机IP>`，
+  此时 Windows 放行 9777 入站即可。
+- 握手行 `>ROLE?` 由转发器吞掉，不会透传进游戏插件。
 
 ## 硬前提（先说清，免得白折腾）
 

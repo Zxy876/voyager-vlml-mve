@@ -67,13 +67,18 @@ def gen_policy(model: str) -> tuple[str, str]:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=9777)
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="直连=Windows机IP；走VPS中继=43.161.203.50")
+    ap.add_argument("--port", type=int, default=9777,
+                    help="直连=9777；走VPS中继=9778")
+    ap.add_argument("--relay", action="store_true",
+                    help="经 VPS 中继（--host 43.161.203.50 --port 9778）")
     ap.add_argument("--model", default="")       # 留空 = mve/.env 的默认模型
     a = ap.parse_args()
 
     print("① 连接游戏桥…")
-    env = GtaEnv(a.host, a.port)
+    env = GtaEnv(a.host, a.port,
+                 handshake="MVE" if a.relay else "")
 
     print("② MVE 学生生成驾驶策略（模型: %s）…" % (a.model or llm_client.MODEL))
     t0 = time.time()

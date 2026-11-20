@@ -33,8 +33,10 @@ BLOCKED = ("__import__", "eval(", "exec(", "open(", "subprocess",
 class GtaEnv:
     """驾驶环境。obs 每帧从桥接插件拉，动作经桥下发。"""
 
-    def __init__(self, host="127.0.0.1", port=9777, timeout=10.0):
-        self.client = GtaClient(host, port, timeout=timeout)
+    def __init__(self, host="127.0.0.1", port=9777, timeout=10.0,
+                 handshake: str = ""):
+        self.client = GtaClient(host, port, timeout=timeout,
+                                handshake=handshake)
         self.last_obs = {}
 
     # ── observation：文本化（LLM 可读，各维带含义）──
