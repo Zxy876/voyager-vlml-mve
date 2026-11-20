@@ -65,6 +65,20 @@
       ],
       "env": {},
       "enabled": true
+    },
+    "gta": {
+      "url": "",
+      "command": "auto",
+      "args": [
+        "/Users/zhangbing/WorkBuddy/MVE-GTA-Drive/gta_drive/mcp_gta_server.py"
+      ],
+      "env": {
+        "GTA_BRIDGE_HOST": "127.0.0.1",
+        "GTA_BRIDGE_PORT": "9778",
+        "GTA_BRIDGE_HANDSHAKE": "MVE",
+        "GTA_SCENE_DIR": "/Users/zhangbing/WorkBuddy/MVE-GTA-Drive/scene_data/G"
+      },
+      "enabled": true
     }
   }
 }

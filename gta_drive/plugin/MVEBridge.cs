@@ -2,6 +2,9 @@
 //
 // 作用：游戏内起一个 TCP 服务（默认监听所有网卡，供局域网里的 Mac mini 连），
 //   - 每秒 ~10Hz 向外发一行 JSON 观测（obs）：车速/位置/朝向/路点/发动机健康
+//     + events：自上一条 obs 以来游戏里**真实发生**的事件（Voyager 的
+//       bot.on(事件)→events 回灌同构）：撞人/碰撞损伤/被警察通缉/翻车/
+//       着火/下车/死亡被捕等——事件由游戏 tick 探测，不是 LLM 编的
 //   - 接收一行 JSON 动作（action）：drive_to / cruise / stop / handback
 // 玩家侧完全不受影响：不按键时插件零干预；F9 激活后也只是"驾驶任务"，
 // 下车、按 W/A/S/D 或再按 F9 即交还控制权。
@@ -36,6 +39,101 @@ public class MVEBridge : Script
     NetworkStream _stream;
     bool _running = false;                // MVE 是否在接管驾驶
     int _lastObs = 0;
+
+    // ── 事件面（Voyager bot.on 同构）：游戏 tick 里探测真实事件，攒缓冲，
+    //    每条 obs 带走并清空。全部是探测事实，没有一条是猜的。──
+    System.Collections.Generic.List<string> _events =
+        new System.Collections.Generic.List<string>();
+    int _lastWanted = 0;                  // 上次通缉等级（被警察追）
+    float _lastVehHealth = -1f;           // 上次车体血量（碰撞损伤代理）
+    bool _wasOnFoot = true;               // 上次是否步行（上/下车）
+    bool _wasDead = false;                // 上次是否死亡
+    bool _wasUpsideDown = false;          // 上次是否翻车
+    int _lastEventTick = 0;               // 行人扫描节流（重活放 10Hz）
+
+    void Ev(string json)                  // 事件入缓冲（封顶防刷屏）
+    {
+        if (_events.Count < 20) _events.Add(json);
+    }
+
+    // 每个 tick 都跑的轻探测（通缉/死亡/上下车/血量跳变）
+    void DetectFast()
+    {
+        Ped p = Game.Player.Character;
+        Vehicle v = p.CurrentVehicle;
+
+        int w = Game.Player.WantedLevel;
+        if (w > _lastWanted) Ev("{\"e\":\"wanted\",\"level\":" + w + "}");
+        else if (w < _lastWanted)
+            Ev("{\"e\":\"wanted_cleared\",\"level\":" + w + "}");
+        _lastWanted = w;
+
+        bool dead = p.IsDead;
+        if (dead && !_wasDead) Ev("{\"e\":\"died\"}");
+        _wasDead = dead;
+        if (Game.Player.IsBeingArrested && !_wasDead)
+            Ev("{\"e\":\"busted\"}");
+
+        bool onFoot = (v == null || !v.Exists());
+        if (onFoot != _wasOnFoot)
+            Ev(onFoot ? "{\"e\":\"left_vehicle\"}" : "{\"e\":\"entered_vehicle\"}");
+        _wasOnFoot = onFoot;
+
+        if (v != null && v.Exists())
+        {
+            // 车体血量下降 = 真实碰撞/损伤（行人碰撞在 DetectSlow 里细判）
+            float h = v.Health;
+            if (_lastVehHealth >= 0 && h < _lastVehHealth - 1f)
+                Ev("{\"e\":\"vehicle_damage\",\"delta\":" +
+                   F(h - _lastVehHealth) + ",\"health\":" + F(h) + "}");
+            _lastVehHealth = h;
+        }
+        else
+            _lastVehHealth = -1f;
+    }
+
+    // 10Hz 节流的重探测（行人碰撞/翻车/着火）
+    void DetectSlow(Ped p, Vehicle v)
+    {
+        if (v != null && v.Exists())
+        {
+            // 翻车（滚转接近/超过 90°；GTA Rotation：X 俯仰 / Y 滚转 / Z 偏航）
+            bool up = Math.Abs(NormalizeAngle(v.Rotation.Y)) > 60f;
+            if (up && !_wasUpsideDown) Ev("{\"e\":\"rolled_over\"}");
+            _wasUpsideDown = up;
+
+            if (v.IsEngineOnFire) Ev("{\"e\":\"vehicle_on_fire\"}");
+            if (v.EngineHealth <= 0f && v.Health > 0)
+                Ev("{\"e\":\"engine_dead\"}");
+
+            // 行人碰撞：车在动 && 近处有倒地/被撞飞的行人
+            float spd = v.Speed;
+            if (spd > 2f)
+            {
+                Ped[] near = World.GetNearbyPeds(p.Position, 12f);
+                foreach (Ped q in near)
+                {
+                    if (q == p || !q.Exists()) continue;
+                    if (q.IsRagdoll || q.IsDead)
+                    {
+                        Ev("{\"e\":\"ped_hit\",\"speed\":" + F(spd) +
+                           ",\"dead\":" + (q.IsDead ? "true" : "false") + "}");
+                        break;            // 一条 obs 一条就够，别刷屏
+                    }
+                }
+            }
+        }
+        else
+            _wasUpsideDown = false;
+    }
+
+    static float NormalizeAngle(float a)   // 归一到 [-180,180]
+    {
+        a %= 360f;
+        if (a > 180f) a -= 360f;
+        if (a < -180f) a += 360f;
+        return a;
+    }
 
     public MVEBridge()
     {
@@ -76,11 +174,18 @@ public class MVEBridge : Script
             _stream = _client.GetStream();
         }
 
+        // ── 事件探测：轻探测每个 tick 都跑（不漏通缉/死亡）， ──
+        DetectFast();
+
         // ── 观测节流 ──
         if (Game.GameTime - _lastObs < OBS_HZ_MS) return;
         _lastObs = Game.GameTime;
 
-        // ── 发观测 ──
+        // ── 重探测（行人扫描等）放 10Hz ──
+        Ped p = Game.Player.Character;
+        DetectSlow(p, p.CurrentVehicle);
+
+        // ── 发观测（带走本窗口内攒下的真实事件）──
         SendLine(BuildObs());
 
         // ── 收动作（非阻塞，一次读一行）──
@@ -123,6 +228,16 @@ public class MVEBridge : Script
         }
         else
             sb.Append(",\"waypoint\":null");
+
+        // ── events：自上一条 obs 以来真实发生的事件，带走并清空 ──
+        sb.Append(",\"events\":[");
+        for (int i = 0; i < _events.Count; i++)
+        {
+            if (i > 0) sb.Append(',');
+            sb.Append(_events[i]);
+        }
+        sb.Append(']');
+        _events.Clear();
         sb.Append('}');
         return sb.ToString();
     }
