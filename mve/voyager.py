@@ -579,8 +579,8 @@ query_sql 的实测限制（踩过）：
 
 **拿不准列名就先查，不要猜**（这是最容易产生幻觉的地方 —— 猜出来的列名
 一定报 Binder Error，然后你会在下一轮原样再猜一遍）：
-    SELECT column_name FROM information_schema.columns WHERE table_name='rounds'
-这张表叫什么也能查：SELECT table_name FROM information_schema.columns GROUP BY table_name
+    SELECT * FROM (DESCRIBE rounds)
+表清单也能查：SELECT * FROM (SHOW TABLES)
 注意：不同表里"队伍"的列名不一样（有的是 team_name，有的是 winning_team_name），
 写 SQL 前先确认目标表里的实际列名。
 
@@ -721,8 +721,8 @@ async def db_self_description() -> str:
         f"现有 series：{series or '（无）'}"
         f"{sample_txt}\n\n"
         "拿不准列名就先查，不要猜：\n"
-        "  SELECT column_name FROM information_schema.columns WHERE table_name='表名'\n"
-        "  SELECT table_name FROM information_schema.columns GROUP BY table_name"
+        "  SELECT * FROM (DESCRIBE 表名)\n"
+        "  SELECT * FROM (SHOW TABLES)"
     )
     return _DB_SELF_DESC
 
@@ -1654,8 +1654,8 @@ VLML 的 10 个报告工具已经封装好指标口径。能用报告工具拿�
   1. 把维度名当列名 —— pistol_win_rate、pattern_rounds、pattern_confidence
      是**要你填的 dimension**，不是表里的列。
   2. 把工具名当表名 —— pattern_detection_report 是工具，不能写在 FROM 后面。
-  3. 猜列名 —— team_name 有的表里有、有的没有，写之前先查
-     information_schema.columns 确认。
+  3. 猜列名 —— team_name 有的表里有、有的没有，写之前先
+     SELECT * FROM (DESCRIBE 表名) 确认。
 
 {LOCAL_SQL_NOTES}
 
@@ -1742,7 +1742,7 @@ VLML 的 10 个报告工具已经封装好指标口径。能用报告工具拿�
 
         同构于原仓库 ActionAgent.render_human_message：它不只给
         "Execution error"，还一并给 Inventory / Nearby blocks（你现在有什么）。
-        在这里，"你现在有什么" 就是 information_schema 里真实存在的列名。
+        在这里，"你现在有什么" 就是 DESCRIBE 实查出来的真实列名。
 
         光列列名还是不够 —— 实测给了列名它照样写 team_name，
         因为它要的是"按队伍分组"这个语义。所以还要把**替代方案**说出来：
@@ -1753,14 +1753,17 @@ VLML 的 10 个报告工具已经封装好指标口径。能用报告工具拿�
         if not tables:
             return ""
         tbls = sorted(set(tables))[:3]
-        in_list = ",".join(f"'{t}'" for t in tbls)
-        q = (f"SELECT table_name, column_name FROM information_schema.columns "
-             f"WHERE table_name IN ({in_list}) ORDER BY table_name, ordinal_position")
-        try:
-            res = await execute_custom_sql(q)
-        except Exception:
-            return ""
-        rows = (res or {}).get("rows") if isinstance(res, dict) else None
+        rows: list[tuple] = []
+        for _t in tbls:
+            # 幻觉表名（模型把工具名写进 FROM）在这里会抛错 → 跳过该表；
+            # 真表照样返回列名，与旧版目录查询过滤同语义。
+            try:
+                _r = await execute_custom_sql(f'SELECT * FROM (DESCRIBE "{_t}")')
+            except Exception:
+                continue
+            _rrows = (_r or {}).get("rows") if isinstance(_r, dict) else None
+            for _row in _rrows or []:
+                rows.append((_t, _row[0]))
         if not rows:
             # 查不到列 = 这张表根本不存在（实测模型把**工具名**当成表名写进了
             # FROM：FROM pattern_detection_report）。照 VLML get_database_info 的做法，
@@ -1795,9 +1798,7 @@ VLML 的 10 个报告工具已经封装好指标口径。能用报告工具拿�
     async def _table_menu(self, tried: list[str]) -> str:
         """照 VLML get_database_info：给可用表清单，而不是只说"你错了"。"""
         try:
-            res = await execute_custom_sql(
-                "SELECT table_name FROM information_schema.columns GROUP BY table_name"
-            )
+            res = await execute_custom_sql("SELECT * FROM (SHOW TABLES)")
         except Exception:
             return ""
         names = sorted({str(r[0]) for r in (res.get("rows") or []) if r})

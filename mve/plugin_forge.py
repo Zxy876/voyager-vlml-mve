@@ -17,7 +17,7 @@
 
 两条硬自律（与全项目同一套，本模块每一行守它）
 --------------------------------------------
-1. **派生只从真实结构来**：表清单、列名全部实查 information_schema
+1. **派生只从真实结构来**：表清单、列名全部实查 SHOW TABLES/DESCRIBE
    （`db_switch.list_tables` / `db_switch.table_columns`），一个字段名都不手写。
    手写清单的实测后果见 `actions.py` 模块 docstring 的
    pattern_detection_report 签名事故（参数名对不上 → TypeError → 四个维度全 None）。
@@ -181,7 +181,7 @@ def forge_plugin(task: str, subtask: dict[str, Any], scene_id: str, *,
     参数：
         task     —— 原问题（进文件头 provenance，也进条目 description）
         subtask  —— task_decompose.plan() 输出的一个子目标（status=="gap"），
-                    取它的 need 与 gap_hint（相关表，实查 information_schema 得来）
+                    取它的 need 与 gap_hint（相关表，实查 SHOW TABLES/DESCRIBE 得来）
         scene_id —— 注册进哪个场景的动作命名空间
         db_path  —— 数据源路径（空 = 当前默认库，照 db_switch 口径）
 
@@ -271,7 +271,7 @@ def _render_forge_source(scene_id: str, task: str, need: str,
         f'来源：场景 {_safe(scene_id)} · 任务「{_safe(task)}」· '
         f'缺口子目标「{_safe(need)}」\n'
         f'生成时间：{time.strftime("%Y-%m-%d %H:%M:%S")}\n'
-        '派生依据（information_schema 实查，不手写）：\n'
+        '派生依据（SHOW TABLES/DESCRIBE 实查，不手写）：\n'
         + "".join(f'  - {_safe(t)}: {len(c)} 列\n'
                   for t, c in cols_by_table.items())
         + 'schema 变更后重跑 plugin_forge.forge_gaps 会覆盖本文件。\n'
@@ -384,12 +384,20 @@ def crystallize_skill(skill: dict[str, Any] | str, *,
     code = str(s.get("code") or "")
     # 泛化模板（code 带 :slot）是给「检索 + _refill_sql 回填」通道用的，
     # 原样重放必错（槽位没填）。结晶条目要重放的是**判对后固化的那段程序**
-    # —— blueprint.rollout_sql（泛化前的原文，2026-10-26 补记）。没有该
-    # 字段的老技能照旧用 code（本机 Python 配方/未泛化的 SQL 都不受影响）。
+    # —— blueprint.rollout_sql（泛化前的原文，2026-10-26 补记）。
+    #
+    # ★ 2026-11-11 修正（用户：「phase2 对 voyager 来说才是真正沉淀积累技能
+    #   的」）：只在 code **确实是泛化模板**时才用 rollout_sql 顶替。
+    #   旧逻辑是「有 rollout_sql 就顶」—— 于是里程碑那条**整题程序**
+    #   （各维配方内联 + RESULT 汇总，447 字）被 blueprint.rollout_sql
+    #   （一条 `SELECT COUNT(*)`）顶掉，落盘的 learned_milestone.py 只剩
+    #   一维的计数。结果是：学完一整轮，真正的 task 级技能没沉淀下来
+    #   （库里 code 是对的，可 invoke 的条目却是残的）。
     _raw = str((s.get("blueprint") or {}).get("rollout_sql") or "").strip()
-    if _raw:
+    _is_tpl = bool(re.search(r":[a-z_][a-z0-9_]*", code, re.I))
+    if _is_tpl and _raw:
         code = _raw
-    elif re.search(r":[a-z_][a-z0-9_]*", code, re.I):
+    elif _is_tpl:
         # 泛化模板（带 :slot）且没有 rollout_sql（2026-10-23 泛化上线前
         # 入库的老技能）—— 槽位没填的原样重放必错，如实拒绝，不注册坏条目。
         out["why"] = ("该技能是泛化模板（带 :slot）且无 blueprint.rollout_sql"

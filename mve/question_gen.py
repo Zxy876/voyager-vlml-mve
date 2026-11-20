@@ -382,7 +382,7 @@ _KEEP = ("win", "rate", "round", "kill", "death", "kast", "adr", "map", "team",
 
 
 async def _sql_catalog() -> str:
-    """SQL 路径的真实表/列（从 information_schema 拉，绝不手写）。
+    """SQL 路径的真实表/列（DESCRIBE 实查，绝不手写）。
 
     跟工具签名同理：**不把真实列名给它，它只能猜**。
     实测不给表结构时，模型写出的 SQL 有三分之一返回 0 行 —— 不是逻辑错，
@@ -392,16 +392,18 @@ async def _sql_catalog() -> str:
     不是列，光说「照抄表结构」模型改不动（实测连改三轮都加同一个不存在的列）。
     """
     global _COLS_CACHE
-    inlist = ", ".join(f"'{t}'" for t in _SQL_TABLES)
     try:
-        res = await vlml_env.execute_custom_sql(
-            "SELECT table_name, column_name FROM information_schema.columns "
-            f"WHERE table_name IN ({inlist}) ORDER BY table_name, ordinal_position")
+        rows: list[tuple] = []
+        for _t in _SQL_TABLES:
+            _r = await vlml_env.execute_custom_sql(
+                f'SELECT * FROM (DESCRIBE "{_t}")')
+            for _row in ((_r or {}).get("rows") or []):
+                rows.append((_t, _row[0]))
     except Exception as e:                                   # pragma: no cover
         return f"（表结构探测失败：{type(e).__name__}）"
     from collections import defaultdict
     cols: dict[str, list[str]] = defaultdict(list)
-    for t, c in (res.get("rows") or []):
+    for t, c in rows:
         cols[str(t)].append(str(c))
     _COLS_CACHE = {str(t): list(cs) for t, cs in cols.items()}
     blocks = []

@@ -267,9 +267,7 @@ def _report_db() -> None:
         print(f"  ⚠️ 连不上当前库：{type(e).__name__}: {e}")
         return
     try:
-        tabs = [r[0] for r in con.execute(
-            "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema='main'").fetchall()]
+        tabs = [str(r[0]) for r in con.execute("show tables").fetchall()]
         print(f"  表               : {len(tabs)} 张")
         for tbl, col, tag in (("games", "map_name", "地图"),
                               ("agg_team_series_stats", "team_name", "队伍")):
@@ -366,6 +364,9 @@ FULL_RESET_DIRS = [
 #   (文件名, 场景字段名, 说明)
 SCENE_ROWS = [
     ("run_log.jsonl", "scene", "每轮作答（练习线）"),
+    # 2026-11-19 补：learn_trace 是 11-18 新账（一次 learn 一行），上线时
+    # 漏进了按场景清单 —— 清库后 hero KPI / 课程曲线会残留旧场景行。
+    ("learn_trace.jsonl", "scene", "学习轨迹（fetch/P1/P2/点亮/gate）"),
     ("causal_timeline.jsonl", "scene", "行动因果时间线"),
     ("coach_log.jsonl", "root_scene", "人导入历史 + 消费记录"),
     ("topic_mastery.jsonl", "root_scene", "掌握库（每个节点的进度 / 完成情况）"),

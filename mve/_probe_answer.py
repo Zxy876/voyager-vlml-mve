@@ -4,13 +4,9 @@ import duckdb
 c = duckdb.connect("vlml/data/vlml_rib.duckdb", read_only=True)
 
 print("== rounds 列 ==")
-print([r[0] for r in c.execute(
-    "select column_name from information_schema.columns "
-    "where table_name = 'rounds' order by ordinal_position").fetchall()])
+print([r[0] for r in c.execute("describe rounds").fetchall()])
 row = c.execute("select * from rounds limit 1").fetchone()
-cols = [r[0] for r in c.execute(
-    "select column_name from information_schema.columns "
-    "where table_name = 'rounds' order by ordinal_position").fetchall()]
+cols = [r[0] for r in c.execute("describe rounds").fetchall()]
 for k, v in zip(cols, row):
     print(f"  {k:26s} = {v}")
 

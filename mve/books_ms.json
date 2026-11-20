@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "source": "MVE 仓库自身（/root/mve/mve，约 188 个 .py / 8 万行）——场景 S：MVE 学 MVE 的书单",
+  "note": "单元 = 真实模块/文件组；points = 一句话行为契约（人草拟待用户审）；files 供 AST import 依赖边与代码取证（file:line）回查。首批细写 3 章：maieutic_scaffold / task_critic / skill_store。",
+  "books": [
+    {"id": "ms-01", "level": 1, "order": 1, "title": "学习主循环", "author": "MVE 仓库", "subject": "MVE 自读",
+     "units": [
+      {"title": "voyager 主循环（Voyager.learn 同构）", "points": "curriculum 提议→执行→critic 判定→技能入库→进度推进的循环骨架；失败任务记 failed 并换题不判死", "files": ["voyager.py", "loop_core.py"]},
+      {"title": "learn_orchestrate 单轮学习闭环", "points": "人消费未命中→图谱建点→拆分到可达→补缺口→真取数→入账（消费侧同一套账）", "files": ["learn_orchestrate.py"]},
+      {"title": "scene_learn 场景学习驱动", "points": "只学当前场景自己的账（fetched_empty/failed 导入问题），场景显式传参不跟当前场景漂", "files": ["scene_learn.py"]},
+      {"title": "learn VLML 课程学习单元", "points": "VLML 场景的学习入口，与 scene_learn 的分工边界", "files": ["learn.py"]}
+     ]},
+    {"id": "ms-02", "level": 2, "order": 2, "title": "助产士与判据", "author": "MVE 仓库", "subject": "MVE 自读",
+     "units": [
+      {"title": "maieutic_scaffold 提问骨架", "points": "契约草稿：拆一段材料为必须逐条承诺的维度清单——每条必须是具体到可判定的问题（『处理空输入』不算承诺，『空输入返回 0』才算）；维度数与复杂度成比例（简单 2-3、复杂 5-7，不许固定条数）；预判偏差分三类：drift=做得比承诺少、revision=换了仍满足承诺的做法（不是错）、bug=按承诺做了但机械失败；材料太模糊给 prompt_quality_note 不拒绝作答；追问只反问不给答案", "files": ["maieutic_scaffold.py"]},
+      {"title": "task_critic 任务完成判定", "points": "契约草稿：判定只看任务达没达成——执行层报错（无答案）直接判 False 不叫 LLM；数据型任务（题面要文件/表/数量/排名/最新）一次数据源都没调直接判 False（真空防线）；LLM 输出 {reasoning, success, critique}，解析失败递归重试 5 次，全败判 (False, \"\")；超出任务要求也算成功，未达标必须给 critique", "files": ["task_critic.py"]},
+      {"title": "maieutic_gate 闸门闭合", "points": "critic 只核清单不做质量评估：passed 当且仅当 gaps_still_open 为空；提到主题≠做出承诺；emergent_gaps 不阻塞闭合；追问上限 3 条", "files": ["maieutic_gate.py"]},
+      {"title": "local_agent 执行层（工具编排与真空防线）", "points": "显式声明压过目录扫描的取数义务；真取到数的证据口径（real_calls/rows）", "files": ["local_agent.py"]}
+     ]},
+    {"id": "ms-03", "level": 3, "order": 3, "title": "记忆与技能", "author": "MVE 仓库", "subject": "MVE 自读",
+     "units": [
+      {"title": "skill_store 技能库", "points": "契约草稿：防膨胀三规矩（照 Voyager SkillManager）——add() 按 (topic,name) 去重、同名覆盖不新增（Rewriting，旧版归档 versions+1）；retrieve() 只回 top_k=5 条（库再大进 prompt 的永远 5 条）；低价值经验（太短/与已有几乎重复/复述题面）不入库", "files": ["skill_store.py"]},
+      {"title": "knowledge_graph 图谱三层", "points": "维度/工具/表三层节点与边；root_scene 隔离；declared 与 observed 两类边的语义", "files": ["knowledge_graph.py"]},
+      {"title": "topic_graph 文档图谱", "points": "导入问题→图谱节点的落账路径", "files": ["topic_graph.py"]},
+      {"title": "图谱种植三入口（books/topics/curriculum）", "points": "graph_books=无题库书单场景、graph_curriculum=有题库场景、graph_topics=问题场景；声明优先（books_json）", "files": ["graph_books.py", "graph_topics.py", "graph_curriculum.py"]}
+     ]},
+    {"id": "ms-04", "level": 4, "order": 4, "title": "出题与课程", "author": "MVE 仓库", "subject": "MVE 自读",
+     "units": [
+      {"title": "curriculum_auto 课程代理", "points": "书单场景的课程投影（render_text+原文摘录）；提议的锚点推进", "files": ["curriculum_auto.py"]},
+      {"title": "book_text/book_content 书目正文与切分", "points": "PDF 目录抽取；中英双语正文判定（CJK）；例题/习题切分不混答案区", "files": ["book_text.py", "book_content.py"]},
+      {"title": "difficulty/exam 难度与考试", "points": "难度分型与考试组织", "files": ["difficulty.py", "exam.py"]}
+     ]},
+    {"id": "ms-05", "level": 5, "order": 5, "title": "面板与交互", "author": "MVE 仓库", "subject": "MVE 自读",
+     "units": [
+      {"title": "dashboard 驾驶舱", "points": "单一份 next_task 口径的驾驶舱入口；场景隔离的页面联动", "files": ["dashboard.py"]},
+      {"title": "chat_page/coach 对话页与教练", "points": "对话入口与教练建议", "files": ["chat_page.py", "coach.py"]},
+      {"title": "upload/feedback/export_md 导入·反馈·导出", "points": "人导入意图的入口；反馈回写；导出", "files": ["upload.py", "feedback.py", "export_md.py"]}
+     ]},
+    {"id": "ms-06", "level": 6, "order": 6, "title": "场景与基建", "author": "MVE 仓库", "subject": "MVE 自读",
+     "units": [
+      {"title": "scenes/scene_profile 场景声明与画像", "points": "scenes.json 声明机制：grounded 显式声明优先、books_json 换资源不改代码；场景插入契约的硬拒绝项与可降级项", "files": ["scenes.py", "scene_profile.py"]},
+      {"title": "reward/failures/untrusted 判据与失败账", "points": "scene_has_env 声明优先；失败原因记账；不可信输入隔离", "files": ["reward.py", "failures.py", "untrusted.py"]},
+      {"title": "plugin_forge/mcp_gateway/orchestrate 插件·MCP·编排", "points": "缺口→插件文件+动态注册；远端工具→动作条目；条目组合成步骤序列", "files": ["plugin_forge.py", "mcp_gateway.py", "orchestrate.py"]},
+      {"title": "task_decompose/routing/cold_start 拆分·路由·冷启动", "points": "拆到任务有抓手可达（reachability）；图谱节点路由；冷启动建点", "files": ["task_decompose.py", "routing.py", "cold_start.py"]},
+      {"title": "llm_client/vlml_env/vlml_schema 模型与环境", "points": "LLM 客户端；VLML 环境与 schema", "files": ["llm_client.py", "vlml_env.py", "vlml_schema.py"]},
+      {"title": "actions/action_code 动作层", "points": "动作条目与动作代码的执行路径", "files": ["actions.py", "action_code.py"]}
+     ]}
+  ]
+}

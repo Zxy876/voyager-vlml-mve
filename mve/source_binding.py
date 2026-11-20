@@ -158,11 +158,18 @@ def bind_hint(dim_text: str, db_path: str) -> str:
 
 
 def check(dim_text: str, evidence: list[dict[str, Any]] | None,
-          db_path: str) -> tuple[bool, str]:
+          db_path: str, *,
+          upstream_tables: list[str] | None = None,
+          upstream_tools: list[str] | None = None) -> tuple[bool, str]:
     """返回 (是否绑定, 不绑定的判词)。无点名来源 / 无法归因 → (True, "")。
 
     「无法归因」= 证据条目里一条 `args` 都没有（老路径产的材料账没记入参）。
     这时不拦：判据只能判它看得见的东西，凭空判死比放过更糟。
+
+    ★ `upstream_tables` / `upstream_tools`（2026-11-09 服务器实测加）：
+      「**取证落点表**」的特殊放宽 —— 见 `_upstream_equivalent`。
+      两个清单都是**实况**（表名来自 `local_agent._ingest_tables` 实查；
+      工具名来自 `actions` 注册表里 origin=net|mcp 的条目），不是词表。
     """
     kind, toks = targets(dim_text, db_path)
     if not toks:
@@ -181,6 +188,10 @@ def check(dim_text: str, evidence: list[dict[str, Any]] | None,
                 (ok_hit if e.get("ok") else tried).add(t)
     if ok_hit:
         return True, ""
+    # ★ 取证落点表：允许用「它的上游抓手」取数（同一份数据的源头）
+    if _upstream_equivalent(kind, toks, items,
+                             upstream_tables, upstream_tools):
+        return True, ""
     what = _KIND_CN.get(kind, "来源")
     if tried:
         return False, (f"本轮确实取了 {'、'.join(sorted(tried))}，但那次调用**没取到内容**"
@@ -192,3 +203,48 @@ def check(dim_text: str, evidence: list[dict[str, Any]] | None,
         f"（实际只用了 {'、'.join(used) if used else '没有可用调用'}）——"
         f"别处的真数据不能当它的答案。先把 {toks[0]} 取到手，再在取到的内容上作答"
     )
+
+
+def _upstream_equivalent(kind: str, toks: list[str],
+                          items: list[dict[str, Any]],
+                          upstream_tables: list[str] | None,
+                          upstream_tools: list[str] | None) -> bool:
+    """「取证落点表」可以用**它的上游抓手**取数（同一份数据的源头）。
+
+    为什么需要这条放宽（2026-11-09 服务器实测，场景 L Sherlock 题）：
+        维度问「在 **web_facts** 表中，当 item='ce' 时，所有平台判定列中值为
+        'CLAIMED' 的列名有哪些？」→ 守卫判 kind=table、tok=web_facts，
+        要求有一条调用的**入参**点到 web_facts。
+        而模型做的是 `mcp_sherlock_lookup_username(username="ce")` ——
+        **web_facts 恰恰就是 Sherlock 结果落库后的摊平宽表**
+        （`web_ingest.save_evidence` → 账本 → `_refresh_facts` 摊平成宽表）。
+        于是「取的是不是这一份」的答案是**是**：同一份数据，只是从源头取，
+        而不是从落库后的宽表取。
+        不放宽 → 守卫把**最直接、最真实**的取法判死 → 这道题永远答不出来
+        （实测：reuse_errors 里明写「来源未绑定…别处的真数据不能当它的答案」，
+        而那恰恰就是要的答案）。
+
+    为什么这条放宽**安全**（不会放过 H 场景那个反例）：
+        · 只对 **kind=="table"** 生效 —— 文件名类（README.md）、URL 类、
+          仓库 slug 类一律不放宽；
+        · 只对**取证落点表**生效（`upstream_tables` = 实查出来的
+          web_docs / web_facts / web_evidence）—— 普通业务表不放宽；
+        · 只认**远端抓手**（`upstream_tools` = actions 注册表里 origin=net|mcp
+          的条目）—— H 场景那个反例调的是 `gh_repo_info`（origin=github/local），
+          **不在**远端抓手里 → 仍判不绑定 ✅；
+        · 仍要求那条远端调用**真的 ok**（材料账里有内容）。
+    """
+    if kind != "table":
+        return False
+    _up = {str(t) for t in (upstream_tables or []) if str(t).strip()}
+    if not _up or not any(str(t) in _up for t in toks):
+        return False
+    _tools = {str(t) for t in (upstream_tools or []) if str(t).strip()}
+    if not _tools:
+        return False
+    for e in items:
+        if not e.get("ok"):
+            continue
+        if str(e.get("tool") or "") in _tools:
+            return True
+    return False

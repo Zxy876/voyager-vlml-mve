@@ -172,9 +172,10 @@ def main() -> int:
     check("coach 落盘白名单带 tool_line_used",
           "tool_line_used" in _coach_src and "referee_compared" in _coach_src)
 
-    print("== 6. 信息路规划接线（2026-10-29 拍板：先规划、再可达性检查）==")
+    print("== 6. 信息路由接线（2026-11-09 删规划员：改由骨架承担）==")
     src_plan = inspect.getsource(C.consume)
-    check("consume 主流程调用 _plan_routes", "_plan_routes(" in src_plan)
+    check("consume 主流程调用 _plan_from_scaffold",
+          "_plan_from_scaffold(" in src_plan)
     check("对比题 db 半场目标被规划裁剪（「本轮只做 db 半场」）",
           "本轮只做 db 半场" in src_plan and "_solve_task" in src_plan)
     # 「所有问题都应由外部规划去完成」（2026-10-29 用户拍板）：
@@ -187,9 +188,46 @@ def main() -> int:
     _all_src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  "..", "voyager_vlml", "consume.py"),
                     encoding="utf-8").read()
-    check("规划员不可用时不碰环境（兜底 planned=False + db=False）",
-          "规划员不可用 → 不碰环境" in _all_src
+    # 2026-11-09：规划员（_plan_routes / _plan_selfcheck）已整体删除 ——
+    # 原版 maieutic 本来就没有「规划员」这层（拆解即骨架），MVE 另设规划员
+    # 与骨架构成第二套分解，实测互相打架（Sherlock 那题规划员判 db:False，
+    # 骨架却写着「在 web_facts 表中查」）。路由改由骨架承担。
+    check("规划员已整体删除（函数不存在 + 源码零调用）",
+          not hasattr(C, "_plan_routes")
+          and not hasattr(C, "_plan_selfcheck")
+          and "_plan_routes(" not in _all_src
+          and "_plan_selfcheck(" not in _all_src)
+    check("路由由骨架承担（source=scaffold）",
+          '"source": "scaffold"' in _all_src
+          or '"source": "scaffold"' in src_plan
+          or 'out["source"] = "scaffold"' in _all_src)
+    check("没有骨架时不猜题型（planned=False + db=False）",
+          "没有骨架（自由提问/还没建里程碑）→ 不猜题型" in _all_src
           and '"db": False, "web": False' in _all_src)
+    # ⚠️ 2026-11-09（用户实测发现）：删掉规划员后 `planned=False` 的语义
+    # 从「规划员挂了」变成了「**没有骨架**」。联网判据还停在旧语义
+    # （`planned and not web`）→ 没骨架时反而去联网，与路由层自相矛盾：
+    # `_plan_from_scaffold` 明说「不碰环境、不联网」，执行却联网了。
+    # 服务器实测（场景 L 清场后重问同一题）：白烧一次联网（三后端全灭），
+    # 还把「搜索失败」写成判词，把真正原因（这题没骨架落点 = 未学）埋掉。
+    # 现在判据**只看 web**：路由里没有 web 这一步 → 计划外的动作不执行。
+    check("联网判据只看 web（不再看 planned）",
+          '_plan.get("planned") and not _plan.get("web")' not in src_plan
+          and 'if not _plan.get("web"):' in src_plan)
+    check("没有骨架 → 路由里没有 web → 不执行计划外动作",
+          "路由里没有联网这一步（计划外的动作不执行）" in src_plan)
+    # 「规划员」这个名号不该再出现在任何**用户可见**的输出里
+    # （用户实测：「消费侧还是有规划员，不是删了吗」—— 看到的是这句文案）。
+    _cp_src2 = open(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "chat_page.py"),
+        encoding="utf-8").read()
+    check("用户可见文案里没有「规划员」",
+          "规划员不可用" not in _all_src
+          and "规划员不可用" not in _cp_src2
+          and "规划员不可用" not in _coach_src)
+    check("思考轨迹不再叫「这一问的规划」（改叫按骨架落点走哪条路）",
+          "这一问的规划" not in _cp_src2
+          and "这一问走哪条路（按骨架落点）" in _cp_src2)
     check("混合题两半由规划合成（_compose_halves）",
           "_compose_halves(" in src_plan and "库内半场" in src_plan)
     # 2026-10-29 服务器实测（腾讯校招起薪）：规划只排 web 路，却仍去技能库
@@ -244,11 +282,21 @@ def main() -> int:
     # 2026-10-29 用户实测：场景库形态（kind=scene）不注册联网原语 → 规划排了
     # web 路却「注册表里没有联网原语」→ 时变题（天气/汇率）在所有场景库形态
     # 永远不可答。两分原则：时变→工具线，所以联网原语必须两种形态都注册。
-    _i_mcp = _all_src.find('mcp_ready = {"skipped"')
+    #
+    # ⚠️ 2026-11-09 修（这条断言此前**一直挂**，是既有失败不是本次引入）：
+    #   锚点 `mcp_ready = {"skipped"` 早已不存在于 consume.py（老版本才有那个
+    #   字典字面量）→ find() 返回 -1 → 条件恒 False。断言锚在字符串上，
+    #   代码一改就失真。改成按**语义**判：
+    #   ① 存在 MCP 挂载步骤；② register_net 出现在它**之后**；
+    #   ③ 两者之间**没有** `if mcp_ready` / `if not mcp_ready` 这样的闸 ——
+    #      即 MCP 没挂上时，联网原语照样注册（这才是这条断言的本意）。
+    _i_mcp = _all_src.find("mcp_ready = await _la.ensure_mcp_tools(")
     _i_net = _all_src.rfind("register_net(")
+    _seg = (_all_src[_i_mcp:_i_net] if (_i_mcp != -1 and _i_net > _i_mcp) else "")
     check("场景库形态也注册联网原语（时变题走工具线的前提）",
-          _i_mcp != -1 and _i_net > _i_mcp,
-          f"mcp_skip@{_i_mcp} register_net@{_i_net}")
+          _i_mcp != -1 and _i_net > _i_mcp
+          and "if mcp_ready" not in _seg and "if not mcp_ready" not in _seg,
+          f"mcp@{_i_mcp} net@{_i_net} 闸={'有' if 'if mcp_ready' in _seg or 'if not mcp_ready' in _seg else '无'}")
     # 2026-10-29 用户拍板「抄 DeepSeek 原理：只有一个执行工具，SQL 只是代码
     # 里的一行」—— 场景库形态 SQL 通道全败要能换说法再试（写代码 query_sql），
     # query_sql 必须认场景契约 db_path（B 的库在 scene_data/P，不在 scene_dir）。

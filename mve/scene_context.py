@@ -9,7 +9,7 @@ MVE 的对应物：
   ──────────────────────────────────────────────────────────────────────
   biome（世界）         数据源身份（vlml_vlr / vlml_rib / 默认库）  db_config
   nearby_blocks（眼前） 当前可见的「表 + VLML 10 工具」（base 层恒给，
-                         ext_* 层进度够了才给）                        information_schema
+                         ext_* 层进度够了才给）                    show tables / describe
   inventory（背包）     实体可填值（锚点 series/team/map + 目录可选项）
                         + 已掌握的知识点                               anchor / entity_catalog / 掌握度
   chests（箱内存货）    技能库图谱（已学会的技能/配方）                 skill_store / 掌握度
@@ -134,9 +134,7 @@ def available_tables(progress_tier: int = TIER_BASE) -> dict[str, list[str]]:
         if _P(p).exists():
             con = duckdb.connect(p, read_only=True)
             try:
-                live = [str(r[0]) for r in con.execute(
-                    "SELECT table_name FROM information_schema.tables "
-                    "WHERE table_schema='main' ORDER BY 1").fetchall()]
+                live = sorted(str(r[0]) for r in con.execute("show tables").fetchall())
             finally:
                 con.close()
     except Exception:

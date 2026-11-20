@@ -98,46 +98,94 @@ def main() -> int:
     check("判官退回记账", '"fit"' in src and "判官退回" in src)
     check("重写仍败记账", '"rewrite"' in src)
     check("组合没取到数记账", '"compose"' in src)
-    check("自检改路也记账", "自检改路" in src and '"plan"' in src)
-    check("自检是增强不是依赖（try 包裹）",
-          src.count("_plan_selfcheck") >= 2)
+    # 2026-11-09：规划员已整体删除（_plan_routes / _plan_selfcheck），
+    # 信息路由改由**骨架**承担 —— 原版 maieutic 本来就没有「规划员」这层
+    # （拆解即骨架）。下面断言的是新链路。
+    check("路由由骨架承担（无规划员）",
+          "_plan_from_scaffold" in src
+          and "_plan_selfcheck(" not in src
+          and "_plan_routes(" not in src)
 
-    print("== 7. _plan_selfcheck 打桩行为 ==")
+    print("== 7. 骨架路由（_plan_from_scaffold）==")
     import voyager_vlml.consume as C
-    _orig_chat = C.chat_json
+    _orig_dims = None
     try:
-        # 7a. 规划本来对 → ok=true，不动
-        C.chat_json = lambda msgs, **kw: {"ok": True, "fix": {}, "why": "对"}
-        out = C._plan_selfcheck("什么是递归", {"db": False, "web": False,
-                                               "infer": True})
-        check("对的规划放行", out["ok"] is True and out["fix"] == {})
+        import maieutic_scaffold as _ms
+        _orig_dims = _ms.milestone_dimensions
 
-        # 7b. 评价题只给 infer → 判错 + 给修好的路
-        C.chat_json = lambda msgs, **kw: {
-            "ok": False,
-            "fix": {"db": True, "web": True, "file": False, "infer": False},
-            "why": "评价题只给 infer 是错的"}
-        out = C._plan_selfcheck("待遇好不好", {"db": False, "web": False,
-                                               "infer": True})
-        check("错规划被判", out["ok"] is False)
-        check("fix 带修好的路", out["fix"].get("db") is True
-              and out["fix"].get("web") is True)
+        def _fake_dims(scene_id, question, *a, **kw):
+            return [{"id": "d1", "question": "在 web_facts 表中查该用户名的判定",
+                     "why": "x", "landing": "web_facts"}]
 
-        # 7c. fix 修出全 False = 修坏了 → 不采信
-        C.chat_json = lambda msgs, **kw: {
-            "ok": False, "fix": {"db": False, "web": False,
-                                 "file": False, "infer": False}, "why": "x"}
-        out = C._plan_selfcheck("x", {"db": True})
-        check("全 False 的 fix 不采信", out["fix"] == {})
+        _ms.milestone_dimensions = _fake_dims
+        # 7a. 维度落在场景可达的表上 → db 路
+        out = C._plan_from_scaffold("某用户名在 GitHub 有没有账号", scene_id="L",
+                                    has_file=False, scene_tables=["web_facts"])
+        check("维度落在场景表 → 判 db 路",
+              out.get("db") is True and out.get("source") == "scaffold")
+        check("db 路不带 web", out.get("web") is False)
 
-        # 7d. LLM 挂 → ok=True 照旧（不挡路）
-        def _boom(*a, **kw):
-            raise RuntimeError("LLM 挂了")
-        C.chat_json = _boom
-        out = C._plan_selfcheck("x", {"db": True})
-        check("自检挂了照旧放行", out["ok"] is True)
+        # 7b（2026-11-09 第二刀改写）：信息路由由**教师端写好的 landing**
+        # 决定（落点 = 远端抓手名 → web 路），不再靠关键词表猜题型。
+        # ⚠️ 原来这里断言的是「维度问句含『各站点/跨平台』→ 判 web」——
+        # 那是两张针对特定场景的关键词表（_mentions_external），与本函数
+        # 文件头「不猜题型、不写关键词表」自相矛盾，且实测在真实骨架上
+        # 从未命中（真实维度全是「在 X 表中，Y 是多少」形式）。
+        def _fake_web(scene_id, question, *a, **kw):
+            return [{"id": "d1", "question": "该 username 在各站点的判定结论分别是什么",
+                     "why": "x", "landing": "mcp_sherlock_lookup_username"}]
+
+        _ms.milestone_dimensions = _fake_web
+        _orig_remote = C._remote_primitive_names
+        C._remote_primitive_names = lambda sid: ["mcp_sherlock_lookup_username"]
+        try:
+            out = C._plan_from_scaffold("某用户名在跨平台网站的账号存在性",
+                                        scene_id="L", has_file=False,
+                                        scene_tables=["web_facts"])
+            check("落点 = 远端抓手 → 判 web 路", out.get("web") is True)
+            check("web 路不带 db", out.get("db") is False)
+        finally:
+            C._remote_primitive_names = _orig_remote
+
+        # 7b2（新增）：落点写了一个**够不着**的表名（实测场景 L 的
+        # web_evidence —— 它在另一个 duckdb 文件里，SQL 连不到）
+        # → 如实不猜：不判 db、不判 web（不假装这条路走得通）。
+        def _fake_ledger(scene_id, question, *a, **kw):
+            return [{"id": "d1",
+                     "question": "在 web_evidence 表中查 item 为 ce 的记录",
+                     "why": "x", "landing": "web_evidence"}]
+
+        _ms.milestone_dimensions = _fake_ledger
+        out = C._plan_from_scaffold("查 ce 的记录", scene_id="L", has_file=False,
+                                    scene_tables=["web_facts"])
+        check("落点够不着（账本表）→ 不猜（db=False / web=False）",
+              out.get("db") is False and out.get("web") is False)
+        check("落点够不着 → 只做模型推断", out.get("infer") is True)
+
+        # 7b3（新增）：落点 = none（概念/解释类）→ 不碰环境
+        def _fake_none(scene_id, question, *a, **kw):
+            return [{"id": "d1", "question": "正念和冥想的关系是什么",
+                     "why": "x", "landing": "none"}]
+
+        _ms.milestone_dimensions = _fake_none
+        out = C._plan_from_scaffold("正念和冥想的关系", scene_id="L",
+                                    has_file=False, scene_tables=["web_facts"])
+        check("落点 = none → 不碰环境（infer）",
+              out.get("db") is False and out.get("web") is False
+              and out.get("infer") is True)
+
+        # 7c. 没有骨架 → 如实不猜（不碰环境、不联网）
+        _ms.milestone_dimensions = lambda scene_id, question, *a, **kw: []
+        out = C._plan_from_scaffold("什么是递归", scene_id="L", has_file=False,
+                                    scene_tables=["web_facts"])
+        check("没有骨架 → 不猜题型（planned=False / db=False / web=False）",
+              out.get("planned") is False and out.get("db") is False
+              and out.get("web") is False)
+        check("没有骨架 → 只做模型推断", out.get("infer") is True)
     finally:
-        C.chat_json = _orig_chat
+        if _orig_dims is not None:
+            import maieutic_scaffold as _ms2
+            _ms2.milestone_dimensions = _orig_dims
 
     print(f"\n通过 {PASS} / 挂 {FAIL}")
     return 1 if FAIL else 0

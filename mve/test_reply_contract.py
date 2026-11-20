@@ -318,44 +318,29 @@ def main() -> int:
     check("coach 白名单透传 inference_used", '"inference_used"' in coach_src)
     dash_src = open(os.path.join(os.path.dirname(_HERE), "mve", "dashboard.py"),
                     encoding="utf-8").read()
-    check("x_mve 带 learn_kicked / inference_used",
-          '"learn_kicked": bool' in dash_src and '"inference_used": bool' in dash_src)
-    check("没答出来的回复带判官结论与学习状态",
-          "判官结论" in dash_src and "已自动拉起后台学习" in dash_src)
-    chat_src = open(os.path.join(os.path.dirname(_HERE), "mve", "chat_page.py"),
-                    encoding="utf-8").read()
-    check("思考轨迹写「已自动拉起后台学习」", "已自动拉起后台学习" in chat_src)
-    check("标签行有「已派学习」「模型推断」", "已派学习" in chat_src and "模型推断" in chat_src)
+    # ★ 2026-11-18：x_mve 响应头随 OpenAI 兼容层删除；同一件事（这次学没学起来）
+    #   现在落在 coach 的落账白名单里，断言跟着搬。
+    check("coach 白名单带 learn_kicked / learn_kick_note / inference_used",
+          '"learn_kicked": bool' in coach_src
+          and '"learn_kick_note"' in coach_src
+          and '"inference_used"' in coach_src)
+    check("面板不再拼「判官结论」回复正文（回复层已删）",
+          "已自动拉起后台学习" not in dash_src)
+    # ★ 2026-11-18：对话页（chat_page.py / /chat / /v1/*）已按用户指令整体删除，
+    #   这条从「读页面源码断言文案」改成「断言页确实没了」——留着旧断言等于让
+    #   一份已删物的测试天天挂（实测 FileNotFoundError 打断了后面两节）。
+    _cp_path = os.path.join(os.path.dirname(_HERE), "mve", "chat_page.py")
+    check("旧对话页已删（2026-11-18 用户指令）", not os.path.exists(_cp_path))
+    _dash_src2 = open(os.path.join(os.path.dirname(_HERE), "mve", "dashboard.py"),
+                      encoding="utf-8").read()
+    check("面板不再挂 /chat 与 /v1 消费线",
+          '"/v1/chat/completions"' not in _dash_src2
+          and '"/chat.html"' not in _dash_src2)
 
-    print("== 6. 回复降级链的顺序（思考轨迹） ==")
-    import chat_page as CP
-    r = CP.reasoning_text(dict(critic_note="口径不符：题面问工资、配方算津贴",
-                               learn_kicked=True,
-                               learn_kick_note="已自动拉起后台学习"),
-                          scene_id="B", scene_label="工资")
-    check("判官局限写进思考轨迹", "核对没过" in r and "口径不符" in r)
-    check("已派学习写进思考轨迹", "已自动拉起后台学习" in r)
+    print("== 6. 回复降级链（随对话页删除，2026-11-18） ==")
+    print("   reasoning_text 随 chat_page.py 一起删了；降级链改由 consume/coach 的")
+    print("   base 字段承载（第 7 节继续验证 plan_routes / learn_kick_note 的透传）。")
 
-    print("== 7. 规划/联网半场的披露（2026-10-29 实测误解：走了联网但没答成 ==")
-    print("   被读成「没触发」，规划与执行结果必须进思考轨迹和正文）")
-    r2 = CP.reasoning_text(dict(plan_routes={"db": True, "web": True,
-                                             "file": False, "infer": False},
-                                plan_why="内部+外部对比题",
-                                tool_line_used=False,
-                                tool_line_note="资料不足以回答（grounded=false，如实不答）"),
-                                scene_id="B", scene_label="工资")
-    check("规划写进思考轨迹（db + web 路）",
-          "这一问的规划" in r2 and "db + web" in r2)
-    check("规划理由写进思考轨迹", "内部+外部对比题" in r2)
-    check("联网没答成也如实转述（不读成没触发）",
-          "联网这半场的执行结果" in r2 and "grounded=false" in r2)
-    r3 = CP.reasoning_text(dict(plan_routes={"db": True, "web": False,
-                                             "file": False, "infer": True},
-                                tool_line_used=False,
-                                tool_line_note="规划里没有联网这一步（计划外的动作不执行）"),
-                                scene_id="B", scene_label="工资")
-    check("计划外不执行也如实转述", "计划外的动作不执行" in r3)
-    check("规划员兜底如实标注", "规划员不可用" not in r3 or "兜底" in r3)
     # consume base 带规划字段 + coach 白名单透传（惯犯第 8 次预防）
     _csrc = open(os.path.join(os.path.dirname(_HERE),
                               "voyager_vlml", "consume.py"),

@@ -50,6 +50,7 @@ VOYAGER_START = "voyager_start"    # 点「▶ 启动 MC 真实学习」（在 M
 VOYAGER_STOP = "voyager_stop"      # 点「■ 停止」（Voyager 学习）
 VOYAGER_CLEAR_SKILL = "voyager_clear_skill"    # 点「清库」（删技能库）
 VOYAGER_CLEAR_MEMORY = "voyager_clear_memory"  # 点「清记忆」（删课程进度 + 事件）
+SKILL_DELETE = "skill_delete"          # 技能·因果页单条清账（人复核出假阳性后的处置权）
 
 # kind -> 人话（导出 md 里直接显示）
 ACTION_LABEL = {
@@ -72,6 +73,7 @@ ACTION_LABEL = {
     VOYAGER_STOP: "点「■ 停止 MC 真实学习」",
     VOYAGER_CLEAR_SKILL: "点「清库（删技能库）」",
     VOYAGER_CLEAR_MEMORY: "点「清记忆（删课程进度 + 事件）」",
+    SKILL_DELETE: "技能·因果页单条清账",
 }
 
 

@@ -524,7 +524,7 @@ def build_seed_facts(schema: dict[str, Any]) -> list[dict[str, Any]]:
             "chapter": "",
             "tables": [name],
             "aliases": sorted(set(aliases)),
-            "origin": "information_schema",
+            "origin": "show_tables",
         })
     return out
 

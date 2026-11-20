@@ -1,0 +1,677 @@
+{
+ "version": 1,
+ "source": "Master Mathematics and Become a Wizard — The Math Sorcerer (YouTube H6XejQOsfBY, 2023-04-26), 视频简介原文书单，按出现顺序",
+ "levels": [
+  {
+   "level": 1,
+   "name": "Apprentice",
+   "ability": "算得出来：算术、代数、几何、三角、统计、微积分计算"
+  },
+  {
+   "level": 2,
+   "name": "Magician",
+   "ability": "写得出来：证明的语法与套路"
+  },
+  {
+   "level": 3,
+   "name": "Warlock",
+   "ability": "结构化：分析、抽象代数、拓扑、数论、PDE 的本科高年级体系"
+  },
+  {
+   "level": 4,
+   "name": "Wizard",
+   "ability": "自洽重建：测度、泛函、交换代数，能自学任何教材"
+  }
+ ],
+ "books": [
+  {
+   "id": "l1-01",
+   "level": 1,
+   "order": 1,
+   "title": "Essential Pre-algebra",
+   "author": "",
+   "subject": "prealgebra",
+   "public_text": false
+  },
+  {
+   "id": "l1-02",
+   "level": 1,
+   "order": 2,
+   "title": "Pre-algebra & Algebra 1",
+   "author": "",
+   "subject": "prealgebra",
+   "public_text": false
+  },
+  {
+   "id": "l1-03",
+   "level": 1,
+   "order": 3,
+   "title": "Schaum's Outline of Geometry",
+   "author": "Barnett Rich",
+   "subject": "geometry",
+   "public_text": false
+  },
+  {
+   "id": "l1-04",
+   "level": 1,
+   "order": 4,
+   "title": "Everything You Need to Ace Geometry",
+   "author": "",
+   "subject": "geometry",
+   "public_text": false
+  },
+  {
+   "id": "l1-05",
+   "level": 1,
+   "order": 5,
+   "title": "Everything You Need to Ace Math",
+   "author": "",
+   "subject": "prealgebra",
+   "public_text": false
+  },
+  {
+   "id": "l1-06",
+   "level": 1,
+   "order": 6,
+   "title": "Basic Mathematics",
+   "author": "Serge Lang",
+   "subject": "prealgebra",
+   "public_text": false
+  },
+  {
+   "id": "l1-07",
+   "level": 1,
+   "order": 7,
+   "title": "Elementary Statistics",
+   "author": "",
+   "subject": "statistics",
+   "public_text": false
+  },
+  {
+   "id": "l1-08",
+   "level": 1,
+   "order": 8,
+   "title": "Mathematical Ideas",
+   "author": "Miller, Heeren, Hornsby",
+   "subject": "survey-math",
+   "public_text": false
+  },
+  {
+   "id": "l1-09",
+   "level": 1,
+   "order": 9,
+   "title": "Schaum's Outline of Probability and Statistics",
+   "author": "Murray Spiegel",
+   "subject": "statistics",
+   "public_text": false
+  },
+  {
+   "id": "l1-10",
+   "level": 1,
+   "order": 10,
+   "title": "Algebra & Trigonometry",
+   "author": "",
+   "subject": "algebra",
+   "public_text": false
+  },
+  {
+   "id": "l1-11",
+   "level": 1,
+   "order": 11,
+   "title": "Trigonometry",
+   "author": "",
+   "subject": "trigonometry",
+   "public_text": false
+  },
+  {
+   "id": "l1-12",
+   "level": 1,
+   "order": 12,
+   "title": "Intermediate Algebra",
+   "author": "",
+   "subject": "algebra",
+   "public_text": false
+  },
+  {
+   "id": "l1-13",
+   "level": 1,
+   "order": 13,
+   "title": "Trigonometry Workbook",
+   "author": "",
+   "subject": "trigonometry",
+   "public_text": false
+  },
+  {
+   "id": "l1-14",
+   "level": 1,
+   "order": 14,
+   "title": "Intermediate Algebra",
+   "author": "Allen R. Angel",
+   "subject": "algebra",
+   "public_text": false
+  },
+  {
+   "id": "l1-15",
+   "level": 1,
+   "order": 15,
+   "title": "Algebra Essentials Practice Workbook",
+   "author": "Chris McMullen",
+   "subject": "algebra",
+   "public_text": false
+  },
+  {
+   "id": "l1-16",
+   "level": 1,
+   "order": 16,
+   "title": "College Algebra Essentials",
+   "author": "",
+   "subject": "algebra",
+   "public_text": false
+  },
+  {
+   "id": "l1-17",
+   "level": 1,
+   "order": 17,
+   "title": "Intermediate Algebra",
+   "author": "Julie Miller",
+   "subject": "algebra",
+   "public_text": false
+  },
+  {
+   "id": "l1-18",
+   "level": 1,
+   "order": 18,
+   "title": "Intermediate Algebra",
+   "author": "Louis Leithold",
+   "subject": "algebra",
+   "public_text": false
+  },
+  {
+   "id": "l1-19",
+   "level": 1,
+   "order": 19,
+   "title": "A First Course in Calculus",
+   "author": "Serge Lang",
+   "subject": "calculus",
+   "public_text": false
+  },
+  {
+   "id": "l1-20",
+   "level": 1,
+   "order": 20,
+   "title": "Differential Equations with Linear Algebra",
+   "author": "",
+   "subject": "differential-equations",
+   "public_text": false
+  },
+  {
+   "id": "l1-21",
+   "level": 1,
+   "order": 21,
+   "title": "Calculus for the Practical Man",
+   "author": "J. E. Thompson",
+   "subject": "calculus",
+   "public_text": false
+  },
+  {
+   "id": "l1-22",
+   "level": 1,
+   "order": 22,
+   "title": "Essential Calculus Skills Practice Workbook",
+   "author": "Chris McMullen",
+   "subject": "calculus",
+   "public_text": false
+  },
+  {
+   "id": "l1-23",
+   "level": 1,
+   "order": 23,
+   "title": "Calculus: A New Horizon",
+   "author": "Howard Anton",
+   "subject": "calculus",
+   "public_text": false
+  },
+  {
+   "id": "l1-24",
+   "level": 1,
+   "order": 24,
+   "title": "A First Course in Differential Equations",
+   "author": "Dennis Zill",
+   "subject": "differential-equations",
+   "public_text": false
+  },
+  {
+   "id": "l1-25",
+   "level": 1,
+   "order": 25,
+   "title": "Calculus",
+   "author": "Earl Swokowski",
+   "subject": "calculus",
+   "public_text": false
+  },
+  {
+   "id": "l1-26",
+   "level": 1,
+   "order": 26,
+   "title": "The Calculus with Analytic Geometry",
+   "author": "Louis Leithold",
+   "subject": "calculus",
+   "public_text": false
+  },
+  {
+   "id": "l1-27",
+   "level": 1,
+   "order": 27,
+   "title": "Calculus with Analytic Geometry",
+   "author": "Robert Ellis, Denny Gulick",
+   "subject": "calculus",
+   "public_text": false
+  },
+  {
+   "id": "l2-01",
+   "level": 2,
+   "order": 1,
+   "title": "A Transition to Advanced Mathematics",
+   "author": "Chartrand, Polimeni, Zhang",
+   "subject": "proof",
+   "public_text": false
+  },
+  {
+   "id": "l2-02",
+   "level": 2,
+   "order": 2,
+   "title": "Proofs: A Long-Form Mathematics Textbook",
+   "author": "Jay Cummings",
+   "subject": "proof",
+   "public_text": false
+  },
+  {
+   "id": "l2-03",
+   "level": 2,
+   "order": 3,
+   "title": "Book of Proof",
+   "author": "Richard Hammack",
+   "subject": "proof",
+   "public_text": true,
+   "public_url": "https://www.people.vcu.edu/~rhammack/BookOfProof/"
+  },
+  {
+   "id": "l2-04",
+   "level": 2,
+   "order": 4,
+   "title": "How to Prove It: A Structured Approach",
+   "author": "Daniel J. Velleman",
+   "subject": "proof",
+   "public_text": false
+  },
+  {
+   "id": "l2-05",
+   "level": 2,
+   "order": 5,
+   "title": "How to Read and Do Proofs",
+   "author": "Daniel Solow",
+   "subject": "proof",
+   "public_text": false
+  },
+  {
+   "id": "l2-06",
+   "level": 2,
+   "order": 6,
+   "title": "Introduction to Abstract Mathematics",
+   "author": "",
+   "subject": "proof",
+   "public_text": false
+  },
+  {
+   "id": "l3-01",
+   "level": 3,
+   "order": 1,
+   "title": "Real Analysis: A Long-Form Mathematics Textbook",
+   "author": "Jay Cummings",
+   "subject": "real-analysis",
+   "public_text": false
+  },
+  {
+   "id": "l3-02",
+   "level": 3,
+   "order": 2,
+   "title": "Discrete Mathematical Structures",
+   "author": "",
+   "subject": "discrete-math",
+   "public_text": false
+  },
+  {
+   "id": "l3-03",
+   "level": 3,
+   "order": 3,
+   "title": "Introductory Discrete Mathematics",
+   "author": "Balakrishnan",
+   "subject": "discrete-math",
+   "public_text": false
+  },
+  {
+   "id": "l3-04",
+   "level": 3,
+   "order": 4,
+   "title": "Concrete Mathematics",
+   "author": "Graham, Knuth, Patashnik",
+   "subject": "discrete-math",
+   "public_text": false
+  },
+  {
+   "id": "l3-05",
+   "level": 3,
+   "order": 5,
+   "title": "Advanced Calculus",
+   "author": "R. Creighton Buck",
+   "subject": "real-analysis",
+   "public_text": false
+  },
+  {
+   "id": "l3-06",
+   "level": 3,
+   "order": 6,
+   "title": "Partial Differential Equations: An Introduction",
+   "author": "Walter A. Strauss",
+   "subject": "pde",
+   "public_text": false
+  },
+  {
+   "id": "l3-07",
+   "level": 3,
+   "order": 7,
+   "title": "Partial Differential Equations",
+   "author": "Greenspan",
+   "subject": "pde",
+   "public_text": false
+  },
+  {
+   "id": "l3-08",
+   "level": 3,
+   "order": 8,
+   "title": "Partial Differential Equations",
+   "author": "Zachmanoglou",
+   "subject": "pde",
+   "public_text": false
+  },
+  {
+   "id": "l3-09",
+   "level": 3,
+   "order": 9,
+   "title": "Introduction to Real Analysis",
+   "author": "Bartle, Sherbert",
+   "subject": "real-analysis",
+   "public_text": false
+  },
+  {
+   "id": "l3-10",
+   "level": 3,
+   "order": 10,
+   "title": "Modern Elementary Statistics",
+   "author": "John E. Freund",
+   "subject": "probability",
+   "public_text": false
+  },
+  {
+   "id": "l3-11",
+   "level": 3,
+   "order": 11,
+   "title": "Elementary Introduction to Number Theory",
+   "author": "Calvin T. Long",
+   "subject": "number-theory",
+   "public_text": false
+  },
+  {
+   "id": "l3-12",
+   "level": 3,
+   "order": 12,
+   "title": "Introduction to Probability and Statistics",
+   "author": "Walpole",
+   "subject": "probability",
+   "public_text": false
+  },
+  {
+   "id": "l3-13",
+   "level": 3,
+   "order": 13,
+   "title": "Understanding Analysis",
+   "author": "Stephen Abbott",
+   "subject": "real-analysis",
+   "public_text": false
+  },
+  {
+   "id": "l3-14",
+   "level": 3,
+   "order": 14,
+   "title": "Applied Numerical Analysis",
+   "author": "Gerald",
+   "subject": "numerical-analysis",
+   "public_text": false
+  },
+  {
+   "id": "l3-15",
+   "level": 3,
+   "order": 15,
+   "title": "Numerical Analysis",
+   "author": "Acton",
+   "subject": "numerical-analysis",
+   "public_text": false
+  },
+  {
+   "id": "l3-16",
+   "level": 3,
+   "order": 16,
+   "title": "Advanced Calculus",
+   "author": "Patrick Fitzpatrick",
+   "subject": "real-analysis",
+   "public_text": false
+  },
+  {
+   "id": "l3-17",
+   "level": 3,
+   "order": 17,
+   "title": "Linear Algebra",
+   "author": "Hoffman, Kunze",
+   "subject": "linear-algebra",
+   "public_text": false
+  },
+  {
+   "id": "l3-18",
+   "level": 3,
+   "order": 18,
+   "title": "Calculus",
+   "author": "Michael Spivak",
+   "subject": "real-analysis",
+   "public_text": false
+  },
+  {
+   "id": "l3-19",
+   "level": 3,
+   "order": 19,
+   "title": "Complex Analysis",
+   "author": "",
+   "subject": "complex-analysis",
+   "public_text": false
+  },
+  {
+   "id": "l3-20",
+   "level": 3,
+   "order": 20,
+   "title": "Abstract Algebra: An Introduction",
+   "author": "Beachy, Blair",
+   "subject": "abstract-algebra",
+   "public_text": false
+  },
+  {
+   "id": "l3-21",
+   "level": 3,
+   "order": 21,
+   "title": "Linear Algebra",
+   "author": "Friedberg, Insel, Spence",
+   "subject": "linear-algebra",
+   "public_text": false
+  },
+  {
+   "id": "l3-22",
+   "level": 3,
+   "order": 22,
+   "title": "Probability",
+   "author": "",
+   "subject": "probability",
+   "public_text": false
+  },
+  {
+   "id": "l3-23",
+   "level": 3,
+   "order": 23,
+   "title": "Topics in Algebra",
+   "author": "I. N. Herstein",
+   "subject": "abstract-algebra",
+   "public_text": false
+  },
+  {
+   "id": "l3-24",
+   "level": 3,
+   "order": 24,
+   "title": "Principles of Mathematical Analysis",
+   "author": "Walter Rudin",
+   "subject": "real-analysis",
+   "public_text": false
+  },
+  {
+   "id": "l3-25",
+   "level": 3,
+   "order": 25,
+   "title": "Abstract Algebra: A First Course",
+   "author": "Dan Saracino",
+   "subject": "abstract-algebra",
+   "public_text": false
+  },
+  {
+   "id": "l3-26",
+   "level": 3,
+   "order": 26,
+   "title": "Topology",
+   "author": "James R. Munkres",
+   "subject": "topology",
+   "public_text": false
+  },
+  {
+   "id": "l3-27",
+   "level": 3,
+   "order": 27,
+   "title": "Advanced Calculus",
+   "author": "Hildebrand",
+   "subject": "real-analysis",
+   "public_text": false
+  },
+  {
+   "id": "l3-28",
+   "level": 3,
+   "order": 28,
+   "title": "Naive Set Theory",
+   "author": "Paul Halmos",
+   "subject": "set-theory",
+   "public_text": false
+  },
+  {
+   "id": "l3-29",
+   "level": 3,
+   "order": 29,
+   "title": "Advanced Engineering Mathematics",
+   "author": "Dennis Zill",
+   "subject": "engineering-math",
+   "public_text": false
+  },
+  {
+   "id": "l3-30",
+   "level": 3,
+   "order": 30,
+   "title": "Introductory Real Analysis",
+   "author": "Kolmogorov, Fomin",
+   "subject": "real-analysis",
+   "public_text": false
+  },
+  {
+   "id": "l3-31",
+   "level": 3,
+   "order": 31,
+   "title": "A First Course in Abstract Algebra",
+   "author": "John B. Fraleigh",
+   "subject": "abstract-algebra",
+   "public_text": false
+  },
+  {
+   "id": "l3-32",
+   "level": 3,
+   "order": 32,
+   "title": "Functions of Several Variables",
+   "author": "Wendell Fleming",
+   "subject": "real-analysis",
+   "public_text": false
+  },
+  {
+   "id": "l4-01",
+   "level": 4,
+   "order": 1,
+   "title": "Measure Theory",
+   "author": "Paul Halmos",
+   "subject": "measure-theory",
+   "public_text": false
+  },
+  {
+   "id": "l4-02",
+   "level": 4,
+   "order": 2,
+   "title": "Functional Analysis",
+   "author": "Narici, Bachman",
+   "subject": "functional-analysis",
+   "public_text": false
+  },
+  {
+   "id": "l4-03",
+   "level": 4,
+   "order": 3,
+   "title": "Functional Analysis",
+   "author": "Walter Rudin",
+   "subject": "functional-analysis",
+   "public_text": false
+  },
+  {
+   "id": "l4-04",
+   "level": 4,
+   "order": 4,
+   "title": "Introductory Functional Analysis with Applications",
+   "author": "Erwin Kreyszig",
+   "subject": "functional-analysis",
+   "public_text": false
+  },
+  {
+   "id": "l4-05",
+   "level": 4,
+   "order": 5,
+   "title": "Abstract Algebra",
+   "author": "Dummit, Foote",
+   "subject": "abstract-algebra",
+   "public_text": false
+  },
+  {
+   "id": "l4-06",
+   "level": 4,
+   "order": 6,
+   "title": "Real and Complex Analysis",
+   "author": "Walter Rudin",
+   "subject": "real-analysis",
+   "public_text": false
+  },
+  {
+   "id": "l4-07",
+   "level": 4,
+   "order": 7,
+   "title": "Algebra",
+   "author": "Thomas W. Hungerford",
+   "subject": "abstract-algebra",
+   "public_text": false
+  }
+ ]
+}

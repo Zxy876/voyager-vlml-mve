@@ -31,7 +31,7 @@ MVE 的同构物是**数据流顺序**：算什么之前必须先有什么。
     dimension MVE 的评分维度（最上层，rubric 声明）
 
 照伴学的规矩：**一切可查的都实查，不手写**。
-列名、表清单来自 information_schema（实查）；派生关系来自 transformations/*.sql；
+列名、表清单来自 SHOW TABLES/DESCRIBE（实查）；派生关系来自 transformations/*.sql；
 洞察来自 tools/sql/*.sql；归属来自源码里的 load_sql() 调用点。
 
 跑法
@@ -91,7 +91,7 @@ _RE_FROM = re.compile(r"\b(?:FROM|JOIN)\s+([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECA
 
 
 # ---------------------------------------------------------------------------
-# 表：实查 information_schema
+# 表：实查 SHOW TABLES / DESCRIBE
 # ---------------------------------------------------------------------------
 def _stage_of_table(name: str) -> str:
     """按 VLML 自己的命名约定分层（可追溯，不是猜的）。"""
@@ -139,11 +139,12 @@ async def _q(sql: str) -> list[tuple]:
 
 async def discover_tables() -> dict[str, dict[str, Any]]:
     """实查表清单 + 列名 + 主键 + 行数。"""
-    rows = await _q("SELECT table_name, column_name FROM information_schema.columns "
-                    "ORDER BY table_name, ordinal_position")
+    tabs = await _q("SELECT * FROM (SHOW TABLES)")
     cols: dict[str, list[str]] = {}
-    for t, c in rows:
-        cols.setdefault(str(t), []).append(str(c))
+    for (t,) in tabs:
+        drows = await _q(f'SELECT * FROM (DESCRIBE "{t}")')
+        for r in drows:
+            cols.setdefault(str(t), []).append(str(r[0]))
 
     out: dict[str, dict[str, Any]] = {}
     for name in sorted(cols):
@@ -157,7 +158,7 @@ async def discover_tables() -> dict[str, dict[str, Any]]:
             "grain": _grain_of_table(name),
             "columns": cols[name],
             "rows": n,
-            "source": "information_schema（实查）",
+            "source": "SHOW TABLES/DESCRIBE（实查）",
         }
     return out
 
@@ -753,7 +754,7 @@ def _main() -> int:
         print(json.dumps(data, ensure_ascii=False, indent=1))
         return 0
     tables = data["tables"]
-    print(f"表 {len(tables)} 张（实查 information_schema）")
+    print(f"表 {len(tables)} 张（实查 SHOW TABLES）")
     by_stage: dict[str, list[str]] = {}
     for name, info in tables.items():
         by_stage.setdefault(info["stage"], []).append(name)

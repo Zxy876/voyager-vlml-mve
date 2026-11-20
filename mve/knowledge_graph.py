@@ -961,6 +961,9 @@ class KnowledgeGraph:
         if _stale(raw):
             try:
                 g2 = build()
+                # 重建只刷新 build() 自己产出的那部分；课程结构与技能沉淀
+                # 不在它的输入里，必须搬回来（见 `_carry_course`）。
+                _carry_course(g2, raw)
                 # 重建出来的图要是也小得离谱（题/文档/库读不到），
                 # 就别拿它覆盖盘上那张 —— 先保旧图，`save()` 里还有一道闸。
                 if len(g2.nodes) >= 50 or not (raw.get("nodes") or []):
@@ -1014,6 +1017,51 @@ def _model_fingerprint() -> str:
         return str(vlml_schema.model_specs().get("fingerprint") or "")
     except Exception:
         return ""
+
+
+# ── 重建时的课程结构搬运（2026-11-14）──────────────────────────────
+# 图谱一个文件里混了两种东西：
+#   ① `build()` 的产物 —— 从 tasks 的 rubric + VLML 数据字典派生（表/维度/工具）；
+#   ② 用户写入 —— 课程结构（人预写的书单与关卡）与技能沉淀（学完的 exercise）。
+# 指纹一变，`load()` 就整张重建，而 `build()` 根本不知道 ② 存在，于是 ② 全丢。
+# 实测事故：14:21 写进 P 的 72 本书 / 648 单元、N 的 111 关，14:40 一次面板
+# 重启触发重建，节点从 1253 掉到 370，两套课程结构一起消失，规划层随即读到空。
+# 所以重建之后必须把 ② 原样搬回来 —— 重建只该刷新它自己产出的那部分。
+_KEEP_KINDS = {"topic", "book", "exercise", "chapter", "unit", "skill"}
+_KEEP_PREFIX = ("topic:", "book:", "exercise:", "phase:", "req:", "import:", "consume:")
+
+
+def _carry_course(g2: "KnowledgeGraph", raw: dict[str, Any]) -> tuple[int, int]:
+    """把旧图里的课程结构节点/边搬进重建后的新图。返回 (节点数, 边数)。"""
+    moved_n = moved_e = 0
+    for n in raw.get("nodes") or []:
+        nid = str(n.get("id") or "")
+        if not nid or nid in g2.nodes:
+            continue
+        kind = str(n.get("kind") or "")
+        if kind not in _KEEP_KINDS and not nid.startswith(_KEEP_PREFIX):
+            continue
+        g2.add_node(Node(id=nid, kind=kind, label=n.get("label", ""),
+                         detail=n.get("detail") or {},
+                         root_scene=n.get("root_scene") or "A",
+                         status=n.get("status") or "verified",
+                         evidence=int(n.get("evidence") or 1)))
+        moved_n += 1
+    for e in raw.get("edges") or []:
+        s, d = str(e.get("from") or ""), str(e.get("to") or "")
+        # add_edge 会丢掉两端不全的边，所以只数「真的进去了」的那些
+        if s in g2.nodes and d in g2.nodes:
+            before = len(g2.edges)
+            g2.add_edge(Edge(src=s, dst=d,
+                             relation=str(e.get("relation") or "related"),
+                             origin=str(e.get("origin") or "declared"),
+                             reason=str(e.get("reason") or ""),
+                             confidence=float(e.get("confidence") or 1.0)))
+            if len(g2.edges) > before:
+                moved_e += 1
+    if moved_n or moved_e:
+        print(f"[图谱] 重建后搬回课程结构：{moved_n} 节点 / {moved_e} 边")
+    return moved_n, moved_e
 
 
 def _stale(raw: dict[str, Any]) -> bool:
@@ -1438,7 +1486,7 @@ def build(*, observe: bool = False, with_schema: bool = True) -> KnowledgeGraph:
     observe=True 时会额外跑一遍裁判，用**实测**的编排顺序补 procedure_step
     边（慢，且要联网/连库），默认只用声明式信息。
     with_schema=True 时把 VLML 的 21 张表 / 46 个洞察 / 7 个工具一起进图
-    （实查 information_schema + 解析源码；连不上库时自动退回文件解析）。
+    （实查 SHOW TABLES/DESCRIBE + 解析源码；连不上库时自动退回文件解析）。
     """
     import vlml_env  # noqa: F401  引导环境
     from tasks import TASKS
@@ -1449,7 +1497,7 @@ def build(*, observe: bool = False, with_schema: bool = True) -> KnowledgeGraph:
     # ---- VLML 的真实结构：21 张表 + 46 个洞察 + 7 个工具 ----
     # 之前只从**我们自己的 rubric SQL** 反推，结果图谱里只有 2 张表 ——
     # 等于"出过题的才进图"，VLML 真正的建模一概没进。
-    # 实查 information_schema + 解析源码（表/派生/洞察/工具）补齐四层。
+    # 实查 SHOW TABLES/DESCRIBE + 解析源码（表/派生/洞察/工具）补齐四层。
     schema: dict[str, Any] = {}
     if with_schema:
         try:

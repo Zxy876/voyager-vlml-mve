@@ -179,15 +179,12 @@ def _schema_block() -> str:
     try:
         import duckdb
         con = duckdb.connect(str(_active_db()), read_only=True)
-        tables = [r[0] for r in con.execute(
-            "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema='main' ORDER BY 1").fetchall()]
+        tables = sorted(str(r[0]) for r in con.execute("show tables").fetchall())
         lines = []
         for t in tables:
             try:
-                cols = [r[0] for r in con.execute(
-                    "SELECT column_name FROM information_schema.columns "
-                    "WHERE table_name=? ORDER BY 1", [t]).fetchall()]
+                cols = sorted(str(r[0]) for r in con.execute(
+                    f'DESCRIBE "{t}"').fetchall())
             except Exception:
                 cols = []
             lines.append(f"- {t}: {', '.join(cols)}")

@@ -450,9 +450,7 @@ def _sample_player() -> str:
     except Exception:
         return ""
     try:
-        have = {t[0] for t in con.execute(
-            "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema='main'").fetchall()}
+        have = {str(r[0]) for r in con.execute("show tables").fetchall()}
         for t in ("agg_player_series_stats", "ext_player_game_stats",
                   "ext_player_round_stats", "ext_player_side_stats"):
             if t not in have:
