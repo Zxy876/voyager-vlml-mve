@@ -45,6 +45,11 @@ public class MVEBridge : Script
     System.Collections.Generic.List<string> _events =
         new System.Collections.Generic.List<string>();
     int _lastWanted = 0;                  // 上次通缉等级（被警察追）
+    int _wanted = 0;                      // 当前通缉等级（obs 直读字段，不靠抓事件）
+    int _policeCount = 0;                 // 警力面：120m 内警用车辆数（含警用直升机）
+    float[] _policePos = null;            // 最近警车坐标
+    float _policeDist = -1f;              // 与最近警车直线距离（-1=视野内没有）
+    bool _policeSiren = false;            // 最近警车是否鸣笛（追击中的强信号）
     float _lastVehHealth = -1f;           // 上次车体血量（碰撞损伤代理）
     bool _wasOnFoot = true;               // 上次是否步行（上/下车）
     bool _wasDead = false;                // 上次是否死亡
@@ -67,6 +72,7 @@ public class MVEBridge : Script
         Vehicle v = p.CurrentVehicle;
 
         int w = Game.Player.WantedLevel;
+        _wanted = w;
         if (w > _lastWanted) Ev("{\"e\":\"wanted\",\"level\":" + w + "}");
         else if (w < _lastWanted)
             Ev("{\"e\":\"wanted_cleared\",\"level\":" + w + "}");
@@ -165,6 +171,27 @@ public class MVEBridge : Script
         _missionActive = mission != null;
         _missionTarget = mission != null ? V(mission.Position) : null;
         _missionDist = mission != null ? bestD : -1f;
+
+        // 警力面解包：120m 内的警用车辆（IS_THIS_MODEL_A_POLICE_VEHICLE
+        // 覆盖警车与警用直升机 polmav）。取最近一台：坐标/距离/鸣笛。
+        // 这是「被追捕」的几何事实——通缉等级只有数字，追不追得掉要看这个。
+        _policeCount = 0; _policePos = null; _policeDist = -1f; _policeSiren = false;
+        float bestP = float.MaxValue;
+        foreach (Vehicle q in World.GetNearbyVehicles(p.Position, 120f))
+        {
+            if (q == null || !q.Exists()) continue;
+            if (!Function.Call<bool>(Hash.IS_THIS_MODEL_A_POLICE_VEHICLE, q.Model))
+                continue;
+            _policeCount++;
+            float d = p.Position.DistanceTo(q.Position);
+            if (d < bestP)
+            {
+                bestP = d;
+                _policePos = V(q.Position);
+                _policeSiren = q.IsSirenActive;
+            }
+        }
+        if (_policeCount > 0) _policeDist = bestP;
     }
 
     static float NormalizeAngle(float a)   // 归一到 [-180,180]
@@ -259,7 +286,17 @@ public class MVEBridge : Script
           .Append(',').Append(F(pos[2])).Append(']')
           .Append(",\"heading\":").Append(F(heading))
           .Append(",\"health_engine\":").Append(F(eng))
-          .Append(",\"in_vehicle_model\":\"").Append(Escape(model)).Append('"');
+          .Append(",\"in_vehicle_model\":\"").Append(Escape(model)).Append('"')
+          .Append(",\"wanted_level\":").Append(_wanted);
+        if (v != null && v.Exists())
+            sb.Append(",\"health_body\":").Append(F(v.Health))
+              .Append(",\"is_engine_running\":").Append(v.IsEngineRunning ? "true" : "false");
+        sb.Append(",\"police_count\":").Append(_policeCount);
+        if (_policePos != null)
+            sb.Append(",\"police_nearest_dist_m\":").Append(F(_policeDist))
+              .Append(",\"police_nearest_pos\":[").Append(F(_policePos[0]))
+              .Append(',').Append(F(_policePos[1])).Append(',').Append(F(_policePos[2])).Append(']')
+              .Append(",\"police_nearest_siren\":").Append(_policeSiren ? "true" : "false");
         if (Game.IsWaypointActive)
         {
             float[] wp = V(World.WaypointPosition);

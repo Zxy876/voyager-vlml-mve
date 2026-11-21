@@ -200,9 +200,11 @@ def gta_get_obs() -> dict:
     }
     if obs.get("events"):
         out["events"] = obs["events"]     # 自上一条 obs 以来真实发生的游戏事件
-    for k in ("health_engine", "nearby_vehicles", "running", "on_foot",
-              "in_vehicle_model", "mission_active", "mission_target",
-              "mission_dist_m"):
+    for k in ("health_engine", "health_body", "is_engine_running",
+              "nearby_vehicles", "running", "on_foot", "in_vehicle_model",
+              "wanted_level", "police_count", "police_nearest_dist_m",
+              "police_nearest_pos", "police_nearest_siren",
+              "mission_active", "mission_target", "mission_dist_m"):
         if k in obs:
             out[k] = obs[k]
     return out

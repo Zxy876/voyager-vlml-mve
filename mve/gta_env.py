@@ -30,18 +30,32 @@ scene.duckdb 是空的属正常，不存在任何表/列，不许承诺 SQL 口�
   running       自动驾驶是否已激活（人按 F9 激活/收回；未激活时动作会被
                 插件静默丢弃，代码要先判它）
   on_foot       是否在车外
-  health_engine 引擎血量（满 1000）
+  health_engine 引擎血量（满 1000；着火/冒烟的先兆）
+  health_body   车体结构血量（满 1000；碰撞损伤看这个）
+  is_engine_running  发动机是否在转（false=熄火/报废）
   in_vehicle_model  当前车辆型号名
+  wanted_level  当前通缉星数（0-5；0=没被通缉。被警察追的直接读数）
+  police_count  120m 内警用车辆数（含警用直升机；0=视野内没有警力）
+  police_nearest_dist_m / police_nearest_pos [x,y,z] / police_nearest_siren
+                最近警车的距离/坐标/是否鸣笛（siren=true 基本就是在追你；
+                police_count=0 且 wanted_level>0 = 警察已看不见你，甩掉中）
   mission_active / mission_target [x,y,z] / mission_dist_m
                 剧情任务面（任务激活时目标点与距离；两套坐标系统一为
                 GTA 世界坐标，可直接算两点距离）
   events[]      自上次观测缓冲的真实事件：ped_hit / vehicle_damage /
-                wanted / rolled_over / vehicle_on_fire / engine_dead /
-                died / busted / cutscene_start / 上下车
+                wanted（升星）/ wanted_cleared（降星） / rolled_over /
+                vehicle_on_fire / engine_dead / died / busted /
+                cutscene_start / 上下车
 
 动作面 —— 可调用的工具（签名如实，不多不少）：
   mcp_gta_gta_get_obs()                       取上述实时观测
-  mcp_gta_gta_drive_to(x, y, z=0, speed=8, style=1)   驶向世界坐标点
+  mcp_gta_gta_drive_to(x, y, z=0, speed=8, style=1)   驶向世界坐标点。
+                style 透传 GTA 原生驾驶风格位掩码（SHVDN DrivingStyle）：
+                1074528293=Rushed（横冲直撞的逃逸驾驶，被追捕时用这个）、
+                5=SometimesOvertakeTraffic（超车绕行，正常赶路）、
+                6=AvoidTrafficExtremely（极度避让车流，安全逃离）、
+                786603=Normal（守交规）、1=裸 flag（几乎无视一切，易撞）。
+                躲避条子=选远坐标 + style=1074528293（或 6）
   mcp_gta_gta_wait_arrive(radius=5, target="waypoint"|"mission", timeout=…)
                                               判据由环境规则判定：距目标
                                               radius 内 = success（不经
