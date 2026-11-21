@@ -27,8 +27,9 @@ scene.duckdb 是空的属正常，不存在任何表/列，不许承诺 SQL 口�
   waypoint      地图路点 [x, y, z]（人按 M 在地图上设的；没有则 null）
   waypoint_dist_m  当前到路点的直线距离（米；无路点则 null）
   obs_age_sec   这条观测的年龄（秒；>2 秒基本就是观测停流，别拿它当实时数据）
-  running       自动驾驶是否已激活（人按 F9 激活/收回；未激活时动作会被
-                插件静默丢弃，代码要先判它）
+  running       MVE 是否在接管驾驶（drive 类动作到达会自动接管置 true，
+                无需人按 F9；人按 F9=把方向盘拿回来，期间 drive 类动作
+                被插件忽略防打架，stop/handback 仍生效）
   on_foot       是否在车外
   health_engine 引擎血量（满 1000；着火/冒烟的先兆）
   health_body   车体结构血量（满 1000；碰撞损伤看这个）

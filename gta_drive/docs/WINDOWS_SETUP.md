@@ -119,12 +119,14 @@ MVEBridge 没加载——游戏开着、剧情模式里即可。）
 
 ## 7. 与 Mac 侧协同跑第一个自动化（说明，无需本机操作）
 
-1. 玩家（用户）在游戏里：**上车 → 按 M 键打开地图设一个路点 → 按 F9**  
-   （右上角出现「MVE 自动驾驶：已激活」）。
+1. 玩家（用户）在游戏里：**上车 → 按 M 键打开地图设一个路点** 即可，
+   **不用按 F9**——watcher 检测到新路点自动投种子，学生代码的动作
+   会让插件自动接管驾驶（右上角出现「MVE 自动驾驶：动作驱动，自动接管」）。
 2. Mac mini 上执行：  
    `python run_first_automation.py --host 127.0.0.1 --port 9778 --relay`
 3. MVE 会生成驾驶代码开这辆车去路点；到达 5m 内算成功。
-4. 玩家随时 **再按 F9 收回方向盘**；按 W/A/S/D 也会打断驾驶。
+4. 玩家随时 **按 F9 拿回方向盘**（之后 MVE 的 drive 类动作会被忽略，
+   直到它下一个动作再自动接管）；按 W/A/S/D 也会打断驾驶。
 
 ## 8. 常见故障对照
 
@@ -133,7 +135,7 @@ MVEBridge 没加载——游戏开着、剧情模式里即可。）
 | 右上角无 MVEBridge 通知 | 查 `ScriptHookVDotNet.log`；确认 .cs 在 `scripts\`；SHV/SHVDN 版本配游戏版本 |
 | 转发器一直重试           | 游戏没开 / 不在剧情模式 / MVEBridge 没加载（netstat -ano 看 9777 是否 LISTENING） |
 | 隧道挂住但 Mac 连不上     | 确认公钥已装 VPS；确认转发器窗口开着（它连了 GAME 角色中继才配对）                          |
-| 车不动               | F9 没按（`running` 标志只在激活后接受动作）；路点没设（obs 里 waypoint 是 null）        |
+| 车不动               | 没上车（动作需要车）；路点没设（obs 里 waypoint 是 null）；刚按过 F9 拿回方向盘（drive 类动作被忽略，学生下一个动作会自动接管）        |
 | 联机被踢/封号警告         | 立刻退 GTA Online——mod 只允许在剧情模式                                    |
 
 ## 9. 日常更新插件（Win 端唯一要做的常规操作）
@@ -160,4 +162,5 @@ copy /Y C:\gta\repo\gta_drive\plugin\MVEBridge.cs "C:\Program Files (x86)\Steam\
 任务面版生效验证：接一个剧情任务， obs 里会出现
 `mission_active: true` / `mission_target` / `mission_dist_m` 字段
 （Mac 侧或面板可见）；剧情演出（cutscene）开始时控制权自动交还、
-演出结束后不再自动抢车——由人工重新 F9 激活。
+演出结束后 MVE 的下一个 drive 类动作会再次自动接管——F9 只是人
+手动拿回方向盘的开关，不再是激活前置。

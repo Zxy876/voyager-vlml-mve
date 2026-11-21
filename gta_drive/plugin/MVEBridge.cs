@@ -6,8 +6,9 @@
 //       bot.on(事件)→events 回灌同构）：撞人/碰撞损伤/被警察通缉/翻车/
 //       着火/下车/死亡被捕等——事件由游戏 tick 探测，不是 LLM 编的
 //   - 接收一行 JSON 动作（action）：drive_to / cruise / stop / handback
-// 玩家侧完全不受影响：不按键时插件零干预；F9 激活后也只是"驾驶任务"，
-// 下车、按 W/A/S/D 或再按 F9 即交还控制权。
+// 玩家侧完全不受影响：drive 类动作（drive_to/cruise）到达时插件自动
+// 接管驾驶（无需按键，cutscene 演出期间除外）；人按 F9 随时拿回方向盘
+// （期间 MVE 的 drive 类动作被忽略防打架）；下车、按 W/A/S/D 也会打断驾驶。
 //
 // 零依赖：不用 System.Web.Extensions（SHVDN 运行时编译 .cs 不一定引用它），
 // JSON 全部手工拼/正则解析——本插件的 obs/action 格式固定，够用且更稳。
@@ -222,12 +223,14 @@ public class MVEBridge : Script
     void OnKeyDown(object sender, KeyEventArgs e)
     {
         if (e.KeyCode != TOGGLE_KEY) return;
+        // F9 现在只当「方向盘开关」：MVE 动作会自动接管驾驶，人按 F9 是
+        // 主动把方向盘拿回来（或再交出去），不再是学习的激活前置。
         _running = !_running;
-        if (_running) Notification("MVE 自动驾驶：已激活（再次按 F9 交还）");
+        if (_running) Notification("MVE 自动驾驶：MVE 接管中（再按 F9 拿回方向盘）");
         else
         {
             GiveBackControl();
-            Notification("MVE 自动驾驶：已交还玩家");
+            Notification("MVE 自动驾驶：已交还玩家（下次动作会自动接管）");
         }
     }
 
@@ -256,9 +259,25 @@ public class MVEBridge : Script
         SendLine(BuildObs());
 
         // ── 收动作（非阻塞，一次读一行）──
+        // 动作到达即自动接管：地图上选完路点直接学习，无需先按 F9。
+        // drive 类动作（drive_to/cruise）在未激活时自动激活（cutscene
+        // 演出期间除外，守门逻辑已交还）；人按 F9 拿回方向盘期间
+        // （_running=false）drive 类动作被忽略防打架，stop/handback
+        // 仍放行——学生停车不抢人手里的方向盘。
         string line = ReadLine();
-        if (line != null && _running)
+        if (line == null) return;
+        string actT = Grab(line, "t");
+        bool isDrive = actT != null &&
+                       (actT.Contains("drive_to") || actT.Contains("cruise"));
+        if (_running || (isDrive && !Game.IsCutscenePlaying))
+        {
+            if (!_running && isDrive)
+            {
+                _running = true;
+                Notification("MVE 自动驾驶：动作驱动，自动接管");
+            }
             ApplyAction(line);
+        }
     }
 
     // ── 观测构造（手工拼 JSON，格式固定）──

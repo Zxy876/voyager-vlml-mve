@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""seed_watcher.py — 游戏侧种子监视器：人在游戏里设路点 + F9 = 投种子。
+"""seed_watcher.py — 游戏侧种子监视器：人在游戏里设路点 = 投种子。
 
-口径（用户 2026-11-21 拍板）
+口径（用户 2026-11-21 二次拍板：F9 多余，地图上选完地点直接学习）
 ----------
 种子不是面板里的一句文本——**种子的本体是游戏里的真实事件**：玩家上车
-（不在步行）、在地图设了路点、按 F9 激活接管。这三件事同时成立时，本进程
-调面板**已有的** /api/learn/start（MVE 一行不改）自动投种子：
+（不在步行）、在地图设了路点（或剧情任务里有开车目标）。这两件事同时
+成立时，本进程调面板**已有的** /api/learn/start（MVE 一行不改）自动投
+种子：
 
     question = "让车自动开到地图路点 (x, y) 并停稳"
 
 坐标来自当帧 obs，所以每个目的地的种子都是真实、不同、账本可读的任务。
 学习闭环里 Phase2 学生代码经 MCP 工具（mcp_gta_gta_drive_to /
-gta_wait_arrive）真开车，判据环境给出；自由学由主循环自己出题连转。
+gta_wait_arrive）真开车，判据环境给出；插件对 drive 类动作自动接管
+（无需 F9，cutscene 除外），F9 只是人手动拿回方向盘的开关。
+自由学由主循环自己出题连转。
 
 「一直开不停」的种子来源：人连续设新路点（与上次已投种子相差 >50m 视为
 新种子）；到账 + 新路点 = 下一轮，技能与会话持续积累。
@@ -63,7 +66,7 @@ def main() -> int:
 
     print(f"[seed] 连游戏桥 {a.host}:{a.port}（handshake={a.handshake!r}）", flush=True)
     client = GtaClient(a.host, a.port, timeout=15.0, handshake=a.handshake)
-    print("[seed] 桥已连。等种子：上车 + 地图设路点 + F9", flush=True)
+    print("[seed] 桥已连。等种子：上车 + 地图设路点（选完即学，无需 F9）", flush=True)
 
     last_seeded_wp = None
     while True:
