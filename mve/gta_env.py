@@ -19,16 +19,19 @@
 _GTA_ENV_BLOCK = """【数据源的真实结构 —— GTA 游戏环境（本场景不是 SQL 库；场景目录里的
 scene.duckdb 是空的属正常，不存在任何表/列，不许承诺 SQL 口径）】
 
-观测面 —— mcp_gta_gta_get_obs() 每次调用返回的实时解包（字段全集）：
-  ts            Unix 时间（秒）
-  running       自动驾驶是否已激活（人按 F9 激活/收回）
-  on_foot       是否在车外
-  speed         车速（m/s）
+观测面 —— mcp_gta_gta_get_obs() 返回的实时解包（**键名如实，代码按这些键取值**）：
+  speed_ms      车速（m/s）
+  speed_kmh     车速（km/h）
   pos           车辆世界坐标 [x, y, z]
   heading       朝向角（度）
+  waypoint      地图路点 [x, y, z]（人按 M 在地图上设的；没有则 null）
+  waypoint_dist_m  当前到路点的直线距离（米；无路点则 null）
+  obs_age_sec   这条观测的年龄（秒；>2 秒基本就是观测停流，别拿它当实时数据）
+  running       自动驾驶是否已激活（人按 F9 激活/收回；未激活时动作会被
+                插件静默丢弃，代码要先判它）
+  on_foot       是否在车外
   health_engine 引擎血量（满 1000）
   in_vehicle_model  当前车辆型号名
-  waypoint      地图路点 [x, y, z]（人按 M 在地图上设的；没有则 null）
   mission_active / mission_target [x,y,z] / mission_dist_m
                 剧情任务面（任务激活时目标点与距离；两套坐标系统一为
                 GTA 世界坐标，可直接算两点距离）

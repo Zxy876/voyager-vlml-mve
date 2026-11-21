@@ -189,6 +189,7 @@ def gta_get_obs() -> dict:
     wp = obs.get("waypoint")
     out = {
         "speed_ms": obs.get("speed"),
+        "speed": obs.get("speed"),        # 兼容别名（老草稿按 raw obs 键名取值）
         "speed_kmh": round((obs.get("speed") or 0) * 3.6, 1),
         "pos": pos,
         "heading": obs.get("heading"),
