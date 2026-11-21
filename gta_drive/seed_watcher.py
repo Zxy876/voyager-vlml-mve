@@ -109,8 +109,20 @@ def main() -> int:
                         f"当前在 ({pos[0]:.0f}, {pos[1]:.0f})，"
                         f"到达后用 gta_wait_arrive target=mission 验收")
         else:
-            question = (f"让车自动开到地图路点 ({wp[0]:.0f}, {wp[1]:.0f}) 并停稳，"
-                        f"当前在 ({pos[0]:.0f}, {pos[1]:.0f})")
+            # 人手点的路点可能不在路上（死胡同/院子/山坡）：GTA 原生驾驶 AI
+            # 只能开到最近街道节点，题面若仍写原坐标，车会在附近绕圈永远到
+            # 不了（实测 14:44 车卡在目标 44m 的死胡同里乱开）。插件已把路点
+            # 吸附到路网，这里用「可开到的那个点」出题，原坐标一并报出来。
+            drive = obs.get("waypoint_drive") or wp
+            offroad = float(obs.get("waypoint_offroad_m") or 0.0)
+            if offroad > 5:
+                question = (f"让车自动开到地图路点 ({wp[0]:.0f}, {wp[1]:.0f}) 最近的"
+                            f"可行驶位置 ({drive[0]:.0f}, {drive[1]:.0f}) 并停稳"
+                            f"（该路点离道路 {offroad:.0f}m，车开不进原坐标），"
+                            f"当前在 ({pos[0]:.0f}, {pos[1]:.0f})")
+            else:
+                question = (f"让车自动开到地图路点 ({wp[0]:.0f}, {wp[1]:.0f}) 并停稳，"
+                            f"当前在 ({pos[0]:.0f}, {pos[1]:.0f})")
         print(f"[seed] ★ 种子：{question}", flush=True)
         last_seeded_wp = list(wp)
         if a.dry_run:

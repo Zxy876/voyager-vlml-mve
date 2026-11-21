@@ -24,8 +24,14 @@ scene.duckdb 是空的属正常，不存在任何表/列，不许承诺 SQL 口�
   speed_kmh     车速（km/h）
   pos           车辆世界坐标 [x, y, z]
   heading       朝向角（度）
-  waypoint      地图路点 [x, y, z]（人按 M 在地图上设的；没有则 null）
-  waypoint_dist_m  当前到路点的直线距离（米；无路点则 null）
+  waypoint      地图路点 [x, y, z]（人按 M 在地图上设的原坐标；没有则 null）
+  waypoint_drive  该路点在**路网上最近的可行驶位置** [x, y, z]——车能真正开到
+                的就是这里。人点的坐标可能不在路上（死胡同/院子/山坡），GTA
+                原生驾驶 AI 只能开到最近街道节点，开向原坐标会在附近绕圈。
+                **开车的目标坐标一律用 waypoint_drive，不要用 waypoint。**
+  waypoint_offroad_m  原路点离道路多远（米）。0~5 表示就在路上，两者基本重合；
+                >20 说明人点的位置车开不进去，实际目标已被吸附到街上
+  waypoint_dist_m  当前到原路点的直线距离（米；无路点则 null）
   obs_age_sec   这条观测的年龄（秒；>2 秒基本就是观测停流，别拿它当实时数据）
   running       MVE 是否在接管驾驶（drive 类动作到达会自动接管置 true，
                 无需人按 F9；人按 F9=把方向盘拿回来，期间 drive 类动作
@@ -60,7 +66,9 @@ scene.duckdb 是空的属正常，不存在任何表/列，不许承诺 SQL 口�
   mcp_gta_gta_wait_arrive(radius=5, target="waypoint"|"mission", timeout=…)
                                               判据由环境规则判定：距目标
                                               radius 内 = success（不经
-                                              LLM），verdict 附真实事件清单
+                                              LLM），verdict 附真实事件清单。
+                                              target=waypoint 时判的是
+                                              obs.waypoint_drive（可行驶位置）
   mcp_gta_gta_cruise(on/off)                  自由巡航开关
   mcp_gta_gta_stop() / mcp_gta_gta_handback() 停车 / 把方向盘交还给人
 
@@ -68,9 +76,10 @@ scene.duckdb 是空的属正常，不存在任何表/列，不许承诺 SQL 口�
   scene_data/G/gta_obs.jsonl   观测流水
   scene_data/G/gta_trace.jsonl 动作 + verdict + 事件账本
 
-承诺口径的规矩：起点=obs.pos、目标=waypoint 或 mission_target、到达判据=
-wait_arrive 的 radius、驾驶能力=drive_to/cruise。任何本题用到的字段必须在
-上面指认得到；指认不了 = 数据源上不可答，如实写缺什么，不许编。"""
+承诺口径的规矩：起点=obs.pos、目标=obs.waypoint_drive（可行驶位置）或
+mission_target、到达判据=wait_arrive 的 radius、驾驶能力=drive_to/cruise。
+任何本题用到的字段必须在上面指认得到；指认不了 = 数据源上不可答，如实写
+缺什么，不许编。"""
 
 
 def env_block() -> str:

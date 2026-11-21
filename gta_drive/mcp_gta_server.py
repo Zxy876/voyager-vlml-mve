@@ -178,12 +178,22 @@ def gta_status() -> dict:
     }
 
 
-def gta_get_obs() -> dict:
-    """取最新车辆状态（Voyager 同构的 observation 面）。"""
+def gta_get_obs(wait_sec: float = 5.0) -> dict:
+    """取最新车辆状态（Voyager 同构的 observation 面）。
+
+    冷启动竞速：MCP 子进程刚连上桥时快照是空的，直接返回 {"error": ...}
+    会让学生第一版代码 `obs['pos']` 当场 KeyError（实测 14:35 那轮
+    「程序在 obs['pos'] 就崩了」）。这里先等首帧，等不到才如实报错。
+    """
     BRIDGE.ensure_connected()
+    deadline = time.time() + max(0.0, float(wait_sec))
     obs = BRIDGE.snapshot()
-    if not obs:
-        return {"error": "还没有收到 obs（桥刚连上？等 1-2 秒再取）",
+    while not obs.get("ts") and time.time() < deadline and BRIDGE.connected:
+        time.sleep(0.05)
+        obs = BRIDGE.snapshot()
+    if not obs.get("ts"):
+        return {"error": "还没有收到 obs（桥连上但一帧都没有）——查 Windows "
+                         "转发器/隧道/游戏内插件是否在推观测",
                 "connected": BRIDGE.connected}
     pos = obs.get("pos") or [0, 0]
     wp = obs.get("waypoint")
@@ -194,6 +204,8 @@ def gta_get_obs() -> dict:
         "pos": pos,
         "heading": obs.get("heading"),
         "waypoint": wp,
+        "waypoint_drive": obs.get("waypoint_drive"),
+        "waypoint_offroad_m": obs.get("waypoint_offroad_m"),
         "waypoint_dist_m": round(dist2d(pos, wp), 1) if wp else None,
         "obs_age_sec": (round(time.time() - BRIDGE.last_obs_ts, 1)
                         if BRIDGE.last_obs_ts else None),
@@ -293,7 +305,14 @@ def gta_wait_arrive(radius: float = ARRIVE_M_DEFAULT,
                 verdict = "failed"
                 reason = "没有任务目标（当前没有进行中的任务或目标不在雷达上）"
                 break
-        elif not wp:
+        else:
+            # 人手点的路点可能不在路上（死胡同/院子/山坡）：GTA 原生驾驶 AI
+            # 只能开到最近街道节点，拿原始路点当判据永远到不了（实测车卡在
+            # 目标 44m 的死胡同里绕圈）。默认按插件吸附出的「可开到点」判；
+            # 判据规则本身（radius 内 = success）一字未改，只是目标的代表点
+            # 换成了同一路点在路网上的可达位置。
+            wp = obs.get("waypoint_drive") or obs.get("waypoint")
+        if not wp:
             verdict = "failed"
             reason = "没有路点（玩家需在地图设一个路点，或 target=mission 用任务目标）"
             break

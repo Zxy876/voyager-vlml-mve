@@ -59,6 +59,8 @@ public class MVEBridge : Script
     bool _missionActive = false;          // 任务面：当前有任务目标 blip
     float[] _missionTarget = null;        // 任务目标坐标（黄色 Standard blip，最近一个）
     float _missionDist = -1f;             // 与任务目标的直线距离
+    float[] _wpDrive = null;              // 路点在路网上的最近可达位置（吸附后）
+    float _wpOffroad = 0f;                // 人手点的路点离路网多远（0=就在路上）
     int _lastEventTick = 0;               // 行人扫描节流（重活放 10Hz）
 
     void Ev(string json)                  // 事件入缓冲（封顶防刷屏）
@@ -172,6 +174,23 @@ public class MVEBridge : Script
         _missionActive = mission != null;
         _missionTarget = mission != null ? V(mission.Position) : null;
         _missionDist = mission != null ? bestD : -1f;
+
+        // 路点可达面：人手点在地图上的路点可能根本不在路上（院子/死胡同/
+        // 山坡），GTA 原生驾驶 AI 只能开到最近的街道节点，于是车会在目标
+        // 附近绕圈永远到不了。这里把路点吸附到路网，暴露「可开到的那个点」，
+        // 判据按它算才可能成立；偏差量一并给出，人一眼能看出点歪了多远。
+        if (Game.IsWaypointActive)
+        {
+            Vector3 wpm = World.WaypointPosition;
+            Vector3 st = World.GetNextPositionOnStreet(wpm, false);
+            if (st != Vector3.Zero)
+            {
+                _wpDrive = new float[] { st.X, st.Y, st.Z };
+                _wpOffroad = wpm.DistanceTo2D(st);
+            }
+            else { _wpDrive = null; _wpOffroad = 0f; }
+        }
+        else { _wpDrive = null; _wpOffroad = 0f; }
 
         // 警力面解包：120m 内的警用车辆（IS_THIS_MODEL_A_POLICE_VEHICLE
         // 覆盖警车与警用直升机 polmav）。取最近一台：坐标/距离/鸣笛。
@@ -320,7 +339,11 @@ public class MVEBridge : Script
         {
             float[] wp = V(World.WaypointPosition);
             sb.Append(",\"waypoint\":[").Append(F(wp[0])).Append(',')
-              .Append(F(wp[1])).Append(',').Append(F(wp[2])).Append(']');
+              .Append(F(wp[1])).Append(',').Append(F(wp[2])).Append(']')
+              .Append(",\"waypoint_offroad_m\":").Append(F(_wpOffroad));
+            if (_wpDrive != null)
+                sb.Append(",\"waypoint_drive\":[").Append(F(_wpDrive[0])).Append(',')
+                  .Append(F(_wpDrive[1])).Append(',').Append(F(_wpDrive[2])).Append(']');
         }
         else
             sb.Append(",\"waypoint\":null");
