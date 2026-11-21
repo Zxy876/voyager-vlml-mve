@@ -49,6 +49,7 @@ SCENE_DIR = Path(os.environ.get(
 OBS_SAMPLE_SEC = 2.0      # obs 落盘采样间隔（游戏侧 10Hz，全落太大）
 ARRIVE_M_DEFAULT = 5.0    # 与 mve_gta_env.ARRIVE_M 同口径
 WAIT_MAX_SEC = 600.0      # wait_arrive 上限（防学生代码把会话挂死）
+OBS_STALE_SEC = 10.0      # wait_arrive 等待期新 obs 断流判定（10Hz 常流下 10s 没帧=停流）
 
 # ---------------------------------------------------------------------------
 # 桥接层：懒连接 + obs 泵线程 + 发送锁（工具调用在工作线程，必须串行化）
@@ -239,6 +240,7 @@ def gta_wait_arrive(radius: float = ARRIVE_M_DEFAULT,
     radius = max(float(radius), 1.0)
     t0, ticks, min_d = time.time(), 0, float("inf")
     last_ts = 0.0
+    last_fresh_wall: float | None = None  # 最近一次收到新 obs 的墙钟时刻
     verdict, reason = None, None
     seen_events: list = []                # 等待期间真实发生的游戏事件（撞/追/翻…）
     while verdict is None:
@@ -251,9 +253,21 @@ def gta_wait_arrive(radius: float = ARRIVE_M_DEFAULT,
             break
         obs = BRIDGE.snapshot()
         if obs.get("ts") == last_ts:
+            # 观测停流检测：新 obs 迟迟不来 = 游戏端没在推观测（插件 OnTick
+            # 停转 / 转发器或隧道半开卡死）。如实判停流，不烧满 timeout、
+            # 不拿冻结的首帧距离冒充「未到达」。
+            if last_fresh_wall is not None and \
+                    time.time() - last_fresh_wall > OBS_STALE_SEC:
+                frozen = (f"{min_d:.1f}m" if min_d < float("inf") else "从未采样")
+                verdict = "failed"
+                reason = (f"观测停流（{time.time() - last_fresh_wall:.0f}s 没有新 obs，"
+                          f"距离采样冻结在 {frozen}）——游戏端没在推观测，"
+                          "到达与否未知；查 Windows 转发器/隧道，恢复后重试")
+                break
             time.sleep(0.05)
             continue
         last_ts = obs.get("ts")
+        last_fresh_wall = time.time()
         for ev in (obs.get("events") or []):
             if len(seen_events) < 50:
                 seen_events.append(ev)

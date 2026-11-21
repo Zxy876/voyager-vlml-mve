@@ -16,10 +16,23 @@ import threading
 import time
 
 
-def pump(src: socket.socket, dst: socket.socket) -> None:
+GAME_IDLE_SEC = 30.0     # 游戏腿空闲超时：obs 本该 10Hz 常流，30s 无数据 = 链路半开卡死
+
+
+def pump(src: socket.socket, dst: socket.socket, tag: str = "",
+         idle_timeout: float | None = None) -> None:
+    """单向泵。idle_timeout 非空时：源超过该秒数无数据就自杀退出触发重连——
+    防 TCP 半开（隧道静默断流无 FIN/RST，recv 永久阻塞，进程假装还活着）。"""
     try:
+        if idle_timeout:
+            src.settimeout(idle_timeout)
         while True:
-            data = src.recv(65536)
+            try:
+                data = src.recv(65536)
+            except socket.timeout:
+                print(f"[fwd] {tag} {idle_timeout:.0f}s 无数据（疑似链路半开卡死），"
+                      "断开重连")
+                break
             if not data:
                 break
             dst.sendall(data)
@@ -52,10 +65,19 @@ def once(relay_host, relay_port) -> None:
         game.sendall(rest)
     # 等中继确认配对（>ROLE? 后发 GAME，会收到透传的另一侧数据）
     print(f"[fwd] 游戏桥 127.0.0.1:9777 ↔ 中继 {relay_host}:{relay_port} 已接通")
-    t1 = threading.Thread(target=pump, args=(game, rl), daemon=True)
+    # 游戏腿带空闲超时（obs 10Hz 常流，断流即触发重连）；中继腿动作稀疏，不设超时
+    t1 = threading.Thread(target=pump, args=(game, rl),
+                          kwargs={"tag": "游戏桥→中继",
+                                  "idle_timeout": GAME_IDLE_SEC}, daemon=True)
     t2 = threading.Thread(target=pump, args=(rl, game), daemon=True)
     t1.start(); t2.start()
-    t1.join()      # 任一方向断开即返回，走重连
+    t1.join()      # 任一方向断开（含空闲超时）即返回，走重连
+    # 收尾：关两条 socket，把可能还挂在 recv 上的另一方向踹出来（防线程泄漏）
+    for s in (game, rl):
+        try:
+            s.close()
+        except OSError:
+            pass
 
 
 def main() -> None:
