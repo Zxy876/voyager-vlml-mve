@@ -244,6 +244,7 @@ def gta_wait_arrive(radius: float = ARRIVE_M_DEFAULT,
     t0, ticks, min_d = time.time(), 0, float("inf")
     last_ts = 0.0
     last_fresh_wall: float | None = None  # 最近一次收到新 obs 的墙钟时刻
+    wait_start = t0                       # 等首帧 obs 的起点（冷启动竞速）
     verdict, reason = None, None
     seen_events: list = []                # 等待期间真实发生的游戏事件（撞/追/翻…）
     while verdict is None:
@@ -255,6 +256,17 @@ def gta_wait_arrive(radius: float = ARRIVE_M_DEFAULT,
             reason = f"超时（{timeout:.0f}s 未到达目标）"
             break
         obs = BRIDGE.snapshot()
+        if not obs.get("ts"):
+            # 桥刚连上、首帧 obs 还没到（MCP 子进程冷启动竞速）——等首帧，
+            # 不能拿空快照当成「没有路点」瞬间失败（实测会让学生 code 立刻
+            # stop()，车根本没开出去）
+            if time.time() - wait_start > OBS_STALE_SEC:
+                verdict = "failed"
+                reason = ("观测从未到达（桥连上但一帧 obs 都没有）——"
+                          "查 Windows 转发器/隧道/游戏内插件是否在推观测")
+                break
+            time.sleep(0.05)
+            continue
         if obs.get("ts") == last_ts:
             # 观测停流检测：新 obs 迟迟不来 = 游戏端没在推观测（插件 OnTick
             # 停转 / 转发器或隧道半开卡死）。如实判停流，不烧满 timeout、
