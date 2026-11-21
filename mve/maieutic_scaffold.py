@@ -1035,6 +1035,16 @@ def scene_sources(question: str, scene_id: str) -> list[str]:
       但标明它不是落点。
     """
     out: list[str] = []
+    # ⓪' 场景 G（GTA 自动驾驶，2026-11-21）：数据源不是表，是游戏环境 ——
+    #    先把 obs 字段 + mcp_gta_* 工具签名摆给骨架生成器，维度才会落在
+    #    真实工具/字段上（否则拆出 start_point/坐标系统这类泛维度，critic
+    #    又拿 SQL 表名列名逼问，Phase1 死循环）。
+    if str(scene_id or "") == "G":
+        try:
+            import gta_env
+            out.append(str(gta_env.env_block() or ""))
+        except Exception:
+            pass
     # ⓪ 可达表清单（**原版 targetUnit 的同构物**：这个场景的「工具」= 表）
     #    放在最前面 —— 教师端第一眼就该知道「哪些表能当落点」。
     try:

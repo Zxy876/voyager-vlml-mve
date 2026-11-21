@@ -3341,6 +3341,17 @@ def _env_obs_block(db_path: str) -> str:
     try:
         if not str(db_path or "").strip():
             return ""
+        # 场景 G（GTA 自动驾驶，2026-11-21）：数据源不是 SQL 库 ——
+        # scene.duckdb 是空库，db_observation 查出来为空 → Phase1 的
+        # 【数据源的真实结构】为空 → critic 拿 SQL 口径逼学生交「表名/列名」
+        # 五轮死循环（req_20261121T0437220abf 实测）。G 的环境结构 =
+        # 游戏 obs 字段 + mcp_gta_* 工具签名，同构 db_observation 的位置。
+        if "/scene_data/G/" in str(db_path).replace("\\", "/"):
+            try:
+                import gta_env
+                return str(gta_env.env_block() or "")
+            except Exception:
+                pass
         from curriculum_auto import db_observation as _dbobs
         obs = str(_dbobs(db_path) or "")
         if not obs:
